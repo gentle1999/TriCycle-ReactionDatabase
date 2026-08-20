@@ -1,10 +1,10 @@
 # MolOP 计算结果导出需求
 
-> 状态：MolOP 契约已实现，数据库接入待更新依赖基线
+> 状态：MolOP 契约已实现，数据库 schema 已对齐
 > 契约版本：`molop-calculation-export-v1`
-> 使用方：TriCycleAgent Reaction Database
-> MolOP 基线提交：`e10a0e073ea2c642342b108fe77a899d9971f3b5`
-> 复核日期：2026-07-14
+> 使用方：Example Chemistry Database（部署显示名可由环境变量覆盖）
+> 最低兼容基线：PyPI `molop>=0.2.4`、`molgr>=0.1.3`
+> 复核日期：2026-08-09
 
 ## 1. 目标
 
@@ -31,7 +31,7 @@ MolOP 不负责：
 
 - 根据文件名、能量顺序或 TS 位移自动决定反应方向；
 - 上传对象存储、生成数据库 UUID 或决定表结构；
-- 决定 ORCA observation 是否可接受为某个 Gaussian 权威 Geometry；
+- 决定任意计算 observation 是否可匹配某个已有 Geometry；
 - 为源文件中不存在的 forces、Hessian 或其他数组补零；
 - 导出私有 `_rdmol` cache、`Chem.Mol`、完整原文或 parser component tree。
 
@@ -86,10 +86,9 @@ ChemFileFrame dump
   parse_diagnostics[]
 ```
 
-`ChemFile.to_unitless_dump_with_unit_keys()` 不含 `frames` 或私有 `_frames_`。数据库先写入一个
-file view，再以 iterator、批次或分页方式消费 frame views，并用 artifact identity
-建立关联。传输层可以临时包装一个 file payload 和一页 frame payload，但该包装不是
-MolOP DTO。
+`ChemFile.model_dump()` 不含私有 `_frames_`。数据库先写入一个 file view，再以 iterator、
+批次或分页方式消费 frame views，并用 artifact identity 建立关联。传输层可以临时包装一个
+file payload 和一页 frame payload，但该包装不是 MolOP DTO。
 
 正式导入必须使用：
 
@@ -99,9 +98,9 @@ chem_file = AutoParser(
     capture_source_evidence=True,
     release_file_content=True,
 )[0]
-file_payload = chem_file.to_unitless_dump_with_unit_keys(exclude_none=True)
+file_payload = chem_file.model_dump(mode="python", exclude_none=False)
 frame_payloads = (
-    frame.to_unitless_dump_with_unit_keys(exclude_none=True)
+    frame.model_dump(mode="python", exclude_none=False)
     for frame in chem_file
 )
 ```
@@ -154,7 +153,7 @@ Gaussian/ORCA 专用 Pydantic 类型。协议从 segment metadata 生成，因�
 | `MOLREQ-021` | 必须提供 portable topology | 至少包含 canonical isomeric SMILES、map-free V3000 MolBlock 和重建 provenance |
 | `MOLREQ-022` | 只对可信 topology 输出 source 到 topology 的 permutation | permutation 完整、无重复；失败或歧义时省略，并输出 `parse_failed` 和稳定 diagnostic |
 | `MOLREQ-023` | ORCA 必须输出实际观察坐标与 `coordinate_decimal_places` | 数据库可据打印精度设置匹配容差并独立计算 RMSD |
-| `MOLREQ-024` | Gaussian 权威计算几何来自公开 `frame.coords` | `standard_coords` 仅作诊断，不创建第二个权威 Geometry |
+| `MOLREQ-024` | 各后端的观测几何来自公开 `frame.coords` | 诊断坐标不创建第二个 Geometry；匹配由数据库执行 |
 | `MOLREQ-025` | V3000 MolBlock 中的坐标仅是 topology carrier placeholder | 数据库不得把 MolBlock 坐标当作计算几何 |
 
 ### 4.4 Typed Energy Observation 与单位 wire format
@@ -271,7 +270,7 @@ identity。
 8. 大数组使用独立 sidecar；数据库记录 dtype、shape、hash、axis convention 和
    source field。
 9. `parse_presence`、`parse_completeness` 和 diagnostics 是 admission 输入，不是可丢弃日志。
-10. Reaction/ReactionPath 语义、Gaussian 权威 Geometry 匹配和 ORCA observation 接纳策略
+10. Reaction/ReactionPath 语义、软件无关的 Geometry 匹配和 observation 接纳策略
     保持在数据库层。
 
 ## 8. 当前实现状态与剩余验收
@@ -288,13 +287,26 @@ MolOP 当前已实现：
 - parse presence/completeness/diagnostics；
 - 命名数组字段、array convention metadata 和 ndarray sidecar 模式。
 
-数据库正式固定 MolOP revision 前仍需：
+数据库接入状态：
 
-1. 在合并后用不可变 commit 更新 `pyproject.toml` 的 MolOP pin，并记录对应 MolGR
-   revision。
-2. 对 Gaussian minimum、TS、多 Link1、异常 termination、相关方法，以及 ORCA 单点、相关
+1. 依赖要求为 PyPI MolOP `>=0.2.4` 与 MolGR `>=0.1.3`。Gaussian 进程内导入直接消费 MolOP
+   公共模型的 `model_dump(mode="python", exclude_none=False)` payload，不重复实现
+   locator、状态判断、拓扑重建或模型校验。数据库侧只做字段裁剪、Quantity 单位归一化、
+   ndarray sidecar 摘要/转换和数据库 identity 绑定。
+2. 已用 DA minimum、TS 和多 Link1 fixture 验证 9 个 segment、45 个 frame、227 个数组、
+   4 个热化学结果、49 条 typed energy observation、14 个 molecular-orbital result、
+   14 个 population result（18 条 series）和 14 个 polarizability result。
+3. Topology graph identity 与版本化 reconstruction derivation 已分表；每个 frame
+   关联实际 derivation，并持久化可选 `coordinate_decimal_places`。该字段因 MolOP
+   `exclude_if` 可能不出现在 `None` dump 中，接收层从同一公共 model field 显式补齐。
+4. 仍需对异常 termination、相关方法，以及 ORCA 单点、相关
    方法、gradient、坐标异常建立数据库端黄金导入快照。
-3. 验证 file/frame 分阶段导入在大优化轨迹下不会构造全帧 JSON，也不会把 ndarray 留在
+5. 验证 file/frame 分阶段导入在大优化轨迹下不会构造全帧 JSON，也不会把 ndarray 留在
    JSON 编码路径。
-4. 完成 unit-key parser、sidecar canonical encoding 和 quarantine policy 的数据库测试。
-5. 将 model chemistry 进一步规范化视为 P2 演进，不阻塞当前 evidence-first 导入。
+6. 完成 ORCA admission 和 quarantine policy 的数据库测试。
+7. 将 model chemistry 进一步规范化视为 P2 演进，不阻塞当前 evidence-first 导入。
+
+MolOP 当前少数 computed evidence 属性尚未进入 `model_dump()`（例如 file/frame
+diagnostics 和部分收敛摘要）。适配器只对这些明确列出的字段做最小属性回退；字段一旦进入
+MolOP dump，数据库适配器不再直接读取该属性。该回退不改变 MolOP 的事实来源，也不构造
+第二套 parser DTO。

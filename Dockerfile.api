@@ -1,0 +1,56 @@
+FROM python:3.12-slim-bookworm@sha256:a116514e19457bcb7af7efe9c3dd0b9b71e85b317694e7882a1c52aa15a78134 AS builder
+
+ARG UV_VERSION=0.9.13
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir "uv==${UV_VERSION}"
+
+COPY pyproject.toml uv.lock README.md ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+COPY src ./src
+RUN uv sync --frozen --no-dev --no-editable
+
+
+FROM python:3.12-slim-bookworm@sha256:a116514e19457bcb7af7efe9c3dd0b9b71e85b317694e7882a1c52aa15a78134 AS runtime
+
+ENV HOME=/tmp \
+    PATH=/app/.venv/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    XDG_CACHE_HOME=/tmp/.cache
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        libexpat1 \
+        libgomp1 \
+        libstdc++6 \
+        libx11-6 \
+        libxext6 \
+        libxrender1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 tricycle \
+    && useradd --uid 10001 --gid tricycle --no-create-home --shell /usr/sbin/nologin tricycle
+
+WORKDIR /app
+
+COPY --from=builder --chown=tricycle:tricycle /app/.venv /app/.venv
+COPY --chown=tricycle:tricycle alembic.ini ./alembic.ini
+COPY --chown=tricycle:tricycle migrations ./migrations
+
+WORKDIR /tmp
+
+USER tricycle
+
+EXPOSE 8000
+STOPSIGNAL SIGTERM
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=20s --retries=6 \
+    CMD python -c "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/health/ready', timeout=4).read()"
+
+CMD ["tricycle-api"]

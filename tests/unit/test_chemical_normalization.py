@@ -1,0 +1,298 @@
+import numpy as np
+import pytest
+from pydantic import ValidationError
+from rdkit import Chem
+
+from tricycle_reaction_db.application.dtos import (
+    GeometryRecord,
+    MolecularTopologyRecord,
+    NormalizedMoleculeRecord,
+)
+from tricycle_reaction_db.domain.enums import StereoStatus, TopologySanitizationStatus
+from tricycle_reaction_db.ingestion.normalization import normalize_molecule, normalize_topology
+
+
+def _explicit_molecule() -> Chem.Mol:
+    mol = Chem.AddHs(Chem.MolFromSmiles("[CH3:8][C@H:2](F)Cl"))
+    mol.SetProp("source", "discarded")
+    mol.GetAtomWithIdx(0).SetProp("annotation", "discarded")
+    return mol
+
+
+def _coordinates(atom_count: int) -> np.ndarray:
+    return np.arange(atom_count * 3, dtype=np.float64).reshape(atom_count, 3) / 10
+
+
+def _unsanitizable_molecule() -> Chem.Mol:
+    molecule = Chem.RWMol()
+    carbon_index = molecule.AddAtom(Chem.Atom(6))
+    for _ in range(5):
+        hydrogen_index = molecule.AddAtom(Chem.Atom(1))
+        molecule.AddBond(carbon_index, hydrogen_index, Chem.BondType.SINGLE)
+    return molecule.GetMol()
+
+
+def test_normalization_separates_formula_topology_and_geometry() -> None:
+    mol = _explicit_molecule()
+    record = normalize_molecule(
+        mol,
+        _coordinates(mol.GetNumAtoms()),
+        charge=0,
+        multiplicity=1,
+        reconstruction_method="test",
+        reconstruction_version="1",
+    )
+
+    assert record.formula.hill_formula == "C2H4ClF"
+    assert record.formula.atom_count == mol.GetNumAtoms()
+    assert record.topology.formal_charge == 0
+    assert record.topology.fragment_count == 1
+    assert record.topology.stereo_status is StereoStatus.ASSIGNED
+    assert record.topology.mol.GetNumConformers() == 0
+    assert not record.topology.mol.HasProp("source")
+    assert all(atom.GetAtomMapNum() == 0 for atom in record.topology.mol.GetAtoms())
+    assert all(not atom.HasProp("annotation") for atom in record.topology.mol.GetAtoms())
+    assert record.geometry.mol.GetNumConformers() == 1
+    assert record.geometry.mol.GetConformer().Is3D()
+    assert [atom.GetAtomicNum() for atom in record.geometry.mol.GetAtoms()] == [
+        atom.GetAtomicNum() for atom in record.topology.mol.GetAtoms()
+    ]
+    assert all(atom.GetAtomMapNum() == 0 for atom in record.geometry.mol.GetAtoms())
+    assert record.geometry.internal_coordinates.shape == (mol.GetNumAtoms(), 3)
+    assert record.geometry.internal_coordinates.dtype == np.dtype("<f8")
+    assert not record.geometry.internal_coordinates.flags.writeable
+    np.testing.assert_array_equal(record.observed_coordinates, _coordinates(mol.GetNumAtoms()))
+    assert sorted(record.observed_to_geometry_atom_indices) == list(range(mol.GetNumAtoms()))
+
+
+def test_topology_identity_is_independent_of_source_atom_order() -> None:
+    mol = _explicit_molecule()
+    coordinates = _coordinates(mol.GetNumAtoms())
+    order = list(reversed(range(mol.GetNumAtoms())))
+    reordered = Chem.RenumberAtoms(mol, order)
+
+    first = normalize_molecule(
+        mol,
+        coordinates,
+        charge=0,
+        multiplicity=1,
+        reconstruction_method="test",
+        reconstruction_version="1",
+    )
+    second = normalize_molecule(
+        reordered,
+        coordinates[order],
+        charge=0,
+        multiplicity=1,
+        reconstruction_method="test",
+        reconstruction_version="1",
+    )
+
+    assert first.formula.composition_hash == second.formula.composition_hash
+    assert first.topology.graph_hash == second.topology.graph_hash
+    assert first.topology.canonical_isomeric_smiles == second.topology.canonical_isomeric_smiles
+    assert [atom.GetAtomicNum() for atom in first.geometry.mol.GetAtoms()] == [
+        atom.GetAtomicNum() for atom in first.topology.mol.GetAtoms()
+    ]
+    assert [atom.GetAtomicNum() for atom in second.geometry.mol.GetAtoms()] == [
+        atom.GetAtomicNum() for atom in second.topology.mol.GetAtoms()
+    ]
+    np.testing.assert_array_equal(first.observed_coordinates, coordinates)
+    np.testing.assert_array_equal(second.observed_coordinates, coordinates[order])
+
+
+def test_unsanitizable_topology_retains_searchable_connectivity_and_geometry() -> None:
+    molecule = _unsanitizable_molecule()
+    coordinates = _coordinates(molecule.GetNumAtoms())
+
+    record = normalize_molecule(
+        molecule,
+        coordinates,
+        charge=0,
+        multiplicity=2,
+        reconstruction_method="molgr/openbabel-fallback",
+        reconstruction_version="1",
+        reconstruction_metadata={"molgr_status": "suspicious_fallback"},
+    )
+
+    assert record.topology.sanitization_status is TopologySanitizationStatus.FAILED
+    assert "AtomValenceException" in (record.topology.sanitization_error or "")
+    assert record.topology.mol.HasSubstructMatch(Chem.MolFromSmarts("[#6]-[#1]"))
+    assert record.geometry.atom_count == molecule.GetNumAtoms()
+    assert record.topology_derivation.reconstruction_metadata == {
+        "molgr_status": "suspicious_fallback",
+        "topology_sanitization_status": "failed",
+        "topology_sanitization_error": record.topology.sanitization_error,
+    }
+
+
+def test_graph_only_normalization_adds_implicit_hydrogens_without_geometry() -> None:
+    implicit = Chem.MolFromSmiles("C=C")
+    explicit = Chem.AddHs(Chem.Mol(implicit))
+    calculated = normalize_molecule(
+        explicit,
+        _coordinates(explicit.GetNumAtoms()),
+        charge=0,
+        multiplicity=1,
+        reconstruction_method="test",
+        reconstruction_version="1",
+    )
+    graph_only = normalize_topology(
+        implicit,
+        add_hydrogens=True,
+        reconstruction_method="rdkit/reaction-representation",
+        reconstruction_version="test",
+    )
+
+    assert graph_only.formula.hill_formula == "C2H4"
+    assert graph_only.topology.graph_hash == calculated.topology.graph_hash
+    assert graph_only.topology.mol.GetNumConformers() == 0
+
+
+def test_normalization_rejects_non_coordinate_bearing_topology_and_bad_coordinates() -> None:
+    implicit_hydrogen_mol = Chem.MolFromSmiles("CC")
+    with pytest.raises(ValueError, match="hydrogen explicitly"):
+        normalize_molecule(
+            implicit_hydrogen_mol,
+            np.zeros((2, 3)),
+            charge=0,
+            multiplicity=1,
+            reconstruction_method="test",
+            reconstruction_version="1",
+        )
+
+
+def test_dtos_enforce_distinct_topology_and_geometry_mol_contracts() -> None:
+    source = _explicit_molecule()
+    record = normalize_molecule(
+        source,
+        _coordinates(source.GetNumAtoms()),
+        charge=0,
+        multiplicity=1,
+        reconstruction_method="test",
+        reconstruction_version="1",
+    )
+
+    mapped_topology = Chem.Mol(record.topology.mol)
+    mapped_topology.GetAtomWithIdx(0).SetAtomMapNum(1)
+    with pytest.raises(ValidationError, match="must not contain atom maps"):
+        MolecularTopologyRecord(
+            **record.topology.model_dump(exclude={"mol"}),
+            mol=mapped_topology,
+        )
+
+    two_dimensional_geometry = Chem.Mol(record.geometry.mol)
+    two_dimensional_geometry.GetConformer().Set3D(False)
+    with pytest.raises(ValidationError, match="must be three-dimensional"):
+        GeometryRecord(
+            **record.geometry.model_dump(exclude={"mol"}),
+            mol=two_dimensional_geometry,
+        )
+
+    invalid_internal = np.array(record.geometry.internal_coordinates, copy=True)
+    invalid_internal[1, 0] += 0.1
+    with pytest.raises(ValidationError, match="internal_coordinate_hash"):
+        GeometryRecord(
+            **record.geometry.model_dump(exclude={"internal_coordinates"}),
+            internal_coordinates=invalid_internal,
+        )
+
+
+def test_normalized_record_validates_source_to_topology_element_mapping() -> None:
+    source = _explicit_molecule()
+    record = normalize_molecule(
+        source,
+        _coordinates(source.GetNumAtoms()),
+        charge=0,
+        multiplicity=1,
+        reconstruction_method="test",
+        reconstruction_version="1",
+    )
+    mismatched_indices = list(record.observed_to_geometry_atom_indices)
+    carbon_source_index = record.observed_atomic_numbers.index(6)
+    fluorine_source_index = record.observed_atomic_numbers.index(9)
+    mismatched_indices[carbon_source_index], mismatched_indices[fluorine_source_index] = (
+        mismatched_indices[fluorine_source_index],
+        mismatched_indices[carbon_source_index],
+    )
+    with pytest.raises(ValidationError, match="does not map source atoms onto Topology"):
+        NormalizedMoleculeRecord(
+            **record.model_dump(exclude={"observed_to_geometry_atom_indices"}),
+            observed_to_geometry_atom_indices=mismatched_indices,
+        )
+
+    explicit = _explicit_molecule()
+    with pytest.raises(ValueError, match="coordinates must have shape"):
+        normalize_molecule(
+            explicit,
+            np.zeros((explicit.GetNumAtoms(), 2)),
+            charge=0,
+            multiplicity=1,
+            reconstruction_method="test",
+            reconstruction_version="1",
+        )
+
+
+def test_topology_derivation_identity_is_independent_from_graph_identity() -> None:
+    source = _explicit_molecule()
+    coordinates = _coordinates(source.GetNumAtoms())
+    first = normalize_molecule(
+        source,
+        coordinates,
+        charge=0,
+        multiplicity=1,
+        reconstruction_method="molgr/cpp",
+        reconstruction_version="1",
+        reconstruction_metadata={"config": "first"},
+    )
+    second = normalize_molecule(
+        source,
+        coordinates,
+        charge=0,
+        multiplicity=1,
+        reconstruction_method="molgr/cpp",
+        reconstruction_version="2",
+        reconstruction_metadata={"config": "second"},
+    )
+
+    assert first.topology.graph_hash == second.topology.graph_hash
+    assert first.topology_derivation.provenance_hash != second.topology_derivation.provenance_hash
+
+
+def test_normalized_record_rejects_graph_charge_and_spin_inconsistency() -> None:
+    source = _explicit_molecule()
+    record = normalize_molecule(
+        source,
+        _coordinates(source.GetNumAtoms()),
+        charge=0,
+        multiplicity=1,
+        reconstruction_method="test",
+        reconstruction_version="1",
+    )
+
+    isotope_geometry_mol = Chem.Mol(record.geometry.mol)
+    carbon_index = next(
+        atom.GetIdx() for atom in isotope_geometry_mol.GetAtoms() if atom.GetAtomicNum() == 6
+    )
+    isotope_geometry_mol.GetAtomWithIdx(carbon_index).SetIsotope(13)
+    isotope_geometry = GeometryRecord(
+        **record.geometry.model_dump(exclude={"mol"}),
+        mol=isotope_geometry_mol,
+    )
+    with pytest.raises(ValidationError, match="does not match Topology"):
+        NormalizedMoleculeRecord(
+            **record.model_dump(exclude={"geometry"}),
+            geometry=isotope_geometry,
+        )
+
+    with pytest.raises(ValidationError, match="charge does not match"):
+        NormalizedMoleculeRecord(
+            **record.model_dump(exclude={"charge"}),
+            charge=1,
+        )
+
+    with pytest.raises(ValidationError, match="inconsistent parity"):
+        NormalizedMoleculeRecord(
+            **record.model_dump(exclude={"multiplicity"}),
+            multiplicity=2,
+        )

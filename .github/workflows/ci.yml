@@ -1,0 +1,345 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UV_FROZEN: "1"
+  TRICYCLE_DATABASE_URL: postgresql+psycopg://tricycle:tricycle-ci@127.0.0.1:5432/tricycle
+  TRICYCLE_RUSTFS_ENDPOINT_URL: http://127.0.0.1:19000
+  TRICYCLE_RUSTFS_ACCESS_KEY: tricycle-ci
+  TRICYCLE_RUSTFS_SECRET_KEY: tricycle-rustfs-ci
+  TRICYCLE_RUSTFS_BUCKET: tricycle-ci-raw-logs
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.9.13"
+          enable-cache: true
+      - run: uv sync --frozen --python 3.12
+      - run: uv run --frozen ruff check src tests migrations scripts
+      - run: uv run --frozen ruff format --check src tests migrations scripts
+
+  type:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.9.13"
+          enable-cache: true
+      - run: uv sync --frozen --python 3.12
+      - run: uv run --frozen mypy src scripts
+      - run: uv run --frozen pyright src scripts
+
+  pytest-default:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.9.13"
+          enable-cache: true
+      - run: uv sync --frozen --python 3.12
+      - run: uv run --frozen pytest
+
+  evidence-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.9.13"
+          enable-cache: true
+      - run: uv sync --frozen --python 3.12
+      - name: Validate evidence generators and acceptance contracts
+        run: >-
+          uv run --frozen pytest -q
+          tests/unit/test_deployment_acceptance.py
+          tests/test_capture_query_plan_evidence.py
+          tests/test_probe_shared_rate_limit.py
+          tests/test_probe_upload_limit.py
+          tests/unit/test_operations_config.py
+
+  operations-config:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install configuration validators
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes nginx prometheus
+      - name: Validate the production reverse proxy
+        run: sudo nginx -p "$GITHUB_WORKSPACE/" -t -c "$GITHUB_WORKSPACE/infra/nginx/tricycle.conf"
+      - name: Exercise proxy routes and MCP streaming
+        run: sudo python3 scripts/validate_nginx_runtime.py
+      - name: Validate Prometheus alert rules
+        run: |
+          promtool check rules infra/monitoring/prometheus-rules.yml
+          cd infra/monitoring
+          promtool test rules prometheus-rules.test.yml
+      - name: Validate scheduler units
+        run: |
+          sudo install -d /opt/reaction-database/.venv/bin
+          sudo ln -sf /bin/true /opt/reaction-database/.venv/bin/tricycle-api
+          sudo ln -sf /bin/true /opt/reaction-database/.venv/bin/tricycle-auth-session-cleanup
+          sudo ln -sf /bin/true /opt/reaction-database/.venv/bin/tricycle-rustfs-gc
+          sudo systemd-analyze verify infra/systemd/*.service infra/systemd/*.timer
+
+  redis-rate-limit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.9.13"
+          enable-cache: true
+      - run: uv sync --frozen --python 3.12
+      - name: Start an isolated Redis rate-limit backend
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes redis-server
+          redis-server --bind 127.0.0.1 --port 6379 --save '' --appendonly no --daemonize yes
+          redis-cli ping
+      - name: Verify shared Redis limits and fail-closed behavior
+        run: >-
+          TRICYCLE_RUN_REDIS_TESTS=1
+          TRICYCLE_RATE_LIMIT_REDIS_URL=redis://127.0.0.1:6379/15
+          uv run --frozen pytest -m redis
+
+  alembic-fresh-database:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: antonsiomchen/cheminfo-db@sha256:6a1a34220c3db264b75ccfc2694f02f8bebde7b0629a91d49f3a9ddae2d1447d
+        env:
+          POSTGRES_DB: tricycle
+          POSTGRES_USER: tricycle
+          POSTGRES_PASSWORD: tricycle-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tricycle -d tricycle"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.9.13"
+          enable-cache: true
+      - run: uv sync --frozen --python 3.12
+      - run: uv run --frozen alembic upgrade head
+      - name: Assert that Alembic created schema only
+        run: |
+          test "$(PGPASSWORD=tricycle-ci psql -h 127.0.0.1 -U tricycle -d tricycle -Atc 'SELECT count(*) FROM user_account')" = "0"
+          test "$(PGPASSWORD=tricycle-ci psql -h 127.0.0.1 -U tricycle -d tricycle -Atc 'SELECT count(*) FROM organization')" = "0"
+          test "$(PGPASSWORD=tricycle-ci psql -h 127.0.0.1 -U tricycle -d tricycle -Atc 'SELECT count(*) FROM project')" = "0"
+      - name: Bootstrap development identity twice
+        run: |
+          first="$(uv run --frozen tricycle-bootstrap --mode development)"
+          second="$(uv run --frozen tricycle-bootstrap --mode development)"
+          test "$first" = "$second"
+      - run: uv run --frozen alembic current
+      - run: uv run --frozen alembic heads
+      - run: uv run --frozen alembic check
+
+  postgres-rdkit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: antonsiomchen/cheminfo-db@sha256:6a1a34220c3db264b75ccfc2694f02f8bebde7b0629a91d49f3a9ddae2d1447d
+        env:
+          POSTGRES_DB: tricycle
+          POSTGRES_USER: tricycle
+          POSTGRES_PASSWORD: tricycle-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tricycle -d tricycle"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.9.13"
+          enable-cache: true
+      - run: uv sync --frozen --python 3.12
+      - run: uv run --frozen alembic upgrade head
+      - run: uv run --frozen tricycle-bootstrap --mode development
+      - run: TRICYCLE_RUN_DATABASE_TESTS=1 uv run --frozen pytest -m "integration and not rustfs"
+
+  rustfs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: antonsiomchen/cheminfo-db@sha256:6a1a34220c3db264b75ccfc2694f02f8bebde7b0629a91d49f3a9ddae2d1447d
+        env:
+          POSTGRES_DB: tricycle
+          POSTGRES_USER: tricycle
+          POSTGRES_PASSWORD: tricycle-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tricycle -d tricycle"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      rustfs:
+        image: rustfs/rustfs:1.0.0-beta.8@sha256:fa19210ac4697c79d7ccca1ec9b0eb91aebacc6691991ffb14014bb3c67e6cc3
+        env:
+          RUSTFS_VOLUMES: /data
+          RUSTFS_ADDRESS: 0.0.0.0:9000
+          RUSTFS_CONSOLE_ENABLE: "false"
+          RUSTFS_ACCESS_KEY: tricycle-ci
+          RUSTFS_SECRET_KEY: tricycle-rustfs-ci
+        ports:
+          - 19000:9000
+        options: >-
+          --health-cmd "curl -fsS http://127.0.0.1:9000/health"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.9.13"
+          enable-cache: true
+      - run: uv sync --frozen --python 3.12
+      - run: uv run --frozen alembic upgrade head
+      - run: uv run --frozen tricycle-bootstrap --mode development
+      - run: >-
+          TRICYCLE_RUN_DATABASE_TESTS=1 TRICYCLE_RUN_RUSTFS_TESTS=1
+          uv run --frozen pytest -m rustfs
+
+  frontend-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm --prefix frontend ci
+      - run: npm --prefix frontend run build
+
+  playwright:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: antonsiomchen/cheminfo-db@sha256:6a1a34220c3db264b75ccfc2694f02f8bebde7b0629a91d49f3a9ddae2d1447d
+        env:
+          POSTGRES_DB: tricycle
+          POSTGRES_USER: tricycle
+          POSTGRES_PASSWORD: tricycle-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tricycle -d tricycle"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      rustfs:
+        image: rustfs/rustfs:1.0.0-beta.8@sha256:fa19210ac4697c79d7ccca1ec9b0eb91aebacc6691991ffb14014bb3c67e6cc3
+        env:
+          RUSTFS_VOLUMES: /data
+          RUSTFS_ADDRESS: 0.0.0.0:9000
+          RUSTFS_CONSOLE_ENABLE: "false"
+          RUSTFS_ACCESS_KEY: tricycle-ci
+          RUSTFS_SECRET_KEY: tricycle-rustfs-ci
+        ports:
+          - 19000:9000
+        options: >-
+          --health-cmd "curl -fsS http://127.0.0.1:9000/health"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.9.13"
+          enable-cache: true
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: uv sync --frozen --python 3.12
+      - run: npm --prefix frontend ci
+      - run: npx --prefix frontend playwright install --with-deps chromium
+      - run: uv run --frozen alembic upgrade head
+      - run: uv run --frozen tricycle-bootstrap --mode development
+      - run: uv run --frozen python scripts/validate_da_bench_fixture.py
+      - run: uv run --frozen tricycle-seed-da-bench
+      - name: Start API
+        run: |
+          uv run --frozen tricycle-api > /tmp/reaction-database-api.log 2>&1 &
+          for attempt in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:8000/health/ready && exit 0
+            sleep 1
+          done
+          cat /tmp/reaction-database-api.log
+          exit 1
+      - run: npm --prefix frontend run test:e2e
+      - if: failure()
+        run: cat /tmp/reaction-database-api.log
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: playwright-results
+          path: frontend/.playwright/results
+          if-no-files-found: ignore

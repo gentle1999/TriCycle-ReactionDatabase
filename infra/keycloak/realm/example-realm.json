@@ -1,0 +1,68 @@
+{
+  "realm": "example",
+  "enabled": true,
+  "displayName": "Example Development",
+  "registrationAllowed": true,
+  "registrationEmailAsUsername": true,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "rememberMe": true,
+  "verifyEmail": false,
+  "resetPasswordAllowed": true,
+  "clients": [
+    {
+      "clientId": "example-chemistry-frontend",
+      "name": "Example Chemistry Database",
+      "enabled": true,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "example-frontend-dev-secret",
+      "redirectUris": [
+        "http://127.0.0.1:8000/api/auth/callback",
+        "http://localhost:8000/api/auth/callback",
+        "http://127.0.0.1:8001/api/auth/callback",
+        "http://localhost:8001/api/auth/callback",
+        "http://127.0.0.1:8002/api/auth/callback",
+        "http://localhost:8002/api/auth/callback",
+        "http://127.0.0.1:8003/api/auth/callback",
+        "http://localhost:8003/api/auth/callback"
+      ],
+      "webOrigins": [
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        "http://127.0.0.1:5174",
+        "http://localhost:5174",
+        "http://127.0.0.1:5176",
+        "http://localhost:5176",
+        "http://127.0.0.1:5177",
+        "http://localhost:5177"
+      ],
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "frontchannelLogout": true,
+      "attributes": {
+        "post.logout.redirect.uris": "http://127.0.0.1:5173/*##http://localhost:5173/*##http://127.0.0.1:5174/*##http://localhost:5174/*##http://127.0.0.1:5176/*##http://localhost:5176/*##http://127.0.0.1:5177/*##http://localhost:5177/*"
+      }
+    }
+  ],
+  "users": [
+    {
+      "id": "00000000-0000-7000-8000-000000000002",
+      "username": "development",
+      "enabled": true,
+      "email": "developer@localhost",
+      "emailVerified": true,
+      "firstName": "Development",
+      "lastName": "User",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "development-password",
+          "temporary": false
+        }
+      ]
+    }
+  ]
+}

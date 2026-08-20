@@ -1,0 +1,364 @@
+{
+  "schema_version": "da-bench-fixture-v3",
+  "source": "user-supplied .tmp snapshot frozen on 2026-08-12",
+  "reaction": {
+    "ene_id": "000000000000",
+    "diene_id": "000000403256",
+    "prod_id": "00",
+    "reaction_smiles": "C=C.c1scc2c1OCCO2>>C1COC2=C(O1)[C@@H]1CC[C@H]2S1"
+  },
+  "workflow": {
+    "manifest_key": "da-bench:000000000000_000000403256:00",
+    "reaction_key": "000000000000_000000403256_00",
+    "path_key": "conf-01-product-00",
+    "mapped_reaction_smiles": [
+      "[C:1](=[C:2]([H:5])[H:6])([H:3])[H:4].[c:7]1([H:16])[s:8][c:9]([H:17])[c:10]2[c:11]1[O:12][C:13]([H:18])([H:19])[C:14]([H:20])([H:21])[O:15]2>>[C:1]1([H:3])([H:4])[C:2]([H:5])([H:6])[C@@:7]2([H:16])[S:8][C@:9]1([H:17])[C:10]1=[C:11]2[O:12][C:13]([H:18])([H:19])[C:14]([H:20])([H:21])[O:15]1"
+    ],
+    "participants": [
+      {
+        "side": "reactant",
+        "participant_index": 0,
+        "role": "dienophile",
+        "log_role": "ene",
+        "source_atom_map_numbers": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6
+        ]
+      },
+      {
+        "side": "reactant",
+        "participant_index": 1,
+        "role": "diene",
+        "log_role": "diene",
+        "source_atom_map_numbers": [
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21
+        ]
+      },
+      {
+        "side": "product",
+        "participant_index": 0,
+        "role": "product",
+        "log_role": "product",
+        "source_atom_map_numbers": [
+          1,
+          2,
+          4,
+          3,
+          6,
+          5,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          19,
+          18,
+          21,
+          20
+        ]
+      }
+    ],
+    "nodes": [
+      {
+        "node_key": "reactants",
+        "node_index": 0,
+        "role": "reactant",
+        "components": [
+          {
+            "component_key": "reactant:0",
+            "component_index": 0,
+            "log_role": "ene",
+            "geometry_authority": {
+              "segment_index": 1,
+              "frame_index": 0,
+              "file_frame_index": 4
+            },
+            "thermochemistry_source": {
+              "segment_index": 1,
+              "frame_index": 0,
+              "file_frame_index": 4
+            },
+            "source_atom_map_numbers": [
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "participant_side": "reactant",
+            "participant_index": 0
+          },
+          {
+            "component_key": "reactant:1",
+            "component_index": 1,
+            "log_role": "diene",
+            "geometry_authority": {
+              "segment_index": 1,
+              "frame_index": 0,
+              "file_frame_index": 6
+            },
+            "thermochemistry_source": {
+              "segment_index": 1,
+              "frame_index": 0,
+              "file_frame_index": 6
+            },
+            "source_atom_map_numbers": [
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21
+            ],
+            "participant_side": "reactant",
+            "participant_index": 1
+          }
+        ]
+      },
+      {
+        "node_key": "transition-state",
+        "node_index": 1,
+        "role": "transition_state",
+        "components": [
+          {
+            "component_key": "transition-state",
+            "component_index": 0,
+            "log_role": "transition_state",
+            "geometry_authority": {
+              "segment_index": 2,
+              "frame_index": 0,
+              "file_frame_index": 22
+            },
+            "thermochemistry_source": {
+              "segment_index": 2,
+              "frame_index": 0,
+              "file_frame_index": 22
+            },
+            "source_atom_map_numbers": [
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21
+            ]
+          }
+        ]
+      },
+      {
+        "node_key": "product",
+        "node_index": 2,
+        "role": "product",
+        "components": [
+          {
+            "component_key": "product:0",
+            "component_index": 0,
+            "log_role": "product",
+            "geometry_authority": {
+              "segment_index": 1,
+              "frame_index": 0,
+              "file_frame_index": 9
+            },
+            "thermochemistry_source": {
+              "segment_index": 1,
+              "frame_index": 0,
+              "file_frame_index": 9
+            },
+            "source_atom_map_numbers": [
+              1,
+              2,
+              4,
+              3,
+              6,
+              5,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              19,
+              18,
+              21,
+              20
+            ],
+            "participant_side": "product",
+            "participant_index": 0
+          }
+        ]
+      }
+    ],
+    "edge": {
+      "edge_key": "cycloaddition-step",
+      "edge_kind": "elementary_step",
+      "source_node_key": "reactants",
+      "target_node_key": "product",
+      "transition_state_node_key": "transition-state"
+    }
+  },
+  "logs": [
+    {
+      "role": "ene",
+      "relative_path": "reac/000000000000/000000000000_02.ene.log.gz",
+      "source_size_bytes": 132919,
+      "source_sha256": "feb1c5f3fcc0f5e1b9ed8cdc95c0de4f1c688ba5dd75b7c5a116df335a087760",
+      "gzip_sha256": "6d32e99963a951920ab996472bbb41a6d69e1459a70c6ad6de0836d892bb206c",
+      "frame_count": 5,
+      "atom_count": 6,
+      "normal_termination_count": 2,
+      "final_formula": "C2H4",
+      "final_topology_smiles": "C=C",
+      "final_imaginary_frequency_count": 0
+    },
+    {
+      "role": "diene",
+      "relative_path": "reac/000000403256/000000403256_03.diene.log.gz",
+      "source_size_bytes": 292687,
+      "source_sha256": "eb53137d8b838f0f66d3480d8248132a3f510d7a35e67e4fcd15bef0cccd3bc9",
+      "gzip_sha256": "7071b9c6a923ee063d0628d1f0b5ff86ff94e3ca89b720d61d81301bdc9750cd",
+      "frame_count": 7,
+      "atom_count": 15,
+      "normal_termination_count": 2,
+      "final_formula": "C6H6O2S",
+      "final_topology_smiles": "c1scc2c1OCCO2",
+      "final_imaginary_frequency_count": 0
+    },
+    {
+      "role": "transition_state",
+      "relative_path": "complete_set/000000000000_000000403256/00/ts/000000000000_000000403256_00_conf_01_ts.43b3faa8fcc9.log.gz",
+      "source_size_bytes": 1018294,
+      "source_sha256": "de24aad074d036c6ecedee3b47ece00a56591f8050afd573ad609f00fbcf858b",
+      "gzip_sha256": "3f4fb0e02857ff3acd4169eda71d391b1bafea67253c131dcf33ecc40f5e2ce2",
+      "frame_count": 23,
+      "atom_count": 21,
+      "normal_termination_count": 3,
+      "final_formula": "C8H10O2S",
+      "final_topology_smiles": "C=C.c1scc2c1OCCO2",
+      "final_imaginary_frequency_count": 1,
+      "reaction_frame_file_index": 22,
+      "positive_frequency_mode_count": 56
+    },
+    {
+      "role": "product",
+      "relative_path": "complete_set/000000000000_000000403256/00/prod/000000000000_000000403256_00_00.prod.log.gz",
+      "source_size_bytes": 515319,
+      "source_sha256": "878609ebdaea0fe52684026f751804ae4e8001d0a96e6cbdb6581ba0f519b1f4",
+      "gzip_sha256": "9869f3839984027c721c51aebf7d6b8386ddb3b70e9fff675858dc64d01d2db0",
+      "frame_count": 10,
+      "atom_count": 21,
+      "normal_termination_count": 2,
+      "final_formula": "C8H10O2S",
+      "final_topology_smiles": "C1COC2=C(O1)[C@@H]1CC[C@H]2S1",
+      "final_imaginary_frequency_count": 0
+    }
+  ],
+  "metadata_files": [
+    {
+      "relative_path": "reac/000000000000/000000000000.json",
+      "size_bytes": 54,
+      "sha256": "3e7904aa0be0fdcce28e92f23b789cdfe36491e1ff9b888afa9b3e3e8f533438"
+    },
+    {
+      "relative_path": "reac/000000403256/000000403256.json",
+      "size_bytes": 64,
+      "sha256": "73e993ea2da3950c0cf9a76a7202a95826157652de1e3ae0e542a3d93eec4ed4"
+    },
+    {
+      "relative_path": "complete_set/000000000000_000000403256/00/000000000000_000000403256_00.json",
+      "size_bytes": 928,
+      "sha256": "a2a0b3fd936650645130f7dcdf2470e1b8b4b8f3a303f2331e9944afb6ee6b78"
+    }
+  ],
+  "expected_molop_totals": {
+    "frames": 45,
+    "segments": 9,
+    "arrays": 227,
+    "thermochemistry": 4,
+    "energies": 45,
+    "energy_observations": 49,
+    "vibrations": 4,
+    "optimizations": 40,
+    "statuses": 40,
+    "molecular_orbitals": 14,
+    "population_results": 14,
+    "population_series": 18,
+    "polarizabilities": 14,
+    "array_assignments": 106,
+    "running_times": 45
+  },
+  "expected_array_counts": {
+    "forces": 40,
+    "hessian": 4,
+    "vibrational_frequencies": 4,
+    "reduced_masses": 4,
+    "vibrational_force_constants": 4,
+    "ir_intensities": 4,
+    "normal_modes": 4,
+    "moments_of_inertia": 4,
+    "rotational_temperatures": 4,
+    "rotational_constants": 45,
+    "vibrational_temperatures": 4,
+    "orbital_alpha_energies": 14,
+    "atomic_population": 18,
+    "polarizability_tensor": 4,
+    "dipole": 14,
+    "quadrupole": 14,
+    "traceless_quadrupole": 14,
+    "octapole": 14,
+    "hexadecapole": 14
+  }
+}

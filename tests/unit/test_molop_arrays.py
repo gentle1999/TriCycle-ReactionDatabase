@@ -1,0 +1,63 @@
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from molop import AutoParser, molopconfig
+
+from tricycle_reaction_db.db.types import summarize_numpy_array
+from tricycle_reaction_db.domain.enums import ScientificArrayKind
+from tricycle_reaction_db.ingestion import scientific_array_records_from_molop_frame
+
+
+def test_da_bench_exports_every_supported_molop_array(
+    da_bench_log_paths: dict[str, Path],
+    da_bench_manifest: dict[str, Any],
+) -> None:
+    molopconfig.show_progress_bar = False
+    records = [
+        record
+        for path in da_bench_log_paths.values()
+        for frame in AutoParser(str(path), n_jobs=1)[0]
+        for record in scientific_array_records_from_molop_frame(frame)
+    ]
+
+    expected_counts = {
+        ScientificArrayKind(kind): count
+        for kind, count in da_bench_manifest["expected_array_counts"].items()
+    }
+    assert Counter(record.kind for record in records) == expected_counts
+    assert len(records) == sum(expected_counts.values())
+    for record in records:
+        summary = summarize_numpy_array(record.data)
+        assert record.dtype == summary.dtype == "float64"
+        assert record.shape == list(summary.shape)
+        assert record.array_nbytes == summary.nbytes
+        assert record.payload_sha256 == summary.sha256
+        assert record.data.flags.c_contiguous
+        assert record.data.dtype == np.dtype("<f8")
+        assert np.isfinite(record.data).all()
+
+
+def test_ts_vibrational_temperatures_map_only_positive_frequency_modes(
+    da_bench_log_paths: dict[str, Path],
+    da_bench_manifest: dict[str, Any],
+) -> None:
+    molopconfig.show_progress_bar = False
+    ts_entry = next(
+        entry for entry in da_bench_manifest["logs"] if entry["role"] == "transition_state"
+    )
+    frame = AutoParser(str(da_bench_log_paths["transition_state"]), n_jobs=1)[0][
+        ts_entry["reaction_frame_file_index"]
+    ]
+    records = scientific_array_records_from_molop_frame(frame)
+    temperatures = next(
+        record for record in records if record.kind is ScientificArrayKind.VIBRATIONAL_TEMPERATURES
+    )
+
+    positive_mode_count = ts_entry["positive_frequency_mode_count"]
+    assert temperatures.shape == [positive_mode_count]
+    assert temperatures.array_metadata is not None
+    assert temperatures.array_metadata["frequency_mode_indices"] == list(
+        range(1, positive_mode_count + 1)
+    )

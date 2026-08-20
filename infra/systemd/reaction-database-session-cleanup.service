@@ -1,0 +1,19 @@
+[Unit]
+Description=Reaction database expired-session cleanup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=reactiondb
+Group=reactiondb
+WorkingDirectory=/opt/reaction-database
+EnvironmentFile=/etc/reaction-database/application.env
+ExecStart=/opt/reaction-database/.venv/bin/tricycle-auth-session-cleanup --revoked-retention-days 30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+LockPersonality=true
+RestrictSUIDSGID=true
+

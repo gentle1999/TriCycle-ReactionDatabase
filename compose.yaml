@@ -1,0 +1,217 @@
+name: ${COMPOSE_PROJECT_NAME:-reaction-database-development}
+
+x-api-service: &api-service
+  image: ${TRICYCLE_API_IMAGE:-tricycle-reaction-database-api:local}
+  build:
+    context: .
+    dockerfile: Dockerfile.api
+    args:
+      UV_VERSION: ${UV_VERSION:-0.9.13}
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    TRICYCLE_API_HOST: 0.0.0.0
+    TRICYCLE_API_PORT: 8000
+    TRICYCLE_DATABASE_URL: ${TRICYCLE_COMPOSE_DATABASE_URL:-postgresql+psycopg://example_user:example-local-password@postgres:5432/example_reaction_db}
+    TRICYCLE_RUSTFS_ENDPOINT_URL: ${TRICYCLE_COMPOSE_RUSTFS_ENDPOINT_URL:-http://rustfs:9000}
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  read_only: true
+  tmpfs:
+    - /tmp:size=512m,mode=1777
+
+services:
+  postgres:
+    image: antonsiomchen/cheminfo-db:postgres18-rdkit2025.09.6
+    restart: unless-stopped
+    shm_size: 256mb
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-example_reaction_db}
+      POSTGRES_USER: ${POSTGRES_USER:-example_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-example-local-password}
+    ports:
+      - "${POSTGRES_BIND_ADDRESS:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}" &&
+          psql -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}" -tAc
+          "SELECT 1 FROM pg_extension WHERE extname = 'rdkit'" | grep -q 1
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    stop_grace_period: 30s
+
+  rustfs:
+    image: rustfs/rustfs:1.0.0-beta.8
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: ${TRICYCLE_RUSTFS_ACCESS_KEY:-example-local-access}
+      RUSTFS_SECRET_KEY: ${TRICYCLE_RUSTFS_SECRET_KEY:-example-local-secret}
+      # RustFS beta.8 disk compression; S3 still exposes logical object bytes.
+      RUSTFS_COMPRESSION_ENABLED: ${RUSTFS_COMPRESSION_ENABLED:-true}
+      RUSTFS_OBS_LOGGER_LEVEL: warn
+    ports:
+      - "${RUSTFS_BIND_ADDRESS:-127.0.0.1}:${RUSTFS_API_PORT:-19000}:9000"
+      - "${RUSTFS_CONSOLE_BIND_ADDRESS:-127.0.0.1}:${RUSTFS_CONSOLE_PORT:-19001}:9001"
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - sh
+        - -ec
+        - >-
+          test "$${RUSTFS_COMPRESSION_ENABLED}" = true &&
+          curl -fsS http://127.0.0.1:9000/health &&
+          curl -fsS http://127.0.0.1:9001/rustfs/console/health
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    stop_grace_period: 30s
+
+  keycloak:
+    # Development-only OIDC service. It stays loopback-bound and must not be exposed directly.
+    image: quay.io/keycloak/keycloak:26.3.2
+    restart: unless-stopped
+    command:
+      - start-dev
+      - --http-port=8080
+      - --import-realm
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USERNAME:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin-dev-password}
+      KC_HOSTNAME: ${KEYCLOAK_HOSTNAME:-127.0.0.1}
+      KC_HOSTNAME_STRICT: "false"
+      KC_HTTP_ENABLED: "true"
+    ports:
+      - "127.0.0.1:${KEYCLOAK_PORT:-8080}:8080"
+    volumes:
+      - ./infra/keycloak/realm:/opt/keycloak/data/import:ro
+      - keycloak-data:/opt/keycloak/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          timeout 3 bash -c '</dev/tcp/127.0.0.1/8080' 2>/dev/null
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    stop_grace_period: 30s
+
+  migrate:
+    <<: *api-service
+    command:
+      - alembic
+      - -c
+      - /app/alembic.ini
+      - upgrade
+      - head
+    restart: "no"
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  bootstrap:
+    <<: *api-service
+    command:
+      - tricycle-bootstrap
+      - --mode
+      - ${TRICYCLE_BOOTSTRAP_MODE:-development}
+    restart: "no"
+    healthcheck:
+      disable: true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  api:
+    <<: *api-service
+    restart: unless-stopped
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      rustfs:
+        condition: service_healthy
+    stop_grace_period: 30s
+
+  frontend:
+    image: ${TRICYCLE_FRONTEND_IMAGE:-tricycle-reaction-database-frontend:local}
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
+        VITE_APP_NAME: ${VITE_APP_NAME:-Example Chemistry Database}
+        VITE_BRAND_NAME: ${VITE_BRAND_NAME:-Example Research Platform}
+        VITE_APP_TAGLINE: ${VITE_APP_TAGLINE:-Computational data browser}
+        VITE_MCP_SERVER_NAME: ${VITE_MCP_SERVER_NAME:-example-chemistry-database}
+        VITE_CSRF_COOKIE_NAME: ${VITE_CSRF_COOKIE_NAME:-example_csrf}
+        VITE_CSRF_HEADER_NAME: ${VITE_CSRF_HEADER_NAME:-x-csrf-token}
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+
+  nginx:
+    image: ${TRICYCLE_NGINX_IMAGE:-tricycle-reaction-database-nginx:local}
+    build:
+      context: .
+      dockerfile: infra/nginx/Dockerfile
+    restart: unless-stopped
+    init: true
+    environment:
+      NGINX_SERVER_NAME: ${NGINX_SERVER_NAME:-localhost}
+      NGINX_SELF_SIGNED_CERT_DAYS: ${NGINX_SELF_SIGNED_CERT_DAYS:-30}
+      NGINX_REQUIRE_PROVIDED_CERTIFICATE: ${NGINX_REQUIRE_PROVIDED_CERTIFICATE:-false}
+    ports:
+      - "${NGINX_BIND_ADDRESS:-0.0.0.0}:${NGINX_HTTP_PORT:-80}:8080"
+      - "${NGINX_BIND_ADDRESS:-0.0.0.0}:${NGINX_HTTPS_PORT:-443}:8443"
+    volumes:
+      - ${NGINX_TLS_DIRECTORY:-nginx-tls}:/etc/nginx/tls
+    depends_on:
+      api:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    stop_grace_period: 30s
+
+volumes:
+  keycloak-data:
+  nginx-tls:
+  postgres-data:
+  rustfs-data:

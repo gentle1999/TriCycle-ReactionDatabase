@@ -1,0 +1,12 @@
+[Unit]
+Description=Run reaction database session cleanup daily
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+RandomizedDelaySec=15m
+Persistent=true
+Unit=reaction-database-session-cleanup.service
+
+[Install]
+WantedBy=timers.target
+

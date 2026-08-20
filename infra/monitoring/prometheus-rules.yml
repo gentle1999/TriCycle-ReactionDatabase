@@ -1,0 +1,147 @@
+groups:
+  - name: reaction-database-availability
+    rules:
+      - alert: ReactionDatabaseLiveProbeFailed
+        expr: probe_success{job="reaction-database-live"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Reaction database process is not live
+      - alert: ReactionDatabaseReadyProbeFailed
+        expr: probe_success{job="reaction-database-ready"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Reaction database cannot reach PostgreSQL/RDKit
+      - alert: ReactionDatabasePostgreSQLExporterDown
+        expr: pg_up{job="reaction-database-postgresql"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: PostgreSQL exporter reports the database unavailable
+      - alert: ReactionDatabaseRustFSProbeFailed
+        expr: probe_success{job="reaction-database-rustfs"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: RustFS/S3 health probe failed
+      - alert: ReactionDatabaseOIDCDiscoveryProbeFailed
+        expr: probe_success{job="reaction-database-oidc-discovery"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: OIDC discovery endpoint is unavailable
+      - alert: ReactionDatabaseSMTPStartTLSProbeFailed
+        expr: probe_success{job="reaction-database-smtp-starttls"} == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: SMTP STARTTLS synthetic probe failed
+      - alert: ReactionDatabaseAPIServiceFailed
+        expr: node_systemd_unit_state{name="reaction-database-api.service",state="failed"} == 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Reaction database API systemd unit failed
+  - name: reaction-database-runtime
+    rules:
+      - alert: ReactionDatabaseMetricsCollectionFailed
+        expr: increase(tricycle_metrics_collection_failures_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Application metrics could not refresh durable database state
+      - alert: ReactionDatabasePoolCoreSaturated
+        expr: tricycle_database_pool_connections{state="checked_out"} >= ignoring(state) tricycle_database_pool_connections{state="size"}
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: API worker is using every core database pool connection
+      - alert: ReactionDatabaseStatementTimeouts
+        expr: increase(tricycle_database_statement_timeouts_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: PostgreSQL statements exceeded the application timeout
+      - alert: ReactionDatabaseUploadFailures
+        expr: increase(tricycle_upload_operations_total{outcome="failed"}[15m]) > 5
+        labels:
+          severity: warning
+        annotations:
+          summary: Artifact upload failures exceeded the expected transient rate
+      - alert: ReactionDatabaseUploadPendingStale
+        expr: tricycle_artifact_storage_rows{status="pending"} > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: One or more durable artifact reservations remain pending
+      - alert: ReactionDatabaseIngestionFailures
+        expr: tricycle_artifact_ingestion_rows{status="failed"} > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: One or more durable artifact ingestion attempts failed
+      - alert: ReactionDatabaseArtifactStorageInvalid
+        expr: sum(tricycle_artifact_storage_rows{status=~"missing|corrupt"}) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Durable artifact rows report missing or corrupt object storage
+      - alert: ReactionDatabaseStorageFailures
+        expr: increase(tricycle_storage_failures_total{reason=~"missing|corrupt"}[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: An artifact access detected a missing or corrupt RustFS object
+      - alert: ReactionDatabaseOIDCCallbackFailures
+        expr: increase(tricycle_oidc_callbacks_total{outcome="failed"}[15m]) > 5
+        labels:
+          severity: warning
+        annotations:
+          summary: OIDC callback failures exceeded the expected user-error rate
+      - alert: ReactionDatabaseSMTPDeliveryFailures
+        expr: increase(tricycle_smtp_deliveries_total{outcome="failed"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Project invitation SMTP delivery failed
+      - alert: ReactionDatabaseMCPConnectionsHigh
+        expr: sum(tricycle_mcp_active_connections) > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Active MCP requests exceed the initial deployment capacity budget
+      - alert: ReactionDatabaseRateLimitBackendFailed
+        expr: increase(tricycle_rate_limit_decisions_total{outcome="backend_error"}[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: Redis could not make an authoritative rate-limit decision
+  - name: reaction-database-maintenance
+    rules:
+      - alert: ReactionDatabaseSessionCleanupFailed
+        expr: node_systemd_unit_state{name="reaction-database-session-cleanup.service",state="failed"} == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Session cleanup systemd unit failed
+      - alert: ReactionDatabaseRustFSGCFailed
+        expr: node_systemd_unit_state{name="reaction-database-rustfs-gc.service",state="failed"} == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: RustFS garbage collection systemd unit failed

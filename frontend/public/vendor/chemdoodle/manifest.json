@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "components": {
+    "chemdoodle-web": {
+      "version": "11.0.0",
+      "source": "https://web.chemdoodle.com/downloads/ChemDoodleWeb-11.0.0.zip",
+      "license": "GPL-3.0-or-later",
+      "license_file": "COPYING.txt"
+    }
+  },
+  "assets": [
+    {
+      "path": "COPYING.txt",
+      "component": "chemdoodle-web",
+      "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
+    },
+    {
+      "path": "ChemDoodleWeb.js",
+      "component": "chemdoodle-web",
+      "version_marker": "ChemDoodle Web Components 11.0.0",
+      "sha256": "1556337edb550218c3c8c36c81b0a67d970c5c6f7692c6f8ca27028a6e134346"
+    },
+    {
+      "path": "ChemDoodleWeb.css",
+      "component": "chemdoodle-web",
+      "version_marker": "ChemDoodle Web Components 11.0.0",
+      "sha256": "5869c992ba48dde4e0c90f0a9c21569f30f0f45074cb1a4d730c355a1a4226f6"
+    },
+    {
+      "path": "ChemDoodleWeb-uis.js",
+      "component": "chemdoodle-web",
+      "version_marker": "ChemDoodle Web Components 11.0.0",
+      "sha256": "9d275f9fc0a56d5b3eb8ca718216d7a7ad04fde1f806ab6394bdbb07b00b9482"
+    }
+  ]
+}

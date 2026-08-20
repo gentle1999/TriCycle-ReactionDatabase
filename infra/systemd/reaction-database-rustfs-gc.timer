@@ -1,0 +1,12 @@
+[Unit]
+Description=Run reaction database RustFS garbage collection hourly
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=10m
+Persistent=true
+Unit=reaction-database-rustfs-gc.service
+
+[Install]
+WantedBy=timers.target
+

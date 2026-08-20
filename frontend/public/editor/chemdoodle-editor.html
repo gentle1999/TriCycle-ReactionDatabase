@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none';">
+    <link rel="stylesheet" href="/vendor/chemdoodle/ChemDoodleWeb.css">
+    <style>html, body { margin: 0; overflow: hidden; background: transparent; } #editor-canvas { display: block; }</style>
+  </head>
+  <body>
+    <canvas id="editor-canvas" aria-label="ChemDoodle structure editor"></canvas>
+    <script>
+      window.addEventListener("error", function (event) {
+        var source = event.target && event.target.src ? String(event.target.src) : "editor runtime";
+        window.parent.postMessage({
+          protocol: "tricycle-chemdoodle-editor/1",
+          type: "error",
+          message: "ChemDoodle editor failed to load: " + source.split("/").pop(),
+        }, "*");
+      }, true);
+    </script>
+    <script src="/vendor/chemdoodle/ChemDoodleWeb.js"></script>
+    <script>
+      try {
+        void localStorage.length;
+      } catch (_) {
+        const values = new Map();
+        Object.defineProperty(window, "localStorage", {
+          configurable: true,
+          value: {
+            clear: () => values.clear(),
+            getItem: (key) => values.has(String(key)) ? values.get(String(key)) : null,
+            key: (index) => Array.from(values.keys())[index] ?? null,
+            get length() { return values.size; },
+            removeItem: (key) => values.delete(String(key)),
+            setItem: (key, value) => values.set(String(key), String(value)),
+          },
+        });
+      }
+      ChemDoodle.iChemLabs.checkForUpdates = function () {};
+    </script>
+    <script src="/vendor/chemdoodle/ChemDoodleWeb-uis.js"></script>
+    <script src="/vendor/ChemDoodleWeb-global.js"></script>
+    <script src="/editor/chemdoodle-editor.js"></script>
+  </body>
+</html>

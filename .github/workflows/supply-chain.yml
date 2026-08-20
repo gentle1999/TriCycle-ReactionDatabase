@@ -1,0 +1,58 @@
+name: Supply chain
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python-lock-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.9.13"
+          enable-cache: false
+      - name: Export and audit the frozen runtime lock
+        run: |
+          uv export --frozen --no-dev --no-emit-project --no-hashes \
+            --format requirements-txt --output-file /tmp/tricycle-runtime-requirements.txt
+          uvx --from pip-audit==2.10.1 pip-audit --disable-pip --no-deps \
+            -r /tmp/tricycle-runtime-requirements.txt
+
+  npm-lock-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install the frozen frontend lock
+        run: npm --prefix frontend ci
+      - name: Reject high-severity npm advisories
+        run: npm --prefix frontend audit --audit-level=high --registry=https://registry.npmjs.org
+
+  vendored-browser-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Verify vendored hashes, versions, and OSV results
+        run: python scripts/audit_vendored_assets.py

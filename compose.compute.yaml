@@ -1,0 +1,30 @@
+# Compute-host overlay for the two-host layout.
+# PostgreSQL and RustFS run on the data host; this host runs the application
+# services and reaches those systems through their private DNS endpoints.
+x-compute-ca-volume: &compute-ca-volume
+  - type: bind
+    source: ${TRICYCLE_COMPOSE_CA_DIRECTORY:?set TRICYCLE_COMPOSE_CA_DIRECTORY to the host CA directory}
+    target: /etc/reaction-database/ca
+    read_only: true
+
+services:
+  postgres:
+    profiles:
+      - local-data
+
+  rustfs:
+    profiles:
+      - local-data
+
+  migrate:
+    depends_on: !reset []
+    volumes: *compute-ca-volume
+
+  bootstrap:
+    volumes: *compute-ca-volume
+
+  api:
+    depends_on: !override
+      bootstrap:
+        condition: service_completed_successfully
+    volumes: *compute-ca-volume

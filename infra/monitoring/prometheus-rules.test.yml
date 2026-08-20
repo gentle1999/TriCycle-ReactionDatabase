@@ -1,0 +1,285 @@
+rule_files:
+  - prometheus-rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: all operational alerts trigger and recover
+    interval: 1m
+    input_series:
+      - series: probe_success{job="reaction-database-live"}
+        values: 0x60 1x20
+      - series: probe_success{job="reaction-database-ready"}
+        values: 0x60 1x20
+      - series: pg_up{job="reaction-database-postgresql"}
+        values: 0x60 1x20
+      - series: probe_success{job="reaction-database-rustfs"}
+        values: 0x60 1x20
+      - series: probe_success{job="reaction-database-oidc-discovery"}
+        values: 0x60 1x20
+      - series: probe_success{job="reaction-database-smtp-starttls"}
+        values: 0x60 1x20
+      - series: node_systemd_unit_state{name="reaction-database-api.service",state="failed"}
+        values: 1x60 0x20
+      - series: tricycle_metrics_collection_failures_total{component="database"}
+        values: 0+1x60 60x20
+      - series: tricycle_database_pool_connections{instance="api-01",state="checked_out"}
+        values: 10x60 0x20
+      - series: tricycle_database_pool_connections{instance="api-01",state="size"}
+        values: 10x80
+      - series: tricycle_database_statement_timeouts_total
+        values: 0+1x60 60x20
+      - series: tricycle_upload_operations_total{outcome="failed"}
+        values: 0+1x60 60x20
+      - series: tricycle_artifact_storage_rows{status="pending"}
+        values: 1x60 0x20
+      - series: tricycle_artifact_ingestion_rows{status="failed"}
+        values: 1x60 0x20
+      - series: tricycle_artifact_storage_rows{status="missing"}
+        values: 1x60 0x20
+      - series: tricycle_storage_failures_total{reason="missing"}
+        values: 0+1x60 60x20
+      - series: tricycle_oidc_callbacks_total{outcome="failed"}
+        values: 0+1x60 60x20
+      - series: tricycle_smtp_deliveries_total{outcome="failed"}
+        values: 0+1x60 60x20
+      - series: tricycle_mcp_active_connections
+        values: 101x60 0x20
+      - series: tricycle_rate_limit_decisions_total{outcome="backend_error"}
+        values: 0+1x60 60x20
+      - series: node_systemd_unit_state{name="reaction-database-session-cleanup.service",state="failed"}
+        values: 1x60 0x20
+      - series: node_systemd_unit_state{name="reaction-database-rustfs-gc.service",state="failed"}
+        values: 1x60 0x20
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: ReactionDatabaseLiveProbeFailed
+        exp_alerts:
+          - exp_labels:
+              job: reaction-database-live
+              severity: critical
+            exp_annotations:
+              summary: Reaction database process is not live
+      - eval_time: 60m
+        alertname: ReactionDatabaseReadyProbeFailed
+        exp_alerts:
+          - exp_labels:
+              job: reaction-database-ready
+              severity: critical
+            exp_annotations:
+              summary: Reaction database cannot reach PostgreSQL/RDKit
+      - eval_time: 60m
+        alertname: ReactionDatabasePostgreSQLExporterDown
+        exp_alerts:
+          - exp_labels:
+              job: reaction-database-postgresql
+              severity: critical
+            exp_annotations:
+              summary: PostgreSQL exporter reports the database unavailable
+      - eval_time: 60m
+        alertname: ReactionDatabaseRustFSProbeFailed
+        exp_alerts:
+          - exp_labels:
+              job: reaction-database-rustfs
+              severity: critical
+            exp_annotations:
+              summary: RustFS/S3 health probe failed
+      - eval_time: 60m
+        alertname: ReactionDatabaseOIDCDiscoveryProbeFailed
+        exp_alerts:
+          - exp_labels:
+              job: reaction-database-oidc-discovery
+              severity: critical
+            exp_annotations:
+              summary: OIDC discovery endpoint is unavailable
+      - eval_time: 60m
+        alertname: ReactionDatabaseSMTPStartTLSProbeFailed
+        exp_alerts:
+          - exp_labels:
+              job: reaction-database-smtp-starttls
+              severity: warning
+            exp_annotations:
+              summary: SMTP STARTTLS synthetic probe failed
+      - eval_time: 60m
+        alertname: ReactionDatabaseAPIServiceFailed
+        exp_alerts:
+          - exp_labels:
+              name: reaction-database-api.service
+              state: failed
+              severity: critical
+            exp_annotations:
+              summary: Reaction database API systemd unit failed
+      - eval_time: 60m
+        alertname: ReactionDatabaseMetricsCollectionFailed
+        exp_alerts:
+          - exp_labels:
+              component: database
+              severity: warning
+            exp_annotations:
+              summary: Application metrics could not refresh durable database state
+      - eval_time: 60m
+        alertname: ReactionDatabasePoolCoreSaturated
+        exp_alerts:
+          - exp_labels:
+              instance: api-01
+              severity: warning
+            exp_annotations:
+              summary: API worker is using every core database pool connection
+      - eval_time: 60m
+        alertname: ReactionDatabaseStatementTimeouts
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: PostgreSQL statements exceeded the application timeout
+      - eval_time: 60m
+        alertname: ReactionDatabaseUploadFailures
+        exp_alerts:
+          - exp_labels:
+              outcome: failed
+              severity: warning
+            exp_annotations:
+              summary: Artifact upload failures exceeded the expected transient rate
+      - eval_time: 60m
+        alertname: ReactionDatabaseUploadPendingStale
+        exp_alerts:
+          - exp_labels:
+              status: pending
+              severity: warning
+            exp_annotations:
+              summary: One or more durable artifact reservations remain pending
+      - eval_time: 60m
+        alertname: ReactionDatabaseIngestionFailures
+        exp_alerts:
+          - exp_labels:
+              status: failed
+              severity: warning
+            exp_annotations:
+              summary: One or more durable artifact ingestion attempts failed
+      - eval_time: 60m
+        alertname: ReactionDatabaseArtifactStorageInvalid
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: Durable artifact rows report missing or corrupt object storage
+      - eval_time: 60m
+        alertname: ReactionDatabaseStorageFailures
+        exp_alerts:
+          - exp_labels:
+              reason: missing
+              severity: critical
+            exp_annotations:
+              summary: An artifact access detected a missing or corrupt RustFS object
+      - eval_time: 60m
+        alertname: ReactionDatabaseOIDCCallbackFailures
+        exp_alerts:
+          - exp_labels:
+              outcome: failed
+              severity: warning
+            exp_annotations:
+              summary: OIDC callback failures exceeded the expected user-error rate
+      - eval_time: 60m
+        alertname: ReactionDatabaseSMTPDeliveryFailures
+        exp_alerts:
+          - exp_labels:
+              outcome: failed
+              severity: warning
+            exp_annotations:
+              summary: Project invitation SMTP delivery failed
+      - eval_time: 60m
+        alertname: ReactionDatabaseMCPConnectionsHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: Active MCP requests exceed the initial deployment capacity budget
+      - eval_time: 60m
+        alertname: ReactionDatabaseRateLimitBackendFailed
+        exp_alerts:
+          - exp_labels:
+              outcome: backend_error
+              severity: critical
+            exp_annotations:
+              summary: Redis could not make an authoritative rate-limit decision
+      - eval_time: 60m
+        alertname: ReactionDatabaseSessionCleanupFailed
+        exp_alerts:
+          - exp_labels:
+              name: reaction-database-session-cleanup.service
+              state: failed
+              severity: warning
+            exp_annotations:
+              summary: Session cleanup systemd unit failed
+      - eval_time: 60m
+        alertname: ReactionDatabaseRustFSGCFailed
+        exp_alerts:
+          - exp_labels:
+              name: reaction-database-rustfs-gc.service
+              state: failed
+              severity: warning
+            exp_annotations:
+              summary: RustFS garbage collection systemd unit failed
+      - eval_time: 80m
+        alertname: ReactionDatabaseLiveProbeFailed
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: ReactionDatabaseReadyProbeFailed
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: ReactionDatabasePostgreSQLExporterDown
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: ReactionDatabaseRustFSProbeFailed
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: ReactionDatabaseOIDCDiscoveryProbeFailed
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: ReactionDatabaseSMTPStartTLSProbeFailed
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: ReactionDatabaseAPIServiceFailed
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: ReactionDatabaseMetricsCollectionFailed
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: ReactionDatabasePoolCoreSaturated
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: ReactionDatabaseStatementTimeouts
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: ReactionDatabaseUploadFailures
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: ReactionDatabaseUploadPendingStale
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: ReactionDatabaseIngestionFailures
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: ReactionDatabaseArtifactStorageInvalid
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: ReactionDatabaseStorageFailures
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: ReactionDatabaseOIDCCallbackFailures
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: ReactionDatabaseSMTPDeliveryFailures
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: ReactionDatabaseMCPConnectionsHigh
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: ReactionDatabaseRateLimitBackendFailed
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: ReactionDatabaseSessionCleanupFailed
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: ReactionDatabaseRustFSGCFailed
+        exp_alerts: []
