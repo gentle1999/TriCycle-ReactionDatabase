@@ -12,8 +12,9 @@ from sqlalchemy import delete, text
 from sqlmodel import col, select
 
 from tricycle_reaction_db.application.services.transition_state_uploads import (
-    INFERENCE_RATIOS,
-    INFERENCE_STEPS,
+    TS_PRE_POST_MAX_RATIO,
+    TS_PRE_POST_MIN_RATIO,
+    TS_PRE_POST_STEPS,
     _parse_calculation_output,
     _persist_transition_state_endpoints,
     _resolve_and_bind_transition_state_reaction,
@@ -205,9 +206,13 @@ def _backfill(
                         inference.mapped_reaction_id = mapped_reaction_id
                         inference_settings = {
                             **inference.inference_settings,
-                            "ratio_attempts": list(INFERENCE_RATIOS),
-                            "steps": INFERENCE_STEPS,
+                            "endpoint_selection": "molop.possible_pre_post_ts",
+                            "sampling_min_ratio": TS_PRE_POST_MIN_RATIO,
+                            "sampling_max_ratio": TS_PRE_POST_MAX_RATIO,
+                            "sampling_steps": TS_PRE_POST_STEPS,
                         }
+                        inference_settings.pop("ratio_attempts", None)
+                        inference_settings.pop("steps", None)
                         inference_settings.pop("endpoint_backfill", None)
                         inference.inference_settings = inference_settings
                         session.add(inference)
@@ -232,8 +237,10 @@ def _backfill(
                         )
                         inference.inference_settings = {
                             **inference.inference_settings,
-                            "ratio_attempts": list(INFERENCE_RATIOS),
-                            "steps": INFERENCE_STEPS,
+                            "endpoint_selection": "molop.possible_pre_post_ts",
+                            "sampling_min_ratio": TS_PRE_POST_MIN_RATIO,
+                            "sampling_max_ratio": TS_PRE_POST_MAX_RATIO,
+                            "sampling_steps": TS_PRE_POST_STEPS,
                             "endpoint_backfill": {
                                 "status": "unavailable",
                                 "reason": "source_reparse_mismatch",
@@ -264,7 +271,7 @@ async def main() -> None:
     parser.add_argument(
         "--replace",
         action="store_true",
-        help="replace existing anchors using the current inference ratios",
+        help="replace existing anchors using the current MolOP pre/post-TS endpoints",
     )
     args = parser.parse_args()
     if args.limit is not None and args.limit < 1:

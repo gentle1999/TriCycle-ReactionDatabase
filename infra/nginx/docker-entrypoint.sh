@@ -4,6 +4,8 @@ set -eu
 certificate=/etc/nginx/tls/tls.crt
 private_key=/etc/nginx/tls/tls.key
 server_name=${NGINX_SERVER_NAME:-localhost}
+public_https_port=${NGINX_PUBLIC_HTTPS_PORT:-443}
+export NGINX_SERVER_NAME="$server_name" NGINX_PUBLIC_HTTPS_PORT="$public_https_port"
 
 if { [ -f "$certificate" ] && [ ! -f "$private_key" ]; } || \
    { [ ! -f "$certificate" ] && [ -f "$private_key" ]; }; then
@@ -29,7 +31,7 @@ if [ ! -f "$certificate" ]; then
         -addext "subjectAltName=DNS:$server_name,DNS:localhost,IP:127.0.0.1"
 fi
 
-envsubst '${NGINX_SERVER_NAME}' \
+envsubst '${NGINX_SERVER_NAME} ${NGINX_PUBLIC_HTTPS_PORT}' \
     < /etc/nginx/templates/tricycle.conf.template \
     > /tmp/tricycle.conf
 

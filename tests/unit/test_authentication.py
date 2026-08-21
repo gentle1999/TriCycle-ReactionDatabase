@@ -119,6 +119,54 @@ def test_anonymous_principal_route_intent(
     assert api_authentication._allows_anonymous_principal(request) is expected
 
 
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        ([("host", "remote.example.test:5173")], "http://remote.example.test:5173/reactions"),
+        (
+            [
+                ("host", "127.0.0.1:8000"),
+                ("x-forwarded-host", "remote.example.test"),
+                ("x-forwarded-proto", "https"),
+            ],
+            "https://remote.example.test/reactions",
+        ),
+    ],
+)
+def test_development_frontend_redirect_uses_request_origin(
+    monkeypatch: pytest.MonkeyPatch,
+    headers: list[tuple[str, str]],
+    expected: str,
+) -> None:
+    monkeypatch.setattr(auth_routes, "get_settings", lambda: Settings(_env_file=None))
+    request = Request(
+        {
+            "type": "http",
+            "scheme": "http",
+            "path": "/api/auth/login",
+            "headers": [(name.encode(), value.encode()) for name, value in headers],
+        }
+    )
+
+    assert auth_routes._frontend_url("/reactions", request) == expected
+
+
+@pytest.mark.asyncio
+async def test_development_login_redirect_is_relative(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(auth_routes, "get_settings", lambda: Settings(_env_file=None))
+    async with AsyncClient(
+        transport=ASGITransport(app=create_app()),
+        base_url="http://remote.example.test:5173",
+        follow_redirects=False,
+    ) as client:
+        response = await client.get("/api/auth/login?return_to=%2Freactions")
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/reactions"
+
+
 @pytest.mark.asyncio
 async def test_optional_authentication_only_allows_anonymous_in_oidc_mode(
     monkeypatch: pytest.MonkeyPatch,

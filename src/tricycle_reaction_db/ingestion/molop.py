@@ -4,6 +4,7 @@ from importlib.metadata import version
 from typing import Any, Literal
 
 from molgr.config import CONFIG as MOLGR_CONFIG
+from molop.config import molopconfig
 from molop.io.base_models.ChemFileFrame import BaseCalcFrame
 from molop.unit import atom_ureg
 from rdkit import Chem
@@ -17,8 +18,15 @@ MOLECULAR_GRAPH_RECONSTRUCTION_FAILURE_POLICY: Literal["return_suspicious"] = "r
 
 
 def configure_molecular_graph_reconstruction() -> None:
-    """Keep calculation frames when MolGR can only return an untrusted topology."""
+    """Keep calculation frames when MolGR can only return an untrusted topology.
 
+    MolOP 0.2.9 reads the policy from its own process-global ``molopconfig`` and
+    applies it to the shared MolGR config; set both so the ``suspicious_fallback``
+    frames keep flowing into the TS inference gate.
+    """
+
+    molopconfig.reconstruction_failure_policy = MOLECULAR_GRAPH_RECONSTRUCTION_FAILURE_POLICY
+    molopconfig.apply_molgr_reconstruction_policy()
     MOLGR_CONFIG.interface.reconstruction_failure_policy = (
         MOLECULAR_GRAPH_RECONSTRUCTION_FAILURE_POLICY
     )

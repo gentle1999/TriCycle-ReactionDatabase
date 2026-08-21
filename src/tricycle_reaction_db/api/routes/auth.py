@@ -9,7 +9,7 @@ import secrets
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlsplit
 from uuid import UUID
 
 import jwt
@@ -59,9 +59,25 @@ def _safe_return_to(value: str | None) -> str:
     return value
 
 
-def _frontend_url(path: str) -> str:
+def _frontend_url(path: str, request: Request | None = None) -> str:
     settings = get_settings()
-    return urljoin(settings.oidc_frontend_url.rstrip("/") + "/", path.lstrip("/"))
+    frontend_origin = settings.oidc_frontend_url.rstrip("/")
+    configured_host = urlsplit(frontend_origin).hostname
+    if (
+        request is not None
+        and settings.environment != "production"
+        and (
+            settings.auth_mode == "development"
+            or configured_host in {"localhost", "127.0.0.1", "::1"}
+        )
+    ):
+        forwarded_host = request.headers.get("x-forwarded-host")
+        host = (forwarded_host or request.headers.get("host") or "").split(",", 1)[0].strip()
+        forwarded_proto = request.headers.get("x-forwarded-proto")
+        scheme = (forwarded_proto or request.url.scheme).split(",", 1)[0].strip().lower()
+        if host and scheme in {"http", "https"}:
+            frontend_origin = f"{scheme}://{host}"
+    return urljoin(frontend_origin + "/", path.lstrip("/"))
 
 
 def _pkce_challenge(verifier: str) -> str:
@@ -69,10 +85,10 @@ def _pkce_challenge(verifier: str) -> str:
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
 
-def _callback_error_response(message: str) -> RedirectResponse:
+def _callback_error_response(message: str, request: Request | None = None) -> RedirectResponse:
     OIDC_CALLBACKS.labels(outcome="failed").inc()
     response = RedirectResponse(
-        _frontend_url(f"/login?error={quote(message[:160], safe='')}"),
+        _frontend_url(f"/login?error={quote(message[:160], safe='')}", request),
         status_code=status.HTTP_303_SEE_OTHER,
     )
     response.delete_cookie("tricycle_oidc_state", path="/api/auth")
@@ -88,11 +104,11 @@ async def auth_config() -> AuthConfigView:
 
 
 @router.get("/login")
-async def login(return_to: str = "/reactions") -> RedirectResponse:
+async def login(request: Request, return_to: str = "/reactions") -> RedirectResponse:
     settings = get_settings()
     destination = _safe_return_to(return_to)
     if settings.auth_mode == "development":
-        return RedirectResponse(_frontend_url(destination), status_code=status.HTTP_303_SEE_OTHER)
+        return RedirectResponse(destination, status_code=status.HTTP_303_SEE_OTHER)
     state = secrets.token_urlsafe(32)
     nonce = secrets.token_urlsafe(32)
     code_verifier = secrets.token_urlsafe(64)
@@ -141,7 +157,7 @@ async def callback(
 ) -> RedirectResponse:
     settings = get_settings()
     if error:
-        return _callback_error_response(error)
+        return _callback_error_response(error, request)
     state_cookie = request.cookies.get("tricycle_oidc_state")
     try:
         if not code or not state or not state_cookie:
@@ -173,10 +189,10 @@ async def callback(
             metadata={"issuer": principal.issuer, "subject": principal.subject},
         )
     except (AuthenticationError, jwt.PyJWTError) as callback_error:
-        return _callback_error_response(str(callback_error))
+        return _callback_error_response(str(callback_error), request)
     OIDC_CALLBACKS.labels(outcome="succeeded").inc()
     response = RedirectResponse(
-        _frontend_url(str(state_payload.get("return_to") or "/reactions")),
+        _frontend_url(str(state_payload.get("return_to") or "/reactions"), request),
         status_code=status.HTTP_303_SEE_OTHER,
     )
     response.set_cookie(
@@ -336,7 +352,7 @@ async def logout_redirect(
                 detail="CSRF token is required for session-authenticated logout",
             )
     await AuthenticationService.revoke_session(raw_session_token)
-    frontend_target = _frontend_url(_safe_return_to(return_to))
+    frontend_target = _frontend_url(_safe_return_to(return_to), request)
     provider_target: str | None = None
     if settings.auth_mode == "oidc":
         with suppress(AuthenticationError):

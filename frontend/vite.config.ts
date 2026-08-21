@@ -105,12 +105,12 @@ export default defineConfig(({ mode }) => {
     },
     build: { sourcemap: true },
     server: {
-      host: "127.0.0.1",
+      host: "0.0.0.0",
       port: 5173,
       proxy,
     },
     preview: {
-      host: "127.0.0.1",
+      host: "0.0.0.0",
       port: 4173,
       proxy,
     },

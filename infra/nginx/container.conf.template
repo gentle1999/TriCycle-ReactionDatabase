@@ -14,13 +14,19 @@ http {
     sendfile on;
     keepalive_timeout 65;
 
+    # The application enforces request budgets. Nginx only transports long
+    # uploads and parsing responses without adding a second size/rate ceiling.
+    client_max_body_size 0;
+    client_body_timeout 3600s;
+    send_timeout 3600s;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+
     client_body_temp_path /tmp/client_temp;
     proxy_temp_path /tmp/proxy_temp;
     fastcgi_temp_path /tmp/fastcgi_temp;
     uwsgi_temp_path /tmp/uwsgi_temp;
     scgi_temp_path /tmp/scgi_temp;
-
-    limit_req_zone $binary_remote_addr zone=reaction_database_api:10m rate=120r/m;
 
     upstream reaction_database_api {
         least_conn;
@@ -36,7 +42,7 @@ http {
     server {
         listen 8080;
         server_name ${NGINX_SERVER_NAME};
-        return 308 https://$host$request_uri;
+        return 308 https://$host:${NGINX_PUBLIC_HTTPS_PORT}$request_uri;
     }
 
     server {
@@ -72,4 +78,3 @@ http {
         }
     }
 }
-

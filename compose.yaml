@@ -64,12 +64,14 @@ services:
       RUSTFS_SECRET_KEY: ${TRICYCLE_RUSTFS_SECRET_KEY:-example-local-secret}
       # RustFS beta.8 disk compression; S3 still exposes logical object bytes.
       RUSTFS_COMPRESSION_ENABLED: ${RUSTFS_COMPRESSION_ENABLED:-true}
+      RUSTFS_OBS_LOG_DIRECTORY: /logs
       RUSTFS_OBS_LOGGER_LEVEL: warn
     ports:
       - "${RUSTFS_BIND_ADDRESS:-127.0.0.1}:${RUSTFS_API_PORT:-19000}:9000"
       - "${RUSTFS_CONSOLE_BIND_ADDRESS:-127.0.0.1}:${RUSTFS_CONSOLE_PORT:-19001}:9001"
     volumes:
       - rustfs-data:/data
+      - rustfs-logs:/logs
     healthcheck:
       test:
         - CMD
@@ -77,8 +79,7 @@ services:
         - -ec
         - >-
           test "$${RUSTFS_COMPRESSION_ENABLED}" = true &&
-          curl -fsS http://127.0.0.1:9000/health &&
-          curl -fsS http://127.0.0.1:9001/rustfs/console/health
+          curl -fsS http://127.0.0.1:9000/health
       interval: 5s
       timeout: 5s
       retries: 12
@@ -100,7 +101,7 @@ services:
       KC_HOSTNAME_STRICT: "false"
       KC_HTTP_ENABLED: "true"
     ports:
-      - "127.0.0.1:${KEYCLOAK_PORT:-8080}:8080"
+      - "${KEYCLOAK_BIND_ADDRESS:-127.0.0.1}:${KEYCLOAK_PORT:-8080}:8080"
     volumes:
       - ./infra/keycloak/realm:/opt/keycloak/data/import:ro
       - keycloak-data:/opt/keycloak/data
@@ -185,6 +186,7 @@ services:
     init: true
     environment:
       NGINX_SERVER_NAME: ${NGINX_SERVER_NAME:-localhost}
+      NGINX_PUBLIC_HTTPS_PORT: ${NGINX_HTTPS_PORT:-443}
       NGINX_SELF_SIGNED_CERT_DAYS: ${NGINX_SELF_SIGNED_CERT_DAYS:-30}
       NGINX_REQUIRE_PROVIDED_CERTIFICATE: ${NGINX_REQUIRE_PROVIDED_CERTIFICATE:-false}
     ports:
@@ -215,3 +217,4 @@ volumes:
   nginx-tls:
   postgres-data:
   rustfs-data:
+  rustfs-logs:

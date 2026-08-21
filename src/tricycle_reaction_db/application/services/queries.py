@@ -1361,6 +1361,8 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
         maximum_activation_gibbs_free_energy_kcal_mol: float | None = None,
         minimum_reaction_gibbs_free_energy_kcal_mol: float | None = None,
         maximum_reaction_gibbs_free_energy_kcal_mol: float | None = None,
+        has_activation_gibbs_free_energy: bool | None = None,
+        has_reaction_gibbs_free_energy: bool | None = None,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
         limit: PageLimit = 50,
@@ -1470,6 +1472,8 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             or maximum_activation_gibbs_free_energy_kcal_mol is not None
             or minimum_reaction_gibbs_free_energy_kcal_mol is not None
             or maximum_reaction_gibbs_free_energy_kcal_mol is not None
+            or has_activation_gibbs_free_energy
+            or has_reaction_gibbs_free_energy
         ):
             mapped_screening_ids = select(col(MappedReaction.logical_reaction_id)).where(
                 mapped_reaction_id_is_visible(scope, col(MappedReaction.id)),
@@ -1493,6 +1497,28 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                 mapped_screening_ids = mapped_screening_ids.where(
                     col(MappedReaction.minimum_reaction_gibbs_free_energy_kcal_mol)
                     <= maximum_reaction_gibbs_free_energy_kcal_mol
+                )
+            if has_activation_gibbs_free_energy:
+                mapped_screening_ids = mapped_screening_ids.where(
+                    or_(
+                        col(MappedReaction.minimum_activation_gibbs_free_energy_kcal_mol).is_not(
+                            None
+                        ),
+                        col(MappedReaction.maximum_activation_gibbs_free_energy_kcal_mol).is_not(
+                            None
+                        ),
+                    )
+                )
+            if has_reaction_gibbs_free_energy:
+                mapped_screening_ids = mapped_screening_ids.where(
+                    or_(
+                        col(MappedReaction.minimum_reaction_gibbs_free_energy_kcal_mol).is_not(
+                            None
+                        ),
+                        col(MappedReaction.maximum_reaction_gibbs_free_energy_kcal_mol).is_not(
+                            None
+                        ),
+                    )
                 )
             predicates.append(col(LogicalReaction.id).in_(mapped_screening_ids))
         _validate_range(

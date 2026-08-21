@@ -191,8 +191,12 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
             assert inference.status is TransitionStateInferenceStatus.SUCCEEDED
             assert inference.parse_revision_id == revision.id
             assert inference.file_frame_index == 22
-            assert inference.inference_settings["ratio_attempts"] == [1.0, 1.25, 1.5]
-            assert inference.inference_settings["steps"] == 2
+            assert (
+                inference.inference_settings["endpoint_selection"] == "molop.possible_pre_post_ts"
+            )
+            assert inference.inference_settings["sampling_min_ratio"] == 0.75
+            assert inference.inference_settings["sampling_max_ratio"] == 1.75
+            assert inference.inference_settings["sampling_steps"] == 7
             assert inference.logical_reaction_id is not None
             assert inference.mapped_reaction_id is not None
             ts_frame = session.exec(
@@ -260,9 +264,6 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
                 TransitionStateEndpointDirection.POSITIVE,
             }
             endpoint_by_direction = {endpoint.direction: endpoint for endpoint in endpoints}
-            assert [endpoint.displacement_ratio for endpoint in endpoints] == pytest.approx(
-                [1.0, 1.0]
-            )
             mapped_reaction = session.get(MappedReaction, inference.mapped_reaction_id)
             assert mapped_reaction is not None
             assert mapped_reaction.mapped_reaction_smiles == parsed.inferences[0].reaction_smiles
@@ -280,12 +281,10 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
             )
             assert np.linalg.norm(negative_coordinates - center_coordinates) > 0
             assert np.linalg.norm(positive_coordinates - center_coordinates) > 0
-            assert np.allclose(
-                (negative_coordinates + positive_coordinates) / 2,
-                center_coordinates,
-                rtol=0,
-                atol=2e-5,
-            )
+            # MolOP selects each signed side independently across amplitudes, so
+            # the two endpoints are not required to bracket the center
+            # symmetrically.  Only their direction along the imaginary mode and
+            # the persisted displacement ratios are asserted below.
             source_ts_frame = next(
                 frame
                 for frame in parsed.chem_file
@@ -313,6 +312,14 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
                 )
                 signed_displacements.append(signed_scale)
             assert signed_displacements[0] * signed_displacements[1] < 0
+            # Persisted ratios are the measured signed displacements of the
+            # MolOP-selected endpoints, not a fixed inference amplitude.
+            assert endpoint_by_direction[
+                TransitionStateEndpointDirection.NEGATIVE
+            ].displacement_ratio == pytest.approx(abs(signed_displacements[0]))
+            assert endpoint_by_direction[
+                TransitionStateEndpointDirection.POSITIVE
+            ].displacement_ratio == pytest.approx(abs(signed_displacements[1]))
             assert (
                 session.exec(
                     select(MappedReactionEdge).where(

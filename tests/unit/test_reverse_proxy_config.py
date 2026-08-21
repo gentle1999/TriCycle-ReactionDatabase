@@ -64,12 +64,18 @@ def test_nginx_does_not_publish_internal_metrics() -> None:
     assert "proxy_pass" not in internal_location
 
 
-def test_nginx_enforces_one_shared_gateway_rate_budget() -> None:
+def test_nginx_leaves_request_budgets_to_the_application() -> None:
     host = _host_configuration()
     locations = _api_locations()
+    api_location = _location(locations, "location ^~ /api/ {")
 
-    assert "limit_req_zone $binary_remote_addr zone=reaction_database_api:10m rate=120r/m;" in host
-    assert locations.count("limit_req zone=reaction_database_api burst=60 nodelay;") >= 4
+    assert "limit_req" not in host
+    assert "limit_req" not in locations
+    assert "client_max_body_size 0;" in host
+    assert "proxy_read_timeout 3600s;" in host
+    assert "proxy_send_timeout 3600s;" in host
+    assert "proxy_request_buffering off;" in api_location
+    assert "proxy_buffering off;" in api_location
 
 
 def test_nginx_api_upstream_supports_multiple_hosts() -> None:
@@ -89,7 +95,7 @@ def test_container_nginx_terminates_tls_and_proxies_frontend_and_api() -> None:
     configuration = (REPOSITORY_ROOT / "infra/nginx/container.conf.template").read_text()
 
     assert "listen 8080;" in configuration
-    assert "return 308 https://$host$request_uri;" in configuration
+    assert "return 308 https://$host:${NGINX_PUBLIC_HTTPS_PORT}$request_uri;" in configuration
     assert "listen 8443 ssl;" in configuration
     assert "ssl_protocols TLSv1.2 TLSv1.3;" in configuration
     assert "server api:8000" in configuration

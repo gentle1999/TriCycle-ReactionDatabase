@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = "==3.12.*"
 resolution-markers = [
     "sys_platform == 'win32'",
@@ -876,7 +876,7 @@ wheels = [
 
 [[package]]
 name = "molop"
-version = "0.2.7"
+version = "0.2.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -893,9 +893,9 @@ dependencies = [
     { name = "tabulate" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/65/28/56dac6a85925d6f0fb526d6c0a7f759cdd5398141c1c618503b027481ea3/molop-0.2.7.tar.gz", hash = "sha256:5dda57a9af18c695f296152ecefad238b73fd284fbbec2693d3a45cc4b3a607a", size = 287124, upload-time = "2026-08-19T15:58:57.728Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/06/ed/0442eaf0fe13b44ea0842dc086048b5522976000c036d5f1c7fa0c597fcb/molop-0.2.9.tar.gz", hash = "sha256:032d605ba0d4010b712b75e5cafac76f0bd5752fef2e81b4e4ee7650aaf5d57d", size = 287915, upload-time = "2026-08-21T13:59:47.153Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f9/43/5d4797abe78d7922d3bdaf3a0d01ccb474a70195922c219cafe7aeb265f0/molop-0.2.7-py3-none-any.whl", hash = "sha256:c0815b2a031f478fb6fbcd82acffb74c0a511469ebb9200af51e6920e31156fe", size = 356441, upload-time = "2026-08-19T15:58:56.386Z" },
+    { url = "https://files.pythonhosted.org/packages/1e/7d/4c1bd35335db7d7fd533adfc00d2a45e4904a615926eac7449268a783c17/molop-0.2.9-py3-none-any.whl", hash = "sha256:86898d3ab68990839f90b95afa115ecfbc773740cbb0b1d0a7ba4165d28b5d26", size = 357247, upload-time = "2026-08-21T13:59:45.632Z" },
 ]
 
 [[package]]
@@ -1677,6 +1677,11 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/e2/22/dbf013a12ec759e54a34a119e9e217435b3f71b2dd5c61a7ade0a25dae87/sqlalchemy-2.0.51-py3-none-any.whl", hash = "sha256:bb024d8b621d0be75f4f44ecc7c950450026e76d66dc8f791bb5331d7fed59d5", size = 1944334, upload-time = "2026-06-15T16:09:22.418Z" },
 ]
 
+[package.optional-dependencies]
+asyncio = [
+    { name = "greenlet" },
+]
+
 [[package]]
 name = "sqlmodel"
 version = "0.0.39"
@@ -1749,6 +1754,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "fastmcp" },
     { name = "httpx" },
+    { name = "joblib" },
     { name = "molalchemy" },
     { name = "molgr" },
     { name = "molop" },
@@ -1763,7 +1769,7 @@ dependencies = [
     { name = "rdkit" },
     { name = "rdkit-dof" },
     { name = "redis" },
-    { name = "sqlalchemy" },
+    { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "sqlmodel" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -1788,9 +1794,10 @@ requires-dist = [
     { name = "fastapi", specifier = "==0.135.1" },
     { name = "fastmcp", specifier = ">=3.2,<4" },
     { name = "httpx", specifier = ">=0.28,<1" },
+    { name = "joblib", specifier = ">=1.5,<2" },
     { name = "molalchemy", specifier = "==0.0.7" },
     { name = "molgr", specifier = ">=0.1.6" },
-    { name = "molop", specifier = ">=0.2.7" },
+    { name = "molop", specifier = ">=0.2.9" },
     { name = "nexusx", specifier = "==6.1.2" },
     { name = "numpy", specifier = ">=2.2,<3" },
     { name = "prometheus-client", specifier = ">=0.24,<1" },
@@ -1802,7 +1809,7 @@ requires-dist = [
     { name = "rdkit", specifier = ">=2025.9.6" },
     { name = "rdkit-dof", specifier = ">=0.2.2" },
     { name = "redis", specifier = ">=7.3,<8" },
-    { name = "sqlalchemy", specifier = "==2.0.51" },
+    { name = "sqlalchemy", extras = ["asyncio"], specifier = "==2.0.51" },
     { name = "sqlmodel", specifier = "==0.0.39" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.40,<1" },
 ]

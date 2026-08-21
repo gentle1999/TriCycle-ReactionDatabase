@@ -299,6 +299,8 @@ async def list_logical_reactions(
     maximum_activation_gibbs_free_energy_kcal_mol: float | None = None,
     minimum_reaction_gibbs_free_energy_kcal_mol: float | None = None,
     maximum_reaction_gibbs_free_energy_kcal_mol: float | None = None,
+    has_activation_gibbs_free_energy: bool | None = None,
+    has_reaction_gibbs_free_energy: bool | None = None,
     limit: CoreLimit = 50,
     offset: CoreOffset = 0,
 ) -> LogicalReactionPage:
@@ -326,6 +328,8 @@ async def list_logical_reactions(
                 maximum_reaction_gibbs_free_energy_kcal_mol=(
                     maximum_reaction_gibbs_free_energy_kcal_mol
                 ),
+                has_activation_gibbs_free_energy=has_activation_gibbs_free_energy,
+                has_reaction_gibbs_free_energy=has_reaction_gibbs_free_energy,
                 limit=limit,
                 offset=offset,
             ),

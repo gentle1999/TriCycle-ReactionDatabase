@@ -38,6 +38,8 @@ const emit = defineEmits<{
 }>();
 
 const quickReactionInput = ref(props.queryFilters.reactionSmarts ?? "");
+const hasActivationGibbsFreeEnergy = ref(props.queryFilters.hasActivationGibbsFreeEnergy ?? false);
+const hasReactionGibbsFreeEnergy = ref(props.queryFilters.hasReactionGibbsFreeEnergy ?? false);
 const validationError = ref("");
 type QueryValidationStatus = "idle" | "pending" | "valid" | "invalid";
 const quickValidation = ref<{ status: QueryValidationStatus; message: string }>({ status: "idle", message: "" });
@@ -55,6 +57,23 @@ const resultTitle = computed(() => {
 watch(() => props.queryFilters.reactionSmarts, (value) => {
   if (value !== quickReactionInput.value) quickReactionInput.value = value ?? "";
 });
+watch(() => props.queryFilters.hasActivationGibbsFreeEnergy, (value) => {
+  hasActivationGibbsFreeEnergy.value = value ?? false;
+});
+watch(() => props.queryFilters.hasReactionGibbsFreeEnergy, (value) => {
+  hasReactionGibbsFreeEnergy.value = value ?? false;
+});
+
+function selectedEnergyFilters(): ReactionQueryFilters {
+  return {
+    ...(hasActivationGibbsFreeEnergy.value ? { hasActivationGibbsFreeEnergy: true } : { hasActivationGibbsFreeEnergy: undefined }),
+    ...(hasReactionGibbsFreeEnergy.value ? { hasReactionGibbsFreeEnergy: true } : { hasReactionGibbsFreeEnergy: undefined }),
+  };
+}
+
+function outerReactionFilters(): ReactionQueryFilters {
+  return { ...props.queryFilters, ...selectedEnergyFilters() };
+}
 
 async function validateQuickQuery(value: string): Promise<boolean> {
   const reaction = value.trim();
@@ -125,7 +144,7 @@ async function applyQuickQuery(): Promise<void> {
     return;
   }
   validationError.value = "";
-  emit("applyFilters", reactionSmarts ? { reactionSmarts } : {});
+  emit("applyFilters", { ...selectedEnergyFilters(), reactionSmarts: reactionSmarts || undefined });
 }
 
 function clearFilters(): void {
@@ -135,6 +154,8 @@ function clearFilters(): void {
   quickValidationController = null;
   quickValidation.value = { status: "idle", message: "" };
   quickReactionInput.value = "";
+  hasActivationGibbsFreeEnergy.value = false;
+  hasReactionGibbsFreeEnergy.value = false;
   validationError.value = "";
   advancedQueryOpen.value = false;
   emit("applyFilters", {});
@@ -144,7 +165,15 @@ function applyAdvancedQuery(filters: ReactionQueryFilters): void {
   quickReactionInput.value = "";
   validationError.value = "";
   advancedQueryOpen.value = false;
-  emit("applyFilters", filters);
+  emit("applyFilters", {
+    ...filters,
+    ...(hasActivationGibbsFreeEnergy.value ? { hasActivationGibbsFreeEnergy: true } : {}),
+    ...(hasReactionGibbsFreeEnergy.value ? { hasReactionGibbsFreeEnergy: true } : {}),
+  });
+}
+
+function applyOuterEnergyFilters(): void {
+  emit("applyFilters", outerReactionFilters());
 }
 
 watch(quickReactionInput, (value) => scheduleQuickValidation(value));
@@ -179,6 +208,16 @@ onBeforeUnmount(() => {
         </div>
       </form>
       <p v-if="validationError" class="filter-error" role="alert">{{ validationError }}</p>
+      <div class="reaction-energy-filters" aria-label="自由能筛选">
+        <label class="toggle-filter">
+          <input v-model="hasActivationGibbsFreeEnergy" type="checkbox" aria-label="仅显示含有活化自由能的反应路径" @change="applyOuterEnergyFilters">
+          <span><strong>含有活化自由能</strong><small>仅保留有 ΔG‡ 数据的反应路径。</small></span>
+        </label>
+        <label class="toggle-filter">
+          <input v-model="hasReactionGibbsFreeEnergy" type="checkbox" aria-label="仅显示含有反应自由能的反应路径" @change="applyOuterEnergyFilters">
+          <span><strong>含有反应自由能</strong><small>仅保留有 ΔG 数据的反应路径。</small></span>
+        </label>
+      </div>
       <div v-if="advancedConditionCount" class="advanced-query-active">
         <span>高级查询</span><strong>{{ advancedConditionCount }} 个条件</strong>
         <button class="icon-button" type="button" title="清除高级查询" aria-label="清除高级查询" @click="clearFilters"><X :size="14" aria-hidden="true" /></button>

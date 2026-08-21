@@ -155,6 +155,7 @@ TRICYCLE_BOOTSTRAP_MODE=production
 
 两台机器在同一路由器下时，不要把 Docker Compose 的默认网络当作跨主机网络。数据服务器和
 算力服务器各运行自己的服务，应用只通过数据服务器的私网 DNS/IP 和端口连接。仓库提供
+[`compose.data.yaml`](../compose.data.yaml) 作为数据服务器独立栈，以及
 [`compose.compute.yaml`](../compose.compute.yaml) 作为算力服务器 overlay：它把本地
 PostgreSQL/RustFS 放入 `local-data` profile，并移除迁移/API 对本地数据服务的依赖。
 
@@ -164,14 +165,14 @@ PostgreSQL/RustFS 放入 `local-data` profile，并移除迁移/API 对本地数
 POSTGRES_DB=reactions
 POSTGRES_USER=reaction_app
 POSTGRES_PASSWORD=<strong-password>
-POSTGRES_BIND_ADDRESS=192.168.1.20
-POSTGRES_PORT=5432
+POSTGRES_BIND_ADDRESS=192.168.50.29
+POSTGRES_PORT=5433
 
-RUSTFS_BIND_ADDRESS=192.168.1.20
-RUSTFS_API_PORT=9000
+RUSTFS_BIND_ADDRESS=192.168.50.29
+RUSTFS_API_PORT=9001
 # Console 不应对算力服务器或公网开放；回环绑定时通过 SSH 隧道管理。
 RUSTFS_CONSOLE_BIND_ADDRESS=127.0.0.1
-RUSTFS_CONSOLE_PORT=9001
+RUSTFS_CONSOLE_PORT=9002
 TRICYCLE_RUSTFS_ACCESS_KEY=<access-key>
 TRICYCLE_RUSTFS_SECRET_KEY=<secret-key>
 ~~~
@@ -179,7 +180,7 @@ TRICYCLE_RUSTFS_SECRET_KEY=<secret-key>
 数据服务器只需启动两个数据服务（不要在这里启动 API/前端）：
 
 ~~~bash
-docker compose up -d --wait postgres rustfs
+docker compose -f compose.data.yaml up -d --wait
 ~~~
 
 `POSTGRES_BIND_ADDRESS`、`RUSTFS_BIND_ADDRESS` 和 `RUSTFS_CONSOLE_BIND_ADDRESS` 只控制宿主机端口绑定，默认仍为
@@ -194,11 +195,11 @@ docker compose up -d --wait postgres rustfs
 COMPOSE_PROJECT_NAME=reaction-database-compute
 TRICYCLE_ENVIRONMENT=production
 TRICYCLE_AUTH_MODE=oidc
-TRICYCLE_COMPOSE_DATABASE_URL=postgresql+psycopg://reaction_app:<url-encoded-password>@db.lan.example:5432/reactions?sslmode=verify-full&sslrootcert=/etc/reaction-database/ca/internal-ca.pem
-TRICYCLE_COMPOSE_RUSTFS_ENDPOINT_URL=https://s3.lan.example:9000
+TRICYCLE_COMPOSE_DATABASE_URL=postgresql+psycopg://reaction_app:<url-encoded-password>@db.lan.example:5433/reactions?sslmode=verify-full&sslrootcert=/etc/reaction-database/ca/internal-ca.pem
+TRICYCLE_COMPOSE_RUSTFS_ENDPOINT_URL=https://s3.lan.example:9001
 # Same endpoints for a host-run `tricycle-import-artifacts` process.
-TRICYCLE_DATABASE_URL=postgresql+psycopg://reaction_app:<url-encoded-password>@db.lan.example:5432/reactions?sslmode=verify-full&sslrootcert=/etc/reaction-database/ca/internal-ca.pem
-TRICYCLE_RUSTFS_ENDPOINT_URL=https://s3.lan.example:9000
+TRICYCLE_DATABASE_URL=postgresql+psycopg://reaction_app:<url-encoded-password>@db.lan.example:5433/reactions?sslmode=verify-full&sslrootcert=/etc/reaction-database/ca/internal-ca.pem
+TRICYCLE_RUSTFS_ENDPOINT_URL=https://s3.lan.example:9001
 # Host directory containing internal-ca.pem; the compute overlay mounts it
 # read-only at /etc/reaction-database/ca in api/migrate/bootstrap.
 TRICYCLE_COMPOSE_CA_DIRECTORY=/etc/reaction-database/ca
@@ -678,7 +679,7 @@ TRICYCLE_MAX_BATCH_BYTES，当前默认批次总大小为 256 MiB；单文件默
 可以从 infra/nginx/tricycle.conf 开始配置。当前示例已经显式代理 `/health/live`、
 `/health/ready`、`/docs`、`/docs/oauth2-redirect`、`/redoc`、`/openapi.json`、GraphQL
 和 `/nexusx/*`，并包含 `/api/` 的 `private, no-store`、272 MiB multipart body 限制和
-MCP 的 `proxy_buffering off`/3600 秒超时。正式配置必须保留这些边界；否则健康检查可能被
+MCP 的 `proxy_buffering off`/3600 秒超时。正式配置必须保留这些代理路由和缓存边界；否则健康检查可能被
 SPA fallback 接管，或 MCP 长连接被短超时/缓冲截断。
 
 如果外层使用 Cloudflare，必须为 /api/* 建立 bypass cache 规则。不能只依赖应用返回的

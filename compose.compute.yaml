@@ -3,7 +3,7 @@
 # services and reaches those systems through their private DNS endpoints.
 x-compute-ca-volume: &compute-ca-volume
   - type: bind
-    source: ${TRICYCLE_COMPOSE_CA_DIRECTORY:?set TRICYCLE_COMPOSE_CA_DIRECTORY to the host CA directory}
+    source: ${TRICYCLE_COMPOSE_CA_DIRECTORY:-./secrets/ca}
     target: /etc/reaction-database/ca
     read_only: true
 

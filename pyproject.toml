@@ -12,9 +12,10 @@ dependencies = [
     "fastapi==0.135.1",
     "fastmcp>=3.2,<4",
     "httpx>=0.28,<1",
+    "joblib>=1.5,<2",
     "molalchemy==0.0.7",
     "molgr>=0.1.6",
-    "molop>=0.2.7",
+    "molop>=0.2.9",
     "nexusx==6.1.2",
     "numpy>=2.2,<3",
     "psycopg[binary,pool]>=3.2,<4",
@@ -27,7 +28,7 @@ dependencies = [
     "rdkit>=2025.9.6",
     "rdkit-dof>=0.2.2",
     "redis>=7.3,<8",
-    "sqlalchemy==2.0.51",
+    "sqlalchemy[asyncio]==2.0.51",
     "sqlmodel==0.0.39",
     "uvicorn[standard]>=0.40,<1",
 ]
@@ -62,6 +63,12 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tricycle_reaction_db"]
+
+[tool.uv]
+# Keep the uv package cache inside the repository so `uv run` works in
+# environments where the user cache directory (~/.cache/uv) is not writable
+# (for example sandboxed developer shells).  Path is relative to this file.
+cache-dir = ".uv-cache"
 
 [[tool.uv.index]]
 name = "pypi"
@@ -106,3 +113,11 @@ warn_required_dynamic_aliases = true
 [[tool.mypy.overrides]]
 module = ["molop", "molop.*"]
 follow_imports = "skip"
+
+[tool.pyright]
+# Resolve third-party packages from the project virtualenv so local runs match
+# the CI `uv run pyright` invocation.  ``pythonVersion`` pins the interpreter
+# contract so a different system ``python3`` on PATH cannot downgrade the check.
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.12"

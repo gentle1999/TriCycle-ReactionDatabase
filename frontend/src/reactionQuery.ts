@@ -34,6 +34,8 @@ export interface ReactionQueryFilters {
   maximumActivationGibbsFreeEnergyKcalMol?: number;
   minimumReactionGibbsFreeEnergyKcalMol?: number;
   maximumReactionGibbsFreeEnergyKcalMol?: number;
+  hasActivationGibbsFreeEnergy?: boolean;
+  hasReactionGibbsFreeEnergy?: boolean;
   createdAfter?: string;
   createdBefore?: string;
   filterExpression?: ReactionQueryExpression;

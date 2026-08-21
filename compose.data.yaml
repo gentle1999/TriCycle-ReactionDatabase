@@ -1,0 +1,73 @@
+# Data-host stack for the two-host development layout.
+# Run this file on the file server. The compute host uses compose.yaml with
+# compose.compute.yaml and connects to the private addresses published here.
+
+name: ${COMPOSE_PROJECT_NAME:-reaction-database-data}
+
+services:
+  postgres:
+    image: antonsiomchen/cheminfo-db:postgres18-rdkit2025.09.6
+    restart: unless-stopped
+    shm_size: 256mb
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-example_reaction_db}
+      POSTGRES_USER: ${POSTGRES_USER:-example_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in the data-host .env}
+    ports:
+      - "${POSTGRES_BIND_ADDRESS:-127.0.0.1}:${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - "${POSTGRES_DATA_DIRECTORY:-postgres-data}:/var/lib/postgresql/data"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}" &&
+          psql -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}" -tAc
+          "SELECT 1 FROM pg_extension WHERE extname = 'rdkit'" | grep -q 1
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    stop_grace_period: 30s
+
+  rustfs:
+    image: rustfs/rustfs:1.0.0-beta.8
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: ${TRICYCLE_RUSTFS_ACCESS_KEY:?set TRICYCLE_RUSTFS_ACCESS_KEY in the data-host .env}
+      RUSTFS_SECRET_KEY: ${TRICYCLE_RUSTFS_SECRET_KEY:?set TRICYCLE_RUSTFS_SECRET_KEY in the data-host .env}
+      RUSTFS_COMPRESSION_ENABLED: ${RUSTFS_COMPRESSION_ENABLED:-true}
+      RUSTFS_OBS_LOG_DIRECTORY: /logs
+      RUSTFS_OBS_LOGGER_LEVEL: warn
+    ports:
+      - "${RUSTFS_BIND_ADDRESS:-127.0.0.1}:${RUSTFS_API_PORT:-9001}:9000"
+      # Keep the console on the management interface only. It is not an API
+      # dependency and should not be reachable from the public network.
+      - "${RUSTFS_CONSOLE_BIND_ADDRESS:-127.0.0.1}:${RUSTFS_CONSOLE_PORT:-9002}:9001"
+    volumes:
+      - "${RUSTFS_DATA_DIRECTORY:-rustfs-data}:/data"
+      - "${RUSTFS_LOG_DIRECTORY:-rustfs-logs}:/logs"
+    healthcheck:
+      test:
+        - CMD
+        - sh
+        - -ec
+        - >-
+          test "$${RUSTFS_COMPRESSION_ENABLED}" = true &&
+          curl -fsS http://127.0.0.1:9000/health
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    stop_grace_period: 30s
+
+volumes:
+  postgres-data:
+  rustfs-data:
+  rustfs-logs:

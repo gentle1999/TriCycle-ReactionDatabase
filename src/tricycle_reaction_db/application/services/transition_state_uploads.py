@@ -18,6 +18,7 @@ from typing import Any, cast
 from uuid import UUID
 
 import numpy as np
+from joblib import Parallel, delayed  # type: ignore[import-untyped]
 from molop import AutoParser
 from molop.io.base_models.ChemFileFrame import BaseCalcFrame
 from molop.unit import atom_ureg
@@ -98,13 +99,14 @@ from tricycle_reaction_db.storage.rustfs import (
 
 MOLOP_VERSION = version("molop")
 logger = logging.getLogger(__name__)
-# Start with the smallest useful displacement and expand only when crowding
-# removes one side of the signed mode pair.
-INFERENCE_RATIOS = (1.0, 1.25, 1.5)
-# ``BaseCalcFrame.vibrate`` samples a linspace.  Endpoint inference must only
-# evaluate the two signed extrema, otherwise a rejected extremum can silently
-# persist an intermediate displacement ratio such as 0.8333.
-INFERENCE_STEPS = 2
+# Pre/post-TS endpoint selection is delegated to MolOP's
+# ``BaseCalcFrame.possible_pre_post_ts``: it samples both signed sides across
+# the amplitude range below and keeps the most frequent side topology.  These
+# values mirror the MolOP defaults so the persisted inference settings always
+# describe the actual sampling grid.
+TS_PRE_POST_MIN_RATIO = 0.75
+TS_PRE_POST_MAX_RATIO = 1.75
+TS_PRE_POST_STEPS = 7
 
 
 class ArtifactUploadError(RuntimeError):
@@ -337,9 +339,23 @@ def _signed_ts_endpoints(
     frame: BaseCalcFrame[Any],
     vibration_position: int,
 ) -> tuple[Chem.Mol, Chem.Mol, float, float]:
-    """Return the first/last valid signed vibration structures in source order."""
+    """Return MolOP's inferred pre/post-TS endpoints with signed displacements.
 
-    if frame.vibrations is None or not len(frame.vibrations):
+    Endpoint *selection* is MolOP's ``possible_pre_post_ts``: it samples each
+    signed side across ``TS_PRE_POST_MIN_RATIO..MAX_RATIO`` and keeps the most
+    frequent side topology, so crowding cannot silently drop one side.  The
+    project only *measures* the selected endpoints' actual displacement along
+    the imaginary mode to restore the signed direction/ratio used by the
+    persisted endpoint rows; it does not choose or rank the endpoints itself.
+    """
+
+    reactant, product = frame.possible_pre_post_ts(
+        show_3D=True,
+        min_ratio=TS_PRE_POST_MIN_RATIO,
+        max_ratio=TS_PRE_POST_MAX_RATIO,
+        steps=TS_PRE_POST_STEPS,
+    )
+    if frame.vibrations is None:
         raise ValueError("TS frame has no vibration mode")
     center = np.asarray(frame.coords.to(atom_ureg.angstrom).magnitude, dtype=np.float64)
     mode = np.asarray(
@@ -349,35 +365,28 @@ def _signed_ts_endpoints(
     mode_norm = float(np.sum(np.square(mode)))
     if mode.shape != center.shape or mode_norm <= 0:
         raise ValueError("TS imaginary mode does not match the source coordinates")
-    for ratio in INFERENCE_RATIOS:
-        molecules = frame.vibrate(
-            vibration_id=vibration_position,
-            ratio=ratio,
-            steps=INFERENCE_STEPS,
+
+    def _signed_ratio(endpoint: Chem.Mol) -> float:
+        if endpoint.GetNumConformers() != 1 or not endpoint.GetConformer().Is3D():
+            raise ValueError("MolOP TS endpoint lost its 3D conformer")
+        coordinates = np.asarray(
+            endpoint.GetConformer().GetPositions(),
+            dtype=np.float64,
         )
-        candidates: list[tuple[float, Chem.Mol]] = []
-        for molecule in molecules:
-            endpoint = molecule.rdmol
-            if not isinstance(endpoint, Chem.Mol) or endpoint.GetNumConformers() != 1:
-                continue
-            coordinates = np.asarray(
-                endpoint.GetConformer().GetPositions(),
-                dtype=np.float64,
-            )
-            signed_ratio = float(np.sum((center - coordinates) * mode) / mode_norm)
-            candidates.append((signed_ratio, endpoint))
-        if len(candidates) > 1:
-            candidates.sort(key=lambda item: item[0])
-            negative_ratio, negative = candidates[0]
-            positive_ratio, positive = candidates[-1]
-            if negative_ratio < 0 < positive_ratio:
-                return (
-                    Chem.Mol(negative),
-                    Chem.Mol(positive),
-                    abs(negative_ratio),
-                    positive_ratio,
-                )
-    raise ValueError("Failed to generate signed TS vibration endpoints")
+        if coordinates.shape != center.shape or not np.isfinite(coordinates).all():
+            raise ValueError("MolOP TS endpoint coordinates are invalid")
+        return float(np.sum((center - coordinates) * mode) / mode_norm)
+
+    negative_ratio = _signed_ratio(reactant)
+    positive_ratio = _signed_ratio(product)
+    if negative_ratio > positive_ratio:
+        negative_ratio, positive_ratio = positive_ratio, negative_ratio
+        reactant, product = product, reactant
+    if negative_ratio >= 0 or positive_ratio <= 0:
+        raise ValueError(
+            "MolOP pre/post-TS endpoints do not bracket the TS center on the imaginary mode"
+        )
+    return reactant, product, abs(negative_ratio), positive_ratio
 
 
 def _parsed_artifact_from_chem_file(
@@ -474,6 +483,65 @@ def _parsed_artifact_from_chem_file(
     )
 
 
+def _parse_calculation_path_worker(
+    path: str,
+    source_compression: str | None,
+) -> tuple[_ParsedArtifact | None, str | None]:
+    """Parse one source-evidence file in a loky worker.
+
+    MolOP disables its own multi-file loky path when source evidence is enabled.
+    Running one evidence-preserving parser invocation per worker retains the
+    provenance contract while allowing a batch to use ``n_jobs`` processes.
+    Errors cross the process boundary as plain text so parser exceptions do not
+    need to be pickled.
+    """
+
+    try:
+        configure_molecular_graph_reconstruction()
+        parsed_report = AutoParser(
+            [path],
+            n_jobs=1,
+            return_report=True,
+            parser_detection="auto",
+            capture_source_evidence=True,
+            release_file_content=True,
+        )
+        outcome = parsed_report.outcomes[0] if parsed_report.outcomes else None
+        if outcome is None or not outcome.succeeded or outcome.value is None:
+            failure = getattr(outcome, "failure", None)
+            message = getattr(failure, "message", None) or "MolOP returned no parsed artifact"
+            return None, str(message)
+        return (
+            _parsed_artifact_from_chem_file(
+                outcome.value,
+                source_compression=source_compression,
+            ),
+            None,
+        )
+    except Exception as error:
+        return None, str(error) or type(error).__name__
+
+
+def _parse_calculation_paths_parallel(
+    paths: list[str],
+    compressions: list[str | None],
+    *,
+    n_jobs: int,
+) -> list[tuple[_ParsedArtifact | None, str | None]]:
+    return cast(
+        "list[tuple[_ParsedArtifact | None, str | None]]",
+        Parallel(
+            n_jobs=n_jobs,
+            backend="loky",
+            return_as="list",
+            maxtasks_per_child=50,
+        )(
+            delayed(_parse_calculation_path_worker)(path, source_compression)
+            for path, source_compression in zip(paths, compressions, strict=True)
+        ),
+    )
+
+
 def _parse_calculation_output(payload: bytes, filename: str) -> _ParsedArtifact:
     configure_molecular_graph_reconstruction()
     decoded_payload, source_compression = _parser_payload(payload, filename)
@@ -522,6 +590,27 @@ def _parse_calculation_outputs_batch(
             compressions.append(source_compression)
         if not paths:
             return parsed_by_index
+
+        # MolOP 0.2.x intentionally disables its own multi-file loky path when
+        # source evidence is requested. Run one evidence-preserving parser call
+        # per loky worker so ``n_jobs`` still controls file-level batch parallelism.
+        if n_jobs != 1 and len(paths) > 1:
+            parallel_results = _parse_calculation_paths_parallel(
+                paths,
+                compressions,
+                n_jobs=n_jobs,
+            )
+            for parser_index, (parsed, error_message) in enumerate(parallel_results):
+                input_index = file_indices[parser_index]
+                parsed_by_index[input_index] = (
+                    parsed
+                    if parsed is not None
+                    else ArtifactUploadError(
+                        error_message or "MolOP did not return a result for this input file"
+                    )
+                )
+            return parsed_by_index
+
         try:
             parsed_report = AutoParser(
                 paths,
@@ -862,7 +951,7 @@ def _persist_transition_state_endpoint(
     topology_record, source_to_topology = normalize_topology_with_mapping(
         endpoint,
         add_hydrogens=False,
-        reconstruction_method="molop/ts-vibration",
+        reconstruction_method="molop/possible_pre_post_ts",
         reconstruction_version=MOLOP_VERSION,
         reconstruction_metadata={
             "coordinate_frame": "calculation_frame.observed_coordinates",
@@ -885,7 +974,7 @@ def _persist_transition_state_endpoint(
         source_coordinate_hash=source_coordinate_hash,
         source_to_topology_atom_indices=source_to_topology,
         provenance={
-            "method": "molop.ts_vibration",
+            "method": "molop.possible_pre_post_ts",
             "molop_version": MOLOP_VERSION,
             "coordinate_frame": "calculation_frame.observed_coordinates",
             "coordinate_order": "molop_source_atom_order",
@@ -925,7 +1014,7 @@ def persist_transition_state_endpoints_from_molop_frame(
     calculation_frame: CalculationFrame,
     source_frame: BaseCalcFrame[Any],
 ) -> None:
-    """Persist signed mode anchors for an already-persisted MolOP TS frame."""
+    """Persist MolOP's inferred pre/post-TS endpoints for a persisted TS frame."""
 
     vibrations = source_frame.vibrations
     if vibrations is None or len(vibrations.imaginary_idxs) != 1:
@@ -1018,10 +1107,16 @@ def _persist_successful_inference(
         imaginary_frequency_cm1=inferred.imaginary_frequency_cm1,
         status=TransitionStateInferenceStatus.SUCCEEDED,
         inference_settings={
-            "ratio_attempts": list(INFERENCE_RATIOS),
-            "steps": INFERENCE_STEPS,
+            "endpoint_selection": "molop.possible_pre_post_ts",
+            "sampling_min_ratio": TS_PRE_POST_MIN_RATIO,
+            "sampling_max_ratio": TS_PRE_POST_MAX_RATIO,
+            "sampling_steps": TS_PRE_POST_STEPS,
+            "side_topology": "most frequent side topology per signed side",
             "reaction_side_semantics": "fragment-rich endpoint first",
-            "direction_semantics": "coords - normal_mode * signed_ratio",
+            "direction_semantics": (
+                "measured signed displacement along the imaginary mode; "
+                "negative side displaces along +mode"
+            ),
             "imaginary_mode_index": inferred.imaginary_mode_index,
         },
         logical_reaction_id=logical_reaction_id,
@@ -1115,8 +1210,10 @@ def _persist_parsed_artifact(
                     imaginary_frequency_cm1=inferred.imaginary_frequency_cm1,
                     status=TransitionStateInferenceStatus.FAILED,
                     inference_settings={
-                        "ratio_attempts": list(INFERENCE_RATIOS),
-                        "steps": INFERENCE_STEPS,
+                        "endpoint_selection": "molop.possible_pre_post_ts",
+                        "sampling_min_ratio": TS_PRE_POST_MIN_RATIO,
+                        "sampling_max_ratio": TS_PRE_POST_MAX_RATIO,
+                        "sampling_steps": TS_PRE_POST_STEPS,
                     },
                     error_code=inferred.error_code,
                     error_message=inferred.error_message,
@@ -1149,8 +1246,10 @@ def _persist_parsed_artifact(
                     imaginary_frequency_cm1=inferred.imaginary_frequency_cm1,
                     status=TransitionStateInferenceStatus.FAILED,
                     inference_settings={
-                        "ratio_attempts": list(INFERENCE_RATIOS),
-                        "steps": INFERENCE_STEPS,
+                        "endpoint_selection": "molop.possible_pre_post_ts",
+                        "sampling_min_ratio": TS_PRE_POST_MIN_RATIO,
+                        "sampling_max_ratio": TS_PRE_POST_MAX_RATIO,
+                        "sampling_steps": TS_PRE_POST_STEPS,
                     },
                     error_code="inferred_reaction_persistence_failed",
                     error_message=str(error) or type(error).__name__,

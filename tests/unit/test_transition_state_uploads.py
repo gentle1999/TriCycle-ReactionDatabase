@@ -165,7 +165,7 @@ def test_parser_payload_enforces_compressed_and_decompressed_limits() -> None:
         _parser_payload(compressed, "calculation.log.gz", max_decompressed_bytes=128)
 
 
-def test_batch_parser_calls_molop_once_and_restores_input_order(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_serial_batch_parser_calls_molop_once_and_restores_input_order(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     calls: list[tuple[list[str], dict[str, object]]] = []
 
     def fake_auto_parser(paths: list[str], **options: object) -> object:
@@ -202,17 +202,42 @@ def test_batch_parser_calls_molop_once_and_restores_input_order(monkeypatch) -> 
 
     parsed = _parse_calculation_outputs_batch(
         [(gzip.compress(b"first"), "first.log.gz"), (b"second", "second.out")],
-        n_jobs=4,
+        n_jobs=1,
     )
 
     assert parsed == {0: ("parsed-first", "gzip"), 1: ("parsed-second", None)}
     assert len(calls) == 1
     paths, options = calls[0]
     assert len(paths) == 2
-    assert options["n_jobs"] == 4
+    assert options["n_jobs"] == 1
     assert options["return_report"] is True
     assert options["capture_source_evidence"] is True
     assert options["release_file_content"] is True
+
+
+def test_parallel_batch_parser_dispatches_each_file_with_source_evidence(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls: list[tuple[list[bytes], list[str | None], int]] = []
+
+    def fake_parallel_parser(
+        paths: list[str],
+        compressions: list[str | None],
+        *,
+        n_jobs: int,
+    ) -> list[tuple[object | None, str | None]]:
+        calls.append(([Path(path).read_bytes() for path in paths], compressions, n_jobs))
+        return [("parsed-first", None), (None, "isolated MolOP failure")]
+
+    monkeypatch.setattr(upload_module, "_parse_calculation_paths_parallel", fake_parallel_parser)
+
+    parsed = _parse_calculation_outputs_batch(
+        [(gzip.compress(b"first"), "first.log.gz"), (b"second", "second.out")],
+        n_jobs=4,
+    )
+
+    assert parsed[0] == "parsed-first"
+    assert isinstance(parsed[1], ArtifactUploadError)
+    assert str(parsed[1]) == "isolated MolOP failure"
+    assert calls == [([b"first", b"second"], ["gzip", None], 4)]
 
 
 def test_batch_parser_isolates_invalid_gzip_before_molop(monkeypatch) -> None:  # type: ignore[no-untyped-def]

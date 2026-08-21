@@ -39,8 +39,10 @@ PostgreSQL/RDKit -> application services -> FastAPI + NexusX
 
 Topology 图优先使用 MolOP 导出的 MolGR 分子图，不从文件名推断。认证用户上传计算
 文件后，系统统一用 MolOP 拆分全部 segment/frame，并保存每帧坐标、拓扑和计算结果；
-其中只对 MolOP 判定为 `is_TS=True` 的帧调用 `possible_pre_post_ts()`，由虚频位移推断
-前后体并创建或复用同一反应；创建方式只记录在 TS 推断溯源中，不形成另一类反应。
+其中只对 MolOP 判定为 `is_TS=True` 的帧调用 `possible_pre_post_ts()`，由 MolOP 沿
+虚频模式对正负两侧独立采样振幅并保留每侧最稳定的拓扑来确定前后体；项目只测量被
+选中端点的实际位移并创建或复用同一反应，创建方式只记录在 TS 推断溯源中，不形成
+另一类反应。
 上传支持一次选择多个原始文件。每个文件独立保存和解析，不依赖文件名、目录结构或
 manifest；坐标相同的帧按版本化 RMSD/最大偏差策略复用 Geometry。TS 帧推断反应后，
 会补齐已存在 Geometry 的节点关系，后续上传的匹配 Geometry 也会反向补链。反应详情

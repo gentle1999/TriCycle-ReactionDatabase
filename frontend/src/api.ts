@@ -501,6 +501,8 @@ export const api = {
           maximum_activation_gibbs_free_energy_kcal_mol: null,
           minimum_reaction_gibbs_free_energy_kcal_mol: null,
           maximum_reaction_gibbs_free_energy_kcal_mol: null,
+          has_activation_gibbs_free_energy: options.hasActivationGibbsFreeEnergy ?? null,
+          has_reaction_gibbs_free_energy: options.hasReactionGibbsFreeEnergy ?? null,
           created_after: null,
           created_before: null,
           filter_expression: JSON.stringify(options.filterExpression),
@@ -524,6 +526,8 @@ export const api = {
         ...(options.maximumActivationGibbsFreeEnergyKcalMol !== undefined ? { maximum_activation_gibbs_free_energy_kcal_mol: String(options.maximumActivationGibbsFreeEnergyKcalMol) } : {}),
         ...(options.minimumReactionGibbsFreeEnergyKcalMol !== undefined ? { minimum_reaction_gibbs_free_energy_kcal_mol: String(options.minimumReactionGibbsFreeEnergyKcalMol) } : {}),
         ...(options.maximumReactionGibbsFreeEnergyKcalMol !== undefined ? { maximum_reaction_gibbs_free_energy_kcal_mol: String(options.maximumReactionGibbsFreeEnergyKcalMol) } : {}),
+        ...(options.hasActivationGibbsFreeEnergy ? { has_activation_gibbs_free_energy: "true" } : {}),
+        ...(options.hasReactionGibbsFreeEnergy ? { has_reaction_gibbs_free_energy: "true" } : {}),
       })}`,
       signal,
     );
