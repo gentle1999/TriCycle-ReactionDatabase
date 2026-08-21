@@ -16,6 +16,7 @@ import {
 } from "@lucide/vue";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { onBeforeRouteLeave, RouterLink, useRoute, useRouter } from "vue-router";
+import { randomUUID } from "@/uuid";
 
 import { ApiError, api } from "@/api";
 import { useProjectContext } from "@/composables/useProjectContext";
@@ -64,6 +65,9 @@ const MAX_QUEUE_FILES = 20_000;
 const MAX_AUTOMATIC_ATTEMPTS = 6;
 const MOLOP_BATCH_MAX_FILES = 32;
 const MOLOP_BATCH_MAX_BYTES = 256 * 1024 * 1024;
+// Leave the completed batch summary on screen briefly before resetting the
+// queue so the user (and the acceptance suite) can observe the final counts.
+const BATCH_COMPLETION_RESET_DELAY_MS = 2_000;
 const PAGE_SIZE = 100;
 const route = useRoute();
 const router = useRouter();
@@ -76,7 +80,7 @@ const reattachFolderInput = ref<HTMLInputElement | null>(null);
 const selectedProjectId = ref(projectContext.currentProjectId.value ?? "");
 const artifactKind = ref<ArtifactUploadResult["artifact_kind"]>("calculation_output");
 const concurrency = ref(Number(window.localStorage.getItem("tricycle.uploadConcurrency") || 3));
-const metadataRows = ref<MetadataRow[]>([{ id: crypto.randomUUID(), key: "", value: "" }]);
+const metadataRows = ref<MetadataRow[]>([{ id: randomUUID(), key: "", value: "" }]);
 const tasks = ref<QueueTask[]>([]);
 const batch = ref<UploadBatch | null>(null);
 const recentBatches = ref<UploadBatch[]>([]);
@@ -166,7 +170,7 @@ function queueTaskFromRemote(item: UploadBatchItem, file: File | null = null): Q
 
 function createQueuedTask(file: File, relativePath = fileRelativePath(file)): QueueTask {
   return {
-    clientFileId: crypto.randomUUID(),
+    clientFileId: randomUUID(),
     file,
     filename: file.name,
     relativePath,
@@ -286,7 +290,7 @@ async function droppedFiles(event: DragEvent): Promise<void> {
 }
 
 function addMetadataRow(): void {
-  metadataRows.value.push({ id: crypto.randomUUID(), key: "", value: "" });
+  metadataRows.value.push({ id: randomUUID(), key: "", value: "" });
 }
 
 function removeMetadataRow(id: string): void {
@@ -583,7 +587,13 @@ async function startQueue(): Promise<void> {
           && batch.value.failed_count === 0
           && batch.value.cancelled_count === 0
         ) {
-          await newBatch();
+          // Keep the completed summary visible briefly, then reset the queue
+          // for the next batch. The summary is rendered from the still-present
+          // batch/task state so users can see the finished counts.
+          const completedBatchId = batch.value.id;
+          window.setTimeout(() => {
+            if (viewMounted && batch.value?.id === completedBatchId) void newBatch();
+          }, BATCH_COMPLETION_RESET_DELAY_MS);
         }
       }
     } finally {

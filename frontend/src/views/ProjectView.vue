@@ -186,6 +186,12 @@ function invitationClass(invitation: { accepted_at: string | null; revoked_at: s
 async function copyInviteUrl(): Promise<void> {
   if (!createdInviteUrl.value) return;
   copyMessage.value = null;
+  // navigator.clipboard only exists in secure contexts (HTTPS/localhost);
+  // degrade with a manual-copy hint when served over plain HTTP on a LAN host.
+  if (!navigator.clipboard?.writeText) {
+    copyMessage.value = "浏览器不允许自动复制，请手动选择链接。";
+    return;
+  }
   try {
     await navigator.clipboard.writeText(createdInviteUrl.value);
     copyMessage.value = "邀请链接已复制。";

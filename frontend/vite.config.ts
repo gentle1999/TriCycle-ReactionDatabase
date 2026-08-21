@@ -108,6 +108,12 @@ export default defineConfig(({ mode }) => {
       host: "0.0.0.0",
       port: 5173,
       proxy,
+      // Playwright artifacts are written next to the project during e2e/probe
+      // runs; ignoring them keeps live-tab HMR from full-reloading on the
+      // artifact HTML files.
+      watch: {
+        ignored: ["**/.playwright/**", "**/test-results/**"],
+      },
     },
     preview: {
       host: "0.0.0.0",

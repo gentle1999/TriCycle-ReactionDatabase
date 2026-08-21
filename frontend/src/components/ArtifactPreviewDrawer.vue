@@ -21,6 +21,9 @@ const downloadUrl = computed(() =>
 
 async function copyPreview(): Promise<void> {
   if (!props.preview) return;
+  // navigator.clipboard only exists in secure contexts (HTTPS/localhost);
+  // degrade to a no-op when the frontend is served over plan HTTP on a LAN host.
+  if (!navigator.clipboard?.writeText) return;
   await navigator.clipboard.writeText(props.preview.preview_text);
   copied.value = true;
   window.setTimeout(() => {
