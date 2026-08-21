@@ -43,8 +43,7 @@ def test_compose_data_service_bindings_keep_storage_console_separate() -> None:
     assert '"${POSTGRES_BIND_ADDRESS:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"' in compose
     assert '"${RUSTFS_BIND_ADDRESS:-127.0.0.1}:${RUSTFS_API_PORT:-19000}:9000"' in compose
     assert (
-        '"${RUSTFS_CONSOLE_BIND_ADDRESS:-127.0.0.1}:${RUSTFS_CONSOLE_PORT:-19001}:9001"'
-        in compose
+        '"${RUSTFS_CONSOLE_BIND_ADDRESS:-127.0.0.1}:${RUSTFS_CONSOLE_PORT:-19001}:9001"' in compose
     )
 
 

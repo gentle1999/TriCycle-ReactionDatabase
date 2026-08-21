@@ -151,6 +151,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+# uv package cache (see [tool.uv] cache-dir in pyproject.toml)
+.uv-cache/
 
 # Spyder project settings
 .spyderproject

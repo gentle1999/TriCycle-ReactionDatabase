@@ -288,8 +288,7 @@ async def upload_batch_files(
                         raise HTTPException(
                             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                             detail=(
-                                "upload batch exceeds the "
-                                f"{settings.max_batch_bytes}-byte limit"
+                                f"upload batch exceeds the {settings.max_batch_bytes}-byte limit"
                             ),
                             headers=UPLOAD_PREFLIGHT_HEADERS,
                         )

@@ -236,37 +236,52 @@ def test_artifact_preview_availability_follows_media_type(
 def test_known_text_extensions_enable_preview_when_browser_mime_is_generic(
     filename: str,
 ) -> None:
-    assert detect_artifact_media_type(
-        filename,
-        "application/octet-stream",
-        b"text\n",
-    ) == "text/plain"
+    assert (
+        detect_artifact_media_type(
+            filename,
+            "application/octet-stream",
+            b"text\n",
+        )
+        == "text/plain"
+    )
 
 
 def test_upload_type_detection_uses_content_before_filename() -> None:
-    assert detect_artifact_media_type(
-        "calculation.log",
-        "application/octet-stream",
-        b"Entering Gaussian System\nNormal termination\n",
-    ) == "text/plain"
-    assert detect_artifact_media_type(
-        "calculation.log",
-        "application/octet-stream",
-        b"\x89PNG\r\n\x1a\n",
-    ) == "image/png"
+    assert (
+        detect_artifact_media_type(
+            "calculation.log",
+            "application/octet-stream",
+            b"Entering Gaussian System\nNormal termination\n",
+        )
+        == "text/plain"
+    )
+    assert (
+        detect_artifact_media_type(
+            "calculation.log",
+            "application/octet-stream",
+            b"\x89PNG\r\n\x1a\n",
+        )
+        == "image/png"
+    )
 
 
 def test_upload_type_detection_recognizes_text_without_extension() -> None:
-    assert detect_artifact_media_type(
-        "README",
-        "application/octet-stream",
-        b"plain UTF-8 text without a suffix\n",
-    ) == "text/plain"
+    assert (
+        detect_artifact_media_type(
+            "README",
+            "application/octet-stream",
+            b"plain UTF-8 text without a suffix\n",
+        )
+        == "text/plain"
+    )
 
 
 def test_binary_extensions_remain_unpreviewable_with_generic_mime() -> None:
-    assert detect_artifact_media_type(
-        "image.png",
-        "application/octet-stream",
-        b"\x89PNG\r\n\x1a\n",
-    ) == "image/png"
+    assert (
+        detect_artifact_media_type(
+            "image.png",
+            "application/octet-stream",
+            b"\x89PNG\r\n\x1a\n",
+        )
+        == "image/png"
+    )

@@ -60,9 +60,7 @@ def _is_upload_request(method: str, path: str) -> bool:
         return False
     if path in {"/api/artifacts", "/api/artifacts/batch", "/api/artifacts/validate"}:
         return True
-    if path.startswith("/api/upload-batches/") and (
-        "/files/" in path or path.endswith("/files")
-    ):
+    if path.startswith("/api/upload-batches/") and ("/files/" in path or path.endswith("/files")):
         return True
     relative = path.removeprefix("/api/artifacts/")
     return relative != path and relative.endswith("/reparse") and relative.count("/") == 1

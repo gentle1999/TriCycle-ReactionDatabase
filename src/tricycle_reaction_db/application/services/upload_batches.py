@@ -588,13 +588,9 @@ class UploadBatchService:
                     completed_items[client_file_id] = _item_view(item)
                     continue
                 if item.status is UploadBatchItemStatus.UPLOADING:
-                    raise UploadBatchConflictError(
-                        "upload batch file is already being processed"
-                    )
+                    raise UploadBatchConflictError("upload batch file is already being processed")
                 if item.status is UploadBatchItemStatus.CANCELLED:
-                    raise UploadBatchConflictError(
-                        "cancelled upload batch files cannot be retried"
-                    )
+                    raise UploadBatchConflictError("cancelled upload batch files cannot be retried")
                 if item.status is UploadBatchItemStatus.FAILED:
                     batch.failed_count -= 1
                 resolved_media_type = _upload_media_type(
@@ -755,8 +751,7 @@ class UploadBatchService:
             for item in items:
                 await session.refresh(item)
             return [
-                _item_view(items_by_client_id[client_file_id])
-                for client_file_id in client_file_ids
+                _item_view(items_by_client_id[client_file_id]) for client_file_id in client_file_ids
             ]
 
 

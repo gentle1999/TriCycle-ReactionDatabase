@@ -10,6 +10,11 @@
 项目首个支持的 Python 版本是 3.12，具体解释器和全部 Python 依赖由
 `.python-version` 与 `uv.lock` 固定。
 
+`pyproject.toml` 的 `[tool.uv] cache-dir` 把 uv 的包缓存放在仓库内的
+`.uv-cache/`（已被 `.gitignore` 排除）。这样在无法写入用户缓存目录
+（如 `~/.cache/uv`）的受限 shell 里 `uv run` 依然可用；不需要时可以删除
+`.uv-cache/`，下次 `uv run` 会重新下载依赖。
+
 ## 初始化
 
 ```bash
@@ -152,8 +157,9 @@ realm 配置，或明确重建开发身份数据。
 `infra/nginx/tricycle.conf` 开始配置 SPA fallback 与 FastAPI 反向代理；该示例对全部
 `/api/*` 关闭 Nginx shared cache，并强制 `Cache-Control: private, no-store`。若外层还有
 Cloudflare，必须另建 Cache Rule，使 URI path 以 `/api/` 开头的请求 bypass cache；应用响应头
-不能纠正已配置的强制边缘缓存规则。代理 `client_max_body_size` 当前为 256 MiB，与批次总预算
-一致；部署采用更小值时以更小值为准。
+不能纠正已配置的强制边缘缓存规则。仓库 Nginx 配置不再添加请求体大小或请求速率限制，并将
+长请求读写超时设为一小时；上传大小、文件数量、并发和查询预算统一由应用配置校验。若外层
+代理另设更小限制，仍以外层限制为准。
 
 | 接口 | 匿名 | 已认证用户 |
 | --- | --- | --- |
@@ -411,7 +417,7 @@ writer endpoint 对应用呈现为同一个逻辑 engine，节点数量不会变
 | `TRICYCLE_QUERY_RATE_LIMIT_WINDOW_SECONDS` | `60` | 限流窗口秒数 |
 | `TRICYCLE_STRUCTURE_QUERY_MAX_CHARACTERS` | `16384` | SMILES/SMARTS/reaction 输入长度上限 |
 | `TRICYCLE_STRUCTURE_CANDIDATE_LIMIT` | `50000` | 需要逐候选后处理的最大关系行数 |
-| `TRICYCLE_MOLOP_BATCH_N_JOBS` | `2` | 批量上传时 MolOP 的文件级并行进程数；生产环境拒绝 `-1`，开发环境才可显式覆盖 |
+| `TRICYCLE_MOLOP_BATCH_N_JOBS` | `2` | 批量上传时保留 source evidence 的文件级并行进程数；`-1` 在开发环境使用全部可用 CPU，生产环境必须显式限界 |
 
 描述符、Murcko scaffold、手性和匹配次数等逐候选计算必须先通过 Formula、
 Topology 或

@@ -53,7 +53,7 @@ _BINARY_SIGNATURES = (
 
 
 def _looks_like_utf8_text(payload: bytes) -> bool:
-    sample = payload[:64 * 1024]
+    sample = payload[: 64 * 1024]
     if not sample or b"\x00" in sample:
         return False
     if any(sample.startswith(signature) for signature, _ in _BINARY_SIGNATURES):
@@ -62,9 +62,7 @@ def _looks_like_utf8_text(payload: bytes) -> bool:
         text = sample.decode("utf-8-sig")
     except UnicodeDecodeError:
         return False
-    control_count = sum(
-        character < " " and character not in "\n\r\t\f\b" for character in text
-    )
+    control_count = sum(character < " " and character not in "\n\r\t\f\b" for character in text)
     return control_count <= max(1, len(text) // 100)
 
 
