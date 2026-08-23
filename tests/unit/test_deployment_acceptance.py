@@ -189,7 +189,7 @@ def _valid_record(root: Path) -> dict[str, Any]:
                 root,
                 "capacity/upload-benchmark.json",
                 {
-                    "schema_version": "upload-resource-benchmark-v1",
+                    "schema_version": "upload-resource-benchmark-v2",
                     "generated_at": "2026-08-20T00:30:00Z",
                     "node": "API-01",
                     "fixture": "fixtures/target-output.log",
@@ -202,6 +202,12 @@ def _valid_record(root: Path) -> dict[str, Any]:
                             "n_jobs": 2,
                             "failed_count": 0,
                             "succeeded_count": size,
+                            "elapsed_seconds": 0.25,
+                            "phase_timings_ms": {
+                                "prepare_inputs_ms": 1.0,
+                                "molop_parse_ms": 200.0,
+                                "total_ms": 201.0,
+                            },
                         }
                         for size in (1, 8, 32)
                     ],
@@ -410,6 +416,23 @@ def test_acceptance_record_validates_all_required_evidence(tmp_path: Path) -> No
     record_path.write_text(json.dumps(_valid_record(tmp_path)), encoding="utf-8")
 
     assert validate_record(record_path) == []
+
+
+def test_acceptance_record_rejects_benchmark_without_phase_timings(tmp_path: Path) -> None:
+    record = _valid_record(tmp_path)
+    payload_path = tmp_path / "capacity/upload-benchmark.json"
+    payload = json.loads(payload_path.read_text())
+    del payload["results"][0]["phase_timings_ms"]["molop_parse_ms"]
+    content = (json.dumps(payload, sort_keys=True) + "\n").encode()
+    payload_path.write_bytes(content)
+    record["capacity"]["benchmark"]["sha256"] = hashlib.sha256(content).hexdigest()
+    record["capacity"]["benchmark"]["size_bytes"] = len(content)
+    record_path = tmp_path / "acceptance-record.json"
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    errors = validate_record(record_path)
+
+    assert any("phase_timings_ms is missing" in error for error in errors)
 
 
 def test_acceptance_record_rejects_attachment_hash_drift(tmp_path: Path) -> None:

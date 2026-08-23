@@ -108,7 +108,7 @@ digest，不要求把 digest 写进开发 Compose。
 默认开启 RustFS 磁盘层对象压缩
 （`RUSTFS_COMPRESSION_ENABLED=true`）；S3 GET/HEAD 和 Artifact SHA-256 仍对应原始逻辑字节。
 
-完整容器栈还包含 API、前端静态服务和同源 HTTPS Nginx。首次本地启动可直接运行：
+完整容器栈还包含 API、前端静态服务和同源 HTTPS Caddy。首次本地启动可直接运行：
 
 ```bash
 cp .env.example .env
@@ -116,10 +116,10 @@ make stack-up
 curl --insecure https://localhost/health/ready
 ```
 
-未配置证书时，Nginx 会在持久化 `nginx-tls` volume 中生成仅供本机验证的自签名证书；浏览器
-需要接受该证书。正式部署应将包含 `tls.crt` 和 `tls.key` 的目录通过
-`NGINX_TLS_DIRECTORY` 挂载，并把 `NGINX_SERVER_NAME` 设置为实际域名。HTTP 端口只做 308
-HTTPS 跳转，API 和前端容器不直接发布宿主机端口。生产模式仍必须按
+本地 `localhost` 使用 Caddy 内置 CA；Caddy 的 ACME 账户、证书和续期状态保存在持久化
+`caddy-data`/`caddy-config` volume。正式部署应把 `CADDY_SERVER_NAME` 设置为实际 DNS 名称，
+并确保 80/443 可达以便 Caddy 自动申请和续期证书。HTTP 端口只做 308 HTTPS 跳转，API 和前端
+容器不直接发布宿主机端口。生产模式仍必须按
 [部署与配置指南](docs/deployment-configuration.md)提供外部 OIDC、SMTP、Redis TLS 以及带 TLS
 校验的 PostgreSQL/RustFS endpoint。
 
@@ -177,7 +177,7 @@ MCP 入口页内置 Claude Desktop、Cursor、Cline、Windsurf、VS Code/Copilot
 GraphQL 不支持 variables，参数需要直接写在查询文本中。
 `make serve-nexusx` 仅启动 GraphQL、分页 GraphQL、MCP 和 Voyager 的独立演示进程；这些
 端口应保持在内网或 loopback。Core API 与 UseCase REST 已包含在组合 API 的 `/docs`，不再
-由该命令重复启动。需要拆分上游时，在 Vite/Nginx 中配置对应的
+由该命令重复启动。需要拆分上游时，在 Vite/Caddy 中配置对应的
 `NEXUSX_*_PROXY_TARGET`，不要把多个后端端口直接暴露给浏览器。
 
 FastAPI REST、GraphQL 和 MCP 共用白名单 `UseCaseService`，当前开放 artifact、

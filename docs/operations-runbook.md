@@ -172,7 +172,7 @@ uv run --frozen tricycle-deployment-smoke
 
 生产演练完成后，将同目录的证据附件按 SHA-256 写入一个 JSON 验收记录。记录必须使用
 `deployment-acceptance-v1`，包含至少两个 API 节点、六类依赖切换、六项用户流程、五项
-监控触发/恢复、`upload-resource-benchmark-v1` 的 1/8/32 文件容量报告、
+监控触发/恢复、`upload-resource-benchmark-v2` 的 1/8/32 文件容量报告、
 `upload-limit-probe-v1` 的稳定 413 预检报告、目标规模 `query-plan-evidence-v1`、
 源/恢复清单和实测 RTO/RPO。
 附件路径只能位于验收记录目录下；validator 会重新读取并计算每个文件的字节大小和 hash，

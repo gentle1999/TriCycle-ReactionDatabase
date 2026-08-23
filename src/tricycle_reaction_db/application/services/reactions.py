@@ -3,6 +3,7 @@
 import json
 from collections import Counter
 from collections.abc import Iterable
+from functools import lru_cache
 from hashlib import sha256
 
 from rdkit import Chem
@@ -27,6 +28,7 @@ from tricycle_reaction_db.application.services._persistence import (
     _require_id,
 )
 from tricycle_reaction_db.application.services.reaction_geometry_policy import (
+    require_geometry_reaction_endpoint_eligibility,
     require_geometry_thermodynamic_property,
 )
 from tricycle_reaction_db.db.models import (
@@ -94,6 +96,22 @@ def _reaction_from_representation(
 
 
 _mapped_reaction_from_smiles = _reaction_from_representation
+
+
+@lru_cache(maxsize=1024)
+def _logical_map_numbers_for_reaction(reaction_representation: str) -> frozenset[int]:
+    """Cache the immutable atom-map projection used by mapping validation."""
+
+    reaction_definition = _reaction_from_representation(reaction_representation)
+    return frozenset(
+        atom.GetAtomMapNum()
+        for templates in (
+            reaction_definition.GetReactants(),
+            reaction_definition.GetProducts(),
+        )
+        for molecule in templates
+        for atom in molecule.GetAtoms()
+    )
 
 
 def atom_maps_from_source_order(
@@ -699,6 +717,8 @@ def persist_mapped_reaction_node_geometry(
     record: MappedReactionNodeGeometryRecord,
     *,
     mapped_reaction_participant: MappedReactionParticipant | None = None,
+    preloaded_bindings: list[MappedReactionNodeGeometry] | None = None,
+    thermodynamic_property_verified: bool = False,
 ) -> MappedReactionNodeGeometry:
     """Bind one Geometry conformer to a logical path node.
 
@@ -709,7 +729,11 @@ def persist_mapped_reaction_node_geometry(
 
     node_id = _require_id(node, label="MappedReactionNode")
     geometry_id = _require_id(geometry, label="Geometry")
-    require_geometry_thermodynamic_property(session, geometry)
+    if mapped_reaction_participant is not None:
+        if not thermodynamic_property_verified:
+            require_geometry_reaction_endpoint_eligibility(session, geometry)
+    elif not thermodynamic_property_verified:
+        require_geometry_thermodynamic_property(session, geometry)
     participant_id = None
     if mapped_reaction_participant is not None:
         participant_id = _require_id(mapped_reaction_participant, label="MappedReactionParticipant")
@@ -760,7 +784,17 @@ def persist_mapped_reaction_node_geometry(
         identity_statement = identity_statement.where(
             MappedReactionNodeGeometry.mapped_reaction_participant_id == participant_id
         )
-    binding = session.exec(identity_statement).first()
+    binding = next(
+        (
+            existing
+            for existing in preloaded_bindings or ()
+            if existing.geometry_id == geometry_id
+            and existing.mapped_reaction_participant_id == participant_id
+        ),
+        None,
+    )
+    if preloaded_bindings is None:
+        binding = session.exec(identity_statement).first()
     if binding is not None:
         if (
             binding.component_key != record.component_key
@@ -771,15 +805,24 @@ def persist_mapped_reaction_node_geometry(
             _promote_mapped_reaction_node_geometry(session, binding)
         return binding
 
-    existing_components = session.exec(
-        select(MappedReactionNodeGeometry).where(
-            MappedReactionNodeGeometry.mapped_reaction_node_id == node_id,
-            (
-                (MappedReactionNodeGeometry.component_key == record.component_key)
-                | (MappedReactionNodeGeometry.component_index == record.component_index)
-            ),
-        )
-    ).all()
+    existing_components = (
+        [
+            existing
+            for existing in preloaded_bindings
+            if existing.component_key == record.component_key
+            or existing.component_index == record.component_index
+        ]
+        if preloaded_bindings is not None
+        else session.exec(
+            select(MappedReactionNodeGeometry).where(
+                MappedReactionNodeGeometry.mapped_reaction_node_id == node_id,
+                (
+                    (MappedReactionNodeGeometry.component_key == record.component_key)
+                    | (MappedReactionNodeGeometry.component_index == record.component_index)
+                ),
+            )
+        ).all()
+    )
     for existing in existing_components:
         if (
             existing.component_key != record.component_key
@@ -788,13 +831,23 @@ def persist_mapped_reaction_node_geometry(
         ):
             raise ValueError("component key/index resolves to inconsistent coordinate identity")
 
-    binding = session.exec(
-        select(MappedReactionNodeGeometry).where(
-            MappedReactionNodeGeometry.mapped_reaction_node_id == node_id,
-            MappedReactionNodeGeometry.component_key == record.component_key,
-            MappedReactionNodeGeometry.coordinate_index == record.coordinate_index,
-        )
-    ).first()
+    binding = next(
+        (
+            existing
+            for existing in preloaded_bindings or ()
+            if existing.component_key == record.component_key
+            and existing.coordinate_index == record.coordinate_index
+        ),
+        None,
+    )
+    if preloaded_bindings is None:
+        binding = session.exec(
+            select(MappedReactionNodeGeometry).where(
+                MappedReactionNodeGeometry.mapped_reaction_node_id == node_id,
+                MappedReactionNodeGeometry.component_key == record.component_key,
+                MappedReactionNodeGeometry.coordinate_index == record.coordinate_index,
+            )
+        ).first()
     if binding is not None:
         raise ValueError("node component coordinate is already assigned to a different Geometry")
 
@@ -847,6 +900,8 @@ def persist_mapped_reaction_node_geometry_mapping(
     session: Session,
     node_geometry: MappedReactionNodeGeometry,
     record: MappedReactionNodeGeometryMappingRecord,
+    *,
+    identity_is_new: bool = False,
 ) -> MappedReactionNodeGeometryMapping:
     """Persist one verified mapped-reaction to Geometry atom-order conversion."""
 
@@ -861,16 +916,7 @@ def persist_mapped_reaction_node_geometry_mapping(
     )
     if record.mapped_smiles != expected_smiles:
         raise ValueError("mapped_smiles does not match the converted coordinate mapping")
-    reaction_definition = _reaction_from_representation(mapped_reaction.mapped_reaction_smiles)
-    logical_map_numbers = {
-        atom.GetAtomMapNum()
-        for templates in (
-            reaction_definition.GetReactants(),
-            reaction_definition.GetProducts(),
-        )
-        for molecule in templates
-        for atom in molecule.GetAtoms()
-    }
+    logical_map_numbers = _logical_map_numbers_for_reaction(mapped_reaction.mapped_reaction_smiles)
     if not set(record.geometry_atom_map_numbers).issubset(logical_map_numbers):
         raise ValueError("coordinate mapping contains atom maps absent from the logical path")
     participant = node_geometry.mapped_reaction_participant
@@ -882,15 +928,18 @@ def persist_mapped_reaction_node_geometry_mapping(
     ):
         raise ValueError("coordinate mapping must match its MappedReactionParticipant")
 
-    _acquire_identity_locks(
-        session,
-        ("mapped_reaction_node_geometry_mapping", node_geometry_id),
-    )
-    binding = session.exec(
-        select(MappedReactionNodeGeometryMapping).where(
-            MappedReactionNodeGeometryMapping.mapped_reaction_node_geometry_id == node_geometry_id,
+    binding = None
+    if not identity_is_new:
+        _acquire_identity_locks(
+            session,
+            ("mapped_reaction_node_geometry_mapping", node_geometry_id),
         )
-    ).first()
+        binding = session.exec(
+            select(MappedReactionNodeGeometryMapping).where(
+                MappedReactionNodeGeometryMapping.mapped_reaction_node_geometry_id
+                == node_geometry_id,
+            )
+        ).first()
     if binding is not None:
         if not _reaction_mapping_isomorphic(
             expected_atom_map_numbers=binding.geometry_atom_map_numbers,

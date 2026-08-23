@@ -2,6 +2,7 @@
 
 import json
 import secrets
+from datetime import UTC, datetime
 from hashlib import sha256
 from math import isnan
 from time import time
@@ -40,6 +41,9 @@ _FAST_INSERT_SAFE_LOCK_NAMES = frozenset(
         "MultireferenceResult",
         "ImplicitSolvationResult",
         "thermochemistry_result",
+        "parse_revision_artifact",
+        "parse_revision",
+        "parse_revision_finalize",
     }
 )
 
@@ -71,12 +75,29 @@ def _acquire_identity_locks(session: Session, *keys: tuple[object, ...]) -> None
     ):
         return
     lock_ids = sorted({_identity_lock_id(*key) for key in keys})
+    if not lock_ids:
+        return
     connection = session.connection()
-    for lock_id in lock_ids:
-        connection.execute(
-            text("SELECT pg_advisory_xact_lock(:lock_id)"),
-            {"lock_id": lock_id},
-        )
+    transaction_marker = id(session.get_transaction())
+    cached_transaction_marker = session.info.get("_identity_lock_transaction_marker")
+    lock_cache = session.info.setdefault("_identity_lock_cache", set())
+    if cached_transaction_marker != transaction_marker:
+        lock_cache.clear()
+        session.info["_identity_lock_transaction_marker"] = transaction_marker
+    uncached_lock_ids = [lock_id for lock_id in lock_ids if lock_id not in lock_cache]
+    if not uncached_lock_ids:
+        return
+    # PostgreSQL acquires the sorted lock set in one statement. This preserves
+    # deterministic deadlock ordering while avoiding one network round trip per
+    # identity in a prepared upload batch.
+    connection.execute(
+        text(
+            "SELECT pg_advisory_xact_lock(lock_id) "
+            "FROM unnest(CAST(:lock_ids AS bigint[])) AS locks(lock_id)"
+        ),
+        {"lock_ids": uncached_lock_ids},
+    )
+    lock_cache.update(uncached_lock_ids)
 
 
 def _fast_insert_enabled(session: Session) -> bool:
@@ -119,6 +140,11 @@ def _prepare_new_entity(session: Session, entity: object) -> None:
         # regular path keeps server-generated IDs for strict idempotent retries.
         object.__setattr__(entity, "id", _uuid7())
     if session.info.get("tricycle_fast_insert", False):
+        # Supplying the immutable timestamp avoids a per-row RETURNING round
+        # trip for PostgreSQL's ``now()`` server default. The value remains
+        # UTC and is only used for newly-created, revision-local rows.
+        if getattr(entity, "created_at", None) is None:
+            object.__setattr__(entity, "created_at", datetime.now(UTC))
         mapper = cast(Any, sa_inspect(entity)).mapper
         for relationship in mapper.relationships:
             if relationship.uselist:
@@ -141,11 +167,25 @@ def _flush_new_entity(session: Session, entity: object, *, label: str) -> None:
     _require_id(entity, label=label)
 
 
-def _flush_shared_entity(session: Session, entity: object, *, label: str) -> None:
-    """Flush one cross-revision identity without draining pending child rows."""
+def _flush_shared_entity(
+    session: Session,
+    entity: object,
+    *,
+    label: str,
+    defer_if_fast: bool = False,
+) -> None:
+    """Persist one shared identity, optionally deferring fast-batch I/O.
+
+    Fast ingestion assigns client-side UUIDs and foreign keys before adding
+    rows.  Callers that have already resolved identities in a batch can defer
+    the flush until the batch boundary, allowing SQLAlchemy to use one
+    executemany per table.  The default preserves the immediate-flush
+    behavior required by idempotent single-entity paths.
+    """
 
     _prepare_new_entity(session, entity)
-    session.flush([entity] if session.info.get("tricycle_fast_insert", False) else None)
+    if not (defer_if_fast and session.info.get("tricycle_fast_insert", False)):
+        session.flush([entity] if session.info.get("tricycle_fast_insert", False) else None)
     _require_id(entity, label=label)
 
 

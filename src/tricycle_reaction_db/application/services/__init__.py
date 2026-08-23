@@ -34,6 +34,12 @@ from tricycle_reaction_db.application.services.artifact_management import (
     ArtifactRemovalNotFoundError,
     ArtifactRemovalUnavailableError,
 )
+from tricycle_reaction_db.application.services.artifact_uploads import (
+    ArtifactUploadConflictError,
+    ArtifactUploadError,
+    ArtifactUploadService,
+    persist_transition_state_endpoints_from_molop_frame,
+)
 from tricycle_reaction_db.application.services.audit import AuditService
 from tricycle_reaction_db.application.services.authentication import (
     AuthenticatedPrincipal,
@@ -177,12 +183,6 @@ from tricycle_reaction_db.application.services.storage_gc import (
     run_incremental_storage_gc,
 )
 from tricycle_reaction_db.application.services.system import SystemService
-from tricycle_reaction_db.application.services.transition_state_uploads import (
-    ArtifactUploadConflictError,
-    ArtifactUploadError,
-    ArtifactUploadService,
-    persist_transition_state_endpoints_from_molop_frame,
-)
 from tricycle_reaction_db.application.services.user_management import (
     UserManagementConflictError,
     UserManagementError,

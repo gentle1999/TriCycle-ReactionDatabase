@@ -94,6 +94,7 @@ class ArtifactBatchUploadResult(BaseModel):
     source_frame_count: int = Field(ge=0)
     transition_state_frame_count: int = Field(ge=0)
     inferred_reaction_count: int = Field(ge=0)
+    timings_ms: dict[str, float] = Field(default_factory=dict)
     items: list[ArtifactBatchUploadItem]
 
 

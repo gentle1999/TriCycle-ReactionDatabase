@@ -10,6 +10,8 @@ from tricycle_reaction_db.db.types import (
     DEFAULT_MAX_INLINE_ARRAY_BYTES,
     NumpyArray,
     NumpyArraySummary,
+    cached_numpy_array_payload,
+    encode_numpy_array,
     summarize_numpy_array,
 )
 
@@ -54,6 +56,15 @@ def test_binary_payload_is_npy_with_pickle_disabled() -> None:
     loaded = np.load(BytesIO(payload), allow_pickle=False)
 
     np.testing.assert_array_equal(loaded, source)
+
+
+def test_bind_reuses_payload_cached_on_encoded_array() -> None:
+    source = np.arange(9, dtype=np.float64).reshape(3, 3)
+    encoded, payload = encode_numpy_array(source)
+
+    assert not encoded.flags.writeable
+    assert cached_numpy_array_payload(encoded) is payload
+    assert NumpyArray().process_bind_param(encoded, _dialect()) is payload
 
 
 def test_none_is_passed_through() -> None:

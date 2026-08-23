@@ -95,11 +95,15 @@ jobs:
       - name: Install configuration validators
         run: |
           sudo apt-get update
-          sudo apt-get install --yes nginx prometheus
-      - name: Validate the production reverse proxy
-        run: sudo nginx -p "$GITHUB_WORKSPACE/" -t -c "$GITHUB_WORKSPACE/infra/nginx/tricycle.conf"
-      - name: Exercise proxy routes and MCP streaming
-        run: sudo python3 scripts/validate_nginx_runtime.py
+          sudo apt-get install --yes prometheus
+      - name: Validate the production Caddyfile
+        run: >-
+          docker run --rm
+          -v "$GITHUB_WORKSPACE/infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro"
+          caddy:2.10.2-alpine caddy validate
+          --config /etc/caddy/Caddyfile --adapter caddyfile
+      - name: Exercise Caddy routes and MCP streaming
+        run: python3 scripts/validate_caddy_runtime.py
       - name: Validate Prometheus alert rules
         run: |
           promtool check rules infra/monitoring/prometheus-rules.yml

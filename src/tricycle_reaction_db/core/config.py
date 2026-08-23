@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     # Per-file cap remains separate from the batch budget so callers cannot
     # trade one unbounded dimension for another.
     max_upload_bytes: int = Field(default=64 * 1024 * 1024, ge=1024)
-    max_batch_files: int = Field(default=32, ge=1, le=10_000)
+    max_batch_files: int = Field(default=64, ge=1, le=10_000)
     max_batch_bytes: int = Field(default=256 * 1024 * 1024, ge=1024, le=4 * 1024 * 1024 * 1024)
     max_upload_queue_files: int = Field(default=20_000, ge=1, le=100_000)
     max_upload_queue_bytes: int = Field(

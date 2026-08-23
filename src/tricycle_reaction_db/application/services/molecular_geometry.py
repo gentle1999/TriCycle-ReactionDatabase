@@ -1,13 +1,17 @@
 """Idempotent persistence for Formula -> Topology -> Geometry."""
 
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Any, cast
 from uuid import UUID
 
 import numpy as np
 import numpy.typing as npt
-from sqlalchemy import Float, SmallInteger, func, literal
+from sqlalchemy import Float, SmallInteger, String, and_, func, literal, text
 from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.orm import load_only
 from sqlmodel import Session, select
 
 from tricycle_reaction_db.application.dtos.chemistry import (
@@ -25,6 +29,8 @@ from tricycle_reaction_db.application.services.reaction_geometry_reconciliation 
 )
 from tricycle_reaction_db.db.models import (
     Geometry,
+    MappedReaction,
+    MappedReactionParticipant,
     MolecularFormula,
     MolecularTopology,
     MolecularTopologyDerivation,
@@ -75,7 +81,24 @@ class GeometryPersistenceContext:
 
     topologies: dict[tuple[str, ...], PersistedMolecularTopology] = field(default_factory=dict)
     geometries_by_hash: dict[tuple[UUID, str, str], Geometry] = field(default_factory=dict)
+    # Keys populated by one PostgreSQL bulk lookup. A missing key is useful
+    # information too: it lets the frame loop skip a per-Geometry SELECT.
+    exact_geometry_keys_loaded: set[tuple[UUID, str, str]] = field(default_factory=set)
+    equivalent_geometry_by_key: dict[tuple[UUID, str, str], Geometry] = field(default_factory=dict)
+    equivalent_geometry_candidates: dict[tuple[UUID, str, str], tuple[UUID, ...]] = field(
+        default_factory=dict
+    )
+    equivalent_geometry_keys_loaded: set[tuple[UUID, str, str]] = field(default_factory=set)
     geometries_to_reconcile: dict[UUID, Geometry] = field(default_factory=dict)
+    # Reaction participants are keyed by topology because reconciliation runs
+    # once per newly observed Geometry.  Reusing this lookup avoids one SELECT
+    # per Geometry when a batch contains many conformers of the same topology.
+    reaction_participants_by_topology: dict[UUID, tuple[MappedReactionParticipant, ...]] = field(
+        default_factory=dict
+    )
+    mapped_reactions_by_id: dict[UUID, MappedReaction] = field(default_factory=dict)
+    # Created lazily by batch reconciliation to avoid a module import cycle.
+    reconciliation_cache: Any = None
 
 
 GEOMETRY_MATCH_POLICY_VERSION = "geometry-internal-coordinate-match-v3"
@@ -282,7 +305,7 @@ def persist_molecular_topology(
     ).first()
     if formula is None:
         formula = MolecularFormula(**record.formula.model_dump())
-        _flush_shared_entity(session, formula, label="MolecularFormula")
+        _flush_shared_entity(session, formula, label="MolecularFormula", defer_if_fast=True)
     if formula.id is None:
         raise RuntimeError("database did not generate MolecularFormula.id")
 
@@ -297,7 +320,7 @@ def persist_molecular_topology(
             formula=formula,
             **record.topology.model_dump(),
         )
-        _flush_shared_entity(session, topology, label="MolecularTopology")
+        _flush_shared_entity(session, topology, label="MolecularTopology", defer_if_fast=True)
     elif topology.formula_id != formula.id:
         raise ValueError("topology identity resolved to a different molecular formula")
     elif (
@@ -343,6 +366,7 @@ def persist_molecular_topology(
             session,
             topology_derivation,
             label="MolecularTopologyDerivation",
+            defer_if_fast=True,
         )
     else:
         _assert_record_matches(
@@ -389,7 +413,10 @@ def persist_molecular_geometry(
         record.geometry.geometry_hash,
     )
     geometry = context.geometries_by_hash.get(geometry_key) if context is not None else None
-    if geometry is None:
+    equivalent_match = False
+    if geometry is None and (
+        context is None or geometry_key not in context.exact_geometry_keys_loaded
+    ):
         geometry = session.exec(
             select(Geometry).where(
                 Geometry.topology_id == topology.id,
@@ -399,12 +426,37 @@ def persist_molecular_geometry(
         ).first()
         if geometry is not None and context is not None:
             context.geometries_by_hash[geometry_key] = geometry
+    if geometry is None and context is not None:
+        candidates = context.equivalent_geometry_candidates.get(geometry_key, ())
+        if len(candidates) > 1:
+            raise GeometryAssignmentAmbiguityError(
+                topology_id=topology.id,
+                observed_geometry_hash=record.geometry.geometry_hash,
+                candidate_ids=candidates,
+            )
+        geometry = context.equivalent_geometry_by_key.get(geometry_key)
+        equivalent_match = geometry is not None
     assignment_kind = GeometryAssignmentKind.PARSED_EXACT
     assignment_indices: list[int] | None = list(record.observed_to_geometry_atom_indices)
     assignment_transform = tuple(record.observed_to_geometry_transform)
     assignment_rmsd = record.geometry_assignment_rmsd_angstrom
     assignment_max_abs = record.geometry_assignment_max_abs_angstrom
-    if geometry is None:
+    if equivalent_match and geometry is not None:
+        observed_topology_coords = _topology_order_coordinates(
+            record.observed_coordinates,
+            record.observed_to_geometry_atom_indices,
+        )
+        candidate_coordinates = np.asarray(
+            geometry.mol.GetConformer().GetPositions(),
+            dtype=np.float64,
+        )
+        assignment_rmsd, assignment_max_abs, assignment_transform = _coordinate_alignment(
+            observed_topology_coords, candidate_coordinates
+        )
+        assignment_kind = GeometryAssignmentKind.MATCHED_EXISTING_GEOMETRY
+    if geometry is None and (
+        context is None or geometry_key not in context.equivalent_geometry_keys_loaded
+    ):
         matched = _find_database_geometry_match(
             session,
             topology=topology,
@@ -420,6 +472,8 @@ def persist_molecular_geometry(
                 assignment_transform,
             ) = matched
             assignment_kind = GeometryAssignmentKind.MATCHED_EXISTING_GEOMETRY
+            if context is not None:
+                context.equivalent_geometry_by_key[geometry_key] = geometry
     if geometry is None:
         distances, angles, dihedrals = _internal_coordinate_projection(
             record.geometry.internal_coordinates
@@ -432,7 +486,7 @@ def persist_molecular_geometry(
             internal_coordinate_dihedrals_degrees=dihedrals,
             minimum_coordinate_decimal_places=coordinate_decimal_places,
         )
-        _flush_shared_entity(session, geometry, label="Geometry")
+        _flush_shared_entity(session, geometry, label="Geometry", defer_if_fast=True)
     if coordinate_decimal_places is not None:
         current = geometry.minimum_coordinate_decimal_places
         minimum_places = (
@@ -444,7 +498,7 @@ def persist_molecular_geometry(
             geometry.minimum_coordinate_decimal_places = minimum_places
             # Fast ingestion disables autoflush. Persist only this shared
             # projection so a later SQL-side match sees the strictest precision.
-            _flush_shared_entity(session, geometry, label="Geometry")
+            _flush_shared_entity(session, geometry, label="Geometry", defer_if_fast=True)
     if context is not None and geometry.geometry_hash == record.geometry.geometry_hash:
         context.geometries_by_hash[geometry_key] = geometry
     geometry_id = _require_id(geometry, label="Geometry")
@@ -465,6 +519,190 @@ def persist_molecular_geometry(
     )
 
 
+def preload_molecular_geometry_context(
+    session: Session,
+    records: Sequence[tuple[NormalizedMoleculeRecord, int | None]],
+    *,
+    context: GeometryPersistenceContext,
+) -> None:
+    """Resolve shared topology identities, then bulk-load exact Geometry rows.
+
+    The frame loop still delegates tolerance matching to PostgreSQL. This
+    preflight only removes the redundant exact-hash lookup for every frame;
+    missing keys are recorded so a new Geometry can be added without another
+    round trip.
+    """
+
+    keys: set[tuple[UUID, str, str]] = set()
+    records_by_key: dict[tuple[UUID, str, str], tuple[NormalizedMoleculeRecord, int | None]] = {}
+    for record, coordinate_decimal_places in records:
+        persisted_topology = persist_molecular_topology(
+            session,
+            NormalizedTopologyRecord(
+                formula=record.formula,
+                topology=record.topology,
+                topology_derivation=record.topology_derivation,
+            ),
+            context=context,
+        )
+        key = (
+            _require_id(persisted_topology.topology, label="MolecularTopology"),
+            record.geometry.canonicalization_version,
+            record.geometry.geometry_hash,
+        )
+        keys.add(key)
+        records_by_key.setdefault(key, (record, coordinate_decimal_places))
+    if not keys:
+        return
+    geometry_columns = cast(Any, Geometry)
+    exact_inputs = (
+        text(
+            """
+            SELECT topology_id, canonicalization_version, geometry_hash
+            FROM jsonb_to_recordset(CAST(:payload AS jsonb)) AS input(
+                topology_id uuid,
+                canonicalization_version text,
+                geometry_hash text
+            )
+            """
+        )
+        .bindparams(
+            payload=json.dumps(
+                [
+                    {
+                        "topology_id": str(topology_id),
+                        "canonicalization_version": canonicalization_version,
+                        "geometry_hash": geometry_hash,
+                    }
+                    for topology_id, canonicalization_version, geometry_hash in keys
+                ]
+            )
+        )
+        .columns(
+            topology_id=PG_UUID(as_uuid=True),
+            canonicalization_version=String,
+            geometry_hash=String,
+        )
+        .subquery("exact_geometry_inputs")
+    )
+    rows = session.exec(
+        select(Geometry)
+        .options(
+            load_only(
+                geometry_columns.id,
+                geometry_columns.topology_id,
+                geometry_columns.canonicalization_version,
+                geometry_columns.geometry_hash,
+                geometry_columns.minimum_coordinate_decimal_places,
+            )
+        )
+        .join(
+            exact_inputs,
+            and_(
+                geometry_columns.topology_id == exact_inputs.c.topology_id,
+                geometry_columns.canonicalization_version
+                == exact_inputs.c.canonicalization_version,
+                geometry_columns.geometry_hash == exact_inputs.c.geometry_hash,
+            ),
+        )
+    ).all()
+    context.exact_geometry_keys_loaded.update(keys)
+    for geometry in rows:
+        key = (
+            geometry.topology_id,
+            geometry.canonicalization_version,
+            geometry.geometry_hash,
+        )
+        context.geometries_by_hash[key] = geometry
+
+    # For non-exact hashes, evaluate the existing PostgreSQL equivalence
+    # function for every input in one set-based query. This replaces one
+    # network round trip per frame with a single JSONB recordset + join.
+    unmatched = [key for key in keys if key not in context.geometries_by_hash]
+    if not unmatched:
+        return
+    input_rows: list[dict[str, object]] = []
+    key_by_input: dict[str, tuple[UUID, str, str]] = {}
+    for input_index, key in enumerate(unmatched):
+        record, coordinate_decimal_places = records_by_key[key]
+        distances, angles, dihedrals = _internal_coordinate_projection(
+            record.geometry.internal_coordinates
+        )
+        input_key = str(input_index)
+        key_by_input[input_key] = key
+        input_rows.append(
+            {
+                "input_key": input_key,
+                "topology_id": str(key[0]),
+                "canonicalization_version": key[1],
+                "distances": distances,
+                "angles": angles,
+                "dihedrals": dihedrals,
+                "coordinate_decimal_places": coordinate_decimal_places,
+            }
+        )
+    matches = (
+        session.connection()
+        .execute(
+            text(
+                """
+            WITH inputs AS (
+                SELECT *
+                FROM jsonb_to_recordset(CAST(:payload AS jsonb)) AS input(
+                    input_key text,
+                    topology_id uuid,
+                    canonicalization_version text,
+                    distances double precision[],
+                    angles double precision[],
+                    dihedrals double precision[],
+                    coordinate_decimal_places smallint
+                )
+            )
+            SELECT inputs.input_key, geometry.id
+            FROM inputs
+            JOIN geometry
+              ON geometry.topology_id = inputs.topology_id
+             AND geometry.canonicalization_version = inputs.canonicalization_version
+             AND geometry_internal_coordinates_equivalent(
+                    geometry.internal_coordinate_distances_angstrom,
+                    geometry.internal_coordinate_angles_degrees,
+                    geometry.internal_coordinate_dihedrals_degrees,
+                    geometry.minimum_coordinate_decimal_places,
+                    inputs.distances,
+                    inputs.angles,
+                    inputs.dihedrals,
+                    inputs.coordinate_decimal_places
+                )
+            ORDER BY inputs.input_key, geometry.id
+            """
+            ),
+            {"payload": json.dumps(input_rows, separators=(",", ":"))},
+        )
+        .all()
+    )
+    matched_ids: dict[str, list[UUID]] = {}
+    for input_key, geometry_id in matches:
+        if isinstance(input_key, str) and isinstance(geometry_id, UUID):
+            matched_ids.setdefault(input_key, []).append(geometry_id)
+    all_matching_ids = {
+        geometry_id for geometry_ids in matched_ids.values() for geometry_id in geometry_ids
+    }
+    context.equivalent_geometry_keys_loaded.update(unmatched)
+    for input_key, key in key_by_input.items():
+        context.equivalent_geometry_candidates[key] = tuple(matched_ids.get(input_key, ()))
+    if all_matching_ids:
+        matching_geometries = session.exec(
+            select(Geometry).where(geometry_columns.id.in_(all_matching_ids))
+        ).all()
+        geometries_by_id = {geometry.id: geometry for geometry in matching_geometries}
+        for _input_key, key in key_by_input.items():
+            geometry_ids = context.equivalent_geometry_candidates[key]
+            if len(geometry_ids) == 1:
+                geometry = geometries_by_id.get(geometry_ids[0])
+                if geometry is not None:
+                    context.equivalent_geometry_by_key[key] = geometry
+
+
 __all__ = [
     "GEOMETRY_MATCH_POLICY_VERSION",
     "GeometryPersistenceContext",
@@ -473,4 +711,5 @@ __all__ = [
     "PersistedMolecularTopology",
     "persist_molecular_geometry",
     "persist_molecular_topology",
+    "preload_molecular_geometry_context",
 ]

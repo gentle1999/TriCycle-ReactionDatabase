@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from tricycle_reaction_db.application.services.transition_state_uploads import (
+from tricycle_reaction_db.application.services.artifact_uploads import (
     ArtifactUploadPayload,
     ArtifactUploadService,
 )

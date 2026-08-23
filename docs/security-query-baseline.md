@@ -79,8 +79,9 @@ uv run --frozen python scripts/benchmark_upload_resources.py \
   --output /srv/reaction-database/acceptance/capacity/upload-benchmark.json
 ```
 
-输出使用 `upload-resource-benchmark-v1`，包含节点、UTC 时间、输入 fixture 路径/hash、`n_jobs`
-和 1/8/32 批次结果；部署验收 validator 会复核三个批次均为零失败且 `n_jobs` 与容量配置一致。
+输出使用 `upload-resource-benchmark-v2`，包含节点、UTC 时间、输入 fixture 路径/hash、`n_jobs`
+和 1/8/32 批次结果。每个结果记录输入准备、MolOP 解析和总耗时的毫秒分布；部署验收
+validator 会复核三个批次均为零失败、`n_jobs` 与容量配置一致，以及每个阶段均为非负数。
 
 生产验收还必须运行 `make probe-upload-limit` 生成 `upload-limit-probe-v1`。该 HTTPS 探针发送
 至少两次大于 `TRICYCLE_MAX_UPLOAD_BYTES` 的请求，并记录稳定 HTTP 413、

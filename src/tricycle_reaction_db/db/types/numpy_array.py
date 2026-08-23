@@ -27,6 +27,32 @@ class NumpyArraySummary:
     sha256: str
 
 
+class EncodedNumpyArray(np.ndarray):
+    """An array carrying the exact NPY payload generated for it.
+
+    The payload is only attached to arrays created by ``encode_numpy_array``.
+    It lets the ORM bind step reuse serialization work already performed by
+    application-level validation.
+    """
+
+    _npy_payload: bytes
+    _npy_summary: NumpyArraySummary | None
+
+    def __new__(
+        cls,
+        value: npt.NDArray[np.generic],
+        payload: bytes,
+    ) -> EncodedNumpyArray:
+        encoded = np.asarray(value).view(cls)
+        encoded._npy_payload = payload
+        encoded._npy_summary = None
+        encoded.setflags(write=False)
+        return encoded
+
+    def __array_finalize__(self, value: object) -> None:
+        del value
+
+
 def _validate_max_inline_array_bytes(max_inline_array_bytes: int) -> None:
     if (
         isinstance(max_inline_array_bytes, bool)
@@ -60,11 +86,48 @@ def _encode_numpy_array(
     max_inline_array_bytes: int,
 ) -> tuple[npt.NDArray[np.generic], bytes]:
     array = _validate_array(value)
+    cached_payload = cached_numpy_array_payload(array)
+    if cached_payload is not None:
+        _check_payload_size(cached_payload, max_inline_array_bytes)
+        return array, cached_payload
     buffer = BytesIO()
     np.save(buffer, array, allow_pickle=False)
     payload = buffer.getvalue()
     _check_payload_size(payload, max_inline_array_bytes)
     return array, payload
+
+
+def encode_numpy_array(
+    value: object,
+    *,
+    max_inline_array_bytes: int = DEFAULT_MAX_INLINE_ARRAY_BYTES,
+) -> tuple[EncodedNumpyArray, bytes]:
+    """Encode an array once and retain the exact payload on the array value."""
+
+    _validate_max_inline_array_bytes(max_inline_array_bytes)
+    array, payload = _encode_numpy_array(
+        value,
+        max_inline_array_bytes=max_inline_array_bytes,
+    )
+    return EncodedNumpyArray(array, payload), payload
+
+
+def cached_numpy_array_payload(value: object) -> bytes | None:
+    """Return a payload cached by ``encode_numpy_array``, if present."""
+
+    if not isinstance(value, EncodedNumpyArray) or value.flags.writeable:
+        return None
+    payload = getattr(value, "_npy_payload", None)
+    return payload if isinstance(payload, bytes) else None
+
+
+def cached_numpy_array_summary(value: object) -> NumpyArraySummary | None:
+    """Return summary metadata cached alongside an encoded array, if present."""
+
+    if not isinstance(value, EncodedNumpyArray):
+        return None
+    summary = getattr(value, "_npy_summary", None)
+    return summary if isinstance(summary, NumpyArraySummary) else None
 
 
 def summarize_numpy_array(
@@ -79,12 +142,18 @@ def summarize_numpy_array(
         value,
         max_inline_array_bytes=max_inline_array_bytes,
     )
-    return NumpyArraySummary(
+    cached_summary = cached_numpy_array_summary(array)
+    if cached_summary is not None:
+        return cached_summary
+    summary = NumpyArraySummary(
         dtype=str(array.dtype),
         shape=tuple(int(dimension) for dimension in array.shape),
         nbytes=int(array.nbytes),
         sha256=sha256(payload).hexdigest(),
     )
+    if isinstance(array, EncodedNumpyArray):
+        array._npy_summary = summary
+    return summary
 
 
 class NumpyArray(TypeDecorator[npt.NDArray[np.generic]]):
@@ -113,10 +182,14 @@ class NumpyArray(TypeDecorator[npt.NDArray[np.generic]]):
         del dialect
         if value is None:
             return None
-        _, payload = _encode_numpy_array(
-            value,
-            max_inline_array_bytes=self.max_inline_array_bytes,
-        )
+        payload = cached_numpy_array_payload(value)
+        if payload is None:
+            _, payload = _encode_numpy_array(
+                value,
+                max_inline_array_bytes=self.max_inline_array_bytes,
+            )
+        else:
+            _check_payload_size(payload, self.max_inline_array_bytes)
         return payload
 
     def process_result_value(

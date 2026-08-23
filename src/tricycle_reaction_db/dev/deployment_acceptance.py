@@ -50,6 +50,9 @@ EXPECTED_MONITORING = frozenset(
     }
 )
 EXPECTED_BATCH_SIZES = frozenset({1, 8, 32})
+EXPECTED_UPLOAD_BENCHMARK_TIMING_PHASES = frozenset(
+    {"prepare_inputs_ms", "molop_parse_ms", "total_ms"}
+)
 EXPECTED_QUERY_PLAN_LABELS = frozenset(
     {
         "formula_exact_counts",
@@ -410,8 +413,8 @@ def _validate_benchmark(path: Path, capacity: CapacityEvidence, errors: list[str
     )
     if payload is None:
         return
-    if payload.get("schema_version") != "upload-resource-benchmark-v1":
-        errors.append("capacity.benchmark.schema_version must be upload-resource-benchmark-v1")
+    if payload.get("schema_version") != "upload-resource-benchmark-v2":
+        errors.append("capacity.benchmark.schema_version must be upload-resource-benchmark-v2")
     if payload.get("succeeded") is not True:
         errors.append("capacity.benchmark.succeeded must be true")
     if payload.get("n_jobs") != capacity.n_jobs:
@@ -453,6 +456,34 @@ def _validate_benchmark(path: Path, capacity: CapacityEvidence, errors: list[str
             errors.append(
                 f"capacity.benchmark.results[{index}].n_jobs does not match capacity.n_jobs"
             )
+        elapsed_seconds = result.get("elapsed_seconds")
+        if (
+            not isinstance(elapsed_seconds, int | float)
+            or isinstance(elapsed_seconds, bool)
+            or elapsed_seconds < 0
+        ):
+            errors.append(
+                f"capacity.benchmark.results[{index}].elapsed_seconds must be non-negative"
+            )
+        timings = result.get("phase_timings_ms")
+        if not isinstance(timings, dict):
+            errors.append(
+                f"capacity.benchmark.results[{index}].phase_timings_ms must be an object"
+            )
+            continue
+        missing_phases = EXPECTED_UPLOAD_BENCHMARK_TIMING_PHASES - timings.keys()
+        if missing_phases:
+            errors.append(
+                f"capacity.benchmark.results[{index}].phase_timings_ms is missing "
+                f"{sorted(missing_phases)}"
+            )
+        for phase in EXPECTED_UPLOAD_BENCHMARK_TIMING_PHASES:
+            timing = timings.get(phase)
+            if not isinstance(timing, int | float) or isinstance(timing, bool) or timing < 0:
+                errors.append(
+                    f"capacity.benchmark.results[{index}].phase_timings_ms.{phase} "
+                    "must be non-negative"
+                )
     if observed != EXPECTED_BATCH_SIZES:
         errors.append(f"capacity.benchmark must contain exactly {sorted(EXPECTED_BATCH_SIZES)}")
 

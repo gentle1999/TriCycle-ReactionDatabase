@@ -40,11 +40,18 @@ from tricycle_reaction_db.application.services.calculations import (
     persist_vibration_result,
 )
 from tricycle_reaction_db.application.services.catalog import persist_calculation_protocol
+from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics_persistence import (
+    refresh_mapped_reaction_thermodynamics,
+)
 from tricycle_reaction_db.application.services.molecular_geometry import (
     GeometryPersistenceContext,
     persist_molecular_geometry,
+    preload_molecular_geometry_context,
 )
 from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
+    ReconciliationBatchCache,
+    preload_reconciliation_context,
+    reconcilable_geometry_ids,
     reconcile_geometry_with_reactions,
 )
 from tricycle_reaction_db.db.models import (
@@ -278,6 +285,9 @@ def persist_molop_calculation_artifact(
     source_compression: str | None = None,
     force_new_revision: bool = False,
     fast_insert: bool = False,
+    geometry_context: GeometryPersistenceContext | None = None,
+    preload_geometry_context: bool = True,
+    defer_reconciliation: bool = False,
 ) -> PersistedMolOPArtifact:
     """Persist every parsed segment, frame, graph, coordinate, scalar, and array."""
 
@@ -308,7 +318,16 @@ def persist_molop_calculation_artifact(
         )
         frames_by_file_index: dict[int, CalculationFrame] = {}
         array_counts: dict[str, int] = {}
-        geometry_context = GeometryPersistenceContext()
+        active_geometry_context = geometry_context or GeometryPersistenceContext()
+        if preload_geometry_context:
+            preload_molecular_geometry_context(
+                session,
+                [
+                    (record.molecule, record.frame.coordinate_decimal_places)
+                    for record in frame_records
+                ],
+                context=active_geometry_context,
+            )
         for source_segment in chem_file.source_segments:
             protocol_record = protocol_record_from_molop_segment(source_segment)
             protocol = (
@@ -334,7 +353,7 @@ def persist_molop_calculation_artifact(
                     session,
                     record.molecule,
                     coordinate_decimal_places=record.frame.coordinate_decimal_places,
-                    context=geometry_context,
+                    context=active_geometry_context,
                 )
                 frame_record = record.frame
                 if (
@@ -390,19 +409,14 @@ def persist_molop_calculation_artifact(
                         reconcile=False,
                     )
 
-        # One ordered flush lets SQLAlchemy group revision-local rows into
-        # executemany batches before reconciliation queries inspect them.
-        session.flush()
-        # Reconciliation performs identity lookups while adding several
-        # conformers for one reaction component.  Fast insert keeps
-        # autoflush disabled for frame-local batches, but these lookups must
-        # see bindings created earlier in this same transaction.
-        session.autoflush = True
-        try:
-            for geometry in geometry_context.geometries_to_reconcile.values():
-                reconcile_geometry_with_reactions(session, geometry)
-        finally:
-            session.autoflush = previous_autoflush
+        # Batch ingestion can keep revision-local rows pending across files.
+        # The shared context owns their identities, and the final reconciliation
+        # flush groups each table across the complete batch.
+        defer_batch_flush = defer_reconciliation and fast_insert
+        if not defer_batch_flush:
+            session.flush()
+        if not defer_reconciliation:
+            reconcile_molop_geometry_context(session, active_geometry_context)
 
         finalize_parse_revision(
             session,
@@ -411,6 +425,7 @@ def persist_molop_calculation_artifact(
                 record_sha256=_revision_record_hash(artifact, chem_file, frame_records),
                 completed_at=completed_at,
             ),
+            defer_flush=defer_batch_flush,
         )
         return PersistedMolOPArtifact(
             parse_revision=revision,
@@ -423,4 +438,54 @@ def persist_molop_calculation_artifact(
         session.info["tricycle_fast_insert"] = previous_fast_insert
 
 
-__all__ = ["PersistedMolOPArtifact", "persist_molop_calculation_artifact"]
+def reconcile_molop_geometry_context(
+    session: Session,
+    context: GeometryPersistenceContext,
+) -> None:
+    """Reconcile all geometries from a batch after their rows are flushed."""
+
+    session.flush()
+    reconcilable_ids = reconcilable_geometry_ids(
+        session,
+        set(context.geometries_to_reconcile),
+    )
+    reconciliation_cache = ReconciliationBatchCache()
+    reconciliation_cache.thermodynamic_property_geometry_ids.update(reconcilable_ids)
+    context.reconciliation_cache = reconciliation_cache
+    preload_reconciliation_context(
+        session,
+        {
+            geometry.topology_id
+            for geometry in context.geometries_to_reconcile.values()
+            if geometry.id in reconcilable_ids
+        },
+        participants_by_topology=context.reaction_participants_by_topology,
+        mapped_reactions_by_id=context.mapped_reactions_by_id,
+        cache=reconciliation_cache,
+    )
+    previous_autoflush = session.autoflush
+    session.autoflush = False
+    try:
+        for geometry in context.geometries_to_reconcile.values():
+            geometry_id = geometry.id
+            if geometry_id is not None:
+                reconcile_geometry_with_reactions(
+                    session,
+                    geometry,
+                    eligibility=geometry_id in reconcilable_ids,
+                    participants_by_topology=context.reaction_participants_by_topology,
+                    mapped_reactions_by_id=context.mapped_reactions_by_id,
+                    cache=reconciliation_cache,
+                )
+        session.flush()
+        for mapped_reaction in reconciliation_cache.affected_reactions_by_id.values():
+            refresh_mapped_reaction_thermodynamics(session, mapped_reaction)
+    finally:
+        session.autoflush = previous_autoflush
+
+
+__all__ = [
+    "PersistedMolOPArtifact",
+    "persist_molop_calculation_artifact",
+    "reconcile_molop_geometry_context",
+]

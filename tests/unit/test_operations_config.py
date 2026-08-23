@@ -116,11 +116,8 @@ def test_monitoring_rules_cover_application_runtime_failures() -> None:
 def test_ci_executes_real_operations_and_shared_redis_validators() -> None:
     workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text()
 
-    assert (
-        'nginx -p "$GITHUB_WORKSPACE/" -t '
-        '-c "$GITHUB_WORKSPACE/infra/nginx/tricycle.conf"' in workflow
-    )
-    assert "sudo python3 scripts/validate_nginx_runtime.py" in workflow
+    assert "caddy:2.10.2-alpine caddy validate" in workflow
+    assert "python3 scripts/validate_caddy_runtime.py" in workflow
     assert "promtool check rules infra/monitoring/prometheus-rules.yml" in workflow
     assert "promtool test rules prometheus-rules.test.yml" in workflow
     assert "sudo systemd-analyze verify infra/systemd/*.service infra/systemd/*.timer" in workflow
@@ -169,7 +166,7 @@ def test_deployment_acceptance_validator_is_exposed_for_target_evidence() -> Non
     assert "probe-upload-limit" in makefile
     assert "probe_upload_limit.py" in makefile
     assert "query-plan-evidence-v1" in runbook
-    assert "upload-resource-benchmark-v1" in runbook
+    assert "upload-resource-benchmark-v2" in runbook
     assert "upload-limit-probe-v1" in runbook
 
 

@@ -601,6 +601,7 @@ export interface ArtifactBatchUploadResult {
   source_frame_count: number;
   transition_state_frame_count: number;
   inferred_reaction_count: number;
+  timings_ms: Record<string, number>;
   items: ArtifactBatchUploadItem[];
 }
 

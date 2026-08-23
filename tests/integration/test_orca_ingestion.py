@@ -7,12 +7,12 @@ from sqlalchemy import create_engine
 from sqlmodel import Session, select
 
 from tricycle_reaction_db.application.dtos import ArtifactFileRecord
-from tricycle_reaction_db.application.services.molop_artifact_ingestion import (
-    persist_molop_calculation_artifact,
-)
-from tricycle_reaction_db.application.services.transition_state_uploads import (
+from tricycle_reaction_db.application.services.artifact_uploads import (
     _parse_calculation_output,
     _persist_uploaded_artifact,
+)
+from tricycle_reaction_db.application.services.molop_artifact_ingestion import (
+    persist_molop_calculation_artifact,
 )
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (

@@ -11,13 +11,13 @@ from rdkit import Chem
 from sqlalchemy import create_engine, text
 from sqlmodel import Session
 
+from tricycle_reaction_db.application.services.artifact_uploads import (
+    _mark_ingestion_failed,
+)
 from tricycle_reaction_db.application.services.molecular_geometry import (
     GEOMETRY_MATCH_POLICY_VERSION,
     GeometryAssignmentAmbiguityError,
     persist_molecular_geometry,
-)
-from tricycle_reaction_db.application.services.transition_state_uploads import (
-    _mark_ingestion_failed,
 )
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import ArtifactFile, ArtifactIngestion, Geometry

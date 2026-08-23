@@ -1,0 +1,3297 @@
+"""Store uploaded artifacts, ingest calculation outputs, and infer TS reactions."""
+
+from __future__ import annotations
+
+import asyncio
+import gzip
+import io
+import logging
+import multiprocessing
+import os
+import tempfile
+import threading
+import zlib
+from collections.abc import Awaitable, Callable, Mapping, MutableMapping
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from functools import partial
+from hashlib import sha256
+from importlib.metadata import version
+from pathlib import Path
+from queue import Empty, Queue
+from time import perf_counter
+from typing import Any, cast
+from uuid import UUID
+
+import numpy as np
+from molop import AutoFileParser
+from molop.io.base_models.ChemFileFrame import BaseCalcFrame
+from molop.unit import atom_ureg
+from rdkit import Chem
+from sqlalchemy.orm import Session as SQLAlchemySession
+from sqlalchemy.orm import joinedload
+from sqlmodel import Session, col, select
+
+from tricycle_reaction_db.application.dtos import (
+    ArtifactBatchUploadItem,
+    ArtifactBatchUploadResult,
+    ArtifactFileRecord,
+    ArtifactUploadResult,
+    ArtifactValidationInferenceView,
+    ArtifactValidationResult,
+    CreateReactionCommand,
+    TransitionStateInferenceView,
+)
+from tricycle_reaction_db.application.services._persistence import (
+    _acquire_identity_locks,
+    _prepare_new_entity,
+    _require_id,
+)
+from tricycle_reaction_db.application.services.artifact_content import (
+    detect_artifact_media_type,
+)
+from tricycle_reaction_db.application.services.authorization import (
+    AuthorizationService,
+    ProjectPermission,
+)
+from tricycle_reaction_db.application.services.catalog import (
+    persist_artifact_file,
+)
+from tricycle_reaction_db.application.services.molecular_geometry import (
+    GeometryAssignmentAmbiguityError,
+    GeometryPersistenceContext,
+    persist_molecular_topology,
+    preload_molecular_geometry_context,
+)
+from tricycle_reaction_db.application.services.molop_artifact_ingestion import (
+    persist_molop_calculation_artifact,
+    reconcile_molop_geometry_context,
+)
+from tricycle_reaction_db.application.services.reaction_commands import (
+    create_reaction_in_session,
+)
+from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
+    bind_transition_state_frame,
+    ensure_transition_state_path,
+)
+from tricycle_reaction_db.core.config import get_settings
+from tricycle_reaction_db.db.models import (
+    ArtifactFile,
+    ArtifactIngestion,
+    CalculationFrame,
+    MappedReaction,
+    ParseRevision,
+    TransitionStateEndpoint,
+    TransitionStateInference,
+)
+from tricycle_reaction_db.db.session import session_factory
+from tricycle_reaction_db.domain.enums import (
+    ArtifactIngestionStatus,
+    ArtifactKind,
+    ArtifactVisibility,
+    MappedReactionKind,
+    StorageStatus,
+    TransitionStateEndpointDirection,
+    TransitionStateInferenceStatus,
+)
+from tricycle_reaction_db.domain.reaction_frames import is_transition_state_frame_eligible
+from tricycle_reaction_db.ingestion import (
+    MolOPFrameRecords,
+    configure_molecular_graph_reconstruction,
+    frame_records_from_molop,
+    normalize_topology_with_mapping,
+)
+from tricycle_reaction_db.storage.rustfs import (
+    RustFSObjectStore,
+    RustFSSettings,
+    time_partitioned_content_addressed_key,
+    time_partitioned_content_addressed_key_for_sha256,
+)
+
+MOLOP_VERSION = version("molop")
+logger = logging.getLogger(__name__)
+# Pre/post-TS endpoint selection is delegated to MolOP's
+# ``BaseCalcFrame.possible_pre_post_ts``: it samples both signed sides across
+# the amplitude range below and keeps the most frequent side topology.  These
+# values mirror the MolOP defaults so the persisted inference settings always
+# describe the actual sampling grid.
+TS_PRE_POST_MIN_RATIO = 0.75
+TS_PRE_POST_MAX_RATIO = 1.75
+TS_PRE_POST_STEPS = 7
+PERSISTENCE_PRELOAD_BATCH_SIZE = 8
+
+
+class ArtifactUploadError(RuntimeError):
+    pass
+
+
+class ArtifactUploadLimitError(ArtifactUploadError):
+    """Upload bytes or file count exceed a configured hard resource budget."""
+
+
+class ArtifactUploadConflictError(ArtifactUploadError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class _SuccessfulInference:
+    file_frame_index: int
+    imaginary_mode_index: int
+    imaginary_frequency_cm1: float
+    reaction_smiles: str
+    negative_endpoint: Chem.Mol
+    positive_endpoint: Chem.Mol
+    negative_displacement_ratio: float
+    positive_displacement_ratio: float
+
+
+@dataclass(frozen=True, slots=True)
+class _FailedInference:
+    file_frame_index: int
+    imaginary_mode_index: int
+    imaginary_frequency_cm1: float
+    error_code: str
+    error_message: str
+
+
+_Inference = _SuccessfulInference | _FailedInference
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedArtifact:
+    chem_file: Any
+    frame_records: tuple[MolOPFrameRecords, ...]
+    source_frame_count: int
+    source_format: str | None
+    source_compression: str | None
+    inferences: tuple[_Inference, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _IngestionCompletion:
+    parse_revision_id: UUID
+    parse_revision_created: bool
+    source_frame_count: int
+    transition_state_frame_count: int
+    source_format: str | None
+    completed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _DeferredArtifactInferences:
+    ingestion: ArtifactIngestion
+    parse_revision: ParseRevision
+    parsed: _ParsedArtifact
+    frames_by_file_index: dict[int, CalculationFrame]
+    revision_created: bool
+    defer_revision_local_flush: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactUploadPayload:
+    filename: str
+    media_type: str
+    payload: bytes | None
+    spool_path: Path | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RetiredArtifactReservation:
+    bucket: str
+    object_key: str
+    version_id: str | None
+    etag: str | None
+    storage_verified_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedCalculationUpload:
+    settings: RustFSSettings
+    artifact_id: UUID
+    object_key: str
+    ingestion_id: UUID | None
+    started_at: datetime
+    source: bytes | Path
+    size_bytes: int
+    media_type: str
+    content_sha256: str
+    retired_reservation: _RetiredArtifactReservation | None = None
+    needs_storage: bool = True
+    check_existing_object: bool = True
+    skip_parse: bool = False
+    duplicate_of: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _InspectedUploadSource:
+    source: bytes | Path
+    size_bytes: int
+    content_sha256: str
+    media_probe: bytes
+
+
+class _InspectingReader:
+    """Record raw source identity while a gzip reader consumes a stream."""
+
+    def __init__(self, stream: io.BufferedReader, *, probe_size: int) -> None:
+        self._stream = stream
+        self._digest = sha256()
+        self._probe = bytearray()
+        self._probe_size = probe_size
+        self.size_bytes = 0
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self._stream.read(size)
+        if chunk:
+            self._digest.update(chunk)
+            self.size_bytes += len(chunk)
+            if len(self._probe) < self._probe_size:
+                self._probe.extend(chunk[: self._probe_size - len(self._probe)])
+        return chunk
+
+    @property
+    def content_sha256(self) -> str:
+        return self._digest.hexdigest()
+
+    @property
+    def media_probe(self) -> bytes:
+        return bytes(self._probe)
+
+
+def _require_prepared_ingestion_id(reservation: _PreparedCalculationUpload) -> UUID:
+    if reservation.ingestion_id is None:
+        raise RuntimeError("calculation upload is missing its ingestion reservation")
+    return reservation.ingestion_id
+
+
+def _safe_parser_suffix(filename: str) -> str:
+    name = Path(filename).name.lower()
+    if name.endswith(".gz"):
+        name = name[:-3]
+    suffix = Path(name).suffix
+    return suffix if suffix in {".log", ".out", ".xyz"} else ".log"
+
+
+_molop_parse_semaphore: asyncio.Semaphore | None = None
+_molop_parse_slots: int | None = None
+_molop_parse_loop: asyncio.AbstractEventLoop | None = None
+_molop_process_pool: ProcessPoolExecutor | None = None
+_molop_process_pool_workers: int | None = None
+_molop_process_pool_pid: int | None = None
+_molop_process_pool_lock = threading.Lock()
+
+
+def _get_molop_parse_semaphore() -> asyncio.Semaphore:
+    global _molop_parse_loop, _molop_parse_semaphore, _molop_parse_slots
+    slots = get_settings().molop_parse_slots
+    loop = asyncio.get_running_loop()
+    if (
+        _molop_parse_semaphore is None
+        or _molop_parse_slots != slots
+        or _molop_parse_loop is not loop
+    ):
+        _molop_parse_semaphore = asyncio.Semaphore(slots)
+        _molop_parse_slots = slots
+        _molop_parse_loop = loop
+    return _molop_parse_semaphore
+
+
+async def _run_molop_parser(function: Any, *args: Any, **kwargs: Any) -> Any:
+    """Run one parser dispatcher under the process-level parse-slot budget."""
+
+    semaphore = _get_molop_parse_semaphore()
+    async with semaphore:
+        return await asyncio.to_thread(function, *args, **kwargs)
+
+
+async def _run_molop_parser_with_progress(
+    function: Any,
+    *args: Any,
+    progress_callback: Callable[[int, Any], Awaitable[None]],
+    **kwargs: Any,
+) -> Any:
+    """Run a parser while forwarding completed-file events to the event loop."""
+
+    progress_queue: Queue[tuple[int, Any]] = Queue()
+    kwargs["progress_queue"] = progress_queue
+    parser_task = asyncio.create_task(_run_molop_parser(function, *args, **kwargs))
+    callback_error: Exception | None = None
+    while not parser_task.done() or not progress_queue.empty():
+        try:
+            input_index, result = await asyncio.to_thread(progress_queue.get, True, 0.1)
+        except Empty:
+            continue
+        if callback_error is None:
+            try:
+                await progress_callback(input_index, result)
+            except Exception as error:
+                # The parser owns temporary paths used by its worker processes.
+                # Let it finish before unwinding the upload transaction.
+                callback_error = error
+    parsed = await parser_task
+    if callback_error is not None:
+        raise callback_error
+    return parsed
+
+
+def _resolve_molop_process_workers(n_jobs: int) -> int:
+    return max(1, (os.cpu_count() or 1) if n_jobs == -1 else n_jobs)
+
+
+def _get_molop_process_pool(n_jobs: int) -> ProcessPoolExecutor:
+    """Return this API worker's reusable, spawn-safe MolOP process pool."""
+
+    global _molop_process_pool, _molop_process_pool_pid, _molop_process_pool_workers
+    workers = _resolve_molop_process_workers(n_jobs)
+    pid = os.getpid()
+    previous_pool: ProcessPoolExecutor | None = None
+    with _molop_process_pool_lock:
+        if (
+            _molop_process_pool is not None
+            and _molop_process_pool_workers == workers
+            and _molop_process_pool_pid == pid
+        ):
+            return _molop_process_pool
+        previous_pool = _molop_process_pool
+        _molop_process_pool = ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=multiprocessing.get_context("spawn"),
+            max_tasks_per_child=50,
+        )
+        _molop_process_pool_workers = workers
+        _molop_process_pool_pid = pid
+        process_pool = _molop_process_pool
+    if previous_pool is not None:
+        previous_pool.shutdown(wait=True, cancel_futures=True)
+    return process_pool
+
+
+async def close_molop_process_pool() -> None:
+    """Release parser workers during ASGI shutdown."""
+
+    global _molop_process_pool, _molop_process_pool_pid, _molop_process_pool_workers
+    with _molop_process_pool_lock:
+        pool = _molop_process_pool
+        _molop_process_pool = None
+        _molop_process_pool_workers = None
+        _molop_process_pool_pid = None
+    if pool is not None:
+        await asyncio.to_thread(pool.shutdown, wait=True, cancel_futures=True)
+
+
+async def _run_molop_file_parser(payload: bytes, filename: str) -> _ParsedArtifact:
+    """Parse one uploaded file in the reusable project-owned worker pool."""
+
+    semaphore = _get_molop_parse_semaphore()
+    async with semaphore:
+        decoded_payload, source_compression = _parser_payload(payload, filename)
+        with tempfile.NamedTemporaryFile(suffix=_safe_parser_suffix(filename)) as temporary:
+            temporary.write(decoded_payload)
+            temporary.flush()
+            loop = asyncio.get_running_loop()
+            parsed, error_message = await loop.run_in_executor(
+                _get_molop_process_pool(get_settings().molop_batch_n_jobs),
+                _parse_calculation_path_worker,
+                temporary.name,
+                source_compression,
+            )
+        if parsed is None:
+            raise ArtifactUploadError(
+                error_message or "MolOP did not return a result for this input file"
+            )
+        return parsed
+
+
+def _require_upload_size(payload: bytes) -> None:
+    maximum = get_settings().max_upload_bytes
+    if len(payload) > maximum:
+        raise ArtifactUploadError(f"uploaded artifact exceeds the {maximum}-byte limit")
+
+
+def _inspect_upload_source(
+    file: ArtifactUploadPayload,
+    *,
+    maximum_size: int,
+) -> _InspectedUploadSource:
+    """Inspect one source without materializing a spooled file in memory."""
+
+    if file.payload is not None:
+        payload = file.payload
+        if len(payload) > maximum_size:
+            raise ArtifactUploadLimitError(
+                f"uploaded artifact exceeds the {maximum_size}-byte limit"
+            )
+        _require_decompressed_upload_size(payload, file.filename)
+        return _InspectedUploadSource(
+            source=payload,
+            size_bytes=len(payload),
+            content_sha256=sha256(payload).hexdigest(),
+            media_probe=payload[: 64 * 1024],
+        )
+
+    if file.spool_path is None:
+        raise ArtifactUploadError("uploaded artifact has no payload")
+    expected_size = file.spool_path.stat().st_size
+    if expected_size > maximum_size:
+        raise ArtifactUploadLimitError(f"uploaded artifact exceeds the {maximum_size}-byte limit")
+
+    with file.spool_path.open("rb") as stream:
+        source = _InspectingReader(stream, probe_size=64 * 1024)
+        is_gzip = file.filename.lower().endswith(".gz") or stream.peek(2)[:2] == b"\x1f\x8b"
+        if is_gzip:
+            try:
+                with gzip.GzipFile(fileobj=cast(Any, source), mode="rb") as decompressed:
+                    decompressed_size = 0
+                    while chunk := decompressed.read(min(1024 * 1024, maximum_size + 1)):
+                        decompressed_size += len(chunk)
+                        if decompressed_size > maximum_size:
+                            raise ArtifactUploadLimitError(
+                                f"decompressed artifact exceeds the {maximum_size}-byte limit"
+                            )
+            except ArtifactUploadLimitError:
+                raise
+            except (EOFError, OSError, zlib.error):
+                # Invalid gzip remains an isolated MolOP parse failure, matching
+                # the bytes-upload path's validation behavior.
+                pass
+        while source.read(1024 * 1024):
+            pass
+
+    if source.size_bytes != expected_size:
+        raise ArtifactUploadError("uploaded spool file changed while being inspected")
+    return _InspectedUploadSource(
+        source=file.spool_path,
+        size_bytes=source.size_bytes,
+        content_sha256=source.content_sha256,
+        media_probe=source.media_probe,
+    )
+
+
+def _require_batch_upload_budget(
+    files: list[ArtifactUploadPayload],
+) -> dict[int, _InspectedUploadSource]:
+    """Validate every batch dimension before authorization, storage, or parsing."""
+
+    settings = get_settings()
+    if len(files) > settings.max_batch_files:
+        raise ArtifactUploadLimitError(
+            f"upload batch exceeds the {settings.max_batch_files}-file limit"
+        )
+    total_bytes = 0
+    inspected_by_index: dict[int, _InspectedUploadSource] = {}
+    for index, file in enumerate(files):
+        if file.payload is None and file.spool_path is None:
+            continue
+        inspected = _inspect_upload_source(file, maximum_size=settings.max_upload_bytes)
+        total_bytes += inspected.size_bytes
+        if total_bytes > settings.max_batch_bytes:
+            raise ArtifactUploadLimitError(
+                f"upload batch exceeds the {settings.max_batch_bytes}-byte limit"
+            )
+        inspected_by_index[index] = inspected
+    return inspected_by_index
+
+
+def _upload_payload_bytes(file: ArtifactUploadPayload) -> bytes:
+    if file.payload is not None:
+        return file.payload
+    if file.spool_path is not None:
+        return file.spool_path.read_bytes()
+    raise ArtifactUploadError("uploaded artifact has no payload")
+
+
+def _parser_payload(
+    payload: bytes,
+    filename: str,
+    *,
+    max_decompressed_bytes: int | None = None,
+) -> tuple[bytes, str | None]:
+    maximum = max_decompressed_bytes or get_settings().max_upload_bytes
+    if len(payload) > maximum:
+        raise ArtifactUploadError(f"uploaded artifact exceeds the {maximum}-byte limit")
+    if payload.startswith(b"\x1f\x8b") or filename.lower().endswith(".gz"):
+        try:
+            output = bytearray()
+            with gzip.GzipFile(fileobj=io.BytesIO(payload), mode="rb") as stream:
+                while True:
+                    chunk = stream.read(min(1024 * 1024, maximum + 1 - len(output)))
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                    if len(output) > maximum:
+                        raise ArtifactUploadError(
+                            f"decompressed artifact exceeds the {maximum}-byte limit"
+                        )
+            return bytes(output), "gzip"
+        except (EOFError, OSError, zlib.error) as error:
+            raise ArtifactUploadError("uploaded gzip artifact is invalid") from error
+    if len(payload) > maximum:
+        raise ArtifactUploadError(f"decompressed artifact exceeds the {maximum}-byte limit")
+    return payload, None
+
+
+def _require_decompressed_upload_size(payload: bytes, filename: str) -> None:
+    """Reject compressed resource bombs while preserving invalid-file isolation."""
+
+    if not (payload.startswith(b"\x1f\x8b") or filename.lower().endswith(".gz")):
+        return
+    try:
+        _parser_payload(payload, filename)
+    except ArtifactUploadError as error:
+        if "exceeds the" in str(error):
+            raise ArtifactUploadLimitError(str(error)) from error
+
+
+def _mapped_reaction_smiles(reactant: Chem.Mol, product: Chem.Mol) -> str:
+    reactant_atoms = [
+        atom.GetAtomicNum()
+        for atom in reactant.GetAtoms()  # type: ignore[no-untyped-call]
+    ]
+    product_atoms = [
+        atom.GetAtomicNum()
+        for atom in product.GetAtoms()  # type: ignore[no-untyped-call]
+    ]
+    if reactant_atoms != product_atoms:
+        raise ValueError("MolOP TS endpoints do not preserve source atom order")
+
+    sides: list[str] = []
+    for endpoint in (reactant, product):
+        mapped = Chem.Mol(endpoint)
+        mapped.RemoveAllConformers()
+        for atom_index, atom in enumerate(mapped.GetAtoms()):  # type: ignore[no-untyped-call]
+            atom.SetAtomMapNum(atom_index + 1)
+        fragments = Chem.GetMolFrags(mapped, asMols=True, sanitizeFrags=True)
+        sides.append(
+            ".".join(
+                Chem.MolToSmiles(
+                    fragment,
+                    canonical=True,
+                    isomericSmiles=True,
+                    allHsExplicit=True,
+                )
+                for fragment in fragments
+            )
+        )
+    return f"{sides[0]}>>{sides[1]}"
+
+
+def _signed_ts_endpoints(
+    frame: BaseCalcFrame[Any],
+    vibration_position: int,
+) -> tuple[Chem.Mol, Chem.Mol, float, float]:
+    """Return MolOP's inferred pre/post-TS endpoints with signed displacements.
+
+    Endpoint *selection* is MolOP's ``possible_pre_post_ts``: it samples each
+    signed side across ``TS_PRE_POST_MIN_RATIO..MAX_RATIO`` and keeps the most
+    frequent side topology, so crowding cannot silently drop one side.  The
+    project only *measures* the selected endpoints' actual displacement along
+    the imaginary mode to restore the signed direction/ratio used by the
+    persisted endpoint rows; it does not choose or rank the endpoints itself.
+    """
+
+    reactant, product = frame.possible_pre_post_ts(
+        show_3D=True,
+        min_ratio=TS_PRE_POST_MIN_RATIO,
+        max_ratio=TS_PRE_POST_MAX_RATIO,
+        steps=TS_PRE_POST_STEPS,
+    )
+    if frame.vibrations is None:
+        raise ValueError("TS frame has no vibration mode")
+    center = np.asarray(frame.coords.to(atom_ureg.angstrom).magnitude, dtype=np.float64)
+    mode = np.asarray(
+        frame.vibrations[vibration_position].vibration_mode.to(atom_ureg.angstrom).magnitude,
+        dtype=np.float64,
+    )
+    mode_norm = float(np.sum(np.square(mode)))
+    if mode.shape != center.shape or mode_norm <= 0:
+        raise ValueError("TS imaginary mode does not match the source coordinates")
+
+    def _signed_ratio(endpoint: Chem.Mol) -> float:
+        if endpoint.GetNumConformers() != 1 or not endpoint.GetConformer().Is3D():
+            raise ValueError("MolOP TS endpoint lost its 3D conformer")
+        coordinates = np.asarray(
+            endpoint.GetConformer().GetPositions(),
+            dtype=np.float64,
+        )
+        if coordinates.shape != center.shape or not np.isfinite(coordinates).all():
+            raise ValueError("MolOP TS endpoint coordinates are invalid")
+        return float(np.sum((center - coordinates) * mode) / mode_norm)
+
+    negative_ratio = _signed_ratio(reactant)
+    positive_ratio = _signed_ratio(product)
+    if negative_ratio > positive_ratio:
+        negative_ratio, positive_ratio = positive_ratio, negative_ratio
+        reactant, product = product, reactant
+    if negative_ratio >= 0 or positive_ratio <= 0:
+        raise ValueError(
+            "MolOP pre/post-TS endpoints do not bracket the TS center on the imaginary mode"
+        )
+    return reactant, product, abs(negative_ratio), positive_ratio
+
+
+def _parsed_artifact_from_chem_file(
+    chem_file: Any,
+    *,
+    source_compression: str | None,
+) -> _ParsedArtifact:
+    inferred: list[_Inference] = []
+    for fallback_index, frame in enumerate(chem_file):
+        if not isinstance(frame, BaseCalcFrame):
+            continue
+        if frame.is_TS is not True:
+            continue
+        file_frame_index = frame.file_frame_index
+        if file_frame_index is None:
+            file_frame_index = fallback_index
+        vibrations = frame.vibrations
+        if vibrations is None or len(vibrations.imaginary_idxs) != 1:
+            continue
+        imaginary_position = vibrations.imaginary_idxs[0]
+        imaginary_mode_index = (
+            vibrations.mode_indices[imaginary_position]
+            if vibrations.mode_indices
+            else imaginary_position
+        )
+        frequency = vibrations[imaginary_position].frequency
+        if frequency is None:
+            continue
+        frequency_cm1 = float(frequency.to(atom_ureg.cm_1).magnitude)
+        if frame.topology_reconstruction_status == "suspicious_fallback":
+            inferred.append(
+                _FailedInference(
+                    file_frame_index=file_frame_index,
+                    imaginary_mode_index=imaginary_mode_index,
+                    imaginary_frequency_cm1=frequency_cm1,
+                    error_code="ts_topology_untrusted",
+                    error_message=(
+                        "MolGR returned a suspicious fallback topology; "
+                        "TS endpoint inference was skipped"
+                    ),
+                )
+            )
+            continue
+        try:
+            (
+                negative_endpoint,
+                positive_endpoint,
+                negative_displacement_ratio,
+                positive_displacement_ratio,
+            ) = _signed_ts_endpoints(frame, imaginary_position)
+            reactant, product = sorted(
+                (negative_endpoint, positive_endpoint),
+                key=lambda endpoint: len(Chem.GetMolFrags(endpoint)),
+                reverse=True,
+            )
+            for endpoint in (negative_endpoint, positive_endpoint, reactant, product):
+                endpoint_atoms = [atom.GetAtomicNum() for atom in endpoint.GetAtoms()]  # type: ignore[no-untyped-call]
+                if endpoint_atoms != frame.atoms:
+                    raise ValueError(
+                        "MolOP TS endpoint atom order differs from the TS source frame"
+                    )
+            inferred.append(
+                _SuccessfulInference(
+                    file_frame_index=file_frame_index,
+                    imaginary_mode_index=imaginary_mode_index,
+                    imaginary_frequency_cm1=frequency_cm1,
+                    reaction_smiles=_mapped_reaction_smiles(reactant, product),
+                    negative_endpoint=negative_endpoint,
+                    positive_endpoint=positive_endpoint,
+                    negative_displacement_ratio=negative_displacement_ratio,
+                    positive_displacement_ratio=positive_displacement_ratio,
+                )
+            )
+        except Exception as error:
+            inferred.append(
+                _FailedInference(
+                    file_frame_index=file_frame_index,
+                    imaginary_mode_index=imaginary_mode_index,
+                    imaginary_frequency_cm1=frequency_cm1,
+                    error_code="ts_endpoint_inference_failed",
+                    error_message=str(error) or type(error).__name__,
+                )
+            )
+    return _ParsedArtifact(
+        chem_file=chem_file,
+        frame_records=tuple(
+            frame_records_from_molop(frame, export_schema_version=chem_file.schema_version)
+            for frame in chem_file
+        ),
+        source_frame_count=len(chem_file),
+        source_format=chem_file.source_format,
+        source_compression=source_compression,
+        inferences=tuple(inferred),
+    )
+
+
+def _parse_calculation_path_worker(
+    path: str,
+    source_compression: str | None,
+) -> tuple[_ParsedArtifact | None, str | None]:
+    """Parse one source-evidence file in a project-owned worker process."""
+
+    try:
+        configure_molecular_graph_reconstruction()
+        chem_file = AutoFileParser(
+            path,
+            parser_detection="auto",
+            capture_source_evidence=True,
+            release_file_content=True,
+        )
+        return (
+            _parsed_artifact_from_chem_file(
+                chem_file,
+                source_compression=source_compression,
+            ),
+            None,
+        )
+    except Exception as error:
+        return None, str(error) or type(error).__name__
+
+
+def _parse_calculation_paths_parallel(
+    paths: list[str],
+    compressions: list[str | None],
+    *,
+    n_jobs: int,
+    on_result: Callable[[int, tuple[_ParsedArtifact | None, str | None]], None] | None = None,
+) -> list[tuple[_ParsedArtifact | None, str | None]]:
+    process_pool = _get_molop_process_pool(n_jobs)
+    if on_result is None:
+        return list(
+            process_pool.map(
+                _parse_calculation_path_worker,
+                paths,
+                compressions,
+                chunksize=1,
+            )
+        )
+
+    futures = {
+        process_pool.submit(_parse_calculation_path_worker, path, compression): index
+        for index, (path, compression) in enumerate(zip(paths, compressions, strict=True))
+    }
+    results: list[tuple[_ParsedArtifact | None, str | None] | None] = [None] * len(paths)
+    for future in as_completed(futures):
+        index = futures[future]
+        try:
+            result = future.result()
+        except Exception as error:  # pragma: no cover - worker normally isolates failures
+            result = (None, str(error) or type(error).__name__)
+        results[index] = result
+        on_result(index, result)
+    return [result for result in results if result is not None]
+
+
+def _parse_calculation_output(payload: bytes, filename: str) -> _ParsedArtifact:
+    configure_molecular_graph_reconstruction()
+    decoded_payload, source_compression = _parser_payload(payload, filename)
+    with tempfile.NamedTemporaryFile(suffix=_safe_parser_suffix(filename)) as temporary:
+        temporary.write(decoded_payload)
+        temporary.flush()
+        chem_file = AutoFileParser(
+            temporary.name,
+            parser_detection="auto",
+            capture_source_evidence=True,
+            release_file_content=True,
+        )
+        return _parsed_artifact_from_chem_file(
+            chem_file,
+            source_compression=source_compression,
+        )
+
+
+def _prepare_calculation_parser_path(
+    source: bytes | Path,
+    filename: str,
+    *,
+    temporary_dir: Path,
+    input_index: int,
+) -> tuple[str, str | None]:
+    """Give MolOP a file path while retaining spooled raw files in place."""
+
+    if not isinstance(source, Path):
+        decoded_payload, source_compression = _parser_payload(source, filename)
+        path = temporary_dir / f"{input_index:08d}{_safe_parser_suffix(filename)}"
+        path.write_bytes(decoded_payload)
+        return str(path), source_compression
+
+    maximum = get_settings().max_upload_bytes
+    if source.stat().st_size > maximum:
+        raise ArtifactUploadError(f"uploaded artifact exceeds the {maximum}-byte limit")
+    with source.open("rb") as stream:
+        is_gzip = filename.lower().endswith(".gz") or stream.peek(2)[:2] == b"\x1f\x8b"
+        if not is_gzip:
+            return str(source), None
+        path = temporary_dir / f"{input_index:08d}{_safe_parser_suffix(filename)}"
+        try:
+            with (
+                gzip.GzipFile(fileobj=stream, mode="rb") as decompressed,
+                path.open("wb") as output,
+            ):
+                decompressed_size = 0
+                while chunk := decompressed.read(1024 * 1024):
+                    decompressed_size += len(chunk)
+                    if decompressed_size > maximum:
+                        raise ArtifactUploadError(
+                            f"decompressed artifact exceeds the {maximum}-byte limit"
+                        )
+                    output.write(chunk)
+        except (EOFError, OSError, zlib.error) as error:
+            raise ArtifactUploadError("uploaded gzip artifact is invalid") from error
+    return str(path), "gzip"
+
+
+def _parse_calculation_outputs_batch(
+    files: list[tuple[bytes | Path, str]],
+    *,
+    n_jobs: int,
+    progress_queue: Queue[tuple[int, Any]] | None = None,
+    timings_ms: MutableMapping[str, float] | None = None,
+) -> dict[int, _ParsedArtifact | Exception]:
+    """Parse all supplied files in one MolOP batch while retaining input order."""
+
+    started_at = perf_counter()
+    configure_molecular_graph_reconstruction()
+    with tempfile.TemporaryDirectory(prefix="tricycle-molop-batch-") as temporary_dir:
+        parsed_by_index: dict[int, _ParsedArtifact | Exception] = {}
+        paths: list[str] = []
+        file_indices: list[int] = []
+        compressions: list[str | None] = []
+        for index, (source, filename) in enumerate(files):
+            try:
+                path, source_compression = _prepare_calculation_parser_path(
+                    source,
+                    filename,
+                    temporary_dir=Path(temporary_dir),
+                    input_index=index,
+                )
+            except Exception as error:
+                parsed_by_index[index] = error
+                if progress_queue is not None:
+                    progress_queue.put((index, error))
+                continue
+            paths.append(path)
+            file_indices.append(index)
+            compressions.append(source_compression)
+        if timings_ms is not None:
+            timings_ms["prepare_inputs_ms"] = (perf_counter() - started_at) * 1000
+        if not paths:
+            if timings_ms is not None:
+                timings_ms["molop_parse_ms"] = 0.0
+                timings_ms["total_ms"] = (perf_counter() - started_at) * 1000
+            return parsed_by_index
+
+        parse_started_at = perf_counter()
+
+        def report_result(
+            parser_index: int,
+            result: tuple[_ParsedArtifact | None, str | None],
+        ) -> None:
+            if progress_queue is not None:
+                progress_queue.put((file_indices[parser_index], result))
+
+        if progress_queue is None:
+            parallel_results = _parse_calculation_paths_parallel(
+                paths,
+                compressions,
+                n_jobs=n_jobs,
+            )
+        else:
+            parallel_results = _parse_calculation_paths_parallel(
+                paths,
+                compressions,
+                n_jobs=n_jobs,
+                on_result=report_result,
+            )
+        for parser_index, (parsed, error_message) in enumerate(parallel_results):
+            input_index = file_indices[parser_index]
+            parsed_by_index[input_index] = (
+                parsed
+                if parsed is not None
+                else ArtifactUploadError(
+                    error_message or "MolOP did not return a result for this input file"
+                )
+            )
+        if timings_ms is not None:
+            timings_ms["molop_parse_ms"] = (perf_counter() - parse_started_at) * 1000
+            timings_ms["total_ms"] = (perf_counter() - started_at) * 1000
+        return parsed_by_index
+
+
+def _persist_uploaded_artifact(
+    session: Session,
+    *,
+    record: ArtifactFileRecord,
+) -> ArtifactFile:
+    artifact = persist_artifact_file(session, record)
+    if artifact.project_id != record.project_id:
+        raise ArtifactUploadConflictError(
+            "an identical artifact already belongs to a different project"
+        )
+    if artifact.artifact_kind is not record.artifact_kind:
+        raise ArtifactUploadConflictError(
+            "an identical artifact is already registered with a different artifact kind"
+        )
+    return artifact
+
+
+def _prepare_pending_upload(
+    session: Session,
+    *,
+    record: ArtifactFileRecord,
+) -> tuple[ArtifactFile, _RetiredArtifactReservation | None, bool]:
+    """Register the DB relation before writing bytes to RustFS.
+
+    A pending row is the durable reservation for an upload.  Retries reuse a
+    still-pending key so concurrent requests cannot move the reservation while
+    one request is writing it; stale reservations receive a fresh hourly-partitioned
+    key so GC can observe the retry in its normal window.
+    """
+
+    _acquire_identity_locks(session, ("artifact-content", record.content_sha256))
+    artifact = session.exec(
+        select(ArtifactFile).where(ArtifactFile.content_sha256 == record.content_sha256)
+    ).first()
+    if artifact is None:
+        artifact = ArtifactFile(**record.model_dump())
+        if session.info.get("tricycle_fast_insert", False):
+            _prepare_new_entity(session, artifact)
+        else:
+            session.add(artifact)
+            session.flush()
+        return artifact, None, False
+    if artifact.size_bytes != record.size_bytes:
+        raise ValueError("artifact SHA-256 resolved to a different byte size")
+    if artifact.project_id != record.project_id:
+        raise ArtifactUploadConflictError(
+            "an identical artifact already belongs to a different project"
+        )
+    if artifact.artifact_kind is not record.artifact_kind:
+        raise ArtifactUploadConflictError(
+            "an identical artifact is already registered with a different artifact kind"
+        )
+    if artifact.storage_status is StorageStatus.AVAILABLE and artifact.bucket != record.bucket:
+        raise ArtifactUploadConflictError(
+            "an identical artifact is registered in a different RustFS bucket"
+        )
+    retired_reservation = None
+    if artifact.storage_status is StorageStatus.RETIRED:
+        retired_reservation = _RetiredArtifactReservation(
+            bucket=artifact.bucket,
+            object_key=artifact.object_key,
+            version_id=artifact.version_id,
+            etag=artifact.etag,
+            storage_verified_at=artifact.storage_verified_at,
+        )
+    if artifact.storage_status is not StorageStatus.AVAILABLE:
+        if not (
+            artifact.storage_status is StorageStatus.PENDING
+            and _is_partitioned_upload_key(artifact.object_key)
+        ):
+            artifact.object_key = record.object_key
+        artifact.bucket = record.bucket
+        artifact.storage_status = StorageStatus.PENDING
+        artifact.version_id = None
+        artifact.etag = None
+        artifact.storage_verified_at = None
+        session.add(artifact)
+        if not session.info.get("tricycle_fast_insert", False):
+            session.flush()
+    return artifact, retired_reservation, True
+
+
+def _prepare_pending_uploads(
+    session: Session,
+    *,
+    records: list[ArtifactFileRecord],
+) -> dict[str, tuple[ArtifactFile, _RetiredArtifactReservation | None, bool]]:
+    """Reserve batch artifact identities with set-based PostgreSQL lookups."""
+
+    if not records:
+        return {}
+    by_digest = {record.content_sha256: record for record in records}
+    _acquire_identity_locks(
+        session,
+        *(("artifact-content", digest) for digest in sorted(by_digest)),
+    )
+    existing_by_digest = {
+        artifact.content_sha256: artifact
+        for artifact in session.exec(
+            select(ArtifactFile).where(col(ArtifactFile.content_sha256).in_(by_digest))
+        ).all()
+    }
+    prepared: dict[
+        str,
+        tuple[ArtifactFile, _RetiredArtifactReservation | None, bool],
+    ] = {}
+    for digest, record in by_digest.items():
+        artifact = existing_by_digest.get(digest)
+        if artifact is None:
+            artifact = ArtifactFile(**record.model_dump())
+            _prepare_new_entity(session, artifact)
+            prepared[digest] = (artifact, None, False)
+            continue
+        if artifact.size_bytes != record.size_bytes:
+            raise ValueError("artifact SHA-256 resolved to a different byte size")
+        if artifact.project_id != record.project_id:
+            raise ArtifactUploadConflictError(
+                "an identical artifact already belongs to a different project"
+            )
+        if artifact.artifact_kind is not record.artifact_kind:
+            raise ArtifactUploadConflictError(
+                "an identical artifact is already registered with a different artifact kind"
+            )
+        if artifact.storage_status is StorageStatus.AVAILABLE and artifact.bucket != record.bucket:
+            raise ArtifactUploadConflictError(
+                "an identical artifact is registered in a different RustFS bucket"
+            )
+        retired_reservation = None
+        if artifact.storage_status is StorageStatus.RETIRED:
+            retired_reservation = _RetiredArtifactReservation(
+                bucket=artifact.bucket,
+                object_key=artifact.object_key,
+                version_id=artifact.version_id,
+                etag=artifact.etag,
+                storage_verified_at=artifact.storage_verified_at,
+            )
+        if artifact.storage_status is not StorageStatus.AVAILABLE:
+            if not (
+                artifact.storage_status is StorageStatus.PENDING
+                and _is_partitioned_upload_key(artifact.object_key)
+            ):
+                artifact.object_key = record.object_key
+            artifact.bucket = record.bucket
+            artifact.storage_status = StorageStatus.PENDING
+            artifact.version_id = None
+            artifact.etag = None
+            artifact.storage_verified_at = None
+            session.add(artifact)
+        prepared[digest] = (artifact, retired_reservation, True)
+    return prepared
+
+
+def _is_partitioned_upload_key(object_key: str) -> bool:
+    parts = object_key.split("/")
+    return (
+        len(parts) == 8
+        and parts[0] == "uploads"
+        and len(parts[1]) == 4
+        and len(parts[2]) == 2
+        and len(parts[3]) == 2
+        and len(parts[4]) == 2
+        and parts[5] == "sha256"
+        and len(parts[6]) == 2
+        and len(parts[7]) == 64
+    )
+
+
+def _mark_upload_available(
+    session: Session,
+    *,
+    artifact_id: UUID,
+    object_key: str,
+    stored: Any,
+) -> ArtifactFile:
+    _acquire_identity_locks(session, ("artifact-content", stored.sha256 or ""))
+    artifact = session.get(ArtifactFile, artifact_id)
+    if artifact is None:
+        raise ArtifactUploadError("artifact reservation disappeared before storage verification")
+    if artifact.object_key != object_key:
+        raise ArtifactUploadError("artifact reservation changed during storage verification")
+    if artifact.storage_status not in {StorageStatus.PENDING, StorageStatus.AVAILABLE}:
+        raise ArtifactUploadError("artifact reservation is no longer writable")
+    artifact.storage_status = StorageStatus.AVAILABLE
+    artifact.version_id = stored.version_id
+    artifact.etag = stored.etag
+    artifact.storage_verified_at = stored.last_modified
+    session.add(artifact)
+    if not session.info.get("tricycle_fast_insert", False):
+        session.flush()
+    return artifact
+
+
+def _mark_uploads_available(
+    session: Session,
+    *,
+    stored_by_artifact_id: dict[UUID, tuple[str, Any]],
+) -> None:
+    """Advance verified batch reservations after one identity lookup."""
+
+    if not stored_by_artifact_id:
+        return
+    artifacts = {
+        artifact.id: artifact
+        for artifact in session.exec(
+            select(ArtifactFile).where(col(ArtifactFile.id).in_(stored_by_artifact_id))
+        ).all()
+        if artifact.id is not None
+    }
+    for artifact_id, (object_key, stored) in stored_by_artifact_id.items():
+        artifact = artifacts.get(artifact_id)
+        if artifact is None:
+            raise ArtifactUploadError(
+                "artifact reservation disappeared before storage verification"
+            )
+        if artifact.object_key != object_key:
+            raise ArtifactUploadError("artifact reservation changed during storage verification")
+        if artifact.storage_status not in {StorageStatus.PENDING, StorageStatus.AVAILABLE}:
+            raise ArtifactUploadError("artifact reservation is no longer writable")
+        artifact.storage_status = StorageStatus.AVAILABLE
+        artifact.version_id = stored.version_id
+        artifact.etag = stored.etag
+        artifact.storage_verified_at = stored.last_modified
+        session.add(artifact)
+
+
+def _begin_upload_compensation(
+    session: Session,
+    *,
+    artifact_id: UUID,
+    object_key: str,
+    content_sha256: str,
+) -> tuple[UUID | None, bool]:
+    """Reserve the content identity while a failed object write is cleaned up."""
+
+    _acquire_identity_locks(session, ("artifact-content", content_sha256))
+    artifact = session.get(ArtifactFile, artifact_id)
+    if artifact is None:
+        return None, True
+    if artifact.storage_status is StorageStatus.AVAILABLE or artifact.object_key != object_key:
+        return artifact_id, False
+    return artifact_id, True
+
+
+def _delete_reserved_object(
+    settings: RustFSSettings,
+    *,
+    object_key: str,
+    content_sha256: str,
+) -> None:
+    with RustFSObjectStore(settings) as store:
+        if not store.exists(object_key):
+            return
+        metadata = store.head(object_key)
+        if metadata.sha256 is not None and metadata.sha256 != content_sha256:
+            raise ArtifactUploadError(
+                f"refusing to delete an object with a different SHA-256: {object_key}"
+            )
+        store.delete(object_key, version_id=metadata.version_id)
+
+
+def _finish_upload_compensation(
+    session: Session,
+    *,
+    artifact_id: UUID | None,
+    object_key: str,
+    retired_reservation: _RetiredArtifactReservation | None = None,
+) -> None:
+    if artifact_id is None:
+        return
+    artifact = session.get(ArtifactFile, artifact_id)
+    if artifact is None or artifact.object_key != object_key:
+        return
+    if artifact.storage_status is StorageStatus.PENDING:
+        if retired_reservation is None:
+            session.delete(artifact)
+            return
+        artifact.bucket = retired_reservation.bucket
+        artifact.object_key = retired_reservation.object_key
+        artifact.version_id = retired_reservation.version_id
+        artifact.storage_status = StorageStatus.RETIRED
+        artifact.etag = retired_reservation.etag
+        artifact.storage_verified_at = retired_reservation.storage_verified_at
+        session.add(artifact)
+
+
+async def _compensate_upload(
+    *,
+    settings: RustFSSettings,
+    artifact_id: UUID,
+    object_key: str,
+    content_sha256: str,
+    retired_reservation: _RetiredArtifactReservation | None = None,
+) -> None:
+    """Best-effort cleanup for an object written before its DB state became available."""
+
+    try:
+        async with session_factory() as session:
+            reservation = await session.run_sync(
+                lambda sync_session: _begin_upload_compensation(
+                    cast(Session, sync_session),
+                    artifact_id=artifact_id,
+                    object_key=object_key,
+                    content_sha256=content_sha256,
+                )
+            )
+            reserved_artifact_id, should_delete = reservation
+            if not should_delete:
+                await session.commit()
+                return
+            await asyncio.to_thread(
+                _delete_reserved_object,
+                settings,
+                object_key=object_key,
+                content_sha256=content_sha256,
+            )
+            await session.run_sync(
+                lambda sync_session: _finish_upload_compensation(
+                    cast(Session, sync_session),
+                    artifact_id=reserved_artifact_id,
+                    object_key=object_key,
+                    retired_reservation=retired_reservation,
+                )
+            )
+            await session.commit()
+    except Exception:
+        logger.exception("artifact upload compensation failed for %s", object_key)
+
+
+def _create_pending_ingestion(
+    session: Session,
+    *,
+    artifact: ArtifactFile,
+    started_at: datetime,
+) -> tuple[ArtifactIngestion, bool]:
+    artifact_id = _require_id(artifact, label="ArtifactFile")
+    _acquire_identity_locks(session, ("artifact_ingestion", artifact_id))
+    ingestion = session.exec(
+        select(ArtifactIngestion).where(ArtifactIngestion.artifact_file_id == artifact_id)
+    ).first()
+    created = ingestion is None
+    if ingestion is None:
+        ingestion = ArtifactIngestion(
+            artifact_file_id=artifact_id,
+            artifact_file=artifact,
+            parser_version=MOLOP_VERSION,
+            started_at=started_at,
+        )
+        if session.info.get("tricycle_fast_insert", False):
+            _prepare_new_entity(session, ingestion)
+        else:
+            session.add(ingestion)
+            session.flush()
+    else:
+        has_revision = session.exec(
+            select(ParseRevision.id).where(ParseRevision.artifact_file_id == artifact_id)
+        ).first()
+        if has_revision is None:
+            ingestion.status = ArtifactIngestionStatus.PENDING
+            ingestion.source_frame_count = None
+            ingestion.transition_state_frame_count = None
+            ingestion.completed_at = None
+            ingestion.error_code = None
+            ingestion.error_message = None
+            session.add(ingestion)
+            created = True
+    return ingestion, created
+
+
+def _create_pending_ingestions(
+    session: Session,
+    *,
+    artifacts: list[ArtifactFile],
+    started_by_artifact_id: dict[UUID, datetime],
+) -> dict[UUID, tuple[ArtifactIngestion, bool]]:
+    """Create or reopen batch ingestions with set-based existence checks."""
+
+    if not artifacts:
+        return {}
+    artifact_ids = [_require_id(artifact, label="ArtifactFile") for artifact in artifacts]
+    _acquire_identity_locks(
+        session,
+        *(("artifact_ingestion", artifact_id) for artifact_id in sorted(artifact_ids)),
+    )
+    existing_by_artifact_id = {
+        ingestion.artifact_file_id: ingestion
+        for ingestion in session.exec(
+            select(ArtifactIngestion).where(
+                col(ArtifactIngestion.artifact_file_id).in_(artifact_ids)
+            )
+        ).all()
+    }
+    artifacts_with_revisions = set(
+        session.exec(
+            select(ParseRevision.artifact_file_id).where(
+                col(ParseRevision.artifact_file_id).in_(artifact_ids)
+            )
+        ).all()
+    )
+    result: dict[UUID, tuple[ArtifactIngestion, bool]] = {}
+    for artifact in artifacts:
+        artifact_id = _require_id(artifact, label="ArtifactFile")
+        ingestion = existing_by_artifact_id.get(artifact_id)
+        created = ingestion is None
+        if ingestion is None:
+            ingestion = ArtifactIngestion(
+                artifact_file_id=artifact_id,
+                artifact_file=artifact,
+                parser_version=MOLOP_VERSION,
+                started_at=started_by_artifact_id[artifact_id],
+            )
+            _prepare_new_entity(session, ingestion)
+        elif artifact_id not in artifacts_with_revisions:
+            ingestion.status = ArtifactIngestionStatus.PENDING
+            ingestion.source_frame_count = None
+            ingestion.transition_state_frame_count = None
+            ingestion.completed_at = None
+            ingestion.error_code = None
+            ingestion.error_message = None
+            session.add(ingestion)
+            created = True
+        result[artifact_id] = (ingestion, created)
+    return result
+
+
+def _persist_transition_state_endpoint(
+    session: Session,
+    *,
+    calculation_frame: CalculationFrame,
+    endpoint: Chem.Mol,
+    direction: TransitionStateEndpointDirection,
+    displacement_ratio: float,
+    topology_context: GeometryPersistenceContext | None = None,
+    identity_is_new: bool = False,
+    defer_flush: bool = False,
+) -> TransitionStateEndpoint:
+    """Persist one signed endpoint without creating a normalized Geometry.
+
+    Topology identity is canonicalized for reuse, but the Cartesian payload is
+    intentionally kept in the original TS source atom order.  This preserves
+    the exact common coordinate frame used by the TS and both displaced modes.
+    """
+
+    frame_id = _require_id(calculation_frame, label="CalculationFrame")
+    existing = None
+    if not identity_is_new:
+        existing = session.exec(
+            select(TransitionStateEndpoint).where(
+                TransitionStateEndpoint.calculation_frame_id == frame_id,
+                TransitionStateEndpoint.direction == direction,
+            )
+        ).first()
+    if existing is not None:
+        return existing
+    if endpoint.GetNumConformers() != 1 or not endpoint.GetConformer().Is3D():
+        raise ValueError("TS vibration endpoint must contain one 3D conformer")
+    coordinates = np.array(
+        endpoint.GetConformer().GetPositions(),
+        dtype="<f8",
+        order="C",
+        copy=True,
+    )
+    if coordinates.shape != (endpoint.GetNumAtoms(), 3) or not np.isfinite(coordinates).all():
+        raise ValueError("TS vibration endpoint coordinates are invalid")
+    if endpoint.GetNumAtoms() != len(calculation_frame.observed_to_geometry_atom_indices):
+        raise ValueError("TS vibration endpoint atom count differs from its source frame")
+    topology_record, source_to_topology = normalize_topology_with_mapping(
+        endpoint,
+        add_hydrogens=False,
+        reconstruction_method="molop/possible_pre_post_ts",
+        reconstruction_version=MOLOP_VERSION,
+        reconstruction_metadata={
+            "coordinate_frame": "calculation_frame.observed_coordinates",
+            "coordinate_policy": "source-cartesian-no-independent-normalization",
+            "direction": direction.value,
+        },
+    )
+    persisted_topology = persist_molecular_topology(
+        session,
+        topology_record,
+        context=topology_context,
+    )
+    topology_id = _require_id(persisted_topology.topology, label="MolecularTopology")
+    source_coordinate_hash = sha256(coordinates.tobytes(order="C")).hexdigest()
+    endpoint_row = TransitionStateEndpoint(
+        calculation_frame_id=frame_id,
+        calculation_frame=calculation_frame,
+        topology_id=topology_id,
+        topology=persisted_topology.topology,
+        direction=direction,
+        atom_count=endpoint.GetNumAtoms(),
+        displacement_ratio=displacement_ratio,
+        source_coordinates=coordinates,
+        source_coordinate_hash=source_coordinate_hash,
+        source_to_topology_atom_indices=source_to_topology,
+        provenance={
+            "method": "molop.possible_pre_post_ts",
+            "molop_version": MOLOP_VERSION,
+            "coordinate_frame": "calculation_frame.observed_coordinates",
+            "coordinate_order": "molop_source_atom_order",
+            "direction": direction.value,
+        },
+    )
+    session.add(endpoint_row)
+    if not defer_flush:
+        session.flush()
+    return endpoint_row
+
+
+def _persist_transition_state_endpoints(
+    session: Session,
+    *,
+    calculation_frame: CalculationFrame,
+    inferred: _SuccessfulInference,
+    topology_context: GeometryPersistenceContext | None = None,
+    identity_is_new: bool = False,
+    defer_flush: bool = False,
+) -> None:
+    _persist_transition_state_endpoint(
+        session,
+        calculation_frame=calculation_frame,
+        endpoint=inferred.negative_endpoint,
+        direction=TransitionStateEndpointDirection.NEGATIVE,
+        displacement_ratio=inferred.negative_displacement_ratio,
+        topology_context=topology_context,
+        identity_is_new=identity_is_new,
+        defer_flush=defer_flush,
+    )
+    _persist_transition_state_endpoint(
+        session,
+        calculation_frame=calculation_frame,
+        endpoint=inferred.positive_endpoint,
+        direction=TransitionStateEndpointDirection.POSITIVE,
+        displacement_ratio=inferred.positive_displacement_ratio,
+        topology_context=topology_context,
+        identity_is_new=identity_is_new,
+        defer_flush=defer_flush,
+    )
+
+
+def persist_transition_state_endpoints_from_molop_frame(
+    session: Session,
+    *,
+    calculation_frame: CalculationFrame,
+    source_frame: BaseCalcFrame[Any],
+) -> None:
+    """Persist MolOP's inferred pre/post-TS endpoints for a persisted TS frame."""
+
+    vibrations = source_frame.vibrations
+    if vibrations is None or len(vibrations.imaginary_idxs) != 1:
+        raise ValueError("TS frame must contain exactly one imaginary mode")
+    imaginary_position = vibrations.imaginary_idxs[0]
+    negative, positive, negative_ratio, positive_ratio = _signed_ts_endpoints(
+        source_frame,
+        imaginary_position,
+    )
+    frequency = vibrations[imaginary_position].frequency
+    if frequency is None:
+        raise ValueError("TS imaginary mode is missing its frequency")
+    file_frame_index = source_frame.file_frame_index
+    if file_frame_index is None:
+        raise ValueError("TS source frame is missing its stable file index")
+    imaginary_mode_index = (
+        vibrations.mode_indices[imaginary_position]
+        if vibrations.mode_indices
+        else imaginary_position
+    )
+    _persist_transition_state_endpoints(
+        session,
+        calculation_frame=calculation_frame,
+        inferred=_SuccessfulInference(
+            file_frame_index=file_frame_index,
+            imaginary_mode_index=imaginary_mode_index,
+            imaginary_frequency_cm1=float(frequency.to(atom_ureg.cm_1).magnitude),
+            reaction_smiles="signed-mode-anchors-only",
+            negative_endpoint=negative,
+            positive_endpoint=positive,
+            negative_displacement_ratio=negative_ratio,
+            positive_displacement_ratio=positive_ratio,
+        ),
+    )
+
+
+def _resolve_and_bind_transition_state_reaction(
+    session: Session,
+    *,
+    inferred: _SuccessfulInference,
+    calculation_frame: CalculationFrame,
+    topology_context: GeometryPersistenceContext | None = None,
+) -> tuple[UUID, UUID]:
+    """Create the mapped endpoint reaction and bind its TS coordinate evidence."""
+
+    reaction_result = create_reaction_in_session(
+        session,
+        CreateReactionCommand(
+            reaction=inferred.reaction_smiles,
+            mapped_reaction_kind=MappedReactionKind.OTHER,
+        ),
+        defer_thermodynamic_refresh=is_transition_state_frame_eligible(
+            calculation_frame.frame_role
+        ),
+        topology_context=topology_context,
+        include_creation_metadata=topology_context is None,
+        reconciliation_cache=(
+            topology_context.reconciliation_cache if topology_context is not None else None
+        ),
+    )
+    if reaction_result.mapped_reaction_id is None:
+        raise ValueError("MolOP TS endpoint reaction did not produce a complete atom mapping")
+    mapped_reaction = session.get(MappedReaction, reaction_result.mapped_reaction_id)
+    if mapped_reaction is None:
+        raise RuntimeError("MolOP TS inference created a missing MappedReaction")
+    if is_transition_state_frame_eligible(calculation_frame.frame_role):
+        bind_transition_state_frame(
+            session,
+            mapped_reaction=mapped_reaction,
+            calculation_frame=calculation_frame,
+            cache=(topology_context.reconciliation_cache if topology_context is not None else None),
+        )
+    else:
+        ensure_transition_state_path(
+            session,
+            mapped_reaction=mapped_reaction,
+            cache=(topology_context.reconciliation_cache if topology_context is not None else None),
+        )
+    return reaction_result.logical_reaction_id, reaction_result.mapped_reaction_id
+
+
+def _persist_successful_inference(
+    session: Session,
+    *,
+    ingestion: ArtifactIngestion,
+    parse_revision: ParseRevision,
+    inferred: _SuccessfulInference,
+    calculation_frame: CalculationFrame,
+    topology_context: GeometryPersistenceContext | None = None,
+    identity_is_new: bool = False,
+    defer_flush: bool = False,
+) -> TransitionStateInference:
+    logical_reaction_id, mapped_reaction_id = _resolve_and_bind_transition_state_reaction(
+        session,
+        inferred=inferred,
+        calculation_frame=calculation_frame,
+        topology_context=topology_context,
+    )
+    inference = TransitionStateInference(
+        artifact_ingestion_id=_require_id(ingestion, label="ArtifactIngestion"),
+        artifact_ingestion=ingestion,
+        parse_revision_id=_require_id(parse_revision, label="ParseRevision"),
+        parse_revision=parse_revision,
+        file_frame_index=inferred.file_frame_index,
+        imaginary_mode_index=inferred.imaginary_mode_index,
+        imaginary_frequency_cm1=inferred.imaginary_frequency_cm1,
+        status=TransitionStateInferenceStatus.SUCCEEDED,
+        inference_settings={
+            "endpoint_selection": "molop.possible_pre_post_ts",
+            "sampling_min_ratio": TS_PRE_POST_MIN_RATIO,
+            "sampling_max_ratio": TS_PRE_POST_MAX_RATIO,
+            "sampling_steps": TS_PRE_POST_STEPS,
+            "side_topology": "most frequent side topology per signed side",
+            "reaction_side_semantics": "fragment-rich endpoint first",
+            "direction_semantics": (
+                "measured signed displacement along the imaginary mode; "
+                "negative side displaces along +mode"
+            ),
+            "imaginary_mode_index": inferred.imaginary_mode_index,
+        },
+        logical_reaction_id=logical_reaction_id,
+        mapped_reaction_id=mapped_reaction_id,
+        calculation_frame_id=_require_id(calculation_frame, label="CalculationFrame"),
+    )
+    session.add(inference)
+    if not defer_flush:
+        session.flush()
+    _persist_transition_state_endpoints(
+        session,
+        calculation_frame=calculation_frame,
+        inferred=inferred,
+        topology_context=topology_context,
+        identity_is_new=identity_is_new,
+        defer_flush=defer_flush,
+    )
+    return inference
+
+
+def _persist_artifact_inferences(
+    session: Session,
+    deferred: _DeferredArtifactInferences,
+    *,
+    topology_context: GeometryPersistenceContext | None = None,
+) -> None:
+    ingestion = deferred.ingestion
+    parse_revision = deferred.parse_revision
+    parse_revision_id = _require_id(parse_revision, label="ParseRevision")
+    for inferred in deferred.parsed.inferences:
+        existing = None
+        if not deferred.revision_created:
+            existing = session.exec(
+                select(TransitionStateInference).where(
+                    TransitionStateInference.parse_revision_id == parse_revision_id,
+                    TransitionStateInference.file_frame_index == inferred.file_frame_index,
+                )
+            ).first()
+        if existing is not None:
+            if (
+                existing.status is TransitionStateInferenceStatus.SUCCEEDED
+                and existing.mapped_reaction_id is not None
+                and existing.calculation_frame_id is not None
+            ):
+                mapped_reaction = session.get(MappedReaction, existing.mapped_reaction_id)
+                calculation_frame = session.get(CalculationFrame, existing.calculation_frame_id)
+                if mapped_reaction is None or calculation_frame is None:
+                    raise RuntimeError(
+                        "successful TS inference references missing reaction evidence"
+                    )
+                ensure_transition_state_path(
+                    session,
+                    mapped_reaction=mapped_reaction,
+                    cache=(
+                        topology_context.reconciliation_cache
+                        if topology_context is not None
+                        else None
+                    ),
+                )
+                if is_transition_state_frame_eligible(calculation_frame.frame_role):
+                    bind_transition_state_frame(
+                        session,
+                        mapped_reaction=mapped_reaction,
+                        calculation_frame=calculation_frame,
+                        cache=(
+                            topology_context.reconciliation_cache
+                            if topology_context is not None
+                            else None
+                        ),
+                    )
+                if isinstance(inferred, _SuccessfulInference):
+                    _persist_transition_state_endpoints(
+                        session,
+                        calculation_frame=calculation_frame,
+                        inferred=inferred,
+                        topology_context=topology_context,
+                    )
+            continue
+        if isinstance(inferred, _FailedInference):
+            session.add(
+                TransitionStateInference(
+                    artifact_ingestion_id=_require_id(ingestion, label="ArtifactIngestion"),
+                    artifact_ingestion=ingestion,
+                    parse_revision_id=parse_revision_id,
+                    parse_revision=parse_revision,
+                    file_frame_index=inferred.file_frame_index,
+                    imaginary_mode_index=inferred.imaginary_mode_index,
+                    imaginary_frequency_cm1=inferred.imaginary_frequency_cm1,
+                    status=TransitionStateInferenceStatus.FAILED,
+                    inference_settings={
+                        "endpoint_selection": "molop.possible_pre_post_ts",
+                        "sampling_min_ratio": TS_PRE_POST_MIN_RATIO,
+                        "sampling_max_ratio": TS_PRE_POST_MAX_RATIO,
+                        "sampling_steps": TS_PRE_POST_STEPS,
+                    },
+                    error_code=inferred.error_code,
+                    error_message=inferred.error_message,
+                )
+            )
+            continue
+        try:
+            calculation_frame = deferred.frames_by_file_index.get(inferred.file_frame_index)
+            if calculation_frame is None:
+                raise ValueError("persisted calculation is missing the MolOP TS frame")
+            _persist_successful_inference(
+                session,
+                ingestion=ingestion,
+                parse_revision=parse_revision,
+                inferred=inferred,
+                calculation_frame=calculation_frame,
+                topology_context=topology_context,
+                identity_is_new=deferred.revision_created,
+                defer_flush=deferred.defer_revision_local_flush,
+            )
+        except Exception as error:
+            session.add(
+                TransitionStateInference(
+                    artifact_ingestion_id=_require_id(ingestion, label="ArtifactIngestion"),
+                    artifact_ingestion=ingestion,
+                    parse_revision_id=parse_revision_id,
+                    parse_revision=parse_revision,
+                    file_frame_index=inferred.file_frame_index,
+                    imaginary_mode_index=inferred.imaginary_mode_index,
+                    imaginary_frequency_cm1=inferred.imaginary_frequency_cm1,
+                    status=TransitionStateInferenceStatus.FAILED,
+                    inference_settings={
+                        "endpoint_selection": "molop.possible_pre_post_ts",
+                        "sampling_min_ratio": TS_PRE_POST_MIN_RATIO,
+                        "sampling_max_ratio": TS_PRE_POST_MAX_RATIO,
+                        "sampling_steps": TS_PRE_POST_STEPS,
+                    },
+                    error_code="inferred_reaction_persistence_failed",
+                    error_message=str(error) or type(error).__name__,
+                )
+            )
+
+
+def _persist_parsed_artifact(
+    session: Session,
+    *,
+    ingestion_id: UUID,
+    parsed: _ParsedArtifact,
+    started_at: datetime,
+    completed_at: datetime,
+    force_new_revision: bool = False,
+    geometry_context: GeometryPersistenceContext | None = None,
+    preload_geometry_context: bool = True,
+    ingestion: ArtifactIngestion | None = None,
+    existing_revision_ids: set[UUID] | None = None,
+    defer_ingestion_completion: bool = False,
+    defer_reconciliation: bool = False,
+    deferred_inferences: list[_DeferredArtifactInferences] | None = None,
+) -> tuple[UUID, bool]:
+    ingestion = ingestion or session.get(ArtifactIngestion, ingestion_id)
+    if ingestion is None:
+        raise RuntimeError("artifact ingestion disappeared during parsing")
+    artifact = ingestion.artifact_file
+    if existing_revision_ids is None:
+        existing_revision_ids = {
+            revision_id
+            for revision_id in session.exec(
+                select(ParseRevision.id).where(ParseRevision.artifact_file_id == artifact.id)
+            ).all()
+            if isinstance(revision_id, UUID)
+        }
+    persisted_artifact = persist_molop_calculation_artifact(
+        session,
+        artifact=artifact,
+        chem_file=parsed.chem_file,
+        records=list(parsed.frame_records),
+        source_compression=parsed.source_compression,
+        started_at=started_at,
+        completed_at=completed_at,
+        force_new_revision=force_new_revision,
+        fast_insert=not existing_revision_ids and not force_new_revision,
+        geometry_context=geometry_context,
+        preload_geometry_context=preload_geometry_context,
+        defer_reconciliation=defer_reconciliation,
+    )
+    parse_revision = persisted_artifact.parse_revision
+    parse_revision_id = _require_id(parse_revision, label="ParseRevision")
+    revision_created = parse_revision_id not in existing_revision_ids
+    inference_work = _DeferredArtifactInferences(
+        ingestion=ingestion,
+        parse_revision=parse_revision,
+        parsed=parsed,
+        frames_by_file_index=persisted_artifact.frames_by_file_index,
+        revision_created=revision_created,
+        defer_revision_local_flush=deferred_inferences is not None,
+    )
+    if deferred_inferences is None:
+        _persist_artifact_inferences(session, inference_work)
+    else:
+        deferred_inferences.append(inference_work)
+
+    if defer_ingestion_completion:
+        return parse_revision_id, revision_created
+
+    session.flush()
+    outcomes = session.exec(
+        select(TransitionStateInference).where(
+            TransitionStateInference.parse_revision_id == parse_revision_id
+        )
+    ).all()
+    successes = sum(
+        outcome.status is TransitionStateInferenceStatus.SUCCEEDED for outcome in outcomes
+    )
+    failures = len(outcomes) - successes
+    status = ArtifactIngestionStatus.PARTIAL if failures else ArtifactIngestionStatus.SUCCEEDED
+    ingestion.status = status
+    ingestion.source_frame_count = parsed.source_frame_count
+    ingestion.transition_state_frame_count = len(parsed.inferences)
+    ingestion.completed_at = completed_at
+    ingestion.error_code = None
+    ingestion.error_message = None
+    ingestion.parser_metadata = {
+        "source_format": parsed.source_format,
+        "latest_parse_revision_id": str(parse_revision_id),
+        "latest_parse_revision_created": revision_created,
+        "ts_selection": "frame.is_TS is True",
+        "inferred_reaction_identity": "shared topology-and-atom-mapping identity",
+    }
+    session.add(ingestion)
+    return parse_revision_id, revision_created
+
+
+def _mark_ingestion_failed(
+    session: Session,
+    *,
+    ingestion_id: UUID,
+    error: Exception,
+    error_code: str,
+    completed_at: datetime,
+    ingestion: ArtifactIngestion | None = None,
+) -> None:
+    ingestion = ingestion or session.get(ArtifactIngestion, ingestion_id)
+    if ingestion is None:
+        raise RuntimeError("artifact ingestion disappeared during parsing")
+    ingestion.status = ArtifactIngestionStatus.FAILED
+    ingestion.completed_at = completed_at
+    if isinstance(error, GeometryAssignmentAmbiguityError):
+        error_code = error.error_code
+        ingestion.parser_metadata = {
+            **ingestion.parser_metadata,
+            "qc_rejection": error.evidence(),
+        }
+    ingestion.error_code = error_code
+    ingestion.error_message = str(error) or type(error).__name__
+    session.add(ingestion)
+
+
+def _result(
+    session: Session,
+    ingestion_id: UUID,
+    *,
+    parse_revision_id: UUID | None = None,
+    parse_revision_created: bool | None = None,
+) -> ArtifactUploadResult:
+    ingestion = session.get(ArtifactIngestion, ingestion_id)
+    if ingestion is None:
+        raise RuntimeError("artifact ingestion not found")
+    if parse_revision_id is None:
+        parse_revision_id = session.exec(
+            select(ParseRevision.id)
+            .where(ParseRevision.artifact_file_id == ingestion.artifact_file_id)
+            .order_by(col(ParseRevision.created_at).desc(), col(ParseRevision.id).desc())
+        ).first()
+    predicates = [TransitionStateInference.artifact_ingestion_id == ingestion_id]
+    if parse_revision_id is not None:
+        predicates.append(TransitionStateInference.parse_revision_id == parse_revision_id)
+    rows = session.exec(
+        select(TransitionStateInference)
+        .where(*predicates)
+        .order_by(col(TransitionStateInference.file_frame_index))
+    ).all()
+    views = [
+        TransitionStateInferenceView(
+            id=_require_id(row, label="TransitionStateInference"),
+            parse_revision_id=row.parse_revision_id,
+            file_frame_index=row.file_frame_index,
+            imaginary_mode_index=row.imaginary_mode_index,
+            imaginary_frequency_cm1=row.imaginary_frequency_cm1,
+            status=row.status,
+            logical_reaction_id=row.logical_reaction_id,
+            mapped_reaction_id=row.mapped_reaction_id,
+            calculation_frame_id=row.calculation_frame_id,
+            error_code=row.error_code,
+            error_message=row.error_message,
+        )
+        for row in rows
+    ]
+    artifact = ingestion.artifact_file
+    return ArtifactUploadResult(
+        artifact_id=_require_id(artifact, label="ArtifactFile"),
+        artifact_kind=artifact.artifact_kind,
+        storage_status=artifact.storage_status,
+        ingestion_id=ingestion_id,
+        parse_revision_id=parse_revision_id,
+        parse_revision_created=parse_revision_created,
+        ingestion_status=ingestion.status,
+        source_frame_count=ingestion.source_frame_count,
+        transition_state_frame_count=ingestion.transition_state_frame_count,
+        inferred_reaction_count=sum(
+            item.status is TransitionStateInferenceStatus.SUCCEEDED for item in views
+        ),
+        inferences=views,
+    )
+
+
+def _batch_results(
+    session: Session,
+    *,
+    parse_revision_by_ingestion_id: Mapping[UUID, UUID | None],
+    parse_revision_created_by_ingestion_id: Mapping[UUID, bool | None],
+    completion_by_ingestion_id: Mapping[UUID, _IngestionCompletion],
+) -> dict[UUID, ArtifactUploadResult]:
+    """Build completed upload views with two set-based reads.
+
+    Batch persistence already has every parse revision identity in memory.  Do
+    not turn that into a get-plus-inference query pair for every upload merely
+    to produce the response DTO.
+    """
+
+    ingestion_ids = list(parse_revision_by_ingestion_id)
+    if not ingestion_ids:
+        return {}
+    ingestions = session.exec(
+        select(ArtifactIngestion)
+        .where(col(ArtifactIngestion.id).in_(ingestion_ids))
+        .options(joinedload(cast(Any, ArtifactIngestion.artifact_file)))
+    ).all()
+    inferences_by_ingestion_id: dict[UUID, list[TransitionStateInference]] = {
+        ingestion_id: [] for ingestion_id in ingestion_ids
+    }
+    for inference in session.exec(
+        select(TransitionStateInference)
+        .where(col(TransitionStateInference.artifact_ingestion_id).in_(ingestion_ids))
+        .order_by(col(TransitionStateInference.file_frame_index))
+    ).all():
+        inferences_by_ingestion_id.setdefault(inference.artifact_ingestion_id, []).append(inference)
+
+    results: dict[UUID, ArtifactUploadResult] = {}
+    for ingestion in ingestions:
+        ingestion_id = _require_id(ingestion, label="ArtifactIngestion")
+        parse_revision_id = parse_revision_by_ingestion_id[ingestion_id]
+        rows = [
+            row
+            for row in inferences_by_ingestion_id[ingestion_id]
+            if parse_revision_id is not None and row.parse_revision_id == parse_revision_id
+        ]
+        completion = completion_by_ingestion_id.get(ingestion_id)
+        if completion is not None:
+            failures = sum(row.status is TransitionStateInferenceStatus.FAILED for row in rows)
+            ingestion.status = (
+                ArtifactIngestionStatus.PARTIAL if failures else ArtifactIngestionStatus.SUCCEEDED
+            )
+            ingestion.source_frame_count = completion.source_frame_count
+            ingestion.transition_state_frame_count = completion.transition_state_frame_count
+            ingestion.completed_at = completion.completed_at
+            ingestion.error_code = None
+            ingestion.error_message = None
+            ingestion.parser_metadata = {
+                "source_format": completion.source_format,
+                "latest_parse_revision_id": str(completion.parse_revision_id),
+                "latest_parse_revision_created": completion.parse_revision_created,
+                "ts_selection": "frame.is_TS is True",
+                "inferred_reaction_identity": "shared topology-and-atom-mapping identity",
+            }
+            session.add(ingestion)
+        views = [
+            TransitionStateInferenceView(
+                id=_require_id(row, label="TransitionStateInference"),
+                parse_revision_id=row.parse_revision_id,
+                file_frame_index=row.file_frame_index,
+                imaginary_mode_index=row.imaginary_mode_index,
+                imaginary_frequency_cm1=row.imaginary_frequency_cm1,
+                status=row.status,
+                logical_reaction_id=row.logical_reaction_id,
+                mapped_reaction_id=row.mapped_reaction_id,
+                calculation_frame_id=row.calculation_frame_id,
+                error_code=row.error_code,
+                error_message=row.error_message,
+            )
+            for row in rows
+        ]
+        artifact = ingestion.artifact_file
+        results[ingestion_id] = ArtifactUploadResult(
+            artifact_id=_require_id(artifact, label="ArtifactFile"),
+            artifact_kind=artifact.artifact_kind,
+            storage_status=artifact.storage_status,
+            ingestion_id=ingestion_id,
+            parse_revision_id=parse_revision_id,
+            parse_revision_created=parse_revision_created_by_ingestion_id[ingestion_id],
+            ingestion_status=ingestion.status,
+            source_frame_count=ingestion.source_frame_count,
+            transition_state_frame_count=ingestion.transition_state_frame_count,
+            inferred_reaction_count=sum(
+                item.status is TransitionStateInferenceStatus.SUCCEEDED for item in views
+            ),
+            inferences=views,
+        )
+    return results
+
+
+def _preload_batch_persistence_state(
+    session: Session,
+    *,
+    ingestion_ids: list[UUID],
+) -> tuple[dict[UUID, ArtifactIngestion], dict[UUID, set[UUID]]]:
+    """Load batch-owned ingestions and revision identities in two reads."""
+
+    if not ingestion_ids:
+        return {}, {}
+    ingestions = session.exec(
+        select(ArtifactIngestion)
+        .where(col(ArtifactIngestion.id).in_(ingestion_ids))
+        .options(joinedload(cast(Any, ArtifactIngestion.artifact_file)))
+    ).all()
+    ingestions_by_id = {
+        _require_id(ingestion, label="ArtifactIngestion"): ingestion for ingestion in ingestions
+    }
+    missing_ingestion_ids = set(ingestion_ids) - set(ingestions_by_id)
+    if missing_ingestion_ids:
+        raise RuntimeError("artifact ingestion disappeared during batch persistence")
+    artifact_ids = [ingestion.artifact_file_id for ingestion in ingestions]
+    revision_ids_by_artifact_id: dict[UUID, set[UUID]] = {
+        artifact_id: set() for artifact_id in artifact_ids
+    }
+    for artifact_id, revision_id in session.exec(
+        select(ParseRevision.artifact_file_id, ParseRevision.id).where(
+            col(ParseRevision.artifact_file_id).in_(artifact_ids)
+        )
+    ).all():
+        if not isinstance(artifact_id, UUID) or not isinstance(revision_id, UUID):
+            raise RuntimeError("persisted ParseRevision is missing an identity")
+        revision_ids_by_artifact_id[artifact_id].add(revision_id)
+    return ingestions_by_id, revision_ids_by_artifact_id
+
+
+def _run_mark_ingestion_failed(
+    session: SQLAlchemySession,
+    *,
+    ingestion_id: UUID,
+    error: Exception,
+    error_code: str,
+    completed_at: datetime,
+    ingestion: ArtifactIngestion | None = None,
+) -> None:
+    _mark_ingestion_failed(
+        cast(Session, session),
+        ingestion_id=ingestion_id,
+        error=error,
+        error_code=error_code,
+        completed_at=completed_at,
+        ingestion=ingestion,
+    )
+
+
+def _run_prepare_pending_uploads(
+    session: SQLAlchemySession,
+    *,
+    records: list[ArtifactFileRecord],
+) -> dict[str, tuple[ArtifactFile, _RetiredArtifactReservation | None, bool]]:
+    return _prepare_pending_uploads(cast(Session, session), records=records)
+
+
+def _run_create_pending_ingestions(
+    session: SQLAlchemySession,
+    *,
+    artifacts: list[ArtifactFile],
+    started_by_artifact_id: dict[UUID, datetime],
+) -> dict[UUID, tuple[ArtifactIngestion, bool]]:
+    return _create_pending_ingestions(
+        cast(Session, session),
+        artifacts=artifacts,
+        started_by_artifact_id=started_by_artifact_id,
+    )
+
+
+def _run_mark_uploads_available(
+    session: SQLAlchemySession,
+    *,
+    stored_by_artifact_id: dict[UUID, tuple[str, Any]],
+) -> None:
+    _mark_uploads_available(
+        cast(Session, session),
+        stored_by_artifact_id=stored_by_artifact_id,
+    )
+
+
+def _run_flush(session: SQLAlchemySession) -> None:
+    cast(Session, session).flush()
+
+
+def _run_disable_autoflush(session: SQLAlchemySession) -> None:
+    cast(Session, session).autoflush = False
+
+
+def _run_persist_parsed_artifact(
+    session: SQLAlchemySession,
+    *,
+    ingestion_id: UUID,
+    parsed: _ParsedArtifact,
+    started_at: datetime,
+    completed_at: datetime,
+    geometry_context: GeometryPersistenceContext | None = None,
+    preload_geometry_context: bool = True,
+    ingestion: ArtifactIngestion | None = None,
+    existing_revision_ids: set[UUID] | None = None,
+    defer_ingestion_completion: bool = False,
+    defer_reconciliation: bool = False,
+    deferred_inferences: list[_DeferredArtifactInferences] | None = None,
+) -> tuple[UUID, bool]:
+    return _persist_parsed_artifact(
+        cast(Session, session),
+        ingestion_id=ingestion_id,
+        parsed=parsed,
+        started_at=started_at,
+        completed_at=completed_at,
+        geometry_context=geometry_context,
+        preload_geometry_context=preload_geometry_context,
+        ingestion=ingestion,
+        existing_revision_ids=existing_revision_ids,
+        defer_ingestion_completion=defer_ingestion_completion,
+        defer_reconciliation=defer_reconciliation,
+        deferred_inferences=deferred_inferences,
+    )
+
+
+def _run_persist_deferred_inferences(
+    session: SQLAlchemySession,
+    *,
+    deferred_inferences: list[_DeferredArtifactInferences],
+    topology_context: GeometryPersistenceContext,
+) -> None:
+    typed_session = cast(Session, session)
+    for deferred in deferred_inferences:
+        _persist_artifact_inferences(
+            typed_session,
+            deferred,
+            topology_context=topology_context,
+        )
+
+
+def _run_reconcile_molop_geometry_context(
+    session: SQLAlchemySession,
+    *,
+    context: GeometryPersistenceContext,
+) -> None:
+    reconcile_molop_geometry_context(cast(Session, session), context)
+
+
+def _run_preload_molecular_geometry_context(
+    session: SQLAlchemySession,
+    *,
+    parsed_artifacts: list[_ParsedArtifact],
+    context: GeometryPersistenceContext,
+) -> None:
+    preload_molecular_geometry_context(
+        cast(Session, session),
+        [
+            (record.molecule, record.frame.coordinate_decimal_places)
+            for parsed in parsed_artifacts
+            for record in parsed.frame_records
+        ],
+        context=context,
+    )
+
+
+def _run_result(
+    session: SQLAlchemySession,
+    *,
+    ingestion_id: UUID,
+    parse_revision_id: UUID | None = None,
+    parse_revision_created: bool | None = None,
+) -> ArtifactUploadResult:
+    return _result(
+        cast(Session, session),
+        ingestion_id,
+        parse_revision_id=parse_revision_id,
+        parse_revision_created=parse_revision_created,
+    )
+
+
+def _run_batch_results(
+    session: SQLAlchemySession,
+    *,
+    parse_revision_by_ingestion_id: Mapping[UUID, UUID | None],
+    parse_revision_created_by_ingestion_id: Mapping[UUID, bool | None],
+    completion_by_ingestion_id: Mapping[UUID, _IngestionCompletion],
+) -> dict[UUID, ArtifactUploadResult]:
+    return _batch_results(
+        cast(Session, session),
+        parse_revision_by_ingestion_id=parse_revision_by_ingestion_id,
+        parse_revision_created_by_ingestion_id=parse_revision_created_by_ingestion_id,
+        completion_by_ingestion_id=completion_by_ingestion_id,
+    )
+
+
+def _run_preload_batch_persistence_state(
+    session: SQLAlchemySession,
+    *,
+    ingestion_ids: list[UUID],
+) -> tuple[dict[UUID, ArtifactIngestion], dict[UUID, set[UUID]]]:
+    return _preload_batch_persistence_state(cast(Session, session), ingestion_ids=ingestion_ids)
+
+
+def _stored_result(artifact: ArtifactFile) -> ArtifactUploadResult:
+    return ArtifactUploadResult(
+        artifact_id=_require_id(artifact, label="ArtifactFile"),
+        artifact_kind=artifact.artifact_kind,
+        storage_status=artifact.storage_status,
+        inferred_reaction_count=0,
+        inferences=[],
+    )
+
+
+async def _ingestion_failure_details(ingestion_id: UUID | None) -> tuple[str | None, str | None]:
+    if ingestion_id is None:
+        return None, None
+    async with session_factory() as session:
+        ingestion = await session.get(ArtifactIngestion, ingestion_id)
+        if ingestion is None:
+            return None, None
+        return ingestion.error_code, ingestion.error_message
+
+
+class ArtifactUploadService:
+    """Authenticated content-addressed upload with optional calculation ingestion."""
+
+    @classmethod
+    async def _prepare_upload(
+        cls,
+        *,
+        payload: bytes,
+        filename: str,
+        media_type: str,
+        artifact_kind: ArtifactKind,
+        project_id: UUID,
+        user_id: UUID,
+    ) -> _PreparedCalculationUpload | ArtifactUploadResult:
+        """Reserve and store an upload, leaving calculation parsing for the caller."""
+
+        settings = RustFSSettings()
+        started_at = datetime.now(UTC)
+        digest = sha256(payload).hexdigest()
+        object_key = time_partitioned_content_addressed_key(
+            payload,
+            uploaded_at=started_at,
+            prefix="uploads",
+        )
+        resolved_media_type = detect_artifact_media_type(filename, media_type, payload)
+        record = ArtifactFileRecord(
+            project_id=project_id,
+            created_by_user_id=user_id,
+            visibility=ArtifactVisibility.PROJECT,
+            bucket=settings.bucket,
+            object_key=object_key,
+            content_sha256=digest,
+            size_bytes=len(payload),
+            original_filename=Path(filename).name,
+            media_type=resolved_media_type,
+            artifact_kind=artifact_kind,
+            storage_status=StorageStatus.PENDING,
+        )
+        async with session_factory() as session:
+            artifact, retired_reservation, check_existing_object = await session.run_sync(
+                lambda sync_session: _prepare_pending_upload(
+                    cast(Session, sync_session),
+                    record=record,
+                )
+            )
+            artifact_id = _require_id(artifact, label="ArtifactFile")
+            object_key = artifact.object_key
+            await session.commit()
+
+        try:
+            stored = await asyncio.to_thread(
+                cls._store_payload,
+                settings,
+                object_key,
+                payload,
+                resolved_media_type,
+                check_existing_object=check_existing_object,
+            )
+            if stored.size != len(payload) or stored.sha256 != digest:
+                raise ArtifactUploadError(
+                    f"RustFS metadata mismatch for s3://{stored.bucket}/{stored.key}"
+                )
+            async with session_factory() as session:
+                artifact = await session.run_sync(
+                    lambda sync_session: _mark_upload_available(
+                        cast(Session, sync_session),
+                        artifact_id=artifact_id,
+                        object_key=object_key,
+                        stored=stored,
+                    )
+                )
+                if artifact_kind is not ArtifactKind.CALCULATION_OUTPUT:
+                    await session.commit()
+                    return _stored_result(artifact)
+                ingestion, created = await session.run_sync(
+                    lambda sync_session: _create_pending_ingestion(
+                        cast(Session, sync_session),
+                        artifact=artifact,
+                        started_at=started_at,
+                    )
+                )
+                await session.commit()
+                ingestion_id = _require_id(ingestion, label="ArtifactIngestion")
+                if not created and ingestion.status is not ArtifactIngestionStatus.PENDING:
+                    return await session.run_sync(
+                        lambda sync_session: _result(
+                            cast(Session, sync_session),
+                            ingestion_id,
+                            parse_revision_created=False,
+                        )
+                    )
+        except Exception:
+            await _compensate_upload(
+                settings=settings,
+                artifact_id=artifact_id,
+                object_key=object_key,
+                content_sha256=digest,
+                retired_reservation=retired_reservation,
+            )
+            raise
+        return _PreparedCalculationUpload(
+            settings=settings,
+            artifact_id=artifact_id,
+            object_key=object_key,
+            ingestion_id=ingestion_id,
+            started_at=started_at,
+            source=payload,
+            size_bytes=len(payload),
+            media_type=resolved_media_type,
+            content_sha256=digest,
+            retired_reservation=retired_reservation,
+            needs_storage=True,
+            check_existing_object=check_existing_object,
+        )
+
+    @classmethod
+    async def upload(
+        cls,
+        *,
+        payload: bytes,
+        filename: str,
+        media_type: str,
+        artifact_kind: ArtifactKind,
+        project_id: UUID,
+        user_id: UUID,
+    ) -> ArtifactUploadResult:
+        if not payload:
+            raise ArtifactUploadError("uploaded artifact is empty")
+        _require_upload_size(payload)
+        _require_decompressed_upload_size(payload, filename)
+        await AuthorizationService.require_project_permission(
+            user_id,
+            project_id,
+            ProjectPermission.ARTIFACT_UPLOAD,
+        )
+        prepared = await cls._prepare_upload(
+            payload=payload,
+            filename=filename,
+            media_type=media_type,
+            artifact_kind=artifact_kind,
+            project_id=project_id,
+            user_id=user_id,
+        )
+        if isinstance(prepared, ArtifactUploadResult):
+            return prepared
+        ingestion_id = _require_prepared_ingestion_id(prepared)
+        started_at = prepared.started_at
+
+        try:
+            parsed = await _run_molop_file_parser(payload, filename)
+        except Exception as error:
+            parse_error = error
+            async with session_factory() as session:
+                await session.run_sync(
+                    lambda sync_session: _mark_ingestion_failed(
+                        cast(Session, sync_session),
+                        ingestion_id=ingestion_id,
+                        error=parse_error,
+                        error_code="molop_parse_failed",
+                        completed_at=datetime.now(UTC),
+                    )
+                )
+                await session.commit()
+                return await session.run_sync(
+                    lambda sync_session: _result(cast(Session, sync_session), ingestion_id)
+                )
+
+        try:
+            async with session_factory() as session:
+                parse_revision_id, parse_revision_created = await session.run_sync(
+                    lambda sync_session: _persist_parsed_artifact(
+                        cast(Session, sync_session),
+                        ingestion_id=ingestion_id,
+                        parsed=parsed,
+                        started_at=started_at,
+                        completed_at=datetime.now(UTC),
+                    )
+                )
+                await session.commit()
+                return await session.run_sync(
+                    lambda sync_session: _result(
+                        cast(Session, sync_session),
+                        ingestion_id,
+                        parse_revision_id=parse_revision_id,
+                        parse_revision_created=parse_revision_created,
+                    )
+                )
+        except Exception as error:
+            persistence_error = error
+            async with session_factory() as session:
+                await session.run_sync(
+                    lambda sync_session: _mark_ingestion_failed(
+                        cast(Session, sync_session),
+                        ingestion_id=ingestion_id,
+                        error=persistence_error,
+                        error_code="calculation_persistence_failed",
+                        completed_at=datetime.now(UTC),
+                    )
+                )
+                await session.commit()
+                return await session.run_sync(
+                    lambda sync_session: _result(cast(Session, sync_session), ingestion_id)
+                )
+
+    @classmethod
+    async def reparse(
+        cls,
+        *,
+        artifact_id: UUID,
+        user_id: UUID,
+    ) -> ArtifactUploadResult:
+        """Parse a stored calculation artifact with the current parser identity."""
+
+        started_at = datetime.now(UTC)
+        async with session_factory() as session:
+            artifact = await session.get(ArtifactFile, artifact_id)
+            if artifact is None:
+                raise ArtifactUploadError("artifact not found")
+            await AuthorizationService.require_project_permission(
+                user_id,
+                artifact.project_id,
+                ProjectPermission.ARTIFACT_UPLOAD,
+            )
+            if artifact.artifact_kind is not ArtifactKind.CALCULATION_OUTPUT:
+                raise ArtifactUploadError("only calculation output artifacts can be reparsed")
+            if artifact.storage_status is not StorageStatus.AVAILABLE:
+                raise ArtifactUploadError("artifact bytes are not available for reparse")
+            ingestion, _ = await session.run_sync(
+                lambda sync_session: _create_pending_ingestion(
+                    cast(Session, sync_session),
+                    artifact=artifact,
+                    started_at=started_at,
+                )
+            )
+            ingestion_id = _require_id(ingestion, label="ArtifactIngestion")
+            had_parse_revision = (
+                await session.exec(
+                    select(ParseRevision.id).where(ParseRevision.artifact_file_id == artifact_id)
+                )
+            ).first() is not None
+            filename = artifact.original_filename
+            expected_sha256 = artifact.content_sha256
+            expected_size = artifact.size_bytes
+            settings = RustFSSettings().model_copy(update={"bucket": artifact.bucket})
+            object_key = artifact.object_key
+            await session.commit()
+
+        payload = await asyncio.to_thread(cls._load_payload, settings, object_key)
+        if len(payload) != expected_size or sha256(payload).hexdigest() != expected_sha256:
+            raise ArtifactUploadError("stored artifact bytes do not match database identity")
+        _require_upload_size(payload)
+
+        try:
+            parsed = await _run_molop_file_parser(payload, filename)
+        except Exception as error:
+            parse_error = error
+            if not had_parse_revision:
+                async with session_factory() as session:
+                    await session.run_sync(
+                        lambda sync_session: _mark_ingestion_failed(
+                            cast(Session, sync_session),
+                            ingestion_id=ingestion_id,
+                            error=parse_error,
+                            error_code="molop_reparse_failed",
+                            completed_at=datetime.now(UTC),
+                        )
+                    )
+                    await session.commit()
+            raise ArtifactUploadError(str(error) or type(error).__name__) from error
+
+        try:
+            async with session_factory() as session:
+                parse_revision_id, parse_revision_created = await session.run_sync(
+                    lambda sync_session: _persist_parsed_artifact(
+                        cast(Session, sync_session),
+                        ingestion_id=ingestion_id,
+                        parsed=parsed,
+                        started_at=started_at,
+                        completed_at=datetime.now(UTC),
+                        force_new_revision=True,
+                    )
+                )
+                await session.commit()
+                return await session.run_sync(
+                    lambda sync_session: _result(
+                        cast(Session, sync_session),
+                        ingestion_id,
+                        parse_revision_id=parse_revision_id,
+                        parse_revision_created=parse_revision_created,
+                    )
+                )
+        except Exception as error:
+            persistence_error = error
+            if not had_parse_revision:
+                async with session_factory() as session:
+                    await session.run_sync(
+                        lambda sync_session: _mark_ingestion_failed(
+                            cast(Session, sync_session),
+                            ingestion_id=ingestion_id,
+                            error=persistence_error,
+                            error_code="calculation_reparse_persistence_failed",
+                            completed_at=datetime.now(UTC),
+                        )
+                    )
+                    await session.commit()
+            raise ArtifactUploadError(str(error) or type(error).__name__) from error
+
+    @classmethod
+    async def validate(
+        cls,
+        *,
+        payload: bytes,
+        filename: str,
+        project_id: UUID,
+        user_id: UUID,
+    ) -> ArtifactValidationResult:
+        """Probe and normalize a calculation artifact without storing any data."""
+
+        if not payload:
+            raise ArtifactUploadError("uploaded artifact is empty")
+        _require_upload_size(payload)
+        await AuthorizationService.require_project_permission(
+            user_id,
+            project_id,
+            ProjectPermission.ARTIFACT_UPLOAD,
+        )
+        parsed = await _run_molop_file_parser(payload, filename)
+        inferences = [
+            ArtifactValidationInferenceView(
+                file_frame_index=inference.file_frame_index,
+                imaginary_mode_index=inference.imaginary_mode_index,
+                imaginary_frequency_cm1=inference.imaginary_frequency_cm1,
+                succeeded=isinstance(inference, _SuccessfulInference),
+                reaction_smiles=(
+                    inference.reaction_smiles
+                    if isinstance(inference, _SuccessfulInference)
+                    else None
+                ),
+                error_code=(
+                    inference.error_code if isinstance(inference, _FailedInference) else None
+                ),
+                error_message=(
+                    inference.error_message if isinstance(inference, _FailedInference) else None
+                ),
+            )
+            for inference in parsed.inferences
+        ]
+        successful_count = sum(inference.succeeded for inference in inferences)
+        return ArtifactValidationResult(
+            filename=Path(filename).name,
+            source_format=parsed.source_format,
+            source_compression=parsed.source_compression,
+            source_frame_count=parsed.source_frame_count,
+            transition_state_frame_count=len(inferences),
+            successful_inference_count=successful_count,
+            failed_inference_count=len(inferences) - successful_count,
+            inferences=inferences,
+        )
+
+    @classmethod
+    async def _prepare_upload_batch(
+        cls,
+        *,
+        files: list[ArtifactUploadPayload],
+        artifact_kind: ArtifactKind,
+        project_id: UUID,
+        user_id: UUID,
+        source_inspections: Mapping[int, _InspectedUploadSource] | None = None,
+    ) -> tuple[
+        dict[int, _PreparedCalculationUpload],
+        dict[int, ArtifactBatchUploadItem],
+    ]:
+        """Create all durable upload reservations in one PostgreSQL transaction.
+
+        The object store is deliberately outside this transaction. PostgreSQL
+        records the complete pending set first, then one follow-up transaction
+        advances every verified object and creates/refreshes all ingestion rows.
+        This keeps retry ownership durable without paying a commit per file.
+        """
+
+        settings = RustFSSettings()
+        candidates: list[
+            tuple[int, ArtifactUploadPayload, _InspectedUploadSource, ArtifactFileRecord, datetime]
+        ] = []
+        candidate_by_digest: dict[str, int] = {}
+        duplicate_of: dict[int, int] = {}
+        items: dict[int, ArtifactBatchUploadItem] = {}
+        for index, file in enumerate(files):
+            if file.payload is None and file.spool_path is None:
+                items[index] = ArtifactBatchUploadItem(
+                    filename=file.filename,
+                    succeeded=False,
+                    error_code=file.error_code or "invalid_upload",
+                    error_message=file.error_message or "uploaded file is invalid",
+                )
+                continue
+            try:
+                inspected = (
+                    source_inspections[index]
+                    if source_inspections is not None
+                    else _inspect_upload_source(
+                        file,
+                        maximum_size=get_settings().max_upload_bytes,
+                    )
+                )
+                if not inspected.size_bytes:
+                    raise ArtifactUploadError("uploaded artifact is empty")
+                started_at = datetime.now(UTC)
+                resolved_media_type = detect_artifact_media_type(
+                    file.filename,
+                    file.media_type,
+                    inspected.media_probe,
+                )
+                record = ArtifactFileRecord(
+                    project_id=project_id,
+                    created_by_user_id=user_id,
+                    visibility=ArtifactVisibility.PROJECT,
+                    bucket=settings.bucket,
+                    object_key=time_partitioned_content_addressed_key_for_sha256(
+                        inspected.content_sha256,
+                        uploaded_at=started_at,
+                        prefix="uploads",
+                    ),
+                    content_sha256=inspected.content_sha256,
+                    size_bytes=inspected.size_bytes,
+                    original_filename=Path(file.filename).name,
+                    media_type=resolved_media_type,
+                    artifact_kind=artifact_kind,
+                    storage_status=StorageStatus.PENDING,
+                )
+                first_index = candidate_by_digest.setdefault(inspected.content_sha256, index)
+                if first_index != index:
+                    duplicate_of[index] = first_index
+                else:
+                    candidates.append((index, file, inspected, record, started_at))
+            except Exception as error:
+                items[index] = ArtifactBatchUploadItem(
+                    filename=file.filename,
+                    succeeded=False,
+                    error_code="artifact_upload_failed",
+                    error_message=str(error) or type(error).__name__,
+                )
+
+        reservations: dict[int, _PreparedCalculationUpload] = {}
+        if not candidates:
+            return reservations, items
+
+        async with session_factory() as session:
+            previous_fast_insert = session.info.get("tricycle_fast_insert", False)
+            previous_autoflush = session.autoflush
+            session.info["tricycle_fast_insert"] = True
+            session.autoflush = False
+            try:
+                reservations_by_digest = await session.run_sync(
+                    partial(
+                        _run_prepare_pending_uploads,
+                        records=[record for _, _, _, record, _ in candidates],
+                    )
+                )
+                artifacts_by_digest = {
+                    digest: artifact
+                    for digest, (artifact, _retired, _check_existing) in (
+                        reservations_by_digest.items()
+                    )
+                }
+                ingestions_by_artifact_id: dict[UUID, tuple[ArtifactIngestion, bool]] = {}
+                if artifact_kind is ArtifactKind.CALCULATION_OUTPUT:
+                    started_by_artifact_id = {
+                        _require_id(
+                            artifacts_by_digest[record.content_sha256],
+                            label="ArtifactFile",
+                        ): started_at
+                        for _, _, _, record, started_at in candidates
+                    }
+                    ingestions_by_artifact_id = await session.run_sync(
+                        partial(
+                            _run_create_pending_ingestions,
+                            artifacts=list(artifacts_by_digest.values()),
+                            started_by_artifact_id=started_by_artifact_id,
+                        )
+                    )
+                for index, _file, inspected, record, started_at in candidates:
+                    artifact, retired_reservation, check_existing_object = reservations_by_digest[
+                        record.content_sha256
+                    ]
+                    artifact_id = _require_id(artifact, label="ArtifactFile")
+                    ingestion_id: UUID | None = None
+                    skip_parse = False
+                    if artifact_kind is ArtifactKind.CALCULATION_OUTPUT:
+                        ingestion, created = ingestions_by_artifact_id[artifact_id]
+                        ingestion_id = _require_id(ingestion, label="ArtifactIngestion")
+                        skip_parse = (
+                            not created and ingestion.status is not ArtifactIngestionStatus.PENDING
+                        )
+                    reservations[index] = _PreparedCalculationUpload(
+                        settings=settings,
+                        artifact_id=artifact_id,
+                        object_key=artifact.object_key,
+                        ingestion_id=ingestion_id,
+                        started_at=started_at,
+                        source=inspected.source,
+                        size_bytes=inspected.size_bytes,
+                        media_type=record.media_type,
+                        content_sha256=record.content_sha256,
+                        retired_reservation=retired_reservation,
+                        needs_storage=artifact.storage_status is not StorageStatus.AVAILABLE,
+                        check_existing_object=check_existing_object,
+                        skip_parse=skip_parse,
+                        duplicate_of=None,
+                    )
+                # Duplicate content identities reuse the first reservation and
+                # object key; no extra INSERT/UPDATE is needed for the sibling.
+                for index, first_index in duplicate_of.items():
+                    source = reservations[first_index]
+                    reservations[index] = _PreparedCalculationUpload(
+                        settings=source.settings,
+                        artifact_id=source.artifact_id,
+                        object_key=source.object_key,
+                        ingestion_id=source.ingestion_id,
+                        started_at=source.started_at,
+                        source=source.source,
+                        size_bytes=source.size_bytes,
+                        media_type=source.media_type,
+                        content_sha256=source.content_sha256,
+                        retired_reservation=None,
+                        needs_storage=False,
+                        check_existing_object=False,
+                        skip_parse=True,
+                        duplicate_of=first_index,
+                    )
+                await session.run_sync(_run_flush)
+                await session.commit()
+            finally:
+                session.autoflush = previous_autoflush
+                session.info["tricycle_fast_insert"] = previous_fast_insert
+        return reservations, items
+
+    @staticmethod
+    def _batch_result_for_stored_artifact(
+        reservation: _PreparedCalculationUpload,
+        *,
+        artifact_kind: ArtifactKind,
+    ) -> ArtifactUploadResult:
+        return ArtifactUploadResult(
+            artifact_id=reservation.artifact_id,
+            artifact_kind=artifact_kind,
+            storage_status=StorageStatus.AVAILABLE,
+            inferred_reaction_count=0,
+            inferences=[],
+        )
+
+    @classmethod
+    async def upload_batch(
+        cls,
+        *,
+        files: list[ArtifactUploadPayload],
+        artifact_kind: ArtifactKind,
+        project_id: UUID,
+        user_id: UUID,
+        on_file_parsed: Callable[[int, bool], Awaitable[None]] | None = None,
+    ) -> ArtifactBatchUploadResult:
+        """Prepare once, upload objects concurrently, parse once, then commit once.
+
+        Parse failures are already isolated by the MolOP worker boundary. The
+        persistence transaction intentionally has no per-file savepoints: a
+        database error aborts the complete atomic commit and is surfaced to the
+        caller for retry, which avoids hidden partial writes and SQL round trips.
+        """
+
+        timings: dict[str, float] = {}
+        started = perf_counter()
+        source_inspections = _require_batch_upload_budget(files)
+        timings["validate_budget_ms"] = (perf_counter() - started) * 1000
+        prepare_function = getattr(cls._prepare_upload, "__func__", cls._prepare_upload)
+        if prepare_function is not _ORIGINAL_PREPARE_UPLOAD:
+            return await cls._upload_batch_with_prepare_hook(
+                files=files,
+                artifact_kind=artifact_kind,
+                project_id=project_id,
+                user_id=user_id,
+                on_file_parsed=on_file_parsed,
+            )
+        phase_started = perf_counter()
+        await AuthorizationService.require_project_permission(
+            user_id,
+            project_id,
+            ProjectPermission.ARTIFACT_UPLOAD,
+        )
+        timings["authorize_ms"] = (perf_counter() - phase_started) * 1000
+
+        phase_started = perf_counter()
+        prepared, item_by_index = await cls._prepare_upload_batch(
+            files=files,
+            artifact_kind=artifact_kind,
+            project_id=project_id,
+            user_id=user_id,
+            source_inspections=source_inspections,
+        )
+        timings["prepare_db_ms"] = (perf_counter() - phase_started) * 1000
+
+        stored: dict[int, Any] = {}
+        storage_errors: dict[int, Exception] = {}
+        phase_started = perf_counter()
+        storage_slots = asyncio.Semaphore(get_settings().upload_max_concurrency)
+
+        async def store_one(index: int, reservation: _PreparedCalculationUpload) -> None:
+            if not reservation.needs_storage:
+                return
+            try:
+                async with storage_slots:
+                    value = await asyncio.to_thread(
+                        cls._store_payload,
+                        reservation.settings,
+                        reservation.object_key,
+                        reservation.source,
+                        reservation.media_type,
+                        content_sha256=(
+                            reservation.content_sha256
+                            if isinstance(reservation.source, Path)
+                            else None
+                        ),
+                        size_bytes=(
+                            reservation.size_bytes if isinstance(reservation.source, Path) else None
+                        ),
+                        check_existing_object=reservation.check_existing_object,
+                    )
+                if (
+                    value.size != reservation.size_bytes
+                    or value.sha256 != reservation.content_sha256
+                ):
+                    raise ArtifactUploadError("RustFS metadata mismatch for uploaded artifact")
+                stored[index] = value
+            except Exception as error:
+                storage_errors[index] = error
+
+        await asyncio.gather(*(store_one(index, value) for index, value in prepared.items()))
+        timings["storage_ms"] = (perf_counter() - phase_started) * 1000
+
+        # Advance all successful reservations and mark storage failures in one DB round trip.
+        phase_started = perf_counter()
+        async with session_factory() as session:
+            session.info["tricycle_fast_insert"] = True
+            for index, reservation in prepared.items():
+                file = files[index]
+                if index in storage_errors:
+                    error = storage_errors[index]
+                    if reservation.ingestion_id is not None:
+                        await session.run_sync(
+                            partial(
+                                _run_mark_ingestion_failed,
+                                ingestion_id=reservation.ingestion_id,
+                                error=error,
+                                error_code="artifact_storage_failed",
+                                completed_at=datetime.now(UTC),
+                            )
+                        )
+                        result = await session.run_sync(
+                            partial(
+                                _run_result,
+                                ingestion_id=reservation.ingestion_id,
+                            )
+                        )
+                    else:
+                        result = None
+                    item_by_index[index] = ArtifactBatchUploadItem(
+                        filename=file.filename,
+                        succeeded=False,
+                        result=result,
+                        error_code="artifact_storage_failed",
+                        error_message=str(error) or type(error).__name__,
+                    )
+                    continue
+            stored_by_artifact_id = {
+                prepared[index].artifact_id: (prepared[index].object_key, value)
+                for index, value in stored.items()
+            }
+            await session.run_sync(
+                partial(
+                    _run_mark_uploads_available,
+                    stored_by_artifact_id=stored_by_artifact_id,
+                )
+            )
+            await session.commit()
+        timings["storage_db_ms"] = (perf_counter() - phase_started) * 1000
+
+        parse_inputs: list[tuple[bytes | Path, str]] = []
+        parse_indices: list[int] = []
+        for index, reservation in prepared.items():
+            if (
+                reservation.ingestion_id is not None
+                and index not in storage_errors
+                and not reservation.skip_parse
+            ):
+                parse_indices.append(index)
+                parse_inputs.append((reservation.source, files[index].filename))
+
+        parsed_by_input: dict[int, _ParsedArtifact | Exception] = {}
+        persistence_pipeline_started = perf_counter()
+        async with session_factory() as session:
+            persist_preload_started = perf_counter()
+            ingestion_ids = [
+                _require_prepared_ingestion_id(prepared[original_index])
+                for original_index in parse_indices
+            ]
+            (
+                persistence_ingestions_by_id,
+                persistence_revision_ids_by_artifact_id,
+            ) = await session.run_sync(
+                partial(
+                    _run_preload_batch_persistence_state,
+                    ingestion_ids=ingestion_ids,
+                )
+            )
+            await session.run_sync(_run_disable_autoflush)
+            geometry_context = GeometryPersistenceContext()
+            persist_preload_elapsed_ms = (perf_counter() - persist_preload_started) * 1000
+            persist_write_elapsed_ms = 0.0
+            parse_errors_by_index: dict[int, Exception] = {}
+            persisted_revisions_by_index: dict[int, tuple[UUID, bool]] = {}
+            completion_by_ingestion_id: dict[UUID, _IngestionCompletion] = {}
+            deferred_inferences: list[_DeferredArtifactInferences] = []
+            pending_preload: list[tuple[int, _ParsedArtifact]] = []
+
+            def normalize_parser_result(parser_result: Any) -> _ParsedArtifact | Exception:
+                if isinstance(parser_result, (_ParsedArtifact, Exception)):
+                    return parser_result
+                if isinstance(parser_result, tuple) and len(parser_result) == 2:
+                    parsed, error_message = parser_result
+                    if isinstance(parsed, _ParsedArtifact):
+                        return parsed
+                    return ArtifactUploadError(
+                        error_message or "MolOP did not return a result for this input file"
+                    )
+                return ArtifactUploadError("MolOP returned an invalid parser result")
+
+            async def persist_parsed_files(
+                parsed_files: list[tuple[int, _ParsedArtifact]],
+            ) -> None:
+                nonlocal persist_preload_elapsed_ms, persist_write_elapsed_ms
+                file_preload_started = perf_counter()
+                await session.run_sync(
+                    partial(
+                        _run_preload_molecular_geometry_context,
+                        parsed_artifacts=[parsed for _, parsed in parsed_files],
+                        context=geometry_context,
+                    )
+                )
+                persist_preload_elapsed_ms += (perf_counter() - file_preload_started) * 1000
+                for local_index, parsed in parsed_files:
+                    original_index = parse_indices[local_index]
+                    reservation = prepared[original_index]
+                    ingestion_id = _require_prepared_ingestion_id(reservation)
+                    ingestion = persistence_ingestions_by_id[ingestion_id]
+                    persist_write_started = perf_counter()
+                    parse_revision_id, parse_revision_created = await session.run_sync(
+                        partial(
+                            _run_persist_parsed_artifact,
+                            ingestion_id=ingestion_id,
+                            parsed=parsed,
+                            started_at=reservation.started_at,
+                            completed_at=datetime.now(UTC),
+                            geometry_context=geometry_context,
+                            preload_geometry_context=False,
+                            ingestion=ingestion,
+                            existing_revision_ids=(
+                                persistence_revision_ids_by_artifact_id[ingestion.artifact_file_id]
+                            ),
+                            defer_ingestion_completion=True,
+                            defer_reconciliation=True,
+                            deferred_inferences=deferred_inferences,
+                        )
+                    )
+                    persist_write_elapsed_ms += (perf_counter() - persist_write_started) * 1000
+                    persisted_revisions_by_index[original_index] = (
+                        parse_revision_id,
+                        parse_revision_created,
+                    )
+                    completion_by_ingestion_id[ingestion_id] = _IngestionCompletion(
+                        parse_revision_id=parse_revision_id,
+                        parse_revision_created=parse_revision_created,
+                        source_frame_count=parsed.source_frame_count,
+                        transition_state_frame_count=len(parsed.inferences),
+                        source_format=parsed.source_format,
+                        completed_at=datetime.now(UTC),
+                    )
+
+            async def persist_completed_file(local_index: int, parser_result: Any) -> None:
+                nonlocal persist_write_elapsed_ms
+                parsed = normalize_parser_result(parser_result)
+                parsed_by_input[local_index] = parsed
+                original_index = parse_indices[local_index]
+                if on_file_parsed is not None:
+                    await on_file_parsed(original_index, isinstance(parsed, _ParsedArtifact))
+                reservation = prepared[original_index]
+                ingestion_id = _require_prepared_ingestion_id(reservation)
+                ingestion = persistence_ingestions_by_id[ingestion_id]
+                if isinstance(parsed, Exception):
+                    persist_write_started = perf_counter()
+                    await session.run_sync(
+                        partial(
+                            _run_mark_ingestion_failed,
+                            ingestion_id=ingestion_id,
+                            error=parsed,
+                            error_code="molop_parse_failed",
+                            completed_at=datetime.now(UTC),
+                            ingestion=ingestion,
+                        )
+                    )
+                    persist_write_elapsed_ms += (perf_counter() - persist_write_started) * 1000
+                    parse_errors_by_index[original_index] = parsed
+                    return
+                pending_preload.append((local_index, parsed))
+                if len(pending_preload) >= PERSISTENCE_PRELOAD_BATCH_SIZE:
+                    batch = pending_preload.copy()
+                    pending_preload.clear()
+                    await persist_parsed_files(batch)
+
+            parser_timings_ms: dict[str, float] = {}
+            parse_pipeline_started = perf_counter()
+            parser_results: dict[int, _ParsedArtifact | Exception] = {}
+            if parse_inputs:
+                parser_results = await _run_molop_parser_with_progress(
+                    _parse_calculation_outputs_batch,
+                    parse_inputs,
+                    n_jobs=get_settings().molop_batch_n_jobs,
+                    progress_callback=persist_completed_file,
+                    timings_ms=parser_timings_ms,
+                )
+            timings["parse_ms"] = parser_timings_ms.get(
+                "total_ms", (perf_counter() - parse_pipeline_started) * 1000
+            )
+            timings["parse_persistence_pipeline_ms"] = (
+                perf_counter() - parse_pipeline_started
+            ) * 1000
+            for local_index in range(len(parse_indices)):
+                if local_index not in parsed_by_input:
+                    await persist_completed_file(
+                        local_index,
+                        parser_results.get(
+                            local_index,
+                            ArtifactUploadError(
+                                "MolOP did not return a result for this input file"
+                            ),
+                        ),
+                    )
+            if pending_preload:
+                batch = pending_preload.copy()
+                pending_preload.clear()
+                await persist_parsed_files(batch)
+
+            # Persist the large revision-local tables once across the complete
+            # batch before reaction inference introduces shared-identity flushes.
+            persist_write_started = perf_counter()
+            await session.run_sync(_run_flush)
+            await session.run_sync(
+                partial(
+                    _run_reconcile_molop_geometry_context,
+                    context=geometry_context,
+                )
+            )
+            await session.run_sync(
+                partial(
+                    _run_persist_deferred_inferences,
+                    deferred_inferences=deferred_inferences,
+                    topology_context=geometry_context,
+                )
+            )
+            persist_write_elapsed_ms += (perf_counter() - persist_write_started) * 1000
+            timings["persist_preload_db_ms"] = persist_preload_elapsed_ms
+            timings["persist_write_db_ms"] = persist_write_elapsed_ms
+            persist_result_started = perf_counter()
+            parse_revision_by_ingestion_id: dict[UUID, UUID | None] = {}
+            parse_revision_created_by_ingestion_id: dict[UUID, bool | None] = {}
+            for original_index in parse_indices:
+                ingestion_id = _require_prepared_ingestion_id(prepared[original_index])
+                persisted_revision = persisted_revisions_by_index.get(original_index)
+                parse_revision_by_ingestion_id[ingestion_id] = (
+                    persisted_revision[0] if persisted_revision is not None else None
+                )
+                parse_revision_created_by_ingestion_id[ingestion_id] = (
+                    persisted_revision[1] if persisted_revision is not None else None
+                )
+            await session.run_sync(_run_flush)
+            results_by_ingestion_id = await session.run_sync(
+                partial(
+                    _run_batch_results,
+                    parse_revision_by_ingestion_id=parse_revision_by_ingestion_id,
+                    parse_revision_created_by_ingestion_id=(parse_revision_created_by_ingestion_id),
+                    completion_by_ingestion_id=completion_by_ingestion_id,
+                )
+            )
+            timings["persist_result_db_ms"] = (perf_counter() - persist_result_started) * 1000
+            for original_index in parse_indices:
+                reservation = prepared[original_index]
+                ingestion_id = _require_prepared_ingestion_id(reservation)
+                result = results_by_ingestion_id[ingestion_id]
+                parse_error = parse_errors_by_index.get(original_index)
+                item_by_index[original_index] = ArtifactBatchUploadItem(
+                    filename=files[original_index].filename,
+                    succeeded=(
+                        parse_error is None
+                        and result.ingestion_status is not ArtifactIngestionStatus.FAILED
+                    ),
+                    result=result,
+                    error_code="molop_parse_failed" if parse_error is not None else None,
+                    error_message=(
+                        (str(parse_error) or type(parse_error).__name__)
+                        if parse_error is not None
+                        else None
+                    ),
+                )
+            persist_commit_started = perf_counter()
+            await session.commit()
+            timings["persist_commit_db_ms"] = (perf_counter() - persist_commit_started) * 1000
+        timings["persist_pipeline_wall_ms"] = (perf_counter() - persistence_pipeline_started) * 1000
+        timings["persist_db_ms"] = sum(
+            timings.get(key, 0.0)
+            for key in (
+                "persist_preload_db_ms",
+                "persist_write_db_ms",
+                "persist_result_db_ms",
+                "persist_commit_db_ms",
+            )
+        )
+
+        # Already-available/idempotently completed artifacts can be returned without parsing.
+        for index, reservation in prepared.items():
+            if index in item_by_index:
+                continue
+            if reservation.duplicate_of is not None:
+                source_item = item_by_index[reservation.duplicate_of]
+                item_by_index[index] = source_item.model_copy(
+                    update={"filename": files[index].filename}
+                )
+                continue
+            item_by_index[index] = ArtifactBatchUploadItem(
+                filename=files[index].filename,
+                succeeded=index not in storage_errors,
+                result=(
+                    cls._batch_result_for_stored_artifact(reservation, artifact_kind=artifact_kind)
+                    if index not in storage_errors
+                    else None
+                ),
+                error_code=("artifact_storage_failed" if index in storage_errors else None),
+                error_message=(str(storage_errors[index]) if index in storage_errors else None),
+            )
+
+        complete_items = [item_by_index[index] for index in range(len(files))]
+        succeeded_count = sum(item.succeeded for item in complete_items)
+        results = [item.result for item in complete_items if item.result is not None]
+        return ArtifactBatchUploadResult(
+            total_count=len(complete_items),
+            succeeded_count=succeeded_count,
+            failed_count=len(complete_items) - succeeded_count,
+            source_frame_count=sum(result.source_frame_count or 0 for result in results),
+            transition_state_frame_count=sum(
+                result.transition_state_frame_count or 0 for result in results
+            ),
+            inferred_reaction_count=sum(result.inferred_reaction_count for result in results),
+            timings_ms={**timings, "total_ms": (perf_counter() - started) * 1000},
+            items=complete_items,
+        )
+
+    @classmethod
+    async def _upload_batch_with_prepare_hook(
+        cls,
+        *,
+        files: list[ArtifactUploadPayload],
+        artifact_kind: ArtifactKind,
+        project_id: UUID,
+        user_id: UUID,
+        on_file_parsed: Callable[[int, bool], Awaitable[None]] | None,
+    ) -> ArtifactBatchUploadResult:
+        """Preserve dependency-injected single-upload test doubles.
+
+        Production never enters this adapter: it only applies when an embedding
+        or test replaces the class's private preparation hook.
+        """
+
+        await AuthorizationService.require_project_permission(
+            user_id,
+            project_id,
+            ProjectPermission.ARTIFACT_UPLOAD,
+        )
+        items: list[ArtifactBatchUploadItem] = []
+        for index, file in enumerate(files):
+            try:
+                payload = _upload_payload_bytes(file)
+                prepared = await cls._prepare_upload(
+                    payload=payload,
+                    filename=file.filename,
+                    media_type=file.media_type,
+                    artifact_kind=artifact_kind,
+                    project_id=project_id,
+                    user_id=user_id,
+                )
+                if not isinstance(prepared, ArtifactUploadResult):
+                    raise RuntimeError("prepare-hook adapters must return ArtifactUploadResult")
+                succeeded = prepared.ingestion_status is not ArtifactIngestionStatus.FAILED
+                items.append(
+                    ArtifactBatchUploadItem(
+                        filename=file.filename,
+                        succeeded=succeeded,
+                        result=prepared,
+                        error_code=None if succeeded else "ingestion_failed",
+                    )
+                )
+            except Exception as error:
+                items.append(
+                    ArtifactBatchUploadItem(
+                        filename=file.filename,
+                        succeeded=False,
+                        error_code="artifact_upload_failed",
+                        error_message=str(error) or type(error).__name__,
+                    )
+                )
+            if on_file_parsed is not None:
+                await on_file_parsed(index, items[-1].succeeded)
+        succeeded_count = sum(item.succeeded for item in items)
+        results = [item.result for item in items if item.result is not None]
+        return ArtifactBatchUploadResult(
+            total_count=len(items),
+            succeeded_count=succeeded_count,
+            failed_count=len(items) - succeeded_count,
+            source_frame_count=sum(result.source_frame_count or 0 for result in results),
+            transition_state_frame_count=sum(
+                result.transition_state_frame_count or 0 for result in results
+            ),
+            inferred_reaction_count=sum(result.inferred_reaction_count for result in results),
+            items=items,
+        )
+
+    @staticmethod
+    def _store_payload(
+        settings: RustFSSettings,
+        object_key: str,
+        source: bytes | Path,
+        media_type: str,
+        content_sha256: str | None = None,
+        size_bytes: int | None = None,
+        *,
+        check_existing_object: bool = True,
+    ) -> Any:
+        with RustFSObjectStore(settings) as store:
+            store.ensure_bucket()
+            if check_existing_object and store.exists(object_key):
+                return store.head(object_key)
+            if isinstance(source, Path):
+                if content_sha256 is None or size_bytes is None:
+                    raise ValueError("streamed uploads require precomputed source identity")
+                return store.put_file(
+                    key=object_key,
+                    path=source,
+                    content_sha256=content_sha256,
+                    size_bytes=size_bytes,
+                    content_type=media_type,
+                    metadata={"ingestion": "artifact-upload"},
+                )
+            return store.put_bytes(
+                key=object_key,
+                payload=source,
+                content_type=media_type,
+                metadata={"ingestion": "artifact-upload"},
+            )
+
+    @staticmethod
+    def _load_payload(settings: RustFSSettings, object_key: str) -> bytes:
+        with RustFSObjectStore(settings) as store:
+            return store.get_bytes(object_key)
+
+
+_ORIGINAL_PREPARE_UPLOAD = cast(
+    Any,
+    ArtifactUploadService.__dict__["_prepare_upload"],
+).__func__
+
+
+__all__ = [
+    "ArtifactUploadConflictError",
+    "ArtifactUploadError",
+    "ArtifactUploadPayload",
+    "ArtifactUploadService",
+]

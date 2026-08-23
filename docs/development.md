@@ -24,6 +24,49 @@ uv sync --python 3.12
 需要覆盖开发默认值时，基于 `.env.example` 创建 `.env`。默认配置只监听
 `127.0.0.1`，数据库账号和密码仅用于本地开发。
 
+完成初始化后，使用以下一个命令启动支持热更新的完整宿主机开发服务：
+
+```bash
+make dev
+```
+
+该命令让 Compose 使用仓库的 `.env.example` 单机开发配置，并显式覆盖 API 的本地数据库、
+RustFS、认证模式与监听地址；因此不会继承两主机 `.env` 中的远端数据服务端点。它会启动
+PostgreSQL/RDKit、RustFS 和本地 Keycloak，执行 migration 与 development bootstrap，并同时启动
+组合 API 和 Vite 前端。Python 源码修改会触发 API reload，前端源码修改
+由 Vite HMR 更新；浏览器访问 <http://127.0.0.1:5173/>。按 `Ctrl-C` 只停止 API 和前端进程，
+基础设施容器与其中的开发数据继续运行。
+
+### 远程 Compute 容器联合压力测试
+
+当 `.env` 使用远程 PostgreSQL/RustFS endpoint 时，使用 Docker Compose 的 compute overlay
+运行应用容器。容器内的 Python 进程可以访问数据主机的局域网地址：
+
+```bash
+docker compose -f compose.yaml -f compose.compute.yaml up -d --build --wait
+make benchmark-remote-upload-resources REMOTE_BATCH_SIZES="1 8 32"
+```
+
+该 benchmark 会实际执行 `ArtifactUploadService.upload_batch()`，记录 PostgreSQL SQL 数量、
+RustFS 写入和所有阶段耗时。每批测试使用外层事务回滚数据库，并删除本批新建的 RustFS 对象，
+不会留下压力测试数据。每批上传前会检查内容 SHA-256 在 PostgreSQL 中不存在、当前/上一小时
+的 RustFS 对象不存在，且批内所有内容哈希唯一；大于默认 64 文件的临时预算可通过
+`REMOTE_BENCHMARK_MAX_BATCH_FILES` 和 `REMOTE_BENCHMARK_MAX_BATCH_BYTES` 覆盖。
+
+使用真实计算文件时，将完整快照只读挂载到 benchmark 容器；目录模式只选取不同的 `.log`/`.out`
+文件并使用原始字节，不会向内容追加 nonce：
+
+```bash
+docker compose -f compose.yaml -f compose.compute.yaml run --rm --no-deps \
+  -v "$PWD:/workspace:ro" \
+  -v /Users/hx_group/proj/tricycle-data/complete_set:/remote-data:ro \
+  api /app/.venv/bin/python /workspace/scripts/benchmark_remote_upload_batch.py \
+  --fixture /remote-data --batch-sizes 8 16 32
+```
+
+真实文件通常比最小 fixture 大很多；如果某一批触发 PostgreSQL 的
+`TRICYCLE_QUERY_STATEMENT_TIMEOUT_MS`，该批应视为失败，而不是用放宽超时后的结果代表当前生产配置。
+
 ## 数据库
 
 启动明确版本 tag 的 PostgreSQL/RDKit 容器：
@@ -154,10 +197,10 @@ JSON 只会在空 Keycloak volume 首次导入；已有开发 volume 需要通�
 realm 配置，或明确重建开发身份数据。
 
 生产部署应由一个 HTTPS origin 提供 `frontend/dist` 和 `/api/*`。可从
-`infra/nginx/tricycle.conf` 开始配置 SPA fallback 与 FastAPI 反向代理；该示例对全部
-`/api/*` 关闭 Nginx shared cache，并强制 `Cache-Control: private, no-store`。若外层还有
+`infra/caddy/Caddyfile` 开始配置 SPA fallback 与 FastAPI 反向代理；该示例对全部
+`/api/*` 关闭共享缓存，并强制 `Cache-Control: private, no-store`。若外层还有
 Cloudflare，必须另建 Cache Rule，使 URI path 以 `/api/` 开头的请求 bypass cache；应用响应头
-不能纠正已配置的强制边缘缓存规则。仓库 Nginx 配置不再添加请求体大小或请求速率限制，并将
+不能纠正已配置的强制边缘缓存规则。仓库 Caddy 配置不再添加请求体大小或请求速率限制，并将
 长请求读写超时设为一小时；上传大小、文件数量、并发和查询预算统一由应用配置校验。若外层
 代理另设更小限制，仍以外层限制为准。
 
@@ -198,7 +241,8 @@ DELETE 保留 `retired` tombstone，RustFS 临时故障时可重复请求继续�
 统一拆分并录入所有 MolOP 帧；检测到
 TS 帧时额外创建或复用同一反应，并保存 TS CalculationFrame 到反应的推断溯源。
 格式由 MolOP probe 从内容识别；文件名、扩展名、目录结构、manifest 和上传顺序都不参与
-化学身份。批量请求中每个 Artifact 使用独立事务，一个文件失败不会回滚其他文件。
+化学身份。批量请求先并行完成 MolOP 解析，再在同一个数据库事务中持久化结果；每个文件使用
+独立 savepoint，一个文件失败不会回滚其他文件，整批结果最后只提交一次。
 生产 OIDC 用户首次登录后才进入本地用户目录；首次 system administrator 需要部署侧将该
 用户加入 system organization 并授予 owner/admin，API 不允许普通项目 manager 提升全局
 账号权限。
@@ -281,7 +325,7 @@ Core API 和 UseCase FastAPI 的独立应用仍保留给兼容性测试和拆分
 
 浏览器只需要访问前端端口 `5173`。`make serve-nexusx` 仍可启动各传输的独立演示进程，
 但它们是代理的内部上游，不应直接暴露；如需拆分上游，可通过 `NEXUSX_*_PROXY_TARGET`
-覆盖 Vite 代理，并在生产 Nginx 中同步调整对应 location。独立演示进程的 GraphQL
+覆盖 Vite 代理，并在生产 Caddy 中同步调整对应路由。独立演示进程的 GraphQL
 playground 占用 `8000`，因此不能与默认也占用 `8000` 的 `tricycle-api` 同时启动。
 
 NexusX `ErManager` 当前不接受复合 relationship join。Voyager ER 子图因此暂时省略
@@ -417,7 +461,7 @@ writer endpoint 对应用呈现为同一个逻辑 engine，节点数量不会变
 | `TRICYCLE_QUERY_RATE_LIMIT_WINDOW_SECONDS` | `60` | 限流窗口秒数 |
 | `TRICYCLE_STRUCTURE_QUERY_MAX_CHARACTERS` | `16384` | SMILES/SMARTS/reaction 输入长度上限 |
 | `TRICYCLE_STRUCTURE_CANDIDATE_LIMIT` | `50000` | 需要逐候选后处理的最大关系行数 |
-| `TRICYCLE_MOLOP_BATCH_N_JOBS` | `2` | 批量上传时保留 source evidence 的文件级并行进程数；`-1` 在开发环境使用全部可用 CPU，生产环境必须显式限界 |
+| `TRICYCLE_MOLOP_BATCH_N_JOBS` | `2` | 每个 API worker 维护的可复用 MolOP 解析进程池大小，单文件与批量解析共用；`-1` 在开发环境使用全部可用 CPU，生产环境必须显式限界 |
 
 描述符、Murcko scaffold、手性和匹配次数等逐候选计算必须先通过 Formula、
 Topology 或

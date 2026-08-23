@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = "==3.12.*"
 resolution-markers = [
     "sys_platform == 'win32'",
@@ -876,7 +876,7 @@ wheels = [
 
 [[package]]
 name = "molop"
-version = "0.2.9"
+version = "0.2.10"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -893,9 +893,9 @@ dependencies = [
     { name = "tabulate" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/06/ed/0442eaf0fe13b44ea0842dc086048b5522976000c036d5f1c7fa0c597fcb/molop-0.2.9.tar.gz", hash = "sha256:032d605ba0d4010b712b75e5cafac76f0bd5752fef2e81b4e4ee7650aaf5d57d", size = 287915, upload-time = "2026-08-21T13:59:47.153Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/87/38/57a7f5f9d30a59124ce2bcff83f7f1b920e7c4efa8256dcca19bcd655994/molop-0.2.10.tar.gz", hash = "sha256:8f2e559c388e1e2a88bdf9c296b44bd4e204d66c9422e04c0eeb497bb1f014d4", size = 294171, upload-time = "2026-08-22T07:19:30.051Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1e/7d/4c1bd35335db7d7fd533adfc00d2a45e4904a615926eac7449268a783c17/molop-0.2.9-py3-none-any.whl", hash = "sha256:86898d3ab68990839f90b95afa115ecfbc773740cbb0b1d0a7ba4165d28b5d26", size = 357247, upload-time = "2026-08-21T13:59:45.632Z" },
+    { url = "https://files.pythonhosted.org/packages/cf/2f/741c1c58776737ad6edd3936ab9dd073c00f5ae6365cad592ae4a036c740/molop-0.2.10-py3-none-any.whl", hash = "sha256:d2ea8d4b63b23f6e2da45dfb402485bcbe78b25e5c76b46b4700e9a024c177e3", size = 363671, upload-time = "2026-08-22T07:19:28.756Z" },
 ]
 
 [[package]]
@@ -1640,8 +1640,8 @@ name = "secretstorage"
 version = "3.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cryptography", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "jeepney", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "cryptography" },
+    { name = "jeepney" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/1c/03/e834bcd866f2f8a49a85eaff47340affa3bfa391ee9912a952a1faa68c7b/secretstorage-3.5.0.tar.gz", hash = "sha256:f04b8e4689cbce351744d5537bf6b1329c6fc68f91fa666f60a380edddcd11be", size = 19884, upload-time = "2025-11-23T19:02:53.191Z" }
 wheels = [
@@ -1754,7 +1754,6 @@ dependencies = [
     { name = "fastapi" },
     { name = "fastmcp" },
     { name = "httpx" },
-    { name = "joblib" },
     { name = "molalchemy" },
     { name = "molgr" },
     { name = "molop" },
@@ -1794,10 +1793,9 @@ requires-dist = [
     { name = "fastapi", specifier = "==0.135.1" },
     { name = "fastmcp", specifier = ">=3.2,<4" },
     { name = "httpx", specifier = ">=0.28,<1" },
-    { name = "joblib", specifier = ">=1.5,<2" },
     { name = "molalchemy", specifier = "==0.0.7" },
     { name = "molgr", specifier = ">=0.1.6" },
-    { name = "molop", specifier = ">=0.2.9" },
+    { name = "molop", specifier = ">=0.2.10" },
     { name = "nexusx", specifier = "==6.1.2" },
     { name = "numpy", specifier = ">=2.2,<3" },
     { name = "prometheus-client", specifier = ">=0.24,<1" },

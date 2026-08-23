@@ -11,6 +11,10 @@ def _api_locations() -> str:
     return (REPOSITORY_ROOT / "infra/nginx/api-locations.conf").read_text(encoding="utf-8")
 
 
+def _caddy_configuration() -> str:
+    return (REPOSITORY_ROOT / "infra/caddy/Caddyfile").read_text(encoding="utf-8")
+
+
 def _location(configuration: str, declaration: str) -> str:
     return configuration.split(declaration, 1)[1].split("\n}", 1)[0]
 
@@ -102,3 +106,30 @@ def test_container_nginx_terminates_tls_and_proxies_frontend_and_api() -> None:
     assert "server frontend:8080" in configuration
     assert "include /etc/nginx/includes/api-locations.conf;" in configuration
     assert "proxy_pass http://reaction_database_frontend;" in configuration
+
+
+def test_caddy_uses_acme_tls_and_explicit_http_redirect() -> None:
+    configuration = _caddy_configuration()
+
+    assert "auto_https disable_redirects" in configuration
+    assert "http://{$CADDY_SERVER_NAME:localhost}:{$CADDY_HTTP_PORT:80}" in configuration
+    assert "redir https://{host}:{$CADDY_HTTPS_PORT:443}{uri} 308" in configuration
+    assert "caddy-data" not in configuration
+
+
+def test_caddy_preserves_api_boundaries_and_nexusx_rewrites() -> None:
+    configuration = _caddy_configuration()
+
+    assert "handle @internal" in configuration
+    assert "respond 404" in configuration
+    assert 'header @api Cache-Control "private, no-store"' in configuration
+    assert "flush_interval -1" in configuration
+    assert "response_header_timeout 1h" in configuration
+    assert "read_timeout 1h" in configuration
+    assert "write_timeout 1h" in configuration
+    for replacement in (
+        "uri replace /nexusx/paginated-graphql /graphql",
+        "uri replace /nexusx/mcp /mcp",
+        "uri replace /nexusx/voyager /voyager",
+    ):
+        assert replacement in configuration

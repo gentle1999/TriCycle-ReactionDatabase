@@ -1,10 +1,26 @@
-.PHONY: init frontend-install frontend-build frontend-check frontend-test-e2e serve-frontend \
+.PHONY: init frontend-install frontend-build frontend-check frontend-test-e2e serve-frontend dev \
+	dev-infra-up dev-migrate dev-bootstrap \
 	format lint type test test-db test-storage test-redis test-infra audit vendor-audit check \
 	db-up db-down storage-up storage-down auth-up auth-down infra-up infra-down migrate import-artifacts \
 	backfill-thermodynamics bootstrap-development bootstrap-production seed-da-bench serve serve-nexusx storage-gc auth-session-cleanup \
-	benchmark-upload-resources capture-query-plan-evidence probe-shared-rate-limit probe-upload-limit \
+	benchmark-upload-resources benchmark-remote-upload-resources capture-query-plan-evidence probe-shared-rate-limit probe-upload-limit \
 	validate-da-bench-fixture validate-restore deployment-smoke validate-deployment-acceptance \
 	stack-build stack-up stack-down stack-logs
+
+DEV_DATABASE_URL := postgresql+psycopg://example_user:example-local-password@127.0.0.1:5432/example_reaction_db
+DEV_RUSTFS_ENDPOINT := http://127.0.0.1:19000
+DEV_RUNTIME_ENV = \
+	TRICYCLE_DATABASE_URL="$(DEV_DATABASE_URL)" \
+	TRICYCLE_RUSTFS_ENDPOINT_URL="$(DEV_RUSTFS_ENDPOINT)" \
+	TRICYCLE_RUSTFS_ACCESS_KEY=example-local-access \
+	TRICYCLE_RUSTFS_SECRET_KEY=example-local-secret \
+	TRICYCLE_RUSTFS_BUCKET=example-reaction-raw-files \
+	TRICYCLE_RUSTFS_REGION=us-east-1 \
+	TRICYCLE_RUSTFS_VERIFY_TLS=true \
+	TRICYCLE_ENVIRONMENT=development \
+	TRICYCLE_AUTH_MODE=development \
+	TRICYCLE_API_HOST=127.0.0.1 \
+	TRICYCLE_API_PORT=8000
 
 init:
 	uv sync --python 3.12
@@ -24,6 +40,38 @@ frontend-test-e2e:
 
 serve-frontend:
 	npm --prefix frontend run dev
+
+# Start the host-based development stack. Uvicorn reloads Python changes and
+# Vite provides frontend HMR; Ctrl-C stops only the two foreground processes.
+dev: dev-infra-up dev-migrate dev-bootstrap
+	@set -u; \
+	$(DEV_RUNTIME_ENV) TRICYCLE_DEBUG=true uv run tricycle-api & api_pid=$$!; \
+	npm --prefix frontend run dev & frontend_pid=$$!; \
+	cleanup() { \
+		kill "$$api_pid" "$$frontend_pid" 2>/dev/null || true; \
+		wait "$$api_pid" 2>/dev/null || true; \
+		wait "$$frontend_pid" 2>/dev/null || true; \
+	}; \
+	trap 'cleanup; exit 0' INT TERM; \
+	while :; do \
+		if ! kill -0 "$$api_pid" 2>/dev/null; then \
+			wait "$$api_pid"; status=$$?; cleanup; exit "$$status"; \
+		fi; \
+		if ! kill -0 "$$frontend_pid" 2>/dev/null; then \
+			wait "$$frontend_pid"; status=$$?; cleanup; exit "$$status"; \
+		fi; \
+		sleep 1; \
+	done
+
+dev-infra-up:
+	KEYCLOAK_PORT=18080 docker compose --env-file .env.example -f compose.yaml \
+		--project-name reaction-database-development up -d --wait postgres rustfs keycloak
+
+dev-migrate:
+	$(DEV_RUNTIME_ENV) uv run alembic upgrade head
+
+dev-bootstrap:
+	$(DEV_RUNTIME_ENV) uv run tricycle-bootstrap --mode development
 
 format:
 	uv run ruff format src tests migrations scripts
@@ -89,7 +137,7 @@ infra-down:
 	docker compose down
 
 stack-build:
-	docker compose build api frontend nginx
+	docker compose build api frontend caddy
 
 stack-up:
 	docker compose up -d --build --wait
@@ -98,7 +146,7 @@ stack-down:
 	docker compose down
 
 stack-logs:
-	docker compose logs --follow api frontend nginx
+	docker compose logs --follow api frontend caddy
 
 migrate:
 	uv run alembic upgrade head
@@ -136,6 +184,15 @@ auth-session-cleanup:
 
 benchmark-upload-resources:
 	uv run --frozen python scripts/benchmark_upload_resources.py
+
+benchmark-remote-upload-resources:
+	docker compose -f compose.yaml -f compose.compute.yaml build api
+	docker compose -f compose.yaml -f compose.compute.yaml run --rm --no-deps \
+		-e TRICYCLE_MAX_BATCH_FILES=$(or $(REMOTE_BENCHMARK_MAX_BATCH_FILES),1024) \
+		-e TRICYCLE_MAX_BATCH_BYTES=$(or $(REMOTE_BENCHMARK_MAX_BATCH_BYTES),1073741824) \
+		-v "$(CURDIR):/workspace:ro" api \
+		/app/.venv/bin/python /workspace/scripts/benchmark_remote_upload_batch.py \
+		$(if $(REMOTE_BATCH_SIZES),--batch-sizes $(REMOTE_BATCH_SIZES),)
 
 capture-query-plan-evidence:
 	@test -n "$(DATASET_SCALE)" || (echo "set DATASET_SCALE to the snapshot ID/scale" >&2; exit 2)

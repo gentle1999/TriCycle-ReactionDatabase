@@ -36,6 +36,9 @@ from tricycle_reaction_db.api.routes import (
 )
 from tricycle_reaction_db.api.routes.graphql import DIRECT_PLAYGROUND_QUERY, create_graphql_router
 from tricycle_reaction_db.application.rate_limits import close_rate_limit_clients
+from tricycle_reaction_db.application.services.artifact_uploads import (
+    close_molop_process_pool,
+)
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.session import dispose_engine
 
@@ -46,6 +49,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         async with mcp_http_app.lifespan(mcp_http_app):
             yield
     finally:
+        await close_molop_process_pool()
         await close_rate_limit_clients()
         await dispose_engine()
 

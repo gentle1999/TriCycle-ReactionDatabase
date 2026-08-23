@@ -52,6 +52,9 @@ interface QueueTask {
   loaded: number;
   error: string;
   artifactId: string | null;
+  parsePhase: string | null;
+  parseCompleted: number;
+  parseTotal: number;
   controller: AbortController | null;
   reserved: boolean;
 }
@@ -69,6 +72,7 @@ const MOLOP_BATCH_MAX_BYTES = 256 * 1024 * 1024;
 // queue so the user (and the acceptance suite) can observe the final counts.
 const BATCH_COMPLETION_RESET_DELAY_MS = 2_000;
 const PAGE_SIZE = 100;
+const UPLOAD_PROGRESS_METADATA_KEY = "__tricycle_upload_progress";
 const route = useRoute();
 const router = useRouter();
 const session = useSession();
@@ -99,6 +103,8 @@ const readingDrop = ref(false);
 let queueRunId = 0;
 let viewMounted = false;
 let preserveQueueOnUnmount = false;
+let progressPollTimer: number | null = null;
+let progressPollInFlight = false;
 
 onBeforeRouteLeave(() => {
   preserveQueueOnUnmount = true;
@@ -150,7 +156,26 @@ function fileRelativePath(file: File): string {
   return (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
 }
 
+interface UploadProgressMetadata {
+  phase: string;
+  completed: number;
+  total: number;
+}
+
+function uploadProgress(metadata: Record<string, unknown>): UploadProgressMetadata | null {
+  const value = metadata[UPLOAD_PROGRESS_METADATA_KEY];
+  if (!value || typeof value !== "object") return null;
+  const progress = value as Record<string, unknown>;
+  if (typeof progress.phase !== "string") return null;
+  return {
+    phase: progress.phase,
+    completed: typeof progress.completed === "number" ? progress.completed : 0,
+    total: typeof progress.total === "number" ? progress.total : 0,
+  };
+}
+
 function queueTaskFromRemote(item: UploadBatchItem, file: File | null = null): QueueTask {
+  const progress = uploadProgress(item.metadata);
   return {
     clientFileId: item.client_file_id,
     file,
@@ -163,6 +188,9 @@ function queueTaskFromRemote(item: UploadBatchItem, file: File | null = null): Q
     loaded: item.status === "succeeded" ? item.size_bytes : 0,
     error: item.error_message ?? "",
     artifactId: item.artifact_file_id,
+    parsePhase: progress?.phase ?? null,
+    parseCompleted: progress?.completed ?? 0,
+    parseTotal: progress?.total ?? 0,
     controller: null,
     reserved: false,
   };
@@ -181,6 +209,9 @@ function createQueuedTask(file: File, relativePath = fileRelativePath(file)): Qu
     loaded: 0,
     error: "",
     artifactId: null,
+    parsePhase: null,
+    parseCompleted: 0,
+    parseTotal: 0,
     controller: null,
     reserved: false,
   };
@@ -333,6 +364,33 @@ async function refreshBatch(): Promise<void> {
   batch.value = await api.uploadBatch(batch.value.id);
 }
 
+async function pollUploadProgress(): Promise<void> {
+  if (
+    !viewMounted
+    || !batch.value
+    || (!queueRunning.value && !(remoteMode.value && batch.value.uploading_count > 0))
+    || progressPollInFlight
+  ) return;
+  progressPollInFlight = true;
+  try {
+    if (remoteMode.value) {
+      await refreshBatch();
+      await refreshRemoteItems();
+      return;
+    }
+    const page = await api.uploadBatchItems(batch.value.id, { status: "uploading", limit: 200 });
+    const localTasks = new Map(tasks.value.map((task) => [task.clientFileId, task]));
+    for (const item of page.items) {
+      const task = localTasks.get(item.client_file_id);
+      if (task) applyItem(task, item);
+    }
+  } catch {
+    // The upload request remains authoritative; a transient progress poll may fail.
+  } finally {
+    progressPollInFlight = false;
+  }
+}
+
 async function refreshRemoteItems(): Promise<void> {
   if (!remoteMode.value || !batch.value) return;
   const page = await api.uploadBatchItems(batch.value.id, {
@@ -454,9 +512,14 @@ async function ensureBatch(): Promise<UploadBatch> {
 function applyItem(task: QueueTask, item: UploadBatchItem): void {
   task.status = item.status;
   task.attempt = item.attempt_count;
-  task.loaded = item.status === "succeeded" ? task.size : 0;
+  if (item.status === "succeeded") task.loaded = task.size;
+  else if (item.status !== "uploading") task.loaded = 0;
   task.error = item.error_message ?? "";
   task.artifactId = item.artifact_file_id;
+  const progress = uploadProgress(item.metadata);
+  task.parsePhase = progress?.phase ?? task.parsePhase;
+  task.parseCompleted = progress?.completed ?? task.parseCompleted;
+  task.parseTotal = progress?.total ?? task.parseTotal;
 }
 
 function updateBatchProgress(selected: QueueTask[], loaded: number, total: number): void {
@@ -493,6 +556,9 @@ async function runTaskBatch(selected: QueueTask[], runId: number): Promise<void>
         task.attempt += 1;
         task.loaded = 0;
         task.error = "";
+        task.parsePhase = "uploading";
+        task.parseCompleted = 0;
+        task.parseTotal = selected.length;
       }
       const controller = new AbortController();
       for (const task of selected) task.controller = controller;
@@ -500,7 +566,14 @@ async function runTaskBatch(selected: QueueTask[], runId: number): Promise<void>
         const items = await api.uploadBatchFiles(
           batch.value.id,
           selected.map((task) => ({ clientFileId: task.clientFileId, file: task.file! })),
-          (loaded, total) => updateBatchProgress(selected, loaded, total),
+          (loaded, total) => {
+            updateBatchProgress(selected, loaded, total);
+            if (total > 0 && loaded >= total) {
+              for (const task of selected) {
+                if (task.status === "uploading") task.parsePhase = "parsing";
+              }
+            }
+          },
           controller.signal,
         );
         const itemsByClientId = new Map(items.map((item) => [item.client_file_id, item]));
@@ -515,6 +588,7 @@ async function runTaskBatch(selected: QueueTask[], runId: number): Promise<void>
           for (const task of selected) {
             task.status = "cancelled";
             task.error = "";
+            task.parsePhase = null;
           }
           return;
         }
@@ -524,6 +598,7 @@ async function runTaskBatch(selected: QueueTask[], runId: number): Promise<void>
           for (const task of selected) {
             task.status = "failed";
             task.error = error instanceof Error ? error.message : "上传失败";
+            task.parsePhase = "failed";
           }
           return;
         }
@@ -663,14 +738,20 @@ async function retryFailed(): Promise<void> {
   }
 }
 
-function taskStatusLabel(status: UploadBatchItemStatus): string {
+function taskStatusLabel(task: QueueTask): string {
+  if (task.status === "uploading" && task.parsePhase === "parsing") {
+    const suffix = task.parseTotal > 0 ? ` · ${task.parseCompleted}/${task.parseTotal}` : "";
+    return `解析中${suffix}`;
+  }
+  if (task.status === "uploading" && task.parsePhase === "parsed") return "解析完成，入库中";
+  if (task.status === "uploading" && task.parsePhase === "parse_failed") return "解析失败，收尾中";
   return {
     queued: "等待",
     uploading: "上传中",
     succeeded: "完成",
     failed: "失败",
     cancelled: "取消",
-  }[status];
+  }[task.status];
 }
 
 function batchStatusLabel(status: UploadBatch["status"]): string {
@@ -718,6 +799,7 @@ watch(statusFilter, () => { queuePage.value = 0; });
 
 onMounted(async () => {
   viewMounted = true;
+  progressPollTimer = window.setInterval(() => void pollUploadProgress(), 750);
   await refreshRecentBatches();
   const routeBatch = typeof route.query.batch === "string" ? route.query.batch : null;
   const lastBatch = window.localStorage.getItem("tricycle.lastUploadBatch");
@@ -727,6 +809,10 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   viewMounted = false;
+  if (progressPollTimer !== null) {
+    window.clearInterval(progressPollTimer);
+    progressPollTimer = null;
+  }
   if (preserveQueueOnUnmount) return;
   queueRunId += 1;
   for (const task of tasks.value) task.controller?.abort();
@@ -895,12 +981,12 @@ onBeforeUnmount(() => {
         <div v-if="loadingBatch" class="table-loading">正在加载上传批次</div>
         <div v-else-if="!visibleTasks.length" class="compact-empty">队列为空</div>
         <div v-for="task in visibleTasks" v-else :key="task.clientFileId" class="upload-task-row" :class="`is-${task.status}`" role="listitem">
-          <span class="upload-task-status" :title="taskStatusLabel(task.status)"></span>
+          <span class="upload-task-status" :title="taskStatusLabel(task)"></span>
           <div class="upload-task-name"><strong>{{ task.filename }}</strong><span>{{ task.relativePath }}</span></div>
           <span class="upload-task-size">{{ formatBytes(task.size) }}</span>
           <div class="upload-task-progress">
             <progress :value="task.status === 'succeeded' ? task.size : task.loaded" :max="Math.max(1, task.size)"></progress>
-            <span>{{ taskStatusLabel(task.status) }}<template v-if="task.attempt"> · {{ task.attempt }} 次</template></span>
+            <span>{{ taskStatusLabel(task) }}<template v-if="task.attempt"> · {{ task.attempt }} 次</template></span>
           </div>
           <span class="upload-task-error" :title="task.error">{{ task.error }}</span>
           <RouterLink

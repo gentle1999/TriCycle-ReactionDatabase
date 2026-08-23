@@ -9,7 +9,7 @@ from tricycle_reaction_db.application.services.artifact_content import (
     ArtifactContentService,
     iter_artifact_download,
 )
-from tricycle_reaction_db.application.services.transition_state_uploads import ArtifactUploadService
+from tricycle_reaction_db.application.services.artifact_uploads import ArtifactUploadService
 from tricycle_reaction_db.db.models import ArtifactFile
 from tricycle_reaction_db.db.session import session_factory
 from tricycle_reaction_db.domain.enums import ArtifactKind

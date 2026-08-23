@@ -20,13 +20,13 @@ from tricycle_reaction_db.application.dtos import (
     UploadBatchStatusUpdate,
     UploadBatchView,
 )
+from tricycle_reaction_db.application.services.artifact_uploads import (
+    ArtifactUploadPayload,
+    ArtifactUploadService,
+)
 from tricycle_reaction_db.application.services.authorization import (
     AuthorizationService,
     ProjectPermission,
-)
-from tricycle_reaction_db.application.services.transition_state_uploads import (
-    ArtifactUploadPayload,
-    ArtifactUploadService,
 )
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import UploadBatch, UploadBatchItem
@@ -36,7 +36,6 @@ from tricycle_reaction_db.domain.enums import (
     UploadBatchStatus,
 )
 from tricycle_reaction_db.ingestion.media_type import detect_artifact_media_type
-
 
 class UploadBatchError(RuntimeError):
     pass
@@ -52,6 +51,36 @@ class UploadBatchConflictError(UploadBatchError):
 
 class UploadBatchLimitError(UploadBatchError):
     pass
+
+
+UPLOAD_PROGRESS_METADATA_KEY = "__tricycle_upload_progress"
+
+
+def _with_upload_progress(
+    metadata: dict[str, object],
+    *,
+    phase: str,
+    completed: int | None = None,
+    total: int | None = None,
+) -> dict[str, object]:
+    current = metadata.get(UPLOAD_PROGRESS_METADATA_KEY)
+    current_progress = current if isinstance(current, dict) else {}
+    resolved_total = total if total is not None else current_progress.get("total", 0)
+    resolved_completed = (
+        completed
+        if completed is not None
+        else resolved_total
+        if phase in {"completed", "failed"}
+        else current_progress.get("completed", 0)
+    )
+    return {
+        **metadata,
+        UPLOAD_PROGRESS_METADATA_KEY: {
+            "phase": phase,
+            "completed": int(resolved_completed),
+            "total": int(resolved_total),
+        },
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -603,6 +632,12 @@ class UploadBatchService:
                 item.attempt_count += 1
                 item.error_code = None
                 item.error_message = None
+                item.metadata_json = _with_upload_progress(
+                    item.metadata_json,
+                    phase="uploading",
+                    completed=0,
+                    total=0,
+                )
                 item.updated_at = now
                 session.add(item)
                 pending_files.append(
@@ -617,6 +652,15 @@ class UploadBatchService:
                     )
                 )
 
+            for pending_client_file_id, _ in pending_files:
+                item = items_by_client_id[pending_client_file_id]
+                item.metadata_json = _with_upload_progress(
+                    item.metadata_json,
+                    phase="parsing",
+                    completed=0,
+                    total=len(pending_files),
+                )
+                session.add(item)
             batch.uploading_count += len(pending_files)
             batch.updated_at = now
             session.add(batch)
@@ -742,14 +786,18 @@ class UploadBatchService:
                 item.artifact_file_id = outcome.artifact_file_id
                 item.error_code = outcome.error_code
                 item.error_message = outcome.error_message
+                item.metadata_json = _with_upload_progress(
+                    item.metadata_json,
+                    phase="completed" if outcome.succeeded else "failed",
+                    completed=None,
+                    total=None,
+                )
                 item.updated_at = now
                 session.add(item)
             batch.updated_at = now
             _finish_batch_if_terminal(batch)
             session.add(batch)
             await session.commit()
-            for item in items:
-                await session.refresh(item)
             return [
                 _item_view(items_by_client_id[client_file_id]) for client_file_id in client_file_ids
             ]

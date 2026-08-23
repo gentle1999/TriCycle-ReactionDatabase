@@ -99,7 +99,15 @@ class ObjectIntegrityError(RuntimeError):
 
 
 def content_addressed_key(payload: bytes, *, prefix: str = "raw/sha256") -> str:
-    digest = sha256(payload).hexdigest()
+    return content_addressed_key_for_sha256(sha256(payload).hexdigest(), prefix=prefix)
+
+
+def content_addressed_key_for_sha256(content_sha256: str, *, prefix: str = "raw/sha256") -> str:
+    """Build a fan-out object key from a precomputed content digest."""
+
+    digest = content_sha256.lower()
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError("content_sha256 must be a lowercase or uppercase SHA-256 digest")
     clean_prefix = prefix.strip("/")
     if not clean_prefix:
         raise ValueError("prefix must not be empty")
@@ -114,14 +122,29 @@ def time_partitioned_content_addressed_key(
 ) -> str:
     """Build a content-addressed key under an hourly UTC listing partition."""
 
+    return time_partitioned_content_addressed_key_for_sha256(
+        sha256(payload).hexdigest(),
+        uploaded_at=uploaded_at,
+        prefix=prefix,
+    )
+
+
+def time_partitioned_content_addressed_key_for_sha256(
+    content_sha256: str,
+    *,
+    uploaded_at: datetime,
+    prefix: str = "uploads",
+) -> str:
+    """Build an hourly content-addressed key from a precomputed digest."""
+
     if uploaded_at.tzinfo is None or uploaded_at.utcoffset() is None:
         raise ValueError("uploaded_at must be timezone-aware")
     clean_prefix = prefix.strip("/")
     if not clean_prefix:
         raise ValueError("prefix must not be empty")
     partition = uploaded_at.astimezone(UTC).strftime("%Y/%m/%d/%H")
-    return content_addressed_key(
-        payload,
+    return content_addressed_key_for_sha256(
+        content_sha256,
         prefix=f"{clean_prefix}/{partition}/sha256",
     )
 
@@ -191,6 +214,41 @@ class RustFSObjectStore:
             ContentType=content_type,
             Metadata=persisted_metadata,
         )
+        return self.head(key, version_id=response.get("VersionId"))
+
+    def put_file(
+        self,
+        *,
+        key: str,
+        path: Path,
+        content_sha256: str,
+        size_bytes: int,
+        content_type: str = "application/octet-stream",
+        metadata: Mapping[str, str] | None = None,
+    ) -> ObjectMetadata:
+        """Stream one already-inspected local file into object storage."""
+
+        self._validate_key(key)
+        if size_bytes < 0:
+            raise ValueError("size_bytes must not be negative")
+        persisted_metadata = dict(metadata or {})
+        persisted_metadata["sha256"] = content_sha256
+        with path.open("rb") as stream:
+            actual_size = stream.seek(0, 2)
+            stream.seek(0)
+            if actual_size != size_bytes:
+                raise ObjectIntegrityError(
+                    "local file size changed before upload: "
+                    f"expected {size_bytes}, got {actual_size}"
+                )
+            response = self._client.put_object(
+                Bucket=self.settings.bucket,
+                Key=key,
+                Body=stream,
+                ContentLength=size_bytes,
+                ContentType=content_type,
+                Metadata=persisted_metadata,
+            )
         return self.head(key, version_id=response.get("VersionId"))
 
     def head(self, key: str, *, version_id: str | None = None) -> ObjectMetadata:

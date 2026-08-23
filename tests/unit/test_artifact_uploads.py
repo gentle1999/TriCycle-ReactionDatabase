@@ -2,6 +2,7 @@ import asyncio
 import gzip
 import threading
 import time
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,9 +12,8 @@ from molop import molopconfig
 from rdkit.Chem import rdChemReactions
 
 from tricycle_reaction_db.application.dtos import ArtifactUploadResult
-from tricycle_reaction_db.application.services import transition_state_uploads as upload_module
-from tricycle_reaction_db.application.services.authorization import AuthorizationService
-from tricycle_reaction_db.application.services.transition_state_uploads import (
+from tricycle_reaction_db.application.services import artifact_uploads as upload_module
+from tricycle_reaction_db.application.services.artifact_uploads import (
     ArtifactUploadError,
     ArtifactUploadLimitError,
     ArtifactUploadPayload,
@@ -22,9 +22,12 @@ from tricycle_reaction_db.application.services.transition_state_uploads import (
     _parse_calculation_output,
     _parse_calculation_outputs_batch,
     _parser_payload,
+    _require_batch_upload_budget,
     _run_molop_parser,
+    _run_molop_parser_with_progress,
     _SuccessfulInference,
 )
+from tricycle_reaction_db.application.services.authorization import AuthorizationService
 from tricycle_reaction_db.core.config import Settings
 from tricycle_reaction_db.domain.enums import (
     ArtifactIngestionStatus,
@@ -32,6 +35,7 @@ from tricycle_reaction_db.domain.enums import (
     StorageStatus,
 )
 from tricycle_reaction_db.domain.identity import DEVELOPMENT_USER_ID, SYSTEM_PROJECT_ID
+from tricycle_reaction_db.storage.rustfs import RustFSSettings
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "da_bench_minimal"
 TS_FIXTURE = (
@@ -42,6 +46,14 @@ NON_TS_FIXTURE = (
     FIXTURE_ROOT / "complete_set/000000000000_000000403256/00/prod/"
     "000000000000_000000403256_00_00.prod.log.gz"
 )
+
+
+@pytest.fixture(autouse=True)
+def close_parser_pool_after_test() -> None:
+    """Keep MolOP's native child-process guard isolated between test cases."""
+
+    yield
+    asyncio.run(upload_module.close_molop_process_pool())
 
 
 def test_molop_infers_one_reaction_for_each_detected_ts_frame() -> None:
@@ -165,54 +177,27 @@ def test_parser_payload_enforces_compressed_and_decompressed_limits() -> None:
         _parser_payload(compressed, "calculation.log.gz", max_decompressed_bytes=128)
 
 
-def test_serial_batch_parser_calls_molop_once_and_restores_input_order(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    calls: list[tuple[list[str], dict[str, object]]] = []
+def test_serial_batch_parser_dispatches_files_and_restores_input_order(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls: list[tuple[list[bytes], list[str | None], int]] = []
 
-    def fake_auto_parser(paths: list[str], **options: object) -> object:
-        calls.append((paths, options))
+    def fake_parallel_parser(
+        paths: list[str],
+        compressions: list[str | None],
+        *,
+        n_jobs: int,
+    ) -> list[tuple[object | None, str | None]]:
+        calls.append(([Path(path).read_bytes() for path in paths], compressions, n_jobs))
         assert [Path(path).read_bytes() for path in paths] == [b"first", b"second"]
-        return SimpleNamespace(
-            outcomes=(
-                SimpleNamespace(
-                    input_index=1,
-                    succeeded=True,
-                    value="parsed-second",
-                    failure=None,
-                    status="ok",
-                ),
-                SimpleNamespace(
-                    input_index=0,
-                    succeeded=True,
-                    value="parsed-first",
-                    failure=None,
-                    status="ok",
-                ),
-            )
-        )
+        return [("parsed-first", None), ("parsed-second", None)]
 
-    monkeypatch.setattr(
-        "tricycle_reaction_db.application.services.transition_state_uploads.AutoParser",
-        fake_auto_parser,
-    )
-    monkeypatch.setattr(
-        "tricycle_reaction_db.application.services.transition_state_uploads."
-        "_parsed_artifact_from_chem_file",
-        lambda chem_file, *, source_compression: (chem_file, source_compression),
-    )
-
+    monkeypatch.setattr(upload_module, "_parse_calculation_paths_parallel", fake_parallel_parser)
     parsed = _parse_calculation_outputs_batch(
         [(gzip.compress(b"first"), "first.log.gz"), (b"second", "second.out")],
         n_jobs=1,
     )
 
-    assert parsed == {0: ("parsed-first", "gzip"), 1: ("parsed-second", None)}
-    assert len(calls) == 1
-    paths, options = calls[0]
-    assert len(paths) == 2
-    assert options["n_jobs"] == 1
-    assert options["return_report"] is True
-    assert options["capture_source_evidence"] is True
-    assert options["release_file_content"] is True
+    assert parsed == {0: "parsed-first", 1: "parsed-second"}
+    assert calls == [([b"first", b"second"], ["gzip", None], 1)]
 
 
 def test_parallel_batch_parser_dispatches_each_file_with_source_evidence(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -241,25 +226,19 @@ def test_parallel_batch_parser_dispatches_each_file_with_source_evidence(monkeyp
 
 
 def test_batch_parser_isolates_invalid_gzip_before_molop(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    def fake_auto_parser(paths: list[str], **_: object) -> object:
+    def fake_parallel_parser(
+        paths: list[str],
+        compressions: list[str | None],
+        *,
+        n_jobs: int,
+    ) -> list[tuple[object | None, str | None]]:
         assert len(paths) == 1
         assert Path(paths[0]).read_bytes() == b"valid"
-        return SimpleNamespace(
-            outcomes=(
-                SimpleNamespace(
-                    input_index=0,
-                    succeeded=False,
-                    value=None,
-                    failure=SimpleNamespace(message="isolated MolOP failure"),
-                    status="error",
-                ),
-            )
-        )
+        assert compressions == [None]
+        assert n_jobs == 2
+        return [(None, "isolated MolOP failure")]
 
-    monkeypatch.setattr(
-        "tricycle_reaction_db.application.services.transition_state_uploads.AutoParser",
-        fake_auto_parser,
-    )
+    monkeypatch.setattr(upload_module, "_parse_calculation_paths_parallel", fake_parallel_parser)
 
     parsed = _parse_calculation_outputs_batch(
         [(b"not-gzip", "broken.log.gz"), (b"valid", "valid.log")],
@@ -270,6 +249,94 @@ def test_batch_parser_isolates_invalid_gzip_before_molop(monkeypatch) -> None:  
     assert str(parsed[0]) == "uploaded gzip artifact is invalid"
     assert isinstance(parsed[1], ArtifactUploadError)
     assert str(parsed[1]) == "isolated MolOP failure"
+
+
+def test_spooled_batch_budget_keeps_source_on_disk(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "calculation.out"
+    payload = b"spooled calculation output\n" * 1024
+    source.write_bytes(payload)
+
+    def unexpected_read_bytes(_: Path) -> bytes:
+        raise AssertionError("spooled batch budget must not materialize the source")
+
+    monkeypatch.setattr(Path, "read_bytes", unexpected_read_bytes)
+    inspected = _require_batch_upload_budget(
+        [ArtifactUploadPayload(source.name, "text/plain", None, spool_path=source)]
+    )
+
+    assert inspected[0].source == source
+    assert inspected[0].size_bytes == len(payload)
+    assert inspected[0].content_sha256 == sha256(payload).hexdigest()
+    assert inspected[0].media_probe == payload[: 64 * 1024]
+
+
+def test_spooled_batch_budget_rejects_gzip_bomb(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "calculation.log.gz"
+    source.write_bytes(gzip.compress(b"x" * 1025))
+    monkeypatch.setattr(
+        upload_module,
+        "get_settings",
+        lambda: Settings(_env_file=None, max_upload_bytes=1024, max_batch_bytes=2048),
+    )
+
+    with pytest.raises(ArtifactUploadLimitError, match="decompressed artifact"):
+        _require_batch_upload_budget(
+            [ArtifactUploadPayload(source.name, "application/gzip", None, spool_path=source)]
+        )
+
+
+def test_batch_parser_uses_uncompressed_spooled_source_directly(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "calculation.out"
+    source.write_bytes(b"direct spooled source")
+
+    def fake_parallel_parser(
+        paths: list[str],
+        compressions: list[str | None],
+        *,
+        n_jobs: int,
+    ) -> list[tuple[object | None, str | None]]:
+        assert paths == [str(source)]
+        assert compressions == [None]
+        assert n_jobs == 2
+        return [("parsed", None)]
+
+    monkeypatch.setattr(upload_module, "_parse_calculation_paths_parallel", fake_parallel_parser)
+    parsed = _parse_calculation_outputs_batch([(source, source.name)], n_jobs=2)
+
+    assert parsed == {0: "parsed"}
+
+
+def test_batch_parser_decompresses_spooled_gzip_input(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "calculation.log.gz"
+    source.write_bytes(gzip.compress(b"decoded spooled source"))
+
+    def fake_parallel_parser(
+        paths: list[str],
+        compressions: list[str | None],
+        *,
+        n_jobs: int,
+    ) -> list[tuple[object | None, str | None]]:
+        assert [Path(path).read_bytes() for path in paths] == [b"decoded spooled source"]
+        assert compressions == ["gzip"]
+        assert n_jobs == 2
+        return [("parsed", None)]
+
+    monkeypatch.setattr(upload_module, "_parse_calculation_paths_parallel", fake_parallel_parser)
+    parsed = _parse_calculation_outputs_batch([(source, source.name)], n_jobs=2)
+
+    assert parsed == {0: "parsed"}
 
 
 def test_validate_probes_calculation_without_persistence(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -333,6 +400,90 @@ def test_batch_upload_isolates_each_file_failure(monkeypatch) -> None:  # type: 
     assert result.items[1].error_code == "artifact_upload_failed"
     assert result.items[1].error_message == "isolated parse failure"
     assert result.source_frame_count == 2
+
+
+def test_new_object_upload_skips_rustfs_existence_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    uploaded = SimpleNamespace(key="new-object")
+
+    class Store:
+        def __init__(self, _settings: RustFSSettings) -> None:
+            pass
+
+        def __enter__(self) -> object:
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            pass
+
+        def ensure_bucket(self) -> None:
+            calls.append("ensure_bucket")
+
+        def exists(self, _key: str) -> bool:
+            raise AssertionError("new object upload performed a redundant HEAD")
+
+        def put_bytes(self, **_: object) -> object:
+            calls.append("put_bytes")
+            return uploaded
+
+    monkeypatch.setattr(upload_module, "RustFSObjectStore", Store)
+
+    result = ArtifactUploadService._store_payload(
+        RustFSSettings(_env_file=None),
+        "uploads/new-object",
+        b"new payload",
+        "text/plain",
+        check_existing_object=False,
+    )
+
+    assert result is uploaded
+    assert calls == ["ensure_bucket", "put_bytes"]
+
+
+def test_retry_upload_keeps_rustfs_existence_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    existing = SimpleNamespace(key="existing-object")
+
+    class Store:
+        def __init__(self, _settings: RustFSSettings) -> None:
+            pass
+
+        def __enter__(self) -> object:
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            pass
+
+        def ensure_bucket(self) -> None:
+            calls.append("ensure_bucket")
+
+        def exists(self, _key: str) -> bool:
+            calls.append("exists")
+            return True
+
+        def head(self, _key: str) -> object:
+            calls.append("head")
+            return existing
+
+        def put_bytes(self, **_: object) -> object:
+            raise AssertionError("retry overwrote an existing RustFS object")
+
+    monkeypatch.setattr(upload_module, "RustFSObjectStore", Store)
+
+    result = ArtifactUploadService._store_payload(
+        RustFSSettings(_env_file=None),
+        "uploads/existing-object",
+        b"existing payload",
+        "text/plain",
+        check_existing_object=True,
+    )
+
+    assert result is existing
+    assert calls == ["ensure_bucket", "exists", "head"]
 
 
 @pytest.mark.parametrize(
@@ -429,3 +580,29 @@ def test_molop_parse_semaphore_enforces_process_level_slot_budget(
     monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
     assert asyncio.run(run()) == [0, 1, 2, 3]
     assert peak == 1
+
+
+def test_molop_progress_callback_runs_before_parser_batch_finishes() -> None:
+    callback_completed = threading.Event()
+    events: list[str] = []
+
+    def parser(*, progress_queue: object) -> dict[int, str]:
+        progress_queue.put((0, "parsed"))  # type: ignore[attr-defined]
+        assert callback_completed.wait(timeout=1)
+        events.append("parser_finished")
+        return {0: "parsed"}
+
+    async def progress_callback(index: int, result: object) -> None:
+        assert (index, result) == (0, "parsed")
+        events.append("persisted")
+        callback_completed.set()
+
+    result = asyncio.run(
+        _run_molop_parser_with_progress(
+            parser,
+            progress_callback=progress_callback,
+        )
+    )
+
+    assert result == {0: "parsed"}
+    assert events == ["persisted", "parser_finished"]

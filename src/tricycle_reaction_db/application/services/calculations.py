@@ -77,7 +77,12 @@ from tricycle_reaction_db.db.models import (
     TotalSpinResult,
     VibrationResult,
 )
-from tricycle_reaction_db.db.types import summarize_numpy_array
+from tricycle_reaction_db.db.types import (
+    cached_numpy_array_payload,
+    cached_numpy_array_summary,
+    encode_numpy_array,
+    summarize_numpy_array,
+)
 from tricycle_reaction_db.domain.enums import (
     ParseStatus,
     QMSoftware,
@@ -257,6 +262,14 @@ def persist_parse_revision(
     """Insert or reuse one parse revision under its immutable artifact."""
 
     artifact_file_id = _require_id(artifact_file, label="ArtifactFile")
+    if _fast_insert_enabled(session) and not force_new_revision:
+        new_revision = ParseRevision(
+            artifact_file=artifact_file,
+            revision_number=1,
+            **record.model_dump(),
+        )
+        _flush_new_entity(session, new_revision, label="ParseRevision")
+        return new_revision
     _acquire_identity_locks(
         session,
         ("parse_revision_artifact", artifact_file_id),
@@ -592,13 +605,25 @@ def persist_calculation_status_result(
 def _validated_array_copy(
     record: ScientificArrayRecord,
 ) -> npt.NDArray[np.generic]:
-    data: npt.NDArray[np.generic] = np.array(
-        record.data,
-        copy=True,
-        order="A",
-        subok=False,
+    cached_payload = cached_numpy_array_payload(record.data)
+    cached_summary = cached_numpy_array_summary(record.data)
+    if cached_payload is not None:
+        # MolOP export records already carry a frozen, payload-backed array. Keep
+        # that object instead of copying tens or hundreds of megabytes again.
+        data = record.data
+    else:
+        data: npt.NDArray[np.generic] = np.array(
+            record.data,
+            copy=True,
+            order="A",
+            subok=False,
+        )
+        data, _ = encode_numpy_array(data)
+    summary = (
+        cached_summary
+        if cached_payload is not None and cached_summary is not None
+        else summarize_numpy_array(data)
     )
-    summary = summarize_numpy_array(data)
     expected_summary = (
         record.dtype,
         tuple(record.shape),
@@ -620,7 +645,7 @@ def persist_scientific_array(
     frame: CalculationFrame,
     record: ScientificArrayRecord,
 ) -> ScientificArray:
-    """Insert or reuse a typed array after validating and freezing an owned copy."""
+    """Insert or reuse a typed array after validating and freezing its data."""
 
     frame_id = _require_id(frame, label="CalculationFrame")
     _validate_scientific_array_shape(frame, record)
@@ -1078,12 +1103,15 @@ def finalize_parse_revision(
     session: Session,
     revision: ParseRevision,
     completion: ParseRevisionCompletionRecord,
+    *,
+    defer_flush: bool = False,
 ) -> ParseRevision:
     """Mark a populated pending revision as succeeded after relationship validation."""
 
     revision_id = _require_id(revision, label="ParseRevision")
-    _acquire_identity_locks(session, ("parse_revision_finalize", revision_id))
-    session.refresh(revision)
+    if not _fast_insert_enabled(session):
+        _acquire_identity_locks(session, ("parse_revision_finalize", revision_id))
+        session.refresh(revision)
     if revision.status is ParseStatus.SUCCEEDED:
         if revision.record_sha256 != completion.record_sha256:
             raise ValueError("ParseRevision was already finalized with a different payload")
@@ -1110,7 +1138,8 @@ def finalize_parse_revision(
     revision.error_message = None
     revision.error_metadata = None
     session.add(revision)
-    session.flush()
+    if not defer_flush:
+        session.flush()
     return revision
 
 

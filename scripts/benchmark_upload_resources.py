@@ -15,13 +15,13 @@ from pathlib import Path
 from time import perf_counter, sleep
 from typing import TypedDict
 
-from tricycle_reaction_db.application.services.transition_state_uploads import (
+from tricycle_reaction_db.application.services.artifact_uploads import (
     _parse_calculation_outputs_batch,
 )
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 DEFAULT_FIXTURE = REPOSITORY_ROOT / "tests/fixtures/qm/minimal_orca_water_sp.orcaout"
-UPLOAD_BENCHMARK_SCHEMA_VERSION = "upload-resource-benchmark-v1"
+UPLOAD_BENCHMARK_SCHEMA_VERSION = "upload-resource-benchmark-v2"
 
 
 class ProcessSample(TypedDict):
@@ -63,7 +63,7 @@ def _sample_process_tree(root_pid: int) -> ProcessSample:
     }
 
 
-def _child(batch_size: int, n_jobs: int, fixture: Path) -> dict[str, int | float | str]:
+def _child(batch_size: int, n_jobs: int, fixture: Path) -> dict[str, object]:
     payload = fixture.read_bytes()
     stop = threading.Event()
     peak = _sample_process_tree(os.getpid())
@@ -81,10 +81,12 @@ def _child(batch_size: int, n_jobs: int, fixture: Path) -> dict[str, int | float
     monitor_thread = threading.Thread(target=monitor, daemon=True)
     monitor_thread.start()
     started_at = perf_counter()
+    phase_timings_ms: dict[str, float] = {}
     try:
         results = _parse_calculation_outputs_batch(
             [(payload, f"baseline-{index:02d}{fixture.suffix}") for index in range(batch_size)],
             n_jobs=n_jobs,
+            timings_ms=phase_timings_ms,
         )
     finally:
         elapsed_seconds = perf_counter() - started_at
@@ -104,6 +106,9 @@ def _child(batch_size: int, n_jobs: int, fixture: Path) -> dict[str, int | float
         "peak_process_tree_rss_mib": round(peak["rss_kib"] / 1024, 1),
         "succeeded_count": len(results) - failures,
         "failed_count": failures,
+        "phase_timings_ms": {
+            phase: round(elapsed, 3) for phase, elapsed in phase_timings_ms.items()
+        },
     }
 
 

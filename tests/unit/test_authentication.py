@@ -29,7 +29,7 @@ from tricycle_reaction_db.application.services import (
     AuthenticationService,
 )
 from tricycle_reaction_db.application.services import authentication as authentication_module
-from tricycle_reaction_db.application.services.transition_state_uploads import (
+from tricycle_reaction_db.application.services.artifact_uploads import (
     ArtifactUploadLimitError,
 )
 from tricycle_reaction_db.core.config import Settings

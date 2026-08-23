@@ -23,19 +23,19 @@ SCHED-01 -----------------------> 同一个 DB、S3 和 Redis 逻辑端点
 ~~~
 
 当前 `compose.yaml` 编排 PostgreSQL/RDKit、RustFS、开发用 Keycloak、数据库迁移、初始数据
-bootstrap、API、前端静态服务和同源 HTTPS Nginx。API 与前端只在 Compose 网络内监听，公网
-入口只有 Nginx 的 HTTP/HTTPS 端口。HTTP 只返回 308 跳转，HTTPS 代理 `/api`、`/health`、
+bootstrap、API、前端静态服务和同源 HTTPS Caddy。API 与前端只在 Compose 网络内监听，公网
+入口只有 Caddy 的 HTTP/HTTPS 端口。HTTP 只返回 308 跳转，HTTPS 代理 `/api`、`/health`、
 `/docs`、GraphQL、MCP 和 `/nexusx/*`，其余路径交给前端 SPA。
 
 ### 两台服务器部署
 
-“数据服务器运行 PostgreSQL/RustFS，算力服务器运行 API、前端、Nginx、Keycloak”是合理的
+“数据服务器运行 PostgreSQL/RustFS，算力服务器运行 API、前端、Caddy、Keycloak”是合理的
 两层拓扑，尤其适合计算解析和 Web 流量集中在算力服务器的场景。但当前根目录
 `compose.yaml` 是单机开发栈，会同时声明本地 PostgreSQL/RustFS；不要把它原样部署到算力
 服务器再让两套数据库并存。生产应拆成两个 Compose project（或使用编排平台的两个 stack）：
 
 ~~~text
-浏览器 -> 算力服务器 Nginx (443)
+浏览器 -> 算力服务器 Caddy (443)
                     |-> frontend 静态服务
                     |-> API / 直接导入 CLI / Keycloak
                     |       |-> TLS -> 数据服务器 PostgreSQL:5432
@@ -59,7 +59,7 @@ bootstrap、API、前端静态服务和同源 HTTPS Nginx。API 与前端只在 
 6. Keycloak 当前 Compose 配置是开发用 `start-dev`，不能作为生产身份服务；生产 Keycloak
    应使用外部数据库、正式 TLS、独立备份和不暴露 admin endpoint 的反向代理规则。
 
-算力服务器只有一台时，API、Nginx、前端和 Keycloak 共机是可接受的起步方案；要横向扩展
+算力服务器只有一台时，API、Caddy、前端和 Keycloak 共机是可接受的起步方案；要横向扩展
    API，需要共享 Redis 限流、共享数据库/RustFS endpoint，以及独立的 Keycloak/负载均衡策略。
 
 Compose 的无参数默认值用于开发或单机验收。生产模式不会降低传输安全要求：仍须使用
@@ -117,28 +117,19 @@ curl --insecure https://localhost/health/ready
 ~~~
 
 也可使用 `make stack-up`、`make stack-logs` 和 `make stack-down`。启动顺序由健康检查保证：
-PostgreSQL -> Alembic migration -> bootstrap -> API；RustFS 与前端 healthy 后才启动 Nginx。
+PostgreSQL -> Alembic migration -> bootstrap -> API；RustFS 与前端 healthy 后才启动 Caddy。
 `docker compose down` 保留 named volumes；只有显式 `docker compose down --volumes` 才删除
 数据库、对象存储、Keycloak 和自签名证书数据。
 
-默认未提供证书时，Nginx 在 `nginx-tls` named volume 生成 30 天自签名证书。这只适合本机
-验收。正式证书目录必须包含固定文件名：
-
-~~~text
-/secure/path/reaction-database-tls/
-|-- tls.crt    # 完整证书链
-`-- tls.key    # 对应私钥
-~~~
-
-生产 `.env` 至少设置：
+开发环境的 `CADDY_SERVER_NAME=localhost` 使用 Caddy 内置 CA；Caddy 状态保存在
+`caddy-data` 和 `caddy-config` named volume 中。生产环境必须将域名解析到算力服务器，并让
+TCP 80/443 可被 ACME issuer 访问，Caddy 会自动申请和续期证书。生产 `.env` 至少设置：
 
 ~~~dotenv
-NGINX_SERVER_NAME=app.example.com
-NGINX_TLS_DIRECTORY=/secure/path/reaction-database-tls
-NGINX_REQUIRE_PROVIDED_CERTIFICATE=true
-NGINX_BIND_ADDRESS=0.0.0.0
-NGINX_HTTP_PORT=80
-NGINX_HTTPS_PORT=443
+CADDY_SERVER_NAME=app.example.com
+CADDY_BIND_ADDRESS=0.0.0.0
+CADDY_HTTP_PORT=80
+CADDY_HTTPS_PORT=443
 
 # 容器内 API 使用这两个值；普通 TRICYCLE_* 变量仍由 API 读取。
 TRICYCLE_COMPOSE_DATABASE_URL=postgresql+psycopg://user:password@db-rw.internal.example/reactions?sslmode=verify-full
@@ -146,10 +137,9 @@ TRICYCLE_COMPOSE_RUSTFS_ENDPOINT_URL=https://s3.internal.example
 TRICYCLE_BOOTSTRAP_MODE=production
 ~~~
 
-`NGINX_REQUIRE_PROVIDED_CERTIFICATE=true` 使生产启动在证书缺失时直接失败，禁止静默回退到
-自签名证书。证书续期后执行 `docker compose restart nginx` 重新加载证书。不要将证书私钥放进镜像、仓库
-或 Compose environment。若 80/443 已由外部负载均衡器占用，可以覆盖端口，但 HTTP 跳转默认
-指向标准 443；非标准 HTTPS 端口的验收应直接访问该端口。
+不要删除或替换 `caddy-data`；其中包含 ACME 账户、证书和续期状态。若 80/443 已由外部负载均衡器
+占用，可以覆盖宿主机端口，但 ACME HTTP-01 仍需要由外部入口转发到 Caddy 的 HTTP 端口；正式
+环境不应关闭 TLS 校验或把 Caddy storage volume 放在临时目录。
 
 ### 4.1.1 两台机器：数据服务器 + 算力服务器
 
@@ -189,7 +179,7 @@ docker compose -f compose.data.yaml up -d --wait
 允许算力服务器私网地址使用 TLS + SCRAM。RustFS S3 API 只允许算力服务器访问，Console
 只绑定回环或管理网访问。
 
-算力服务器（运行 API、迁移、bootstrap、前端、Nginx 和开发 Keycloak）配置 `.env`：
+算力服务器（运行 API、迁移、bootstrap、前端、Caddy 和开发 Keycloak）配置 `.env`：
 
 ~~~dotenv
 COMPOSE_PROJECT_NAME=reaction-database-compute
@@ -271,7 +261,7 @@ Alembic 和 migrations，可单独执行 `docker compose run --rm migrate`。
 | `TRICYCLE_COMPOSE_DATABASE_URL` | Compose API 容器使用的 PostgreSQL URL | 容器运行时连接配置 |
 | `TRICYCLE_COMPOSE_RUSTFS_ENDPOINT_URL` | Compose API 容器使用的 S3 endpoint | 容器运行时连接配置 |
 | `TRICYCLE_RUSTFS_BUCKET` | 实际对象存储 bucket | 运行时存储配置 |
-| `NGINX_SERVER_NAME` / `NGINX_TLS_DIRECTORY` | HTTPS 域名和 `tls.crt`/`tls.key` 所在目录 | Compose 边缘入口配置 |
+| `CADDY_SERVER_NAME` / `CADDY_*_PORT` | HTTPS 域名、HTTP/HTTPS 监听端口和 ACME 证书状态 | Compose 边缘入口配置 |
 | `TRICYCLE_OIDC_CA_BUNDLE` / `TRICYCLE_RUSTFS_CA_BUNDLE` / `TRICYCLE_SMTP_CA_BUNDLE` | 私有 CA 的绝对 PEM 路径 | 可选 TLS 信任链 |
 | `TRICYCLE_BOOTSTRAP_ORGANIZATION_*` | 初始组织 slug 和显示名 | 首次 bootstrap 注入 |
 | `TRICYCLE_BOOTSTRAP_PROJECT_*` | 初始项目 slug 和显示名 | 首次 bootstrap 注入 |
@@ -448,7 +438,7 @@ uv run tricycle-bootstrap --mode production
    Sentinel-aware proxy 或 VIP 暴露稳定的 `redis-rw.internal.example`。限流窗口可重建，但部署方
    仍必须监控可用性和容量并演练 endpoint 切换。
 6. EDGE 将 `/api`、`/health`、`/graphql`、`/mcp` 和 `/nexusx` 负载均衡到 API 节点；
-   MCP 关闭 buffering 并保持 3600 秒 timeout。不能把每台 Nginx 的内存 zone 当作全局额度。
+   MCP 关闭 buffering 并保持 3600 秒 timeout。Caddy 不在边缘重复实现全局限流。
 7. 在独立 scheduler 节点以单实例运行 `tricycle-auth-session-cleanup` 和
    `tricycle-rustfs-gc`。这些 CLI 也读取 `TRICYCLE_ENVIRONMENT`，生产环境下独立 RustFS
    配置同样拒绝 HTTP endpoint 或关闭 TLS 校验；数据库备份与对象存储备份独立执行，但使用
@@ -471,21 +461,17 @@ uv run tricycle-bootstrap --mode production
 负责。应用连接池会在逻辑 endpoint 切换后通过 `pool_pre_ping` 淘汰失效 PostgreSQL 连接；这不
 替代数据库层对脑裂、事务复制和只读节点误路由的防护。
 
-EDGE 节点可直接使用 `infra/nginx/tricycle.conf`。单机时保留 upstream 中的
+EDGE 节点可直接使用 `infra/caddy/Caddyfile`。单机时保留 `CADDY_API_UPSTREAM` 中的
 `127.0.0.1:8000`；多机时删除该成员并启用实际 API 节点，例如：
 
-~~~nginx
-upstream reaction_database_api {
-    least_conn;
-    server api01.internal.example:8000 max_fails=3 fail_timeout=10s;
-    server api02.internal.example:8000 max_fails=3 fail_timeout=10s;
-    keepalive 32;
-}
+~~~dotenv
+CADDY_API_UPSTREAM="api01.internal.example:8000 api02.internal.example:8000"
+CADDY_FRONTEND_UPSTREAM=frontend.internal.example:8080
 ~~~
 
 每台 EDGE 必须使用相同 upstream 成员和代理规则。若有多台 EDGE，健康检查和故障摘除应
-由它们前面的云负载均衡协调；全局请求预算由 API/MCP worker 共用的 Redis 保证，Nginx 的
-内存限流区只能作为单个 EDGE 进程组的额外防线。API 节点本身无状态，但会话、权限和科学数据都依赖同一 PostgreSQL，原始
+由它们前面的云负载均衡协调；全局请求预算由 API/MCP worker 共用的 Redis 保证，Caddy 不增加
+第二套请求限流。API 节点本身无状态，但会话、权限和科学数据都依赖同一 PostgreSQL，原始
 文件都依赖同一逻辑 S3 bucket，因此不能为每个 API 节点配置彼此独立的数据后端。
 
 API 节点的关键连接配置示例：
@@ -654,7 +640,7 @@ VITE_CSRF_HEADER_NAME=x-example-chemistry-csrf \
 npm --prefix frontend run build
 ~~~
 
-构建结果在 frontend/dist，由 Nginx/Caddy/静态服务器提供。开发代理目标由
+构建结果在 frontend/dist，由 Caddy/静态服务器提供（前端镜像内部仍可使用 Nginx）。开发代理目标由
 VITE_API_PROXY_TARGET 控制，生产不应把开发端口暴露给浏览器。
 
 ### 代理路径
@@ -676,10 +662,10 @@ VITE_API_PROXY_TARGET 控制，生产不应把开发端口暴露给浏览器。
 SPA 必须启用 history fallback 到 index.html。上传请求的代理 body 限制不能小于
 TRICYCLE_MAX_BATCH_BYTES，当前默认批次总大小为 256 MiB；单文件默认 64 MiB。
 
-可以从 infra/nginx/tricycle.conf 开始配置。当前示例已经显式代理 `/health/live`、
+可以从 infra/caddy/Caddyfile 开始配置。当前示例已经显式代理 `/health/live`、
 `/health/ready`、`/docs`、`/docs/oauth2-redirect`、`/redoc`、`/openapi.json`、GraphQL
-和 `/nexusx/*`，并包含 `/api/` 的 `private, no-store`、272 MiB multipart body 限制和
-MCP 的 `proxy_buffering off`/3600 秒超时。正式配置必须保留这些代理路由和缓存边界；否则健康检查可能被
+和 `/nexusx/*`，并包含 `/api/` 的 `private, no-store`、应用侧批次大小校验和
+MCP 的无缓冲/3600 秒超时。正式配置必须保留这些代理路由和缓存边界；否则健康检查可能被
 SPA fallback 接管，或 MCP 长连接被短超时/缓冲截断。
 
 如果外层使用 Cloudflare，必须为 /api/* 建立 bypass cache 规则。不能只依赖应用返回的
@@ -701,10 +687,11 @@ uv run tricycle-api
 ~~~
 
 API 默认只监听 127.0.0.1:8000，由反向代理对外提供 HTTPS。`infra/systemd/` 提供可直接安装
-的单进程 API service；生产通过多个 API 主机和 Nginx upstream 横向扩容。当前 Prometheus
+的单进程 API service；生产通过多个 API 主机和 Caddy upstream 横向扩容。当前 Prometheus
 指标是进程内状态，不应在同一个监听端口启动 Uvicorn 多 worker，否则抓取请求只会随机命中
 其中一个 worker。若未来引入 Prometheus multiprocess 聚合，同机多 worker 仍必须按
-“worker 数 × TRICYCLE_MOLOP_PARSE_SLOTS × TRICYCLE_MOLOP_BATCH_N_JOBS”评估 CPU 和内存。
+“Uvicorn worker 数 × TRICYCLE_MOLOP_BATCH_N_JOBS”评估 MolOP 解析进程的 CPU 和内存；
+`TRICYCLE_MOLOP_PARSE_SLOTS` 是每个 API worker 的请求级并发闸门，只决定排队，不会额外创建解析进程。
 生产不得设置 `TRICYCLE_MOLOP_BATCH_N_JOBS=-1`。
 
 ## 12. 定时任务、备份与验收
@@ -748,7 +735,7 @@ curl -fsS https://<app-host>/health/live
 curl -fsS https://<app-host>/health/ready
 uv run alembic current
 uv run alembic check
-nginx -t
+caddy validate --config infra/caddy/Caddyfile --adapter caddyfile
 ~~~
 
 并完成一次真实 OIDC 登录、退出、项目邀请邮件、邀请接受、artifact 上传/下载和备份恢复

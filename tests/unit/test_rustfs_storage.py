@@ -166,6 +166,29 @@ def test_versioned_put_and_reads_use_the_exact_s3_version() -> None:
     )
 
 
+def test_put_file_streams_an_inspected_spool_source(tmp_path: Path) -> None:
+    payload = b"streamed artifact\n"
+    source = tmp_path / "artifact.log"
+    source.write_bytes(payload)
+    client = _VersionedClient(payload)
+    store = RustFSObjectStore(
+        RustFSSettings(_env_file=None, bucket="streamed-artifacts"),
+        client=client,  # type: ignore[arg-type]
+    )
+
+    metadata = store.put_file(
+        key="raw/streamed.log",
+        path=source,
+        content_sha256=sha256(payload).hexdigest(),
+        size_bytes=len(payload),
+    )
+
+    request = client.requests[0][1]
+    assert metadata.size == len(payload)
+    assert request["ContentLength"] == len(payload)
+    assert not isinstance(request["Body"], bytes)
+
+
 def test_rustfs_settings_reject_relative_endpoint() -> None:
     with pytest.raises(ValidationError):
         RustFSSettings(_env_file=None, endpoint_url="rustfs:9000")

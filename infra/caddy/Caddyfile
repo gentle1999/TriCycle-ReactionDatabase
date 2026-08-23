@@ -1,0 +1,120 @@
+{
+	# Caddy obtains/renews the certificate for the configured site name. The
+	# explicit HTTP site below owns the 308 redirect so port overrides remain
+	# deterministic in local probes; production should leave them at 80/443.
+	http_port {$CADDY_HTTP_PORT:80}
+	https_port {$CADDY_HTTPS_PORT:443}
+	auto_https disable_redirects
+}
+
+http://{$CADDY_SERVER_NAME:localhost}:{$CADDY_HTTP_PORT:80} {
+	redir https://{host}:{$CADDY_HTTPS_PORT:443}{uri} 308
+}
+
+{$CADDY_SERVER_NAME:localhost} {
+	# Long uploads and MCP streams are governed by the application. Caddy does
+	# not add a request-body limit and keeps upstream responses unbuffered.
+	header {
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+
+	@internal path /internal/*
+	handle @internal {
+		respond 404
+	}
+
+	@api path /api /api/*
+	header @api Cache-Control "private, no-store"
+	handle @api {
+		reverse_proxy {$CADDY_API_UPSTREAM:api:8000} {
+			transport http {
+				keepalive 32s
+				response_header_timeout 1h
+				read_timeout 1h
+				write_timeout 1h
+			}
+		}
+	}
+
+	@editor path /editor/chemdoodle-editor.html
+	handle @editor {
+		header Content-Security-Policy "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'"
+		reverse_proxy {$CADDY_FRONTEND_UPSTREAM:frontend:8080}
+	}
+
+	@health_live path /health/live
+	@health_ready path /health/ready
+	@docs path /docs /docs/oauth2-redirect /redoc /openapi.json
+	@graphql path /graphql /graphql/*
+	@nx_graphql path /nexusx/graphql /nexusx/graphql/*
+	@nx_core path /nexusx/core /nexusx/core/*
+	@nx_paged_graphql path /nexusx/paginated-graphql /nexusx/paginated-graphql/*
+	@nx_mcp path /nexusx/mcp /nexusx/mcp/*
+	@nx_rest path /nexusx/rest /nexusx/rest/*
+	@nx_voyager path /nexusx/voyager /nexusx/voyager/*
+	@mcp path /mcp /mcp/*
+
+	# Explicit API routes prevent health/docs/GraphQL requests from falling
+	# through to the SPA. The NexusX URI transforms mirror the old edge rules.
+	handle @health_live {
+		reverse_proxy {$CADDY_API_UPSTREAM:api:8000}
+	}
+	handle @health_ready {
+		reverse_proxy {$CADDY_API_UPSTREAM:api:8000}
+	}
+	handle @docs {
+		reverse_proxy {$CADDY_API_UPSTREAM:api:8000}
+	}
+	handle @graphql {
+		reverse_proxy {$CADDY_API_UPSTREAM:api:8000}
+	}
+	handle @nx_graphql {
+		uri strip_prefix /nexusx
+		reverse_proxy {$CADDY_API_UPSTREAM:api:8000}
+	}
+	handle @nx_core {
+		uri strip_prefix /nexusx/core
+		reverse_proxy {$CADDY_API_UPSTREAM:api:8000}
+	}
+	handle @nx_paged_graphql {
+		uri replace /nexusx/paginated-graphql /graphql
+		reverse_proxy {$CADDY_API_UPSTREAM:api:8000}
+	}
+	handle @mcp {
+		reverse_proxy {$CADDY_API_UPSTREAM:api:8000} {
+			flush_interval -1
+			transport http {
+				keepalive 32s
+				response_header_timeout 1h
+				read_timeout 1h
+				write_timeout 1h
+			}
+		}
+	}
+	handle @nx_mcp {
+		uri replace /nexusx/mcp /mcp
+		reverse_proxy {$CADDY_API_UPSTREAM:api:8000} {
+			flush_interval -1
+			transport http {
+				keepalive 32s
+				response_header_timeout 1h
+				read_timeout 1h
+				write_timeout 1h
+			}
+		}
+	}
+	handle @nx_rest {
+		uri strip_prefix /nexusx/rest
+		reverse_proxy {$CADDY_API_UPSTREAM:api:8000}
+	}
+	handle @nx_voyager {
+		uri replace /nexusx/voyager /voyager
+		reverse_proxy {$CADDY_API_UPSTREAM:api:8000}
+	}
+
+	# The frontend container owns the built SPA and its history fallback.
+	handle {
+		reverse_proxy {$CADDY_FRONTEND_UPSTREAM:frontend:8080}
+	}
+}

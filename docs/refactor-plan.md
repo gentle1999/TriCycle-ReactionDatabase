@@ -22,7 +22,7 @@
 | 优先级 | 当前风险 | 目标 |
 | --- | --- | --- |
 | P0 | visibility scope、REST/GraphQL/MCP/depiction 授权矩阵已实现并有 integration 回归；真实公网缓存绕过仍需目标代理演练 | 所有传输面共享 artifact-rooted visibility；跨项目对象不可枚举 |
-| P1 | Nginx 路径、MCP 流式代理和内部 metrics 已通过本地真实运行探针；真实公网 TLS 入口仍需部署验证 | 生产入口与应用实际路由一致，MCP 可稳定长连接/流式返回 |
+| P1 | Caddy 路径、MCP 流式代理和内部 metrics 已通过本地真实运行探针；真实公网 TLS 入口仍需部署验证 | 生产入口与应用实际路由一致，MCP 可稳定长连接/流式返回 |
 | P1 | 生产安全配置和 Redis 共享限流已在代码中 fail-closed，但真实 PostgreSQL/RustFS/Redis TLS、SMTP STARTTLS 和多节点切换尚未部署验证 | 在目标拓扑验证 TLS、共享额度、容量和故障切换 |
 | P1 | 代码、CI、前端 fixture 和运维 unit 已形成发布门；真实生产恢复、告警触发和 RTO/RPO 仍缺记录 | 每次发布有可重复的代码、数据库、前端和运维证据 |
 | P2 | OIDC provision、`create_reaction` 全局 curator 和 Cookie CSRF 策略已书面化并有回归测试；真实 OIDC authorization-code 仍需部署验证 | 认证、provision、写入和会话安全策略明确且有回归测试 |
@@ -129,7 +129,7 @@ TRICYCLE_RUN_DATABASE_TESTS=1 uv run pytest -q tests/integration -k 'auth or ses
 
 **产物：** `docs/identity-provider-decision.md` 补充决策、认证/授权矩阵和回归测试。
 
-### R3：生产配置 fail-closed 与 Nginx/MCP/health 代理
+### R3：生产配置 fail-closed 与 Caddy/MCP/health 代理
 
 **目标：** 让生产配置错误在启动或部署检查阶段失败，而不是上线后暴露。
 
@@ -139,25 +139,25 @@ TRICYCLE_RUN_DATABASE_TESTS=1 uv run pytest -q tests/integration -k 'auth or ses
 - PostgreSQL 连接启用并验证 SSL（托管服务 CA/`sslmode=verify-full` 或等价 psycopg 参数）。
 - RustFS/S3 强制 HTTPS 和 TLS 校验；私有 bucket，不暴露 Console/API。
 - SMTP 生产强制 STARTTLS，验证发件人域名；对仅支持 465 的服务商明确不兼容或增加 SMTP_SSL 适配器。
-- Nginx 明确代理 `/health/live`、`/health/ready`、`/redoc`、`/docs/oauth2-redirect`、`/openapi.json`、`/graphql*` 和 `/nexusx/*`；MCP 设置 `proxy_buffering off`、长 `proxy_read_timeout` 和正确的 HTTP/1.1 headers。
+- Caddy 明确代理 `/health/live`、`/health/ready`、`/redoc`、`/docs/oauth2-redirect`、`/openapi.json`、`/graphql*` 和 `/nexusx/*`；MCP 关闭缓冲、设置长超时并保留 HTTP/1.1 长连接。
 - 代理 body 限制不小于应用批次上限；API 默认 `private, no-store`，SPA history fallback 不得接管健康检查。
 
 **验收命令：**
 
 ```bash
 uv run pytest -q tests -k 'config or proxy or health or mcp'
-nginx -t -c "$PWD/infra/nginx/tricycle.conf"
-python scripts/validate_nginx_runtime.py
+caddy validate --config "$PWD/infra/caddy/Caddyfile" --adapter caddyfile
+python scripts/validate_caddy_runtime.py
 promtool check rules infra/monitoring/prometheus-rules.yml
 curl -fsS http://127.0.0.1:8000/health/live
 curl -fsS http://127.0.0.1:8000/health/ready
 ```
 
-**通过标准：** production 配置缺少任一安全项时启动失败；Nginx 每个路径返回真实上游状态而非 index.html；MCP 流式响应不被缓冲或短超时截断；真实 HTTPS OIDC callback、SMTP 邀请和 RustFS HEAD/GET 验证通过。
+**通过标准：** production 配置缺少任一安全项时启动失败；Caddy 每个路径返回真实上游状态而非 index.html；MCP 流式响应不被缓冲或短超时截断；真实 HTTPS OIDC callback、SMTP 邀请和 RustFS HEAD/GET 验证通过。
 
 **阻塞条件：** 上游托管 PostgreSQL/S3/SMTP 无法提供 TLS 验证、OIDC issuer 不支持 PKCE，或反向代理无法保留同源 Cookie。
 
-**产物：** `docs/deployment-configuration.md` 的生产检查表、Nginx 配置测试和部署 smoke log。
+**产物：** `docs/deployment-configuration.md` 的生产检查表、Caddy 配置测试和部署 smoke log。
 
 ### R4：查询性能、限流、上传资源和多 worker 容量
 
@@ -167,7 +167,8 @@ curl -fsS http://127.0.0.1:8000/health/ready
 
 - 继续使用数据库 statement timeout、GraphQL 深度/复杂度、结构候选集和分页上限。
 - 多 worker 使用 Redis 共享固定窗口限流；HTTP 与 MCP 共用 Lua 原子 `INCR + EXPIRE` 预算，生产只接受 `rediss://`，后端故障返回 503。
-- 按 `worker 数 × parse slots × n_jobs` 计算 CPU/内存；压缩输入同时限制解压后大小；上传采用受控 spool，避免整批 bytes 常驻内存。
+- 按 `Uvicorn worker 数 × n_jobs` 计算 MolOP 解析池的 CPU/内存；`parse slots` 只限制请求级排队。
+  压缩输入同时限制解压后大小；上传采用受控 spool，避免整批 bytes 常驻内存。
 - 为 Topology、Artifact、Geometry 和 reaction 搜索保存代表性 `EXPLAIN (ANALYZE, BUFFERS)`。
 
 **验收命令：**
@@ -349,10 +350,10 @@ discovery/JWKS/PKCE、PostgreSQL TLS/writer/RDKit、RustFS bucket versioning、R
 | R0 | `done` | `git status --short`；隔离 bootstrap；`uv run --frozen pytest -q tests/integration` 中授权 fixture 与清理边界通过 | 生产数据分类和审批仍需部署方在上线单中确认 |
 | R1 | `done` | Topology 列表改用 visibility-scoped 分页服务；完整 integration `113 passed`，覆盖 REST/GraphQL/MCP/depiction 授权 | 真实公网共享缓存绕过仍需在目标代理演练 |
 | R2 | `done` | `uv run --frozen pytest -q`：`269 passed, 112 skipped`；integration：`113 passed`；OIDC provision、system-curator `create_reaction`、Session CSRF 和 MCP 仅 `/mcp/` 的决策见 `docs/identity-provider-decision.md` 与 `docs/security-query-identity-remediation-plan.md` | 真实 OIDC authorization-code、邀请邮件和跨域 Cookie 仍需生产身份服务验证 |
-| R3 | `in_progress` | config/reverse-proxy focused tests通过；真实 Nginx 1.24 `nginx -t` 通过；运行探针通过 16 条代理/重写路径、`/internal` 404 和 MCP 首块直出；Prometheus 规则由 promtool 2.45 检查通过；部署显示名、Cookie/header 名可由环境变量覆盖，多节点 DB/S3/Redis/OIDC/SMTP 通过稳定逻辑 endpoint 接入的模板已由 production Settings 实际解析；API 与 scheduler 使用的 RustFSSettings 均在 production 拒绝 HTTP/关闭 TLS（scheduler fail-closed 单测覆盖 HTTP endpoint 和 `verify_tls=false` 两种路径）；新增 `tricycle-deployment-smoke`，SMTP 强制验证 TLS context/主机名，OIDC discovery/token/JWKS 支持私有 CA | 真实 HTTPS OIDC authorization-code、SMTP 邀请、PostgreSQL/RustFS/Redis 私有 CA、多节点切换和公网 edge 仍需部署演练 |
-| R4 | `in_progress` | `make benchmark-upload-resources` 仍保留本地快速测量；新增 `upload-resource-benchmark-v1` 输出节点、UTC、fixture SHA-256 和 1/8/32 结果，新增 `upload-limit-probe-v1` 记录重复超限请求在解析/RustFS 前稳定返回 413，新增 `query-plan-evidence-v1` 生成器保存目标数据库版本、核心表行数、10 条完整 `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`、命中索引和顺序扫描例外；新增双 API 节点 `shared-rate-limit-v1` 与 Redis 故障 `rate-limit-fail-closed-v1` HTTPS 探针；validator 重新计算观察值、计划树、行数和响应契约；真实 Redis 7.0 明文 loopback 及本轮 Redis 6.0.16 + 临时 CA/SAN 的 `rediss://` 共享 limiter 均为 `2 passed`，HTTP/MCP 共用 Lua 原子固定窗口，生产要求 TLS、零客户端重试且故障 fail-closed | 当前 PostgreSQL 容器凭据与 `.env.example` 不一致，query-plan capture 未能在默认环境运行；真实多 API 节点 Redis/TLS 故障切换、上传超限探针和目标规模 planner 结果仍需部署环境证据 |
+| R3 | `in_progress` | config/reverse-proxy focused tests通过；Caddy 2.10 `validate` 通过；运行探针通过 17 条代理/重写路径、HTTPS 跳转、`/internal` 404、API 缓存边界和 MCP 首块直出；Prometheus 规则由 promtool 2.45 检查通过；部署显示名、Cookie/header 名可由环境变量覆盖，多节点 DB/S3/Redis/OIDC/SMTP 通过稳定逻辑 endpoint 接入的模板已由 production Settings 实际解析；API 与 scheduler 使用的 RustFSSettings 均在 production 拒绝 HTTP/关闭 TLS（scheduler fail-closed 单测覆盖 HTTP endpoint 和 `verify_tls=false` 两种路径）；新增 `tricycle-deployment-smoke`，SMTP 强制验证 TLS context/主机名，OIDC discovery/token/JWKS 支持私有 CA | 真实 HTTPS OIDC authorization-code、SMTP 邀请、PostgreSQL/RustFS/Redis 私有 CA、多节点切换和公网 edge 仍需部署演练 |
+| R4 | `in_progress` | `make benchmark-upload-resources` 仍保留本地快速测量；`upload-resource-benchmark-v2` 输出节点、UTC、fixture SHA-256、1/8/32 结果及输入准备/MolOP 解析/总耗时分布，validator 复核每个阶段非负；新增 `upload-limit-probe-v1` 记录重复超限请求在解析/RustFS 前稳定返回 413，新增 `query-plan-evidence-v1` 生成器保存目标数据库版本、核心表行数、10 条完整 `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`、命中索引和顺序扫描例外；新增双 API 节点 `shared-rate-limit-v1` 与 Redis 故障 `rate-limit-fail-closed-v1` HTTPS 探针；validator 重新计算观察值、计划树、行数和响应契约；真实 Redis 7.0 明文 loopback 及本轮 Redis 6.0.16 + 临时 CA/SAN 的 `rediss://` 共享 limiter 均为 `2 passed`，HTTP/MCP 共用 Lua 原子固定窗口，生产要求 TLS、零客户端重试且故障 fail-closed | 当前 PostgreSQL 容器凭据与 `.env.example` 不一致，query-plan capture 未能在默认环境运行；真实多 API 节点 Redis/TLS 故障切换、上传超限探针和目标规模 planner 结果仍需部署环境证据 |
 | R5 | `done` | 默认前端 typecheck/build 通过；自定义应用/品牌/MCP 名称、HTML title 和 CSRF Cookie/header 的生产构建通过；DA seed integration `1 passed`；隔离 API `18001` + 干净 DA fixture 的完整 Playwright `45 passed`；独立 validator 在 seed 前校验 manifest v3、4 个日志的压缩/解压 hash 与大小，以及 3 个 metadata JSON 的 hash 与大小；CI 已分离默认测试、PostgreSQL/RDKit、RustFS、frontend build、Playwright、Alembic、Redis、operations config 和 audit job | 远端 GitHub Actions 首次执行报告仍需随 pull request 留存；不能退回默认空库运行 E2E |
-| R6 | `in_progress` | 隔离恢复后领域记录和 4/4 Artifact 对象校验一致；新增只读 `tricycle-validate-restore` 全量校验表计数与精确 S3 `VersionId`/长度/metadata/content SHA-256，支持备份切点 `source-manifest.json` 与恢复侧 `--expected-manifest` 的确定性 Artifact 清单摘要/行数比对，versioned RustFS 真实契约 `2 passed`；恢复清单单测 `5 passed`，部分校验明确返回 `succeeded=false`；`/internal/metrics` 指标齐全，公网 Nginx 禁止 `/internal/`；21 条告警经 promtool 触发/恢复测试通过，三个 service 和两个 timer 隔离校验通过；新增 `deployment-acceptance-v1` JSON Schema/validator，校验两节点 smoke、六类切换、六项用户流程、五类告警、OIDC/secret/backup receipt、source/restore manifests 和由时间戳推导的 RTO/RPO | 本地恢复未测量生产 RTO/RPO；真实 OIDC realm/签名密钥、SMTP、告警触发恢复和生产备份对象版本恢复仍须部署演练；空白 Markdown 模板和本地 Compose 结果不能通过 validator |
+| R6 | `in_progress` | 隔离恢复后领域记录和 4/4 Artifact 对象校验一致；新增只读 `tricycle-validate-restore` 全量校验表计数与精确 S3 `VersionId`/长度/metadata/content SHA-256，支持备份切点 `source-manifest.json` 与恢复侧 `--expected-manifest` 的确定性 Artifact 清单摘要/行数比对，versioned RustFS 真实契约 `2 passed`；恢复清单单测 `5 passed`，部分校验明确返回 `succeeded=false`；`/internal/metrics` 指标齐全，公网 Caddy 禁止 `/internal/`；21 条告警经 promtool 触发/恢复测试通过，三个 service 和两个 timer 隔离校验通过；新增 `deployment-acceptance-v1` JSON Schema/validator，校验两节点 smoke、六类切换、六项用户流程、五类告警、OIDC/secret/backup receipt、source/restore manifests 和由时间戳推导的 RTO/RPO | 本地恢复未测量生产 RTO/RPO；真实 OIDC realm/签名密钥、SMTP、告警触发恢复和生产备份对象版本恢复仍须部署演练；空白 Markdown 模板和本地 Compose 结果不能通过 validator |
 | R7 | `done` | `tricycle_integration_20260819_r6` 从空库执行 `uv run --frozen alembic upgrade head`；`alembic current`/`heads` 均为 `0001_initial_schema (head)`；当前开发库 `alembic check`：`No new upgrade operations detected`；bootstrap 双跑幂等 | `alembic check` 仍有 RDKit custom type/computed default 警告，但没有漂移操作 |
 
 ### 全树门禁
@@ -375,7 +376,7 @@ uvx --from pip-audit==2.10.1 pip-audit ...            PASS (no known vulnerabili
 python scripts/audit_vendored_assets.py              PASS (4 assets)
 uv lock --check                                      PASS
 docker compose config --quiet                       PASS
-nginx 1.24 syntax + runtime proxy probe              PASS (16 paths + MCP streaming)
+Caddy 2.10 syntax + runtime proxy probe              PASS (17 paths + HTTPS redirect + MCP streaming)
 promtool 2.45 check/test rules                       PASS (21 rules)
 systemd-analyze verify infra/systemd/*                PASS (3 services + 2 timers)
 ```
@@ -433,7 +434,7 @@ R3/R4/R6 的仓库验收工具增量（2026-08-20）：`tricycle-deployment-smok
 `deployment-acceptance-v1` 模型，禁止 `PENDING`、重复/越界附件和不一致 RTO/RPO，并重新计算
 所有附件 SHA-256/大小。R4 证据必须分别由
 `scripts/benchmark_upload_resources.py --output`、`scripts/capture_query_plan_evidence.py` 和
-`scripts/probe_shared_rate_limit.py` 生成；validator 要求 `upload-resource-benchmark-v1`、
+`scripts/probe_shared_rate_limit.py` 生成；validator 要求 `upload-resource-benchmark-v2`、
 `upload-limit-probe-v1`、`query-plan-evidence-v1`、`shared-rate-limit-v1`、
 `rate-limit-fail-closed-v1`，不接受人工自报字段。validator 会从完整计划树和逐节点 HTTP 观察
 重新计算 accepted/index/scan、共享预算和 503 fail-closed，而不是信任布尔字段。相关

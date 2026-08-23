@@ -23,9 +23,11 @@ from tricycle_reaction_db.application.services.audit import AuditService
 from tricycle_reaction_db.application.services.authentication import current_principal
 from tricycle_reaction_db.application.services.authorization import AuthorizationService
 from tricycle_reaction_db.application.services.molecular_geometry import (
+    GeometryPersistenceContext,
     persist_molecular_topology,
 )
 from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
+    ReconciliationBatchCache,
     reconcile_mapped_reaction_with_geometries,
     resolve_endpoint_node,
 )
@@ -65,6 +67,9 @@ class _ResolvedComponent:
 def _resolve_components(
     session: Session,
     definition: rdChemReactions.ChemicalReaction,
+    *,
+    topology_context: GeometryPersistenceContext | None = None,
+    include_creation_metadata: bool = True,
 ) -> tuple[list[_ResolvedComponent], int]:
     components: list[_ResolvedComponent] = []
     topologies_created = 0
@@ -83,15 +88,23 @@ def _resolve_components(
                     "template_index": template_index,
                 },
             )
-            existing = session.exec(
-                select(MolecularTopology).where(
-                    MolecularTopology.identity_schema_version
-                    == normalized.topology.identity_schema_version,
-                    MolecularTopology.graph_hash == normalized.topology.graph_hash,
-                )
-            ).first()
-            persisted = persist_molecular_topology(session, normalized)
-            if existing is None:
+            existing = (
+                session.exec(
+                    select(MolecularTopology).where(
+                        MolecularTopology.identity_schema_version
+                        == normalized.topology.identity_schema_version,
+                        MolecularTopology.graph_hash == normalized.topology.graph_hash,
+                    )
+                ).first()
+                if include_creation_metadata
+                else None
+            )
+            persisted = persist_molecular_topology(
+                session,
+                normalized,
+                context=topology_context,
+            )
+            if include_creation_metadata and existing is None:
                 topologies_created += 1
             components.append(
                 _ResolvedComponent(
@@ -166,9 +179,22 @@ def _automatic_reaction_label(
     )
 
 
-def _create_reaction(session: Session, command: CreateReactionCommand) -> CreateReactionResult:
+def _create_reaction(
+    session: Session,
+    command: CreateReactionCommand,
+    *,
+    defer_thermodynamic_refresh: bool = False,
+    topology_context: GeometryPersistenceContext | None = None,
+    include_creation_metadata: bool = True,
+    reconciliation_cache: ReconciliationBatchCache | None = None,
+) -> CreateReactionResult:
     definition = _reaction_from_representation(command.reaction)
-    components, topologies_created = _resolve_components(session, definition)
+    components, topologies_created = _resolve_components(
+        session,
+        definition,
+        topology_context=topology_context,
+        include_creation_metadata=include_creation_metadata,
+    )
     mapping_complete = _has_complete_mapping(components)
     identities = [(component.side, component.topology, 1) for component in components]
     reaction_hash = reaction_hash_for_participants(identities)
@@ -219,12 +245,16 @@ def _create_reaction(session: Session, command: CreateReactionCommand) -> Create
 
     canonical_smiles = rdChemReactions.ReactionToSmiles(definition, True)
     mapping_hash = sha256(canonical_smiles.encode("utf-8")).hexdigest()
-    existing_mapped = session.exec(
-        select(MappedReaction).where(
-            MappedReaction.logical_reaction_id == logical_reaction.id,
-            MappedReaction.mapping_hash == mapping_hash,
-        )
-    ).first()
+    existing_mapped = (
+        session.exec(
+            select(MappedReaction).where(
+                MappedReaction.logical_reaction_id == logical_reaction.id,
+                MappedReaction.mapping_hash == mapping_hash,
+            )
+        ).first()
+        if include_creation_metadata
+        else None
+    )
     mapped_reaction = persist_mapped_reaction(
         session,
         logical_reaction,
@@ -240,13 +270,20 @@ def _create_reaction(session: Session, command: CreateReactionCommand) -> Create
         session,
         mapped_reaction,
         LogicalReactionParticipantSide.REACTANT,
+        cache=reconciliation_cache,
     )
     product_node = resolve_endpoint_node(
         session,
         mapped_reaction,
         LogicalReactionParticipantSide.PRODUCT,
+        cache=reconciliation_cache,
     )
-    reconcile_mapped_reaction_with_geometries(session, mapped_reaction)
+    reconcile_mapped_reaction_with_geometries(
+        session,
+        mapped_reaction,
+        refresh_thermodynamics=not defer_thermodynamic_refresh,
+        cache=reconciliation_cache,
+    )
     return CreateReactionResult(
         logical_reaction_id=_require_id(logical_reaction, label="LogicalReaction"),
         mapped_reaction_id=_require_id(mapped_reaction, label="MappedReaction"),
@@ -257,7 +294,7 @@ def _create_reaction(session: Session, command: CreateReactionCommand) -> Create
         topologies_created=topologies_created,
         mapping_complete=True,
         logical_reaction_created=logical_created,
-        mapped_reaction_created=existing_mapped is None,
+        mapped_reaction_created=(existing_mapped is None if include_creation_metadata else False),
     )
 
 

@@ -12,7 +12,7 @@ from tricycle_reaction_db.application.dtos import (
     ScientificArrayAssignmentRecord,
     ScientificArrayRecord,
 )
-from tricycle_reaction_db.db.types import summarize_numpy_array
+from tricycle_reaction_db.db.types import encode_numpy_array, summarize_numpy_array
 from tricycle_reaction_db.domain.enums import (
     ElectronicStateSetKind,
     ScientificArrayKind,
@@ -41,7 +41,9 @@ def _record(
     ordinal: int = 0,
     metadata: dict[str, Any] | None = None,
 ) -> ScientificArrayRecord:
-    summary = summarize_numpy_array(data)
+    encoded_data, _ = encode_numpy_array(data)
+    encoded_data.setflags(write=False)
+    summary = summarize_numpy_array(encoded_data)
     array_metadata: dict[str, Any] = {
         "source": "molop",
         "source_field": source_field,
@@ -57,7 +59,7 @@ def _record(
         shape=list(summary.shape),
         array_nbytes=summary.nbytes,
         payload_sha256=summary.sha256,
-        data=data,
+        data=encoded_data,
         metadata_schema_version=_ARRAY_METADATA_SCHEMA_VERSION,
         array_metadata=array_metadata,
     )

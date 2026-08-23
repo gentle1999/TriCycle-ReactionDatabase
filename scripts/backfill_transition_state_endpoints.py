@@ -11,7 +11,7 @@ from uuid import UUID
 from sqlalchemy import delete, text
 from sqlmodel import col, select
 
-from tricycle_reaction_db.application.services.transition_state_uploads import (
+from tricycle_reaction_db.application.services.artifact_uploads import (
     TS_PRE_POST_MAX_RATIO,
     TS_PRE_POST_MIN_RATIO,
     TS_PRE_POST_STEPS,

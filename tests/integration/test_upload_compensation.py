@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlmodel import Session
 
-from tricycle_reaction_db.application.services.transition_state_uploads import (
+from tricycle_reaction_db.application.services.artifact_uploads import (
     _compensate_upload,
     _RetiredArtifactReservation,
 )
