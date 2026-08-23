@@ -236,14 +236,9 @@ async def import_files(
             )
         )
 
-    for batch in iter_batches(
-        [candidate for candidate, _ in pending],
-        max_files=settings.max_batch_files,
-        max_bytes=settings.max_batch_bytes,
-    ):
-        fingerprints = {
-            candidate.path: fingerprint for candidate, fingerprint in pending if candidate in batch
-        }
+    fingerprints = dict(pending)
+
+    async def import_batch(batch: list[ImportCandidate]) -> ImportSummary:
         payloads = [
             ArtifactUploadPayload(
                 filename=candidate.path.name,
@@ -264,14 +259,36 @@ async def import_files(
                 project_id=project_id,
                 user_id=user_id,
             )
+        except ValueError as error:
+            if len(batch) > 1:
+                midpoint = len(batch) // 2
+                print(
+                    f"batch failed ({error}); retrying as {midpoint} and "
+                    f"{len(batch) - midpoint} files",
+                    file=sys.stderr,
+                )
+                first = await import_batch(batch[:midpoint])
+                second = await import_batch(batch[midpoint:])
+                return first.add(second)
+            candidate = batch[0]
+            state.append(
+                _record(
+                    candidate,
+                    fingerprints[candidate],
+                    project_id=project_id,
+                    artifact_kind=artifact_kind,
+                    status="failed",
+                    error=str(error) or type(error).__name__,
+                )
+            )
+            return ImportSummary(attempted=1, failed=1)
         except Exception as error:
             message = str(error) or type(error).__name__
             for candidate in batch:
-                fingerprint = fingerprints[candidate.path]
                 state.append(
                     _record(
                         candidate,
-                        fingerprint,
+                        fingerprints[candidate],
                         project_id=project_id,
                         artifact_kind=artifact_kind,
                         status="failed",
@@ -282,7 +299,7 @@ async def import_files(
 
         batch_summary = ImportSummary(attempted=len(batch))
         for candidate, item in zip(batch, result.items, strict=True):
-            fingerprint = fingerprints[candidate.path]
+            fingerprint = fingerprints[candidate]
             artifact_id = item.result.artifact_id if item.result is not None else None
             if item.succeeded:
                 batch_summary = batch_summary.add(
@@ -308,7 +325,14 @@ async def import_files(
                     error=item.error_message,
                 )
             )
-        summary = summary.add(batch_summary)
+        return batch_summary
+
+    for batch in iter_batches(
+        [candidate for candidate, _ in pending],
+        max_files=settings.max_batch_files,
+        max_bytes=settings.max_batch_bytes,
+    ):
+        summary = summary.add(await import_batch(batch))
     return summary
 
 

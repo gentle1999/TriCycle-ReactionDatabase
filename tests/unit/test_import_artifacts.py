@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 from typing import cast
 from uuid import UUID
@@ -135,3 +136,75 @@ def test_import_files_passes_local_paths_to_upload_service(monkeypatch, tmp_path
     assert summary.succeeded == 1
     assert len(calls) == 1
     assert calls[0][0].spool_path == source.resolve()
+
+
+def test_import_files_isolates_deterministic_batch_failures(monkeypatch, tmp_path: Path) -> None:
+    sources = [tmp_path / name for name in ("bad.log", "good-a.log", "good-b.log")]
+    for source in sources:
+        source.write_text(source.name, encoding="utf-8")
+    calls: list[list[str]] = []
+
+    async def fake_upload_batch(**kwargs: object) -> ArtifactBatchUploadResult:
+        payloads = cast(list[ArtifactUploadPayload], kwargs["files"])
+        filenames = [payload.filename for payload in payloads]
+        calls.append(filenames)
+        if "bad.log" in filenames:
+            raise ValueError("inconsistent topology")
+        return ArtifactBatchUploadResult(
+            total_count=len(payloads),
+            succeeded_count=len(payloads),
+            failed_count=0,
+            source_frame_count=0,
+            transition_state_frame_count=0,
+            inferred_reaction_count=0,
+            items=[
+                ArtifactBatchUploadItem(
+                    filename=payload.filename,
+                    succeeded=True,
+                    result=ArtifactUploadResult(
+                        artifact_id=UUID("00000000-0000-7000-8000-000000000301"),
+                        artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+                        storage_status=StorageStatus.AVAILABLE,
+                        ingestion_status=ArtifactIngestionStatus.SUCCEEDED,
+                        inferred_reaction_count=0,
+                        inferences=[],
+                    ),
+                )
+                for payload in payloads
+            ],
+        )
+
+    monkeypatch.setattr(ArtifactUploadService, "upload_batch", fake_upload_batch)
+    monkeypatch.setattr(
+        "tricycle_reaction_db.dev.import_artifacts.get_settings",
+        lambda: Settings(_env_file=None, max_batch_files=10, max_batch_bytes=1024),
+    )
+    state_path = tmp_path / "state.jsonl"
+
+    summary = asyncio.run(
+        import_files(
+            discover_files(
+                [tmp_path / "bad.log", tmp_path / "good-a.log", tmp_path / "good-b.log"]
+            ),
+            project_id=UUID("00000000-0000-7000-8000-000000000201"),
+            user_id=UUID("00000000-0000-7000-8000-000000000002"),
+            artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+            state=ImportState(state_path),
+            dry_run=False,
+        )
+    )
+
+    records = [json.loads(line) for line in state_path.read_text(encoding="utf-8").splitlines()]
+    assert summary.attempted == 3
+    assert summary.succeeded == 2
+    assert summary.failed == 1
+    assert calls == [
+        ["bad.log", "good-a.log", "good-b.log"],
+        ["bad.log"],
+        ["good-a.log", "good-b.log"],
+    ]
+    assert {record["filename"]: record["status"] for record in records} == {
+        "bad.log": "failed",
+        "good-a.log": "succeeded",
+        "good-b.log": "succeeded",
+    }
