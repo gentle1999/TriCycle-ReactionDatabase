@@ -4,6 +4,7 @@
 	# deterministic in local probes; production should leave them at 80/443.
 	http_port {$CADDY_HTTP_PORT:80}
 	https_port {$CADDY_HTTPS_PORT:443}
+	default_sni {$CADDY_SERVER_NAME:localhost}
 	auto_https disable_redirects
 }
 
