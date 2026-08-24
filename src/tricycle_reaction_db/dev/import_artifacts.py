@@ -6,8 +6,10 @@ import argparse
 import asyncio
 import json
 import mimetypes
+import os
 import sys
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -22,6 +24,7 @@ from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.domain.enums import ArtifactKind
 
 HASH_CHUNK_BYTES = 1024 * 1024
+MAX_FINGERPRINT_WORKERS = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,12 +215,24 @@ async def import_files(
     artifact_kind: ArtifactKind,
     state: ImportState,
     dry_run: bool,
+    fingerprint_workers: int | None = None,
 ) -> ImportSummary:
     settings = get_settings()
     summary = ImportSummary(scanned=len(candidates))
+    workers = fingerprint_workers or min(MAX_FINGERPRINT_WORKERS, max(4, os.cpu_count() or 4))
+    if workers < 1:
+        raise ValueError("fingerprint_workers must be positive")
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        fingerprints = dict(
+            zip(
+                candidates,
+                executor.map(file_fingerprint, (candidate.path for candidate in candidates)),
+                strict=True,
+            )
+        )
     pending: list[tuple[ImportCandidate, ImportFingerprint]] = []
     for candidate in candidates:
-        fingerprint = file_fingerprint(candidate.path)
+        fingerprint = fingerprints[candidate]
         if state.path is not None and state.succeeded(
             candidate.path,
             project_id=project_id,
