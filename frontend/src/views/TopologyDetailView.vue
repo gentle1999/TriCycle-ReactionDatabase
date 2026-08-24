@@ -136,7 +136,10 @@ function openGeometry(id: string): void {
       <section class="topology-overview">
         <div class="topology-structure-panel">
           <ChemDoodleMolecule :topology-id="topology.id" :label="topology.canonical_isomeric_smiles ?? undefined" :height="360" />
-          <code>{{ topology.canonical_isomeric_smiles ?? "SMILES 不可用" }}</code>
+          <code
+            class="topology-smiles-value"
+            :title="topology.canonical_isomeric_smiles ?? undefined"
+          >{{ topology.canonical_isomeric_smiles ?? "SMILES 不可用" }}</code>
         </div>
         <div class="topology-facts-panel">
           <header><strong>{{ topology.hill_formula }}</strong><code :title="topology.id">{{ topology.id }}</code></header>

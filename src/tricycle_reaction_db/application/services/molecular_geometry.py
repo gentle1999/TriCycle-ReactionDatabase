@@ -258,17 +258,10 @@ def _validate_cached_topology(
     topology = persisted.topology
     if (
         topology.formula_id != persisted.formula.id
-        or topology.canonical_isomeric_smiles != record.topology.canonical_isomeric_smiles
-        or topology.atom_count != record.topology.atom_count
-        or topology.heavy_atom_count != record.topology.heavy_atom_count
-        or topology.formal_charge != record.topology.formal_charge
-        or topology.radical_electron_count != record.topology.radical_electron_count
-        or topology.fragment_count != record.topology.fragment_count
-        or topology.stereo_status != record.topology.stereo_status
-        or topology.sanitization_status != record.topology.sanitization_status
-        or topology.sanitization_error != record.topology.sanitization_error
+        or topology.identity_schema_version != record.topology.identity_schema_version
+        or topology.graph_hash != record.topology.graph_hash
     ):
-        raise ValueError("cached topology identity resolved to different graph projections")
+        raise ValueError("cached molecular topology identity is inconsistent")
     _assert_record_matches(
         persisted.topology_derivation,
         record.topology_derivation,
@@ -323,18 +316,9 @@ def persist_molecular_topology(
         _flush_shared_entity(session, topology, label="MolecularTopology", defer_if_fast=True)
     elif topology.formula_id != formula.id:
         raise ValueError("topology identity resolved to a different molecular formula")
-    elif (
-        topology.canonical_isomeric_smiles != record.topology.canonical_isomeric_smiles
-        or topology.atom_count != record.topology.atom_count
-        or topology.heavy_atom_count != record.topology.heavy_atom_count
-        or topology.formal_charge != record.topology.formal_charge
-        or topology.radical_electron_count != record.topology.radical_electron_count
-        or topology.fragment_count != record.topology.fragment_count
-        or topology.stereo_status != record.topology.stereo_status
-        or topology.sanitization_status != record.topology.sanitization_status
-        or topology.sanitization_error != record.topology.sanitization_error
-    ):
-        raise ValueError("topology identity resolved to different graph projections")
+    # The graph identity is canonical, but the stored descriptors are one
+    # projection of that graph.  A batch may legitimately produce another
+    # projection for the same identity, so the first persisted projection wins.
     if topology.id is None:
         raise RuntimeError("database did not generate MolecularTopology.id")
     topology_id = _require_id(topology, label="MolecularTopology")
