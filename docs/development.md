@@ -44,7 +44,9 @@ PostgreSQL/RDKit、RustFS 和本地 Keycloak，执行 migration 与 development 
 
 ```bash
 docker compose -f compose.yaml -f compose.compute.yaml up -d --build --wait
-make benchmark-remote-upload-resources REMOTE_BATCH_SIZES="1 8 32"
+make benchmark-remote-upload-resources \
+  REMOTE_BENCHMARK_FIXTURE=/Users/hx_group/proj/tricycle-data/complete_set \
+  REMOTE_BATCH_SIZES="1 8 32"
 ```
 
 该 benchmark 会实际执行 `ArtifactUploadService.upload_batch()`，记录 PostgreSQL SQL 数量、
@@ -64,7 +66,7 @@ docker compose -f compose.yaml -f compose.compute.yaml run --rm --no-deps \
   --fixture /remote-data --batch-sizes 8 16 32
 ```
 
-真实文件通常比最小 fixture 大很多；如果某一批触发 PostgreSQL 的
+这里只接受真实 Gaussian/ORCA 文件或目录，禁止使用仓库中的合成 fixture；如果某一批触发 PostgreSQL 的
 `TRICYCLE_QUERY_STATEMENT_TIMEOUT_MS`，该批应视为失败，而不是用放宽超时后的结果代表当前生产配置。
 
 ## 数据库
@@ -241,8 +243,10 @@ DELETE 保留 `retired` tombstone，RustFS 临时故障时可重复请求继续�
 统一拆分并录入所有 MolOP 帧；检测到
 TS 帧时额外创建或复用同一反应，并保存 TS CalculationFrame 到反应的推断溯源。
 格式由 MolOP probe 从内容识别；文件名、扩展名、目录结构、manifest 和上传顺序都不参与
-化学身份。批量请求先并行完成 MolOP 解析，再在同一个数据库事务中持久化结果；每个文件使用
-独立 savepoint，一个文件失败不会回滚其他文件，整批结果最后只提交一次。
+化学身份。批量请求按文件在 RustFS、MolOP 和数据库之间流水推进：RustFS 写入完成即提交
+该文件的单文件 MolOP 进程池任务，解析结果由单一有界数据库消费者顺序持久化；最终请求仍在
+同一个数据库事务中提交。每个文件使用独立 savepoint，一个文件失败不会回滚其他文件，整批
+结果最后只提交一次。
 生产 OIDC 用户首次登录后才进入本地用户目录；首次 system administrator 需要部署侧将该
 用户加入 system organization 并授予 owner/admin，API 不允许普通项目 manager 提升全局
 账号权限。
@@ -551,13 +555,24 @@ uv run tricycle-import-artifacts \
 也可以使用 Makefile：
 
 ```bash
+IMPORT_MODE=development \
 IMPORT_PROJECT_ID=00000000-0000-7000-8000-000000000201 \
 IMPORT_ROOTS='/data/archive/reactions /data/archive/supplemental' \
 IMPORT_STATE_FILE=.tmp/artifact-import.jsonl \
 make import-artifacts
 ```
 
-命令最后输出 JSON 统计，包括扫描、跳过、尝试、成功、失败数量和成功字节数。失败批次会写入检查点并以非零状态退出；修复原因后重新执行同一个命令即可继续。
+`make import-artifacts` 默认继承当前 shell 的数据库、RustFS 和认证配置，适合部署主机或
+已通过 `.env` 配置的运行环境，不会静默改写目标端点。上面的开发示例显式选择了
+`IMPORT_MODE=development`；其他环境应保留默认的部署模式。
+
+开发模式固定使用本机 PostgreSQL/RustFS 和 development auth；部署模式保留调用者提供的
+`TRICYCLE_*` 环境变量。生产导入仍必须提供 `IMPORT_USER_ID`，并使用部署用户的项目权限。
+
+命令最后输出 JSON 统计，包括扫描、跳过、尝试、成功、失败数量和成功字节数；`timings` 字段
+还包含发现/指纹/状态筛选/批次上传的分步耗时、每批 `ArtifactUploadService` 解析与持久化阶段耗时，
+以及按 SQL 操作类型汇总的语句数量和数据库执行耗时。失败批次会写入检查点并以非零状态退出；
+修复原因后重新执行同一个命令即可继续。
 
 该命令会将 manifest 和四个解压后的 Gaussian 日志真实上传到 RustFS，并将反应物、
 过渡态、产物及其反应路径写入 PostgreSQL。四个日志的全部 9 个 Link1 segment 和

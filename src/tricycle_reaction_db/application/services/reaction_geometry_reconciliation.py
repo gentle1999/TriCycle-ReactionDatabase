@@ -81,6 +81,11 @@ class ReconciliationBatchCache:
         default_factory=dict
     )
     loaded_mappings: set[UUID] = field(default_factory=set)
+    # A TS inference may bind several frames to the same mapped reaction. Once
+    # its path and thermodynamic profile have been checked in this batch, avoid
+    # repeating the same SELECT/refresh work for the next frame.
+    transition_state_paths_ready: set[UUID] = field(default_factory=set)
+    thermodynamics_refreshed_reactions: set[UUID] = field(default_factory=set)
     new_node_geometry_ids: set[UUID] = field(default_factory=set)
     thermodynamic_property_geometry_ids: set[UUID] = field(default_factory=set)
     affected_reactions_by_id: dict[UUID, MappedReaction] = field(default_factory=dict)
@@ -810,6 +815,14 @@ def ensure_transition_state_path(
 ) -> MappedReactionNode:
     """Ensure an elementary TS path without requiring a calculation Geometry."""
 
+    mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
+    if cache is not None and mapped_reaction_id in cache.transition_state_paths_ready:
+        transition_state_node = cache.nodes_by_key.get(
+            (mapped_reaction_id, "transition-state")
+        )
+        if transition_state_node is not None:
+            return transition_state_node
+
     reactant_node = resolve_endpoint_node(
         session,
         mapped_reaction,
@@ -834,6 +847,8 @@ def ensure_transition_state_path(
         product_node=product_node,
         transition_state_node=transition_state_node,
     )
+    if cache is not None:
+        cache.transition_state_paths_ready.add(mapped_reaction_id)
     return transition_state_node
 
 
@@ -843,6 +858,7 @@ def bind_transition_state_frame(
     mapped_reaction: MappedReaction,
     calculation_frame: CalculationFrame,
     cache: ReconciliationBatchCache | None = None,
+    refresh_thermodynamics: bool = True,
 ) -> MappedReactionNodeGeometry:
     """Bind one TS conformer; distinct Geometry identities remain distinct candidates."""
 
@@ -879,7 +895,13 @@ def bind_transition_state_frame(
         mapped_smiles=mapped_smiles_for_topology(geometry.topology, topology_atom_maps),
         cache=cache,
     )
-    refresh_mapped_reaction_thermodynamics(session, mapped_reaction)
+    mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
+    if cache is not None:
+        cache.affected_reactions_by_id[mapped_reaction_id] = mapped_reaction
+    if refresh_thermodynamics:
+        refresh_mapped_reaction_thermodynamics(session, mapped_reaction)
+        if cache is not None:
+            cache.thermodynamics_refreshed_reactions.add(mapped_reaction_id)
     return node_geometry
 
 

@@ -77,7 +77,13 @@ class Settings(BaseSettings):
     read_rate_limit_requests: int = Field(default=10_000, ge=1, le=1_000_000)
     upload_rate_limit_requests: int = Field(default=1_000, ge=1, le=1_000_000)
     upload_max_concurrency: int = Field(default=8, ge=1, le=128)
-    molop_parse_slots: int = Field(default=1, ge=1, le=128)
+    # Source spans and block hashes are expensive to collect for large logs.
+    # Keep them opt-in for normal ingestion; audit/reproducibility workflows
+    # can enable this setting explicitly.
+    molop_capture_source_evidence: bool = False
+    # Fast ingestion batches revision-local frame rows in one transaction.
+    # This is enabled automatically only when source evidence is disabled.
+    molop_parallel_frame_persistence: bool = True
     molecule_query_rate_limit_requests: int = Field(default=10_000, ge=1, le=1_000_000)
     depiction_rate_limit_requests: int = Field(default=10_000, ge=1, le=1_000_000)
     query_rate_limit_window_seconds: int = Field(default=60, ge=1, le=86_400)

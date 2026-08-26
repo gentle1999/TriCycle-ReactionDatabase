@@ -12,7 +12,10 @@ from sqlalchemy import delete, func
 from sqlmodel import Session, col, select
 
 from tricycle_reaction_db.application.dtos import MappedReactionThermodynamics
-from tricycle_reaction_db.application.services._persistence import _require_id
+from tricycle_reaction_db.application.services._persistence import (
+    _attach_pending_entities,
+    _require_id,
+)
 from tricycle_reaction_db.application.services.geometry_energy import geometry_energy_composites
 from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics import (
     MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION,
@@ -47,6 +50,7 @@ def refresh_mapped_reaction_thermodynamics(
     JSON profile and indexed screening bounds already stored on MappedReaction.
     """
 
+    _attach_pending_entities(session)
     mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
     participant_rows = session.exec(
         select(MappedReactionParticipant, LogicalReactionParticipant)

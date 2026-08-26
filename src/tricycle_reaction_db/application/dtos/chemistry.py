@@ -367,6 +367,9 @@ class NormalizedMoleculeRecord(BaseModel):
 
     @model_validator(mode="after")
     def validate_chemical_axes(self) -> "NormalizedMoleculeRecord":
+        topology_is_untrusted = (
+            self.topology.sanitization_status is TopologySanitizationStatus.FAILED
+        )
         atom_count = self.geometry.mol.GetNumAtoms()
         if not (self.formula.atom_count == self.topology.atom_count == atom_count):
             raise ValueError("Formula, Topology, and Geometry atom counts must match")
@@ -404,29 +407,30 @@ class NormalizedMoleculeRecord(BaseModel):
             geometry_graph.GetAtoms()  # type: ignore[no-untyped-call]
         ):
             atom.SetAtomMapNum(topology_index + 1)
-        Chem.AssignStereochemistry(topology_graph, cleanIt=True, force=True)
-        Chem.AssignStereochemistry(geometry_graph, cleanIt=True, force=True)
-        if Chem.MolToCXSmiles(
-            topology_graph,
-            canonical=True,
-            isomericSmiles=True,
-        ) != Chem.MolToCXSmiles(
-            geometry_graph,
-            canonical=True,
-            isomericSmiles=True,
-        ):
-            raise ValueError("Geometry.mol does not match Topology in canonical atom order")
-        if self.charge != self.topology.formal_charge:
-            raise ValueError("calculation charge does not match Topology formal charge")
-        electron_count = (
-            sum(
-                atom.GetAtomicNum()
-                for atom in self.geometry.mol.GetAtoms()  # type: ignore[no-untyped-call]
+        if not topology_is_untrusted:
+            Chem.AssignStereochemistry(topology_graph, cleanIt=True, force=True)
+            Chem.AssignStereochemistry(geometry_graph, cleanIt=True, force=True)
+            if Chem.MolToCXSmiles(
+                topology_graph,
+                canonical=True,
+                isomericSmiles=True,
+            ) != Chem.MolToCXSmiles(
+                geometry_graph,
+                canonical=True,
+                isomericSmiles=True,
+            ):
+                raise ValueError("Geometry.mol does not match Topology in canonical atom order")
+            if self.charge != self.topology.formal_charge:
+                raise ValueError("calculation charge does not match Topology formal charge")
+            electron_count = (
+                sum(
+                    atom.GetAtomicNum()
+                    for atom in self.geometry.mol.GetAtoms()  # type: ignore[no-untyped-call]
+                )
+                - self.charge
             )
-            - self.charge
-        )
-        if (electron_count + self.multiplicity) % 2 != 1:
-            raise ValueError("electron count and multiplicity have inconsistent parity")
+            if (electron_count + self.multiplicity) % 2 != 1:
+                raise ValueError("electron count and multiplicity have inconsistent parity")
         transform = np.asarray(self.observed_to_geometry_transform, dtype=np.float64).reshape(4, 4)
         rotation = transform[:3, :3]
         if not np.isfinite(transform).all():

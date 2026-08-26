@@ -12,6 +12,8 @@ DEV_RUSTFS_ENDPOINT := http://127.0.0.1:19000
 DEV_RUNTIME_ENV = \
 	TRICYCLE_DATABASE_URL="$(DEV_DATABASE_URL)" \
 	TRICYCLE_RUSTFS_ENDPOINT_URL="$(DEV_RUSTFS_ENDPOINT)" \
+	NO_PROXY="127.0.0.1,localhost,postgres,rustfs,host.docker.internal" \
+	no_proxy="127.0.0.1,localhost,postgres,rustfs,host.docker.internal" \
 	TRICYCLE_RUSTFS_ACCESS_KEY=example-local-access \
 	TRICYCLE_RUSTFS_SECRET_KEY=example-local-secret \
 	TRICYCLE_RUSTFS_BUCKET=example-reaction-raw-files \
@@ -21,6 +23,17 @@ DEV_RUNTIME_ENV = \
 	TRICYCLE_AUTH_MODE=development \
 	TRICYCLE_API_HOST=127.0.0.1 \
 	TRICYCLE_API_PORT=8000
+
+# Artifact imports default to the caller's configured runtime. Use the local
+# development stack explicitly with IMPORT_MODE=development.
+IMPORT_MODE ?= deployment
+ifeq ($(IMPORT_MODE),development)
+IMPORT_RUNTIME_ENV := $(DEV_RUNTIME_ENV)
+else ifeq ($(IMPORT_MODE),deployment)
+IMPORT_RUNTIME_ENV :=
+else
+$(error IMPORT_MODE must be either development or deployment)
+endif
 
 init:
 	uv sync --python 3.12
@@ -166,7 +179,7 @@ seed-da-bench:
 import-artifacts:
 	@test -n "$(IMPORT_PROJECT_ID)" || (echo "set IMPORT_PROJECT_ID to a project UUID" >&2; exit 2)
 	@test -n "$(IMPORT_ROOTS)" || (echo "set IMPORT_ROOTS='path/to/file-or-directory ...'" >&2; exit 2)
-	uv run tricycle-import-artifacts \
+	$(IMPORT_RUNTIME_ENV) uv run tricycle-import-artifacts \
 		--project-id "$(IMPORT_PROJECT_ID)" \
 		$(if $(IMPORT_USER_ID),--user-id "$(IMPORT_USER_ID)",) \
 		$(if $(IMPORT_ARTIFACT_KIND),--artifact-kind "$(IMPORT_ARTIFACT_KIND)",) \
@@ -183,15 +196,19 @@ auth-session-cleanup:
 	uv run tricycle-auth-session-cleanup
 
 benchmark-upload-resources:
-	uv run --frozen python scripts/benchmark_upload_resources.py
+	@test -n "$(UPLOAD_BENCHMARK_FIXTURE)" || (echo "set UPLOAD_BENCHMARK_FIXTURE=/path/to/real-gaussian-orca-file-or-directory" >&2; exit 2)
+	uv run --frozen python scripts/benchmark_upload_resources.py --fixture "$(UPLOAD_BENCHMARK_FIXTURE)"
 
 benchmark-remote-upload-resources:
+	@test -n "$(REMOTE_BENCHMARK_FIXTURE)" || (echo "set REMOTE_BENCHMARK_FIXTURE=/path/to/real-gaussian-orca-file-or-directory" >&2; exit 2)
 	docker compose -f compose.yaml -f compose.compute.yaml build api
 	docker compose -f compose.yaml -f compose.compute.yaml run --rm --no-deps \
 		-e TRICYCLE_MAX_BATCH_FILES=$(or $(REMOTE_BENCHMARK_MAX_BATCH_FILES),1024) \
 		-e TRICYCLE_MAX_BATCH_BYTES=$(or $(REMOTE_BENCHMARK_MAX_BATCH_BYTES),1073741824) \
-		-v "$(CURDIR):/workspace:ro" api \
+		-v "$(CURDIR):/workspace:ro" \
+		-v "$(REMOTE_BENCHMARK_FIXTURE):/remote-fixture:ro" api \
 		/app/.venv/bin/python /workspace/scripts/benchmark_remote_upload_batch.py \
+		--fixture /remote-fixture \
 		$(if $(REMOTE_BATCH_SIZES),--batch-sizes $(REMOTE_BATCH_SIZES),)
 
 capture-query-plan-evidence:

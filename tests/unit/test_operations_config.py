@@ -136,6 +136,27 @@ def test_ci_validates_da_bench_fixture_before_seeding() -> None:
     assert "validate-da-bench-fixture" in (REPOSITORY_ROOT / "Makefile").read_text()
 
 
+def test_artifact_import_make_target_has_explicit_runtime_modes() -> None:
+    makefile = (REPOSITORY_ROOT / "Makefile").read_text()
+
+    assert "IMPORT_MODE ?= deployment" in makefile
+    assert "IMPORT_MODE=development" in makefile
+    import_recipe = makefile.split("import-artifacts:\n", 1)[1].split(
+        "\n\nvalidate-da-bench-fixture:", 1
+    )[0]
+    assert "$(DEV_RUNTIME_ENV) uv run tricycle-import-artifacts" not in import_recipe
+    assert "$(IMPORT_RUNTIME_ENV) uv run tricycle-import-artifacts" in import_recipe
+
+
+def test_make_dev_uses_documented_local_development_auth() -> None:
+    makefile = (REPOSITORY_ROOT / "Makefile").read_text()
+
+    dev_runtime = makefile.split("DEV_RUNTIME_ENV = ", 1)[1].split("\n\n", 1)[0]
+    assert "TRICYCLE_AUTH_MODE=development" in dev_runtime
+    assert "TRICYCLE_OIDC_ISSUER" not in dev_runtime
+    assert "61.151.139.69" not in dev_runtime
+
+
 def test_multi_host_runbook_exposes_a_repeatable_dependency_smoke_and_evidence_template() -> None:
     project = (REPOSITORY_ROOT / "pyproject.toml").read_text()
     deployment_guide = (REPOSITORY_ROOT / "docs/deployment-configuration.md").read_text()

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
+from threading import Lock
 from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlsplit
 
@@ -20,6 +21,9 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from mypy_boto3_s3 import S3Client
+
+
+_BUCKET_INITIALIZATION_LOCK = Lock()
 
 
 class RustFSSettings(BaseSettings):
@@ -157,6 +161,14 @@ class RustFSObjectStore:
         client: S3Client | None = None,
     ) -> None:
         self.settings = settings
+        endpoint_host = urlsplit(settings.endpoint_url).hostname
+        local_endpoint = endpoint_host in {
+            "localhost",
+            "127.0.0.1",
+            "::1",
+            "rustfs",
+            "host.docker.internal",
+        }
         self._client = client or boto3.client(
             "s3",
             endpoint_url=settings.endpoint_url,
@@ -170,6 +182,7 @@ class RustFSObjectStore:
                 read_timeout=settings.read_timeout_seconds,
                 retries={"mode": "standard", "max_attempts": 3},
                 s3={"addressing_style": "path"},
+                **({"proxies": {}} if local_endpoint else {}),
             ),
         )
 
@@ -183,12 +196,20 @@ class RustFSObjectStore:
         self._client.close()
 
     def ensure_bucket(self) -> None:
-        try:
-            self._client.head_bucket(Bucket=self.settings.bucket)
-        except ClientError as error:
-            if not self._is_not_found(error):
-                raise
-            self._client.create_bucket(Bucket=self.settings.bucket)
+        # A batch upload opens one store per storage worker. Serialize the
+        # first head/create sequence so a fresh RustFS volume does not receive
+        # concurrent MakeBucket requests during initialization.
+        with _BUCKET_INITIALIZATION_LOCK:
+            try:
+                self._client.head_bucket(Bucket=self.settings.bucket)
+            except ClientError as error:
+                if not self._is_not_found(error):
+                    raise
+                try:
+                    self._client.create_bucket(Bucket=self.settings.bucket)
+                except ClientError as create_error:
+                    if not self._is_already_exists(create_error):
+                        raise
 
     def bucket_versioning_status(self) -> str | None:
         response = self._client.get_bucket_versioning(Bucket=self.settings.bucket)
@@ -424,3 +445,14 @@ class RustFSObjectStore:
         error_code = str(response.get("Error", {}).get("Code", ""))
         status_code = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
         return status_code == 404 or error_code in {"404", "NoSuchBucket", "NoSuchKey", "NotFound"}
+
+    @staticmethod
+    def _is_already_exists(error: ClientError) -> bool:
+        response = error.response
+        error_code = str(response.get("Error", {}).get("Code", ""))
+        status_code = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        return status_code == 409 or error_code in {
+            "409",
+            "BucketAlreadyExists",
+            "BucketAlreadyOwnedByYou",
+        }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import gzip
 import io
 import logging
@@ -13,6 +14,7 @@ import threading
 import zlib
 from collections.abc import Awaitable, Callable, Mapping, MutableMapping
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
@@ -26,9 +28,11 @@ from uuid import UUID
 
 import numpy as np
 from molop import AutoFileParser
+from molop.config import molopconfig
 from molop.io.base_models.ChemFileFrame import BaseCalcFrame
 from molop.unit import atom_ureg
 from rdkit import Chem
+from rdkit.Chem import rdChemReactions
 from sqlalchemy.orm import Session as SQLAlchemySession
 from sqlalchemy.orm import joinedload
 from sqlmodel import Session, col, select
@@ -45,6 +49,10 @@ from tricycle_reaction_db.application.dtos import (
 )
 from tricycle_reaction_db.application.services._persistence import (
     _acquire_identity_locks,
+    _attach_pending_entities,
+    _fast_insert_enabled,
+    _flush_new_entity,
+    _new_entity,
     _prepare_new_entity,
     _require_id,
 )
@@ -58,6 +66,9 @@ from tricycle_reaction_db.application.services.authorization import (
 from tricycle_reaction_db.application.services.catalog import (
     persist_artifact_file,
 )
+from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics_persistence import (
+    refresh_mapped_reaction_thermodynamics,
+)
 from tricycle_reaction_db.application.services.molecular_geometry import (
     GeometryAssignmentAmbiguityError,
     GeometryPersistenceContext,
@@ -65,15 +76,22 @@ from tricycle_reaction_db.application.services.molecular_geometry import (
     preload_molecular_geometry_context,
 )
 from tricycle_reaction_db.application.services.molop_artifact_ingestion import (
+    _revision_record_hash,
     persist_molop_calculation_artifact,
     reconcile_molop_geometry_context,
 )
 from tricycle_reaction_db.application.services.reaction_commands import (
     create_reaction_in_session,
+    reaction_topology_records,
 )
 from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
+    ReconciliationBatchCache,
     bind_transition_state_frame,
     ensure_transition_state_path,
+)
+from tricycle_reaction_db.application.services.reactions import (
+    _canonical_mapped_reaction_smiles,
+    _reaction_from_representation,
 )
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
@@ -119,7 +137,12 @@ logger = logging.getLogger(__name__)
 TS_PRE_POST_MIN_RATIO = 0.75
 TS_PRE_POST_MAX_RATIO = 1.75
 TS_PRE_POST_STEPS = 7
-PERSISTENCE_PRELOAD_BATCH_SIZE = 8
+PERSISTENCE_PRELOAD_BATCH_SIZE = 32
+# MolGR reconstruction is CPU-heavy and each frame crosses a process boundary.
+# Larger chunks amortize pickle/future overhead while retaining enough tasks to
+# keep all configured workers busy across a multi-file batch.
+FRAME_CONVERSION_CHUNK_SIZE = 32
+INFERENCE_PERSIST_BATCH_SIZE = 16
 
 
 class ArtifactUploadError(RuntimeError):
@@ -132,6 +155,10 @@ class ArtifactUploadLimitError(ArtifactUploadError):
 
 class ArtifactUploadConflictError(ArtifactUploadError):
     pass
+
+
+class NoCalculationFramesError(ArtifactUploadError):
+    """The source is not a QM calculation output accepted by the catalogue."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,12 +187,63 @@ _Inference = _SuccessfulInference | _FailedInference
 
 @dataclass(frozen=True, slots=True)
 class _ParsedArtifact:
+    # Production parsing keeps the owning-process ChemFile so topology
+    # reconstruction can be deferred until persistence.  The slim wrapper is
+    # retained for the legacy process-pool parser, where the frame tree cannot
+    # be sent back over IPC without a large copy.
     chem_file: Any
     frame_records: tuple[MolOPFrameRecords, ...]
     source_frame_count: int
     source_format: str | None
     source_compression: str | None
     inferences: tuple[_Inference, ...]
+    record_sha256: str | None = None
+    artifact_sha256: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ProcessedFrame:
+    """One frame after MolGR reconstruction and ingestion-level validation."""
+
+    file_frame_index: int
+    record: MolOPFrameRecords
+    inference: _Inference | None
+    topology_reconstruction_status: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedChemFile:
+    """File-level MolOP metadata retained after worker conversion.
+
+    The original ChemFile contains every parsed frame.  Returning it together
+    with ``frame_records`` duplicates the complete frame tree across the
+    process boundary, so only the metadata and source segments cross IPC.
+    """
+
+    payload: dict[str, Any]
+    source_segments: tuple[Any, ...]
+
+    @property
+    def schema_version(self) -> str:
+        return str(self.payload["schema_version"])
+
+    @property
+    def artifact_sha256(self) -> str | None:
+        value = self.payload.get("artifact_sha256")
+        return value if isinstance(value, str) else None
+
+    @property
+    def artifact_size_bytes(self) -> int | None:
+        value = self.payload.get("artifact_size_bytes")
+        return value if isinstance(value, int) else None
+
+    @property
+    def source_diagnostics(self) -> list[Any]:
+        value = self.payload.get("source_diagnostics", [])
+        return value if isinstance(value, list) else []
+
+    def model_dump(self, *, mode: str = "python", **_kwargs: Any) -> dict[str, Any]:
+        return dict(self.payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +267,13 @@ class _DeferredArtifactInferences:
 
 
 @dataclass(frozen=True, slots=True)
+class _InferencePersistenceTask:
+    deferred: _DeferredArtifactInferences
+    inferred: _SuccessfulInference
+    calculation_frame: CalculationFrame
+
+
+@dataclass(frozen=True, slots=True)
 class ArtifactUploadPayload:
     filename: str
     media_type: str
@@ -205,6 +290,15 @@ class _RetiredArtifactReservation:
     version_id: str | None
     etag: str | None
     storage_verified_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class _RetiredArtifactObject:
+    bucket: str
+    object_key: str
+    version_id: str | None
+    content_sha256: str
+    size_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,36 +369,103 @@ def _safe_parser_suffix(filename: str) -> str:
     return suffix if suffix in {".log", ".out", ".xyz"} else ".log"
 
 
-_molop_parse_semaphore: asyncio.Semaphore | None = None
-_molop_parse_slots: int | None = None
-_molop_parse_loop: asyncio.AbstractEventLoop | None = None
 _molop_process_pool: ProcessPoolExecutor | None = None
 _molop_process_pool_workers: int | None = None
 _molop_process_pool_pid: int | None = None
 _molop_process_pool_lock = threading.Lock()
+_frame_process_pool: ProcessPoolExecutor | None = None
+_frame_process_pool_workers: int | None = None
+_frame_process_pool_pid: int | None = None
+_frame_process_pool_lock = threading.Lock()
+_storage_process_pool: ProcessPoolExecutor | None = None
+_storage_process_pool_workers: int | None = None
+_storage_process_pool_pid: int | None = None
+_storage_process_pool_lock = threading.Lock()
+
+# A storage-pool child handles many files over its lifetime. Recreating a
+# boto3 client and performing a bucket HEAD for every file adds a large fixed
+# latency to small and medium calculation outputs. Keep one client per child
+# and initialize the bucket lazily on its first task.
+_storage_worker_store: RustFSObjectStore | None = None
+_storage_worker_store_key: tuple[Any, ...] | None = None
+_storage_worker_bucket_ready = False
+
+# A parsed ChemFile is already resident in the MolOP worker. On Linux we can
+# fork short-lived conversion workers from that process and share parsed frames
+# copy-on-write, avoiding another large IPC transfer for every frame.
+_frame_conversion_chem_file: Any = None
+_frame_conversion_schema_version: str | None = None
 
 
-def _get_molop_parse_semaphore() -> asyncio.Semaphore:
-    global _molop_parse_loop, _molop_parse_semaphore, _molop_parse_slots
-    slots = get_settings().molop_parse_slots
-    loop = asyncio.get_running_loop()
-    if (
-        _molop_parse_semaphore is None
-        or _molop_parse_slots != slots
-        or _molop_parse_loop is not loop
-    ):
-        _molop_parse_semaphore = asyncio.Semaphore(slots)
-        _molop_parse_slots = slots
-        _molop_parse_loop = loop
-    return _molop_parse_semaphore
+def _initialize_frame_process_worker() -> None:
+    """Configure MolGR once when a frame-pool child starts."""
+
+    configure_molecular_graph_reconstruction()
+    molopconfig.prewarm_topologies = False
+
+
+def _frame_record_from_shared_chem_file(index: int) -> MolOPFrameRecords:
+    chem_file = _frame_conversion_chem_file
+    schema_version = _frame_conversion_schema_version
+    if chem_file is None or schema_version is None:
+        raise RuntimeError("frame conversion worker was not initialized")
+    return frame_records_from_molop(
+        chem_file[index],
+        export_schema_version=schema_version,
+        fallback_index=index,
+    )
+
+
+def _frame_records_from_chem_file(
+    chem_file: Any,
+    *,
+    parallel: bool,
+) -> tuple[MolOPFrameRecords, ...]:
+    """Convert parsed frames without re-entering MolGR from worker children."""
+
+    global _frame_conversion_chem_file, _frame_conversion_schema_version
+    frame_count = len(chem_file)
+    if not parallel or os.name != "posix" or frame_count < 32:
+        return tuple(
+            frame_records_from_molop(
+                frame,
+                export_schema_version=chem_file.schema_version,
+                fallback_index=index,
+            )
+            for index, frame in enumerate(chem_file)
+        )
+
+    # ``fork`` shares the already-materialized RDKit/MolOP frame graph read-only.
+    # The worker only serializes DTOs; it must never invoke MolGR itself.
+    _frame_conversion_chem_file = chem_file
+    _frame_conversion_schema_version = str(chem_file.schema_version)
+    workers = min(_resolve_molop_process_workers(get_settings().molop_batch_n_jobs), frame_count)
+    try:
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=multiprocessing.get_context("fork"),
+        ) as pool:
+            return tuple(
+                pool.map(
+                    _frame_record_from_shared_chem_file,
+                    range(frame_count),
+                    chunksize=1,
+                )
+            )
+    finally:
+        _frame_conversion_chem_file = None
+        _frame_conversion_schema_version = None
 
 
 async def _run_molop_parser(function: Any, *args: Any, **kwargs: Any) -> Any:
-    """Run one parser dispatcher under the process-level parse-slot budget."""
+    """Run a synchronous parser dispatcher without a request-level gate.
 
-    semaphore = _get_molop_parse_semaphore()
-    async with semaphore:
-        return await asyncio.to_thread(function, *args, **kwargs)
+    Concurrency is owned by the explicit stage process pools. Keeping an
+    asyncio semaphore here made the effective parallelism opaque and forced
+    unrelated upload batches to queue behind one another.
+    """
+
+    return await asyncio.to_thread(function, *args, **kwargs)
 
 
 async def _run_molop_parser_with_progress(
@@ -341,6 +502,21 @@ def _resolve_molop_process_workers(n_jobs: int) -> int:
     return max(1, (os.cpu_count() or 1) if n_jobs == -1 else n_jobs)
 
 
+def _frame_submission_limit() -> int:
+    workers = _resolve_molop_process_workers(get_settings().molop_batch_n_jobs)
+    return max(1, workers * 2)
+
+
+def _fast_molop_ingestion_enabled() -> bool:
+    """Return whether deferred MolGR work and batched frame writes are enabled."""
+
+    settings = get_settings()
+    return (
+        not settings.molop_capture_source_evidence
+        and settings.molop_parallel_frame_persistence
+    )
+
+
 def _get_molop_process_pool(n_jobs: int) -> ProcessPoolExecutor:
     """Return this API worker's reusable, spawn-safe MolOP process pool."""
 
@@ -359,7 +535,8 @@ def _get_molop_process_pool(n_jobs: int) -> ProcessPoolExecutor:
         _molop_process_pool = ProcessPoolExecutor(
             max_workers=workers,
             mp_context=multiprocessing.get_context("spawn"),
-            max_tasks_per_child=50,
+            max_tasks_per_child=100,
+            initializer=_initialize_frame_process_worker,
         )
         _molop_process_pool_workers = workers
         _molop_process_pool_pid = pid
@@ -369,8 +546,53 @@ def _get_molop_process_pool(n_jobs: int) -> ProcessPoolExecutor:
     return process_pool
 
 
+def _get_frame_process_pool(n_jobs: int) -> ProcessPoolExecutor:
+    """Return the shared file/frame pool for MolOP-stage work."""
+
+    # File parsing and frame reconstruction are different task granularities,
+    # but they are both CPU-bound MolOP-stage work. Sharing workers prevents
+    # two independent ``n_jobs`` process sets from duplicating RSS and startup
+    # cost while the stages overlap in the batch pipeline.
+    return _get_molop_process_pool(n_jobs)
+
+
+def _get_storage_process_pool(n_jobs: int) -> ProcessPoolExecutor:
+    """Return the reusable process pool for RustFS upload and HEAD validation."""
+
+    global _storage_process_pool, _storage_process_pool_workers, _storage_process_pool_pid
+    workers = _resolve_molop_process_workers(n_jobs)
+    pid = os.getpid()
+    previous_pool: ProcessPoolExecutor | None = None
+    with _storage_process_pool_lock:
+        if (
+            _storage_process_pool is not None
+            and _storage_process_pool_workers == workers
+            and _storage_process_pool_pid == pid
+        ):
+            return _storage_process_pool
+        previous_pool = _storage_process_pool
+        _storage_process_pool = ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=multiprocessing.get_context("spawn"),
+            max_tasks_per_child=100,
+        )
+        _storage_process_pool_workers = workers
+        _storage_process_pool_pid = pid
+        process_pool = _storage_process_pool
+    if previous_pool is not None:
+        previous_pool.shutdown(wait=True, cancel_futures=True)
+    return process_pool
+
+
 async def close_molop_process_pool() -> None:
     """Release parser workers during ASGI shutdown."""
+
+    await asyncio.to_thread(_shutdown_molop_process_pool_sync)
+    await asyncio.to_thread(_shutdown_upload_stage_pools_sync)
+
+
+def _shutdown_molop_process_pool_sync() -> None:
+    """Stop parser workers before entering MolGR's native boundary."""
 
     global _molop_process_pool, _molop_process_pool_pid, _molop_process_pool_workers
     with _molop_process_pool_lock:
@@ -379,30 +601,75 @@ async def close_molop_process_pool() -> None:
         _molop_process_pool_workers = None
         _molop_process_pool_pid = None
     if pool is not None:
-        await asyncio.to_thread(pool.shutdown, wait=True, cancel_futures=True)
+        pool.shutdown(wait=True, cancel_futures=False)
+
+
+def _shutdown_upload_stage_pools_sync() -> None:
+    """Stop frame and RustFS pools owned by this API worker."""
+
+    global _frame_process_pool, _frame_process_pool_workers, _frame_process_pool_pid
+    global _storage_process_pool, _storage_process_pool_workers, _storage_process_pool_pid
+    with _frame_process_pool_lock:
+        frame_pool = _frame_process_pool
+        _frame_process_pool = None
+        _frame_process_pool_workers = None
+        _frame_process_pool_pid = None
+    with _storage_process_pool_lock:
+        storage_pool = _storage_process_pool
+        _storage_process_pool = None
+        _storage_process_pool_workers = None
+        _storage_process_pool_pid = None
+    for pool in (frame_pool, storage_pool):
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=False)
+
+
+async def _run_molop_source_parser(
+    source: bytes | Path,
+    filename: str,
+    *,
+    artifact_sha256: str | None = None,
+) -> _ParsedArtifact:
+    """Parse one source asynchronously in the shared MolOP process pool.
+
+    ``AutoFileParser`` is synchronous and CPU-bound.  The awaitable boundary is
+    deliberately around the process-pool future, so RustFS, parsing, and the
+    database writer can make progress independently on the event loop.
+    """
+
+    with tempfile.TemporaryDirectory(prefix="tricycle-molop-file-") as directory:
+        parser_path, source_compression = await asyncio.to_thread(
+            _prepare_calculation_parser_path,
+            source,
+            filename,
+            temporary_dir=Path(directory),
+            input_index=0,
+        )
+        try:
+            process_pool = _get_molop_process_pool(get_settings().molop_batch_n_jobs)
+            loop = asyncio.get_running_loop()
+            parsed, error_message = await loop.run_in_executor(
+                process_pool,
+                _parse_calculation_path_worker,
+                parser_path,
+                source_compression,
+                artifact_sha256,
+            )
+            if parsed is None:
+                raise ArtifactUploadError(
+                    error_message or "MolOP did not return a result for this input file"
+                )
+            return parsed
+        except Exception as error:
+            if isinstance(error, ArtifactUploadError):
+                raise
+            raise ArtifactUploadError(str(error) or type(error).__name__) from error
 
 
 async def _run_molop_file_parser(payload: bytes, filename: str) -> _ParsedArtifact:
-    """Parse one uploaded file in the reusable project-owned worker pool."""
+    """Backward-compatible bytes-only wrapper used by reparse callers."""
 
-    semaphore = _get_molop_parse_semaphore()
-    async with semaphore:
-        decoded_payload, source_compression = _parser_payload(payload, filename)
-        with tempfile.NamedTemporaryFile(suffix=_safe_parser_suffix(filename)) as temporary:
-            temporary.write(decoded_payload)
-            temporary.flush()
-            loop = asyncio.get_running_loop()
-            parsed, error_message = await loop.run_in_executor(
-                _get_molop_process_pool(get_settings().molop_batch_n_jobs),
-                _parse_calculation_path_worker,
-                temporary.name,
-                source_compression,
-            )
-        if parsed is None:
-            raise ArtifactUploadError(
-                error_message or "MolOP did not return a result for this input file"
-            )
-        return parsed
+    return await _run_molop_source_parser(payload, filename)
 
 
 def _require_upload_size(payload: bytes) -> None:
@@ -575,7 +842,13 @@ def _mapped_reaction_smiles(reactant: Chem.Mol, product: Chem.Mol) -> str:
                 for fragment in fragments
             )
         )
-    return f"{sides[0]}>>{sides[1]}"
+    reaction_smiles = f"{sides[0]}>>{sides[1]}"
+    reaction = rdChemReactions.ReactionFromSmarts(reaction_smiles, useSmiles=True)
+    if reaction is None:
+        raise ValueError("MolOP TS endpoints did not produce a valid reaction")
+    # Fragment order is not stable enough for persist_mapped_reaction's
+    # canonical serialization check, so canonicalize the complete reaction.
+    return _canonical_mapped_reaction_smiles(reaction)
 
 
 def _signed_ts_endpoints(
@@ -632,123 +905,433 @@ def _signed_ts_endpoints(
     return reactant, product, abs(negative_ratio), positive_ratio
 
 
+def _infer_ts_frame(frame: BaseCalcFrame[Any], fallback_index: int) -> _Inference | None:
+    """Validate and infer one TS frame after its topology was reconstructed."""
+
+    if frame.is_TS is not True:
+        return None
+    file_frame_index = frame.file_frame_index
+    if file_frame_index is None:
+        file_frame_index = fallback_index
+    vibrations = frame.vibrations
+    if vibrations is None or len(vibrations.imaginary_idxs) != 1:
+        return None
+    imaginary_position = vibrations.imaginary_idxs[0]
+    imaginary_mode_index = (
+        vibrations.mode_indices[imaginary_position]
+        if vibrations.mode_indices
+        else imaginary_position
+    )
+    frequency = vibrations[imaginary_position].frequency
+    if frequency is None:
+        return None
+    frequency_cm1 = float(frequency.to(atom_ureg.cm_1).magnitude)
+    if frame.topology_reconstruction_status == "suspicious_fallback":
+        return _FailedInference(
+            file_frame_index=file_frame_index,
+            imaginary_mode_index=imaginary_mode_index,
+            imaginary_frequency_cm1=frequency_cm1,
+            error_code="ts_topology_untrusted",
+            error_message=(
+                "MolGR returned a suspicious fallback topology; "
+                "TS endpoint inference was skipped"
+            ),
+        )
+    try:
+        (
+            negative_endpoint,
+            positive_endpoint,
+            negative_displacement_ratio,
+            positive_displacement_ratio,
+        ) = _signed_ts_endpoints(frame, imaginary_position)
+        reactant, product = sorted(
+            (negative_endpoint, positive_endpoint),
+            key=lambda endpoint: len(Chem.GetMolFrags(endpoint)),
+            reverse=True,
+        )
+        for endpoint in (negative_endpoint, positive_endpoint, reactant, product):
+            endpoint_atoms = [atom.GetAtomicNum() for atom in endpoint.GetAtoms()]
+            if endpoint_atoms != frame.atoms:
+                raise ValueError("MolOP TS endpoint atom order differs from the TS source frame")
+        return _SuccessfulInference(
+            file_frame_index=file_frame_index,
+            imaginary_mode_index=imaginary_mode_index,
+            imaginary_frequency_cm1=frequency_cm1,
+            reaction_smiles=_mapped_reaction_smiles(reactant, product),
+            negative_endpoint=negative_endpoint,
+            positive_endpoint=positive_endpoint,
+            negative_displacement_ratio=negative_displacement_ratio,
+            positive_displacement_ratio=positive_displacement_ratio,
+        )
+    except Exception as error:
+        return _FailedInference(
+            file_frame_index=file_frame_index,
+            imaginary_mode_index=imaginary_mode_index,
+            imaginary_frequency_cm1=frequency_cm1,
+            error_code="ts_endpoint_inference_failed",
+            error_message=str(error) or type(error).__name__,
+        )
+
+
+def _detach_frame_for_process(frame: BaseCalcFrame[Any]) -> BaseCalcFrame[Any]:
+    """Break ChemFile navigation links before sending one frame over IPC."""
+
+    detached = copy.copy(frame)
+    detached._prev_frame = None
+    detached._next_frame = None
+    return detached
+
+
+def _process_frame_without_configuration(
+    frame: BaseCalcFrame[Any],
+    fallback_index: int,
+    schema_version: str,
+) -> _ProcessedFrame:
+    """Reconstruct, normalize, and validate one frame under configured MolGR."""
+
+    record = frame_records_from_molop(
+        frame,
+        export_schema_version=schema_version,
+        fallback_index=fallback_index,
+    )
+    file_frame_index = frame.file_frame_index
+    if file_frame_index is None:
+        file_frame_index = fallback_index
+    return _ProcessedFrame(
+        file_frame_index=file_frame_index,
+        record=record,
+        inference=_infer_ts_frame(frame, fallback_index),
+        topology_reconstruction_status=frame.topology_reconstruction_status,
+    )
+
+
+def _process_frame_worker(
+    frame: BaseCalcFrame[Any],
+    fallback_index: int,
+    schema_version: str,
+) -> _ProcessedFrame:
+    """Reconstruct one frame after pool-level MolGR initialization."""
+
+    return _process_frame_without_configuration(frame, fallback_index, schema_version)
+
+
+def _process_frame_chunk_worker(
+    frames: tuple[tuple[BaseCalcFrame[Any], int], ...],
+    schema_version: str,
+) -> tuple[_ProcessedFrame, ...]:
+    """Process a frame chunk after one-time worker initialization."""
+
+    return tuple(
+        _process_frame_without_configuration(frame, fallback_index, schema_version)
+        for frame, fallback_index in frames
+    )
+
+
+def _store_payload_worker(
+    settings: RustFSSettings,
+    object_key: str,
+    source: bytes | Path,
+    media_type: str,
+    content_sha256: str | None,
+    size_bytes: int | None,
+    check_existing_object: bool,
+) -> Any:
+    """Process-pool entry point for one RustFS transfer plus HEAD check."""
+
+    global _storage_worker_store, _storage_worker_store_key, _storage_worker_bucket_ready
+    settings_key = (
+        settings.endpoint_url,
+        settings.access_key,
+        settings.secret_key,
+        settings.bucket,
+        settings.region,
+        settings.verify_tls,
+        settings.ca_bundle,
+        settings.connect_timeout_seconds,
+        settings.read_timeout_seconds,
+    )
+    if _storage_worker_store is None or _storage_worker_store_key != settings_key:
+        if _storage_worker_store is not None:
+            with suppress(Exception):
+                _storage_worker_store.close()
+        _storage_worker_store = RustFSObjectStore(settings)
+        _storage_worker_store_key = settings_key
+        _storage_worker_bucket_ready = False
+    store = _storage_worker_store
+    if not _storage_worker_bucket_ready:
+        store.ensure_bucket()
+        _storage_worker_bucket_ready = True
+    if check_existing_object and store.exists(object_key):
+        return store.head(object_key)
+    if isinstance(source, Path):
+        if content_sha256 is None or size_bytes is None:
+            raise ValueError("streamed uploads require precomputed source identity")
+        return store.put_file(
+            key=object_key,
+            path=source,
+            content_sha256=content_sha256,
+            size_bytes=size_bytes,
+            content_type=media_type,
+            metadata={"ingestion": "artifact-upload"},
+        )
+    return store.put_bytes(
+        key=object_key,
+        payload=source,
+        content_type=media_type,
+        metadata={"ingestion": "artifact-upload"},
+    )
+
+
 def _parsed_artifact_from_chem_file(
     chem_file: Any,
     *,
     source_compression: str | None,
+    artifact_sha256: str | None = None,
+    slim_chem_file: bool = False,
+    parallel_frame_conversion: bool = False,
+    materialize_topologies: bool = True,
 ) -> _ParsedArtifact:
     inferred: list[_Inference] = []
-    for fallback_index, frame in enumerate(chem_file):
-        if not isinstance(frame, BaseCalcFrame):
-            continue
-        if frame.is_TS is not True:
-            continue
-        file_frame_index = frame.file_frame_index
-        if file_frame_index is None:
-            file_frame_index = fallback_index
-        vibrations = frame.vibrations
-        if vibrations is None or len(vibrations.imaginary_idxs) != 1:
-            continue
-        imaginary_position = vibrations.imaginary_idxs[0]
-        imaginary_mode_index = (
-            vibrations.mode_indices[imaginary_position]
-            if vibrations.mode_indices
-            else imaginary_position
+    if materialize_topologies:
+        for fallback_index, frame in enumerate(chem_file):
+            if isinstance(frame, BaseCalcFrame):
+                inference = _infer_ts_frame(frame, fallback_index)
+                if inference is not None:
+                    inferred.append(inference)
+    frame_records = (
+        _frame_records_from_chem_file(
+            chem_file,
+            parallel=parallel_frame_conversion,
         )
-        frequency = vibrations[imaginary_position].frequency
-        if frequency is None:
-            continue
-        frequency_cm1 = float(frequency.to(atom_ureg.cm_1).magnitude)
-        if frame.topology_reconstruction_status == "suspicious_fallback":
-            inferred.append(
-                _FailedInference(
-                    file_frame_index=file_frame_index,
-                    imaginary_mode_index=imaginary_mode_index,
-                    imaginary_frequency_cm1=frequency_cm1,
-                    error_code="ts_topology_untrusted",
-                    error_message=(
-                        "MolGR returned a suspicious fallback topology; "
-                        "TS endpoint inference was skipped"
-                    ),
-                )
-            )
-            continue
-        try:
-            (
-                negative_endpoint,
-                positive_endpoint,
-                negative_displacement_ratio,
-                positive_displacement_ratio,
-            ) = _signed_ts_endpoints(frame, imaginary_position)
-            reactant, product = sorted(
-                (negative_endpoint, positive_endpoint),
-                key=lambda endpoint: len(Chem.GetMolFrags(endpoint)),
-                reverse=True,
-            )
-            for endpoint in (negative_endpoint, positive_endpoint, reactant, product):
-                endpoint_atoms = [atom.GetAtomicNum() for atom in endpoint.GetAtoms()]  # type: ignore[no-untyped-call]
-                if endpoint_atoms != frame.atoms:
-                    raise ValueError(
-                        "MolOP TS endpoint atom order differs from the TS source frame"
-                    )
-            inferred.append(
-                _SuccessfulInference(
-                    file_frame_index=file_frame_index,
-                    imaginary_mode_index=imaginary_mode_index,
-                    imaginary_frequency_cm1=frequency_cm1,
-                    reaction_smiles=_mapped_reaction_smiles(reactant, product),
-                    negative_endpoint=negative_endpoint,
-                    positive_endpoint=positive_endpoint,
-                    negative_displacement_ratio=negative_displacement_ratio,
-                    positive_displacement_ratio=positive_displacement_ratio,
-                )
-            )
-        except Exception as error:
-            inferred.append(
-                _FailedInference(
-                    file_frame_index=file_frame_index,
-                    imaginary_mode_index=imaginary_mode_index,
-                    imaginary_frequency_cm1=frequency_cm1,
-                    error_code="ts_endpoint_inference_failed",
-                    error_message=str(error) or type(error).__name__,
-                )
-            )
+        if materialize_topologies
+        else ()
+    )
+    parsed_chem_file: Any = chem_file
+    if slim_chem_file:
+        file_payload = chem_file.model_dump(mode="python")
+        source_segments = tuple(chem_file.source_segments)
+        file_payload["source_segments"] = list(source_segments)
+        parsed_chem_file = _ParsedChemFile(
+            payload=file_payload,
+            source_segments=source_segments,
+        )
     return _ParsedArtifact(
-        chem_file=chem_file,
-        frame_records=tuple(
-            frame_records_from_molop(frame, export_schema_version=chem_file.schema_version)
-            for frame in chem_file
-        ),
+        chem_file=parsed_chem_file,
+        frame_records=frame_records,
         source_frame_count=len(chem_file),
         source_format=chem_file.source_format,
         source_compression=source_compression,
         inferences=tuple(inferred),
+        record_sha256=(
+            _revision_record_hash(artifact_sha256, parsed_chem_file, list(frame_records))
+            if artifact_sha256 is not None and materialize_topologies
+            else None
+        ),
+        artifact_sha256=artifact_sha256,
+    )
+
+
+def _materialize_parsed_artifacts(
+    parsed_artifacts: list[_ParsedArtifact],
+) -> list[_ParsedArtifact]:
+    """Process deferred frames through the dedicated frame process pool."""
+
+    materialized: dict[int, _ParsedArtifact] = {}
+    pool = _get_frame_process_pool(get_settings().molop_batch_n_jobs)
+    for parsed in parsed_artifacts:
+        if parsed.frame_records:
+            materialized[id(parsed)] = parsed
+            continue
+        chem_file = parsed.chem_file
+        if isinstance(chem_file, _ParsedChemFile):
+            raise RuntimeError(
+                "deferred MolOP topology reconstruction requires the owning-process ChemFile"
+            )
+        jobs = [
+            pool.submit(
+                _process_frame_worker,
+                _detach_frame_for_process(frame),
+                fallback_index,
+                str(chem_file.schema_version),
+            )
+            for fallback_index, frame in enumerate(chem_file)
+            if isinstance(frame, BaseCalcFrame)
+        ]
+        processed = [job.result() for job in jobs]
+        status_by_index = {
+            item.file_frame_index: item.topology_reconstruction_status
+            for item in processed
+        }
+        for fallback_index, frame in enumerate(chem_file):
+            file_frame_index = frame.file_frame_index
+            if file_frame_index is None:
+                file_frame_index = fallback_index
+            frame.topology_reconstruction_status = status_by_index.get(file_frame_index)
+        records = tuple(
+            item.record
+            for item in sorted(processed, key=lambda item: item.file_frame_index)
+        )
+        inferences = tuple(
+            item.inference for item in processed if item.inference is not None
+        )
+        materialized[id(parsed)] = _ParsedArtifact(
+            chem_file=chem_file,
+            frame_records=records,
+            source_frame_count=parsed.source_frame_count,
+            source_format=parsed.source_format,
+            source_compression=parsed.source_compression,
+            inferences=inferences,
+            record_sha256=_revision_record_hash(
+                parsed.artifact_sha256 or "", chem_file, list(records)
+            )
+            if parsed.artifact_sha256 is not None
+            else None,
+            artifact_sha256=parsed.artifact_sha256,
+        )
+    return [materialized[id(parsed)] for parsed in parsed_artifacts]
+
+
+async def _process_parsed_artifact_frames(
+    parsed: _ParsedArtifact,
+    *,
+    submission_slots: asyncio.Semaphore,
+) -> _ParsedArtifact:
+    """Submit frame chunks and collect completions in source order."""
+
+    if parsed.frame_records:
+        return parsed
+    chem_file = parsed.chem_file
+    if isinstance(chem_file, _ParsedChemFile):
+        raise RuntimeError(
+            "deferred MolOP topology reconstruction requires the owning-process ChemFile"
+        )
+    pool = _get_frame_process_pool(get_settings().molop_batch_n_jobs)
+    loop = asyncio.get_running_loop()
+
+    frame_inputs = tuple(
+        (
+            frame,
+            fallback_index,
+        )
+        for fallback_index, frame in enumerate(chem_file)
+        if isinstance(frame, BaseCalcFrame)
+    )
+    frame_chunks = tuple(
+        frame_inputs[start : start + FRAME_CONVERSION_CHUNK_SIZE]
+        for start in range(0, len(frame_inputs), FRAME_CONVERSION_CHUNK_SIZE)
+    )
+
+    async def process_frame_chunk(
+        chunk: tuple[tuple[BaseCalcFrame[Any], int], ...],
+    ) -> tuple[_ProcessedFrame, ...]:
+        async with submission_slots:
+            detached_chunk = tuple(
+                (_detach_frame_for_process(frame), fallback_index)
+                for frame, fallback_index in chunk
+            )
+            return await loop.run_in_executor(
+                pool,
+                _process_frame_chunk_worker,
+                detached_chunk,
+                str(chem_file.schema_version),
+            )
+
+    processed_chunks = await asyncio.gather(*(process_frame_chunk(chunk) for chunk in frame_chunks))
+    processed = [item for chunk in processed_chunks for item in chunk]
+    status_by_index = {
+        item.file_frame_index: item.topology_reconstruction_status for item in processed
+    }
+    for fallback_index, frame in enumerate(chem_file):
+        file_frame_index = frame.file_frame_index
+        if file_frame_index is None:
+            file_frame_index = fallback_index
+        frame.topology_reconstruction_status = status_by_index.get(file_frame_index)
+    records = tuple(
+        item.record for item in sorted(processed, key=lambda item: item.file_frame_index)
+    )
+    inferences = tuple(item.inference for item in processed if item.inference is not None)
+    return _ParsedArtifact(
+        chem_file=chem_file,
+        frame_records=records,
+        source_frame_count=parsed.source_frame_count,
+        source_format=parsed.source_format,
+        source_compression=parsed.source_compression,
+        inferences=inferences,
+        record_sha256=_revision_record_hash(parsed.artifact_sha256 or "", chem_file, list(records))
+        if parsed.artifact_sha256 is not None
+        else None,
+        artifact_sha256=parsed.artifact_sha256,
     )
 
 
 def _parse_calculation_path_worker(
     path: str,
     source_compression: str | None,
+    artifact_sha256: str | None = None,
 ) -> tuple[_ParsedArtifact | None, str | None]:
-    """Parse one source-evidence file in a project-owned worker process."""
+    """Parse one source file in a worker without entering MolGR."""
 
+    previous_prewarm = molopconfig.prewarm_topologies
     try:
         configure_molecular_graph_reconstruction()
+        molopconfig.prewarm_topologies = False
         chem_file = AutoFileParser(
             path,
             parser_detection="auto",
-            capture_source_evidence=True,
+            capture_source_evidence=get_settings().molop_capture_source_evidence,
             release_file_content=True,
         )
         return (
             _parsed_artifact_from_chem_file(
                 chem_file,
                 source_compression=source_compression,
+                artifact_sha256=artifact_sha256,
+                slim_chem_file=False,
+                materialize_topologies=False,
             ),
             None,
         )
     except Exception as error:
         return None, str(error) or type(error).__name__
+    finally:
+        molopconfig.prewarm_topologies = previous_prewarm
+        configure_molecular_graph_reconstruction()
+
+
+def _parse_calculation_path_parent(
+    path: str,
+    source_compression: str | None,
+    artifact_sha256: str | None = None,
+) -> _ParsedArtifact:
+    """Parse one file in the API process, optionally deferring topology work."""
+
+    previous_prewarm = molopconfig.prewarm_topologies
+    fast_ingestion = _fast_molop_ingestion_enabled()
+    try:
+        # Fast parsing is intentionally text-only.  ``frame.rdmol`` remains
+        # lazy and is materialized later by the persistence microbatch.
+        configure_molecular_graph_reconstruction()
+        molopconfig.prewarm_topologies = False
+        chem_file = AutoFileParser(
+            path,
+            parser_detection="auto",
+            capture_source_evidence=get_settings().molop_capture_source_evidence,
+            release_file_content=True,
+        )
+        return _parsed_artifact_from_chem_file(
+            chem_file,
+            source_compression=source_compression,
+            artifact_sha256=artifact_sha256,
+            # The owning process keeps the complete ChemFile for deferred
+            # reconstruction.  Audit/validation callers still materialize
+            # records immediately when the fast path is disabled.
+            slim_chem_file=False,
+            parallel_frame_conversion=False,
+            materialize_topologies=not fast_ingestion,
+        )
+    finally:
+        molopconfig.prewarm_topologies = previous_prewarm
+        configure_molecular_graph_reconstruction()
 
 
 def _parse_calculation_paths_parallel(
@@ -786,6 +1369,7 @@ def _parse_calculation_paths_parallel(
 
 
 def _parse_calculation_output(payload: bytes, filename: str) -> _ParsedArtifact:
+    """Parse an in-memory payload with full evidence for validation callers."""
     configure_molecular_graph_reconstruction()
     decoded_payload, source_compression = _parser_payload(payload, filename)
     with tempfile.NamedTemporaryFile(suffix=_safe_parser_suffix(filename)) as temporary:
@@ -915,6 +1499,21 @@ def _parse_calculation_outputs_batch(
                     error_message or "MolOP did not return a result for this input file"
                 )
             )
+        deferred = [
+            parsed
+            for parsed in parsed_by_index.values()
+            if isinstance(parsed, _ParsedArtifact) and not parsed.frame_records
+        ]
+        if deferred:
+            materialized = _materialize_parsed_artifacts(deferred)
+            materialized_by_id = {
+                id(original): converted
+                for original, converted in zip(deferred, materialized, strict=True)
+            }
+            parsed_by_index = {
+                index: materialized_by_id.get(id(parsed), parsed)
+                for index, parsed in parsed_by_index.items()
+            }
         if timings_ms is not None:
             timings_ms["molop_parse_ms"] = (perf_counter() - parse_started_at) * 1000
             timings_ms["total_ms"] = (perf_counter() - started_at) * 1000
@@ -1181,6 +1780,100 @@ def _delete_reserved_object(
         store.delete(object_key, version_id=metadata.version_id)
 
 
+def _retire_artifacts_without_calculation_frames(
+    session: Session,
+    *,
+    artifact_ids: set[UUID],
+) -> dict[UUID, _RetiredArtifactObject]:
+    if not artifact_ids:
+        return {}
+    artifacts = session.exec(
+        select(ArtifactFile).where(col(ArtifactFile.id).in_(artifact_ids))
+    ).all()
+    _acquire_identity_locks(
+        session,
+        *sorted(
+            {("artifact-content", artifact.content_sha256) for artifact in artifacts},
+            key=str,
+        ),
+    )
+    retired: dict[UUID, _RetiredArtifactObject] = {}
+    for artifact in artifacts:
+        artifact_id = _require_id(artifact, label="ArtifactFile")
+        if artifact.storage_status is StorageStatus.RETIRED:
+            continue
+        retired[artifact_id] = _RetiredArtifactObject(
+            bucket=artifact.bucket,
+            object_key=artifact.object_key,
+            version_id=artifact.version_id,
+            content_sha256=artifact.content_sha256,
+            size_bytes=artifact.size_bytes,
+        )
+        artifact.storage_status = StorageStatus.RETIRED
+        session.add(artifact)
+    return retired
+
+
+def _delete_retired_artifact_object(reservation: _RetiredArtifactObject) -> None:
+    settings = RustFSSettings().model_copy(update={"bucket": reservation.bucket})
+    with RustFSObjectStore(settings) as store:
+        if not store.exists(reservation.object_key, version_id=reservation.version_id):
+            return
+        metadata = store.head(reservation.object_key, version_id=reservation.version_id)
+        if metadata.size != reservation.size_bytes or metadata.sha256 != reservation.content_sha256:
+            raise ArtifactUploadError(
+                "stored object metadata no longer matches the rejected artifact identity"
+            )
+        store.delete(reservation.object_key, version_id=reservation.version_id)
+
+
+async def _delete_retired_artifact_objects(
+    reservations: Mapping[UUID, _RetiredArtifactObject],
+) -> None:
+    for artifact_id, reservation in reservations.items():
+        try:
+            await asyncio.to_thread(_delete_retired_artifact_object, reservation)
+        except Exception:
+            logger.exception("failed to remove rejected artifact %s from RustFS", artifact_id)
+
+
+async def _reject_artifact_without_calculation_frames(
+    *,
+    ingestion_id: UUID,
+) -> ArtifactUploadResult:
+    async with session_factory() as session:
+        ingestion = await session.get(ArtifactIngestion, ingestion_id)
+        if ingestion is None:
+            raise ArtifactUploadError("artifact ingestion not found")
+        error = NoCalculationFramesError(
+            "source contains no QM calculation frames; artifact was filtered"
+        )
+        await session.run_sync(
+            partial(
+                _run_mark_ingestion_failed,
+                ingestion_id=ingestion_id,
+                error=error,
+                error_code="no_calculation_frames",
+                completed_at=datetime.now(UTC),
+                source_frame_count=0,
+                transition_state_frame_count=0,
+            )
+        )
+        artifact_id = ingestion.artifact_file_id
+        retired = await session.run_sync(
+            cast(Any, partial(
+                _retire_artifacts_without_calculation_frames,
+                artifact_ids={artifact_id},
+            ))
+        )
+        # Keep the content advisory lock held until the object has been
+        # verified and removed. This closes the unversioned-object retry race.
+        await _delete_retired_artifact_objects(retired)
+        await session.commit()
+    async with session_factory() as session:
+        return await session.run_sync(partial(_run_result, ingestion_id=ingestion_id))
+
+
 def _finish_upload_compensation(
     session: Session,
     *,
@@ -1386,7 +2079,53 @@ def _persist_transition_state_endpoint(
         raise ValueError("TS vibration endpoint coordinates are invalid")
     if endpoint.GetNumAtoms() != len(calculation_frame.observed_to_geometry_atom_indices):
         raise ValueError("TS vibration endpoint atom count differs from its source frame")
-    topology_record, source_to_topology = normalize_topology_with_mapping(
+    topology_record, source_to_topology = _normalize_transition_state_endpoint_topology(
+        endpoint,
+        direction,
+    )
+    persisted_topology = persist_molecular_topology(
+        session,
+        topology_record,
+        context=topology_context,
+    )
+    topology_id = _require_id(persisted_topology.topology, label="MolecularTopology")
+    source_coordinate_hash = sha256(coordinates.tobytes(order="C")).hexdigest()
+    endpoint_values = {
+        "calculation_frame_id": frame_id,
+        "calculation_frame": calculation_frame,
+        "topology_id": topology_id,
+        "topology": persisted_topology.topology,
+        "direction": direction,
+        "atom_count": endpoint.GetNumAtoms(),
+        "displacement_ratio": displacement_ratio,
+        "source_coordinates": coordinates,
+        "source_coordinate_hash": source_coordinate_hash,
+        "source_to_topology_atom_indices": source_to_topology,
+        "provenance": {
+            "method": "molop.possible_pre_post_ts",
+            "molop_version": MOLOP_VERSION,
+            "coordinate_frame": "calculation_frame.observed_coordinates",
+            "coordinate_order": "molop_source_atom_order",
+            "direction": direction.value,
+        },
+    }
+    endpoint_row = (
+        _new_entity(session, TransitionStateEndpoint, **endpoint_values)
+        if _fast_insert_enabled(session)
+        else TransitionStateEndpoint(**endpoint_values)
+    )
+    _flush_new_entity(session, endpoint_row, label="TransitionStateEndpoint")
+    if not defer_flush:
+        _attach_pending_entities(session)
+        session.flush()
+    return endpoint_row
+
+
+def _normalize_transition_state_endpoint_topology(
+    endpoint: Chem.Mol,
+    direction: TransitionStateEndpointDirection,
+) -> tuple[Any, list[int]]:
+    return normalize_topology_with_mapping(
         endpoint,
         add_hydrogens=False,
         reconstruction_method="molop/possible_pre_post_ts",
@@ -1397,36 +2136,6 @@ def _persist_transition_state_endpoint(
             "direction": direction.value,
         },
     )
-    persisted_topology = persist_molecular_topology(
-        session,
-        topology_record,
-        context=topology_context,
-    )
-    topology_id = _require_id(persisted_topology.topology, label="MolecularTopology")
-    source_coordinate_hash = sha256(coordinates.tobytes(order="C")).hexdigest()
-    endpoint_row = TransitionStateEndpoint(
-        calculation_frame_id=frame_id,
-        calculation_frame=calculation_frame,
-        topology_id=topology_id,
-        topology=persisted_topology.topology,
-        direction=direction,
-        atom_count=endpoint.GetNumAtoms(),
-        displacement_ratio=displacement_ratio,
-        source_coordinates=coordinates,
-        source_coordinate_hash=source_coordinate_hash,
-        source_to_topology_atom_indices=source_to_topology,
-        provenance={
-            "method": "molop.possible_pre_post_ts",
-            "molop_version": MOLOP_VERSION,
-            "coordinate_frame": "calculation_frame.observed_coordinates",
-            "coordinate_order": "molop_source_atom_order",
-            "direction": direction.value,
-        },
-    )
-    session.add(endpoint_row)
-    if not defer_flush:
-        session.flush()
-    return endpoint_row
 
 
 def _persist_transition_state_endpoints(
@@ -1512,32 +2221,78 @@ def _resolve_and_bind_transition_state_reaction(
 ) -> tuple[UUID, UUID]:
     """Create the mapped endpoint reaction and bind its TS coordinate evidence."""
 
-    reaction_result = create_reaction_in_session(
-        session,
-        CreateReactionCommand(
-            reaction=inferred.reaction_smiles,
-            mapped_reaction_kind=MappedReactionKind.OTHER,
-        ),
-        defer_thermodynamic_refresh=is_transition_state_frame_eligible(
-            calculation_frame.frame_role
-        ),
-        topology_context=topology_context,
-        include_creation_metadata=topology_context is None,
-        reconciliation_cache=(
-            topology_context.reconciliation_cache if topology_context is not None else None
-        ),
+    cached_reaction_ids = (
+        topology_context.inferred_reaction_ids_by_smiles.get(inferred.reaction_smiles)
+        if topology_context is not None
+        else None
     )
-    if reaction_result.mapped_reaction_id is None:
-        raise ValueError("MolOP TS endpoint reaction did not produce a complete atom mapping")
-    mapped_reaction = session.get(MappedReaction, reaction_result.mapped_reaction_id)
+    if cached_reaction_ids is None:
+        reaction_result = create_reaction_in_session(
+            session,
+            CreateReactionCommand(
+                reaction=inferred.reaction_smiles,
+                mapped_reaction_kind=MappedReactionKind.OTHER,
+            ),
+            defer_thermodynamic_refresh=is_transition_state_frame_eligible(
+                calculation_frame.frame_role
+            ),
+            topology_context=topology_context,
+            include_creation_metadata=topology_context is None,
+            precomputed_topology_records=(
+                topology_context.inferred_reaction_topology_records.get(
+                    inferred.reaction_smiles
+                )
+                if topology_context is not None
+                else None
+            ),
+            reconciliation_cache=(
+                topology_context.reconciliation_cache if topology_context is not None else None
+            ),
+        )
+        if reaction_result.mapped_reaction_id is None:
+            raise ValueError("MolOP TS endpoint reaction did not produce a complete atom mapping")
+        logical_reaction_id = reaction_result.logical_reaction_id
+        mapped_reaction_id = reaction_result.mapped_reaction_id
+        if topology_context is not None:
+            topology_context.inferred_reaction_ids_by_smiles[inferred.reaction_smiles] = (
+                logical_reaction_id,
+                mapped_reaction_id,
+            )
+    else:
+        logical_reaction_id, mapped_reaction_id = cached_reaction_ids
+        if topology_context is not None:
+            topology_context.inferred_reaction_cache_hits += 1
+    mapped_reaction = (
+        topology_context.mapped_reactions_by_id.get(mapped_reaction_id)
+        if topology_context is not None
+        else None
+    )
+    if mapped_reaction is None:
+        mapped_reaction = session.get(MappedReaction, mapped_reaction_id)
+    if mapped_reaction is None:
+        mapped_reaction = next(
+            (
+                candidate
+                for candidate in (
+                    *session.new,
+                    *session.info.get("_fast_pending_entities", ()),
+                )
+                if isinstance(candidate, MappedReaction) and candidate.id == mapped_reaction_id
+            ),
+            None,
+        )
     if mapped_reaction is None:
         raise RuntimeError("MolOP TS inference created a missing MappedReaction")
+    # Reaction reconciliation may flush internally; register all deferred
+    # reaction rows before that happens so relationship backrefs stay intact.
+    _attach_pending_entities(session)
     if is_transition_state_frame_eligible(calculation_frame.frame_role):
         bind_transition_state_frame(
             session,
             mapped_reaction=mapped_reaction,
             calculation_frame=calculation_frame,
             cache=(topology_context.reconciliation_cache if topology_context is not None else None),
+            refresh_thermodynamics=topology_context is None,
         )
     else:
         ensure_transition_state_path(
@@ -1545,7 +2300,7 @@ def _resolve_and_bind_transition_state_reaction(
             mapped_reaction=mapped_reaction,
             cache=(topology_context.reconciliation_cache if topology_context is not None else None),
         )
-    return reaction_result.logical_reaction_id, reaction_result.mapped_reaction_id
+    return logical_reaction_id, mapped_reaction_id
 
 
 def _persist_successful_inference(
@@ -1565,16 +2320,17 @@ def _persist_successful_inference(
         calculation_frame=calculation_frame,
         topology_context=topology_context,
     )
-    inference = TransitionStateInference(
-        artifact_ingestion_id=_require_id(ingestion, label="ArtifactIngestion"),
-        artifact_ingestion=ingestion,
-        parse_revision_id=_require_id(parse_revision, label="ParseRevision"),
-        parse_revision=parse_revision,
-        file_frame_index=inferred.file_frame_index,
-        imaginary_mode_index=inferred.imaginary_mode_index,
-        imaginary_frequency_cm1=inferred.imaginary_frequency_cm1,
-        status=TransitionStateInferenceStatus.SUCCEEDED,
-        inference_settings={
+    inference_values = {
+        "artifact_ingestion_id": _require_id(ingestion, label="ArtifactIngestion"),
+        "artifact_ingestion": ingestion,
+        "parse_revision_id": _require_id(parse_revision, label="ParseRevision"),
+        "parse_revision": parse_revision,
+        "file_frame_index": inferred.file_frame_index,
+        "imaginary_mode_index": inferred.imaginary_mode_index,
+        "imaginary_frequency_cm1": inferred.imaginary_frequency_cm1,
+        "status": TransitionStateInferenceStatus.SUCCEEDED,
+        "inference_method": "molop/possible_pre_post_ts",
+        "inference_settings": {
             "endpoint_selection": "molop.possible_pre_post_ts",
             "sampling_min_ratio": TS_PRE_POST_MIN_RATIO,
             "sampling_max_ratio": TS_PRE_POST_MAX_RATIO,
@@ -1587,12 +2343,20 @@ def _persist_successful_inference(
             ),
             "imaginary_mode_index": inferred.imaginary_mode_index,
         },
-        logical_reaction_id=logical_reaction_id,
-        mapped_reaction_id=mapped_reaction_id,
-        calculation_frame_id=_require_id(calculation_frame, label="CalculationFrame"),
+        "logical_reaction_id": logical_reaction_id,
+        "mapped_reaction_id": mapped_reaction_id,
+        "calculation_frame_id": _require_id(calculation_frame, label="CalculationFrame"),
+    }
+    inference = (
+        _new_entity(session, TransitionStateInference, **inference_values)
+        if _fast_insert_enabled(session)
+        else TransitionStateInference(**inference_values)
     )
-    session.add(inference)
+    _flush_new_entity(session, inference, label="TransitionStateInference")
+    if _fast_insert_enabled(session):
+        session.add(inference)
     if not defer_flush:
+        _attach_pending_entities(session)
         session.flush()
     _persist_transition_state_endpoints(
         session,
@@ -1605,121 +2369,358 @@ def _persist_successful_inference(
     return inference
 
 
+def _add_failed_inference(
+    session: Session,
+    *,
+    deferred: _DeferredArtifactInferences,
+    inferred: _Inference,
+    error_code: str,
+    error_message: str | None = None,
+) -> None:
+    values = {
+            "artifact_ingestion_id": _require_id(
+                deferred.ingestion,
+                label="ArtifactIngestion",
+            ),
+            "artifact_ingestion": deferred.ingestion,
+            "parse_revision_id": _require_id(deferred.parse_revision, label="ParseRevision"),
+            "parse_revision": deferred.parse_revision,
+            "file_frame_index": inferred.file_frame_index,
+            "imaginary_mode_index": inferred.imaginary_mode_index,
+            "imaginary_frequency_cm1": inferred.imaginary_frequency_cm1,
+            "status": TransitionStateInferenceStatus.FAILED,
+            "inference_method": "molop/possible_pre_post_ts",
+            "inference_settings": {
+                "endpoint_selection": "molop.possible_pre_post_ts",
+                "sampling_min_ratio": TS_PRE_POST_MIN_RATIO,
+                "sampling_max_ratio": TS_PRE_POST_MAX_RATIO,
+                "sampling_steps": TS_PRE_POST_STEPS,
+            },
+            "error_code": error_code,
+            "error_message": (
+                error_message
+                if error_message is not None
+                else getattr(inferred, "error_message", None)
+            ),
+    }
+    failed_inference = (
+        _new_entity(session, TransitionStateInference, **values)
+        if _fast_insert_enabled(session)
+        else TransitionStateInference(**values)
+    )
+    _flush_new_entity(session, failed_inference, label="TransitionStateInference")
+    if _fast_insert_enabled(session):
+        session.add(failed_inference)
+
+
+def _persist_one_new_inference(
+    session: Session,
+    task: _InferencePersistenceTask,
+    *,
+    topology_context: GeometryPersistenceContext | None,
+) -> None:
+    try:
+        with session.begin_nested():
+            _persist_successful_inference(
+                session,
+                ingestion=task.deferred.ingestion,
+                parse_revision=task.deferred.parse_revision,
+                inferred=task.inferred,
+                calculation_frame=task.calculation_frame,
+                topology_context=topology_context,
+                identity_is_new=task.deferred.revision_created,
+                defer_flush=False,
+        )
+    except Exception as error:
+        _add_failed_inference(
+            session,
+            deferred=task.deferred,
+            inferred=task.inferred,
+            error_code="inferred_reaction_persistence_failed",
+            error_message=str(error) or type(error).__name__,
+        )
+
+
+_INFERENCE_CONTEXT_MUTABLE_FIELDS = (
+    "topologies",
+    "formulas_by_hash",
+    "topologies_by_identity",
+    "topology_derivations_by_key",
+    "geometries_by_hash",
+    "exact_geometry_keys_loaded",
+    "equivalent_geometry_by_key",
+    "equivalent_geometry_candidates",
+    "equivalent_geometry_keys_loaded",
+    "geometries_to_reconcile",
+    "reaction_participants_by_topology",
+    "mapped_reactions_by_id",
+    "inferred_reaction_ids_by_smiles",
+    "inferred_reaction_topology_records",
+)
+_RECONCILIATION_CACHE_MUTABLE_FIELDS = (
+    "nodes_by_reaction",
+    "nodes_by_key",
+    "loaded_reaction_nodes",
+    "node_geometries_by_node",
+    "loaded_node_geometries",
+    "mappings_by_node_geometry_id",
+    "loaded_mappings",
+    "transition_state_paths_ready",
+    "thermodynamics_refreshed_reactions",
+    "new_node_geometry_ids",
+    "thermodynamic_property_geometry_ids",
+    "affected_reactions_by_id",
+)
+
+
+def _snapshot_inference_context(
+    topology_context: GeometryPersistenceContext | None,
+) -> tuple[dict[str, object], dict[str, object] | None, int] | None:
+    if topology_context is None:
+        return None
+    context_state = {
+        name: copy.copy(getattr(topology_context, name))
+        for name in _INFERENCE_CONTEXT_MUTABLE_FIELDS
+    }
+    cache = topology_context.reconciliation_cache
+    cache_state = (
+        {
+            name: copy.copy(getattr(cache, name))
+            for name in _RECONCILIATION_CACHE_MUTABLE_FIELDS
+        }
+        if isinstance(cache, ReconciliationBatchCache)
+        else None
+    )
+    return context_state, cache_state, topology_context.inferred_reaction_cache_hits
+
+
+def _restore_inference_context(
+    topology_context: GeometryPersistenceContext | None,
+    snapshot: tuple[dict[str, object], dict[str, object] | None, int] | None,
+) -> None:
+    if topology_context is None or snapshot is None:
+        return
+    context_state, cache_state, cache_hits = snapshot
+    for name, saved in context_state.items():
+        current = getattr(topology_context, name)
+        current.clear()
+        current.update(saved)  # type: ignore[arg-type]
+    topology_context.inferred_reaction_cache_hits = cache_hits
+    cache = topology_context.reconciliation_cache
+    if cache_state is None or not isinstance(cache, ReconciliationBatchCache):
+        return
+    for name, saved in cache_state.items():
+        current = getattr(cache, name)
+        current.clear()
+        current.update(saved)  # type: ignore[arg-type]
+
+
+def _persist_inference_batch(
+    session: Session,
+    tasks: list[_InferencePersistenceTask],
+    *,
+    topology_context: GeometryPersistenceContext | None,
+) -> None:
+    """Flush several new TS inferences together, with per-row fallback."""
+
+    if not tasks:
+        return
+    previous_bulk_insert_disabled = session.info.get("tricycle_bulk_insert_disabled", False)
+    session.info["tricycle_bulk_insert_disabled"] = True
+    try:
+        if len(tasks) == 1:
+            _persist_one_new_inference(
+                session,
+                tasks[0],
+                topology_context=topology_context,
+            )
+            _refresh_inference_reaction_profiles(
+                session,
+                topology_context=topology_context,
+            )
+            return
+        context_snapshot = _snapshot_inference_context(topology_context)
+        pending_snapshot = list(session.info.get("_fast_pending_entities", ()))
+        try:
+            with session.begin_nested():
+                for task in tasks:
+                    _persist_successful_inference(
+                        session,
+                        ingestion=task.deferred.ingestion,
+                        parse_revision=task.deferred.parse_revision,
+                        inferred=task.inferred,
+                        calculation_frame=task.calculation_frame,
+                        topology_context=topology_context,
+                        identity_is_new=task.deferred.revision_created,
+                        defer_flush=True,
+                    )
+                _attach_pending_entities(session)
+                session.flush()
+                _refresh_inference_reaction_profiles(
+                    session,
+                    topology_context=topology_context,
+                )
+        except Exception:
+            _restore_inference_context(topology_context, context_snapshot)
+            if pending_snapshot:
+                session.info["_fast_pending_entities"] = pending_snapshot
+            else:
+                session.info.pop("_fast_pending_entities", None)
+            for task in tasks:
+                _persist_one_new_inference(
+                    session,
+                    task,
+                    topology_context=topology_context,
+                )
+            _refresh_inference_reaction_profiles(
+                session,
+                topology_context=topology_context,
+            )
+    finally:
+        session.info["tricycle_bulk_insert_disabled"] = previous_bulk_insert_disabled
+
+
+def _refresh_inference_reaction_profiles(
+    session: Session,
+    *,
+    topology_context: GeometryPersistenceContext | None,
+) -> None:
+    """Refresh TS reaction profiles once after a persistence microbatch.
+
+    Binding a TS frame used to refresh and flush the whole Session for every
+    inference.  The batch cache already tracks affected reactions, so refresh
+    them after all evidence rows in the microbatch have been attached.
+    """
+
+    if topology_context is None or topology_context.reconciliation_cache is None:
+        return
+    cache = topology_context.reconciliation_cache
+    reactions = tuple(cache.affected_reactions_by_id.values())
+    for mapped_reaction in reactions:
+        mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
+        refresh_mapped_reaction_thermodynamics(session, mapped_reaction)
+        cache.thermodynamics_refreshed_reactions.add(mapped_reaction_id)
+    # New TS frames can add the same reaction in a later inference
+    # microbatch, so retain only the dirty set for the current flush window.
+    cache.affected_reactions_by_id.clear()
+
+
 def _persist_artifact_inferences(
     session: Session,
     deferred: _DeferredArtifactInferences,
     *,
     topology_context: GeometryPersistenceContext | None = None,
 ) -> None:
-    ingestion = deferred.ingestion
-    parse_revision = deferred.parse_revision
-    parse_revision_id = _require_id(parse_revision, label="ParseRevision")
-    for inferred in deferred.parsed.inferences:
-        existing = None
-        if not deferred.revision_created:
-            existing = session.exec(
-                select(TransitionStateInference).where(
-                    TransitionStateInference.parse_revision_id == parse_revision_id,
-                    TransitionStateInference.file_frame_index == inferred.file_frame_index,
-                )
-            ).first()
-        if existing is not None:
-            if (
-                existing.status is TransitionStateInferenceStatus.SUCCEEDED
-                and existing.mapped_reaction_id is not None
-                and existing.calculation_frame_id is not None
-            ):
-                mapped_reaction = session.get(MappedReaction, existing.mapped_reaction_id)
-                calculation_frame = session.get(CalculationFrame, existing.calculation_frame_id)
-                if mapped_reaction is None or calculation_frame is None:
-                    raise RuntimeError(
-                        "successful TS inference references missing reaction evidence"
-                    )
-                ensure_transition_state_path(
-                    session,
-                    mapped_reaction=mapped_reaction,
-                    cache=(
-                        topology_context.reconciliation_cache
-                        if topology_context is not None
-                        else None
-                    ),
-                )
-                if is_transition_state_frame_eligible(calculation_frame.frame_role):
-                    bind_transition_state_frame(
-                        session,
-                        mapped_reaction=mapped_reaction,
-                        calculation_frame=calculation_frame,
-                        cache=(
-                            topology_context.reconciliation_cache
-                            if topology_context is not None
-                            else None
-                        ),
-                    )
-                if isinstance(inferred, _SuccessfulInference):
-                    _persist_transition_state_endpoints(
-                        session,
-                        calculation_frame=calculation_frame,
-                        inferred=inferred,
-                        topology_context=topology_context,
-                    )
-            continue
-        if isinstance(inferred, _FailedInference):
-            session.add(
-                TransitionStateInference(
-                    artifact_ingestion_id=_require_id(ingestion, label="ArtifactIngestion"),
-                    artifact_ingestion=ingestion,
-                    parse_revision_id=parse_revision_id,
-                    parse_revision=parse_revision,
-                    file_frame_index=inferred.file_frame_index,
-                    imaginary_mode_index=inferred.imaginary_mode_index,
-                    imaginary_frequency_cm1=inferred.imaginary_frequency_cm1,
-                    status=TransitionStateInferenceStatus.FAILED,
-                    inference_settings={
-                        "endpoint_selection": "molop.possible_pre_post_ts",
-                        "sampling_min_ratio": TS_PRE_POST_MIN_RATIO,
-                        "sampling_max_ratio": TS_PRE_POST_MAX_RATIO,
-                        "sampling_steps": TS_PRE_POST_STEPS,
-                    },
-                    error_code=inferred.error_code,
-                    error_message=inferred.error_message,
-                )
-            )
-            continue
-        try:
-            calculation_frame = deferred.frames_by_file_index.get(inferred.file_frame_index)
-            if calculation_frame is None:
-                raise ValueError("persisted calculation is missing the MolOP TS frame")
-            _persist_successful_inference(
+    _persist_artifact_inferences_batch(
+        session,
+        [deferred],
+        topology_context=topology_context,
+    )
+
+
+def _persist_artifact_inferences_batch(
+    session: Session,
+    deferred_items: list[_DeferredArtifactInferences],
+    *,
+    topology_context: GeometryPersistenceContext | None = None,
+) -> None:
+    pending_tasks: list[_InferencePersistenceTask] = []
+
+    def flush_pending() -> None:
+        nonlocal pending_tasks
+        if pending_tasks:
+            _persist_inference_batch(
                 session,
-                ingestion=ingestion,
-                parse_revision=parse_revision,
-                inferred=inferred,
-                calculation_frame=calculation_frame,
+                pending_tasks,
                 topology_context=topology_context,
-                identity_is_new=deferred.revision_created,
-                defer_flush=deferred.defer_revision_local_flush,
             )
-        except Exception as error:
-            session.add(
-                TransitionStateInference(
-                    artifact_ingestion_id=_require_id(ingestion, label="ArtifactIngestion"),
-                    artifact_ingestion=ingestion,
-                    parse_revision_id=parse_revision_id,
-                    parse_revision=parse_revision,
-                    file_frame_index=inferred.file_frame_index,
-                    imaginary_mode_index=inferred.imaginary_mode_index,
-                    imaginary_frequency_cm1=inferred.imaginary_frequency_cm1,
-                    status=TransitionStateInferenceStatus.FAILED,
-                    inference_settings={
-                        "endpoint_selection": "molop.possible_pre_post_ts",
-                        "sampling_min_ratio": TS_PRE_POST_MIN_RATIO,
-                        "sampling_max_ratio": TS_PRE_POST_MAX_RATIO,
-                        "sampling_steps": TS_PRE_POST_STEPS,
-                    },
-                    error_code="inferred_reaction_persistence_failed",
-                    error_message=str(error) or type(error).__name__,
+            pending_tasks = []
+
+    for deferred in deferred_items:
+        parse_revision_id = _require_id(deferred.parse_revision, label="ParseRevision")
+        for inferred in deferred.parsed.inferences:
+                existing = None
+                if not deferred.revision_created:
+                    existing = session.exec(
+                        select(TransitionStateInference).where(
+                            TransitionStateInference.parse_revision_id == parse_revision_id,
+                            TransitionStateInference.file_frame_index == inferred.file_frame_index,
+                        )
+                    ).first()
+                if existing is not None:
+                    flush_pending()
+                    if (
+                        existing.status is TransitionStateInferenceStatus.SUCCEEDED
+                        and existing.mapped_reaction_id is not None
+                        and existing.calculation_frame_id is not None
+                    ):
+                        mapped_reaction = session.get(MappedReaction, existing.mapped_reaction_id)
+                        calculation_frame = session.get(
+                            CalculationFrame,
+                            existing.calculation_frame_id,
+                        )
+                        if mapped_reaction is None or calculation_frame is None:
+                            raise RuntimeError(
+                                "successful TS inference references missing reaction evidence"
+                            )
+                        ensure_transition_state_path(
+                            session,
+                            mapped_reaction=mapped_reaction,
+                            cache=(
+                                topology_context.reconciliation_cache
+                                if topology_context is not None
+                                else None
+                            ),
+                        )
+                        if is_transition_state_frame_eligible(calculation_frame.frame_role):
+                            bind_transition_state_frame(
+                                session,
+                                mapped_reaction=mapped_reaction,
+                                calculation_frame=calculation_frame,
+                                cache=(
+                                    topology_context.reconciliation_cache
+                                    if topology_context is not None
+                                    else None
+                                ),
+                            )
+                        if isinstance(inferred, _SuccessfulInference):
+                            _persist_transition_state_endpoints(
+                                session,
+                                calculation_frame=calculation_frame,
+                                inferred=inferred,
+                                topology_context=topology_context,
+                            )
+                    continue
+                if isinstance(inferred, _FailedInference):
+                    flush_pending()
+                    _add_failed_inference(
+                        session,
+                        deferred=deferred,
+                        inferred=inferred,
+                        error_code=inferred.error_code,
+                    )
+                    continue
+                calculation_frame = deferred.frames_by_file_index.get(inferred.file_frame_index)
+                if calculation_frame is None:
+                    flush_pending()
+                    _add_failed_inference(
+                        session,
+                        deferred=deferred,
+                        inferred=inferred,
+                        error_code="inferred_reaction_persistence_failed",
+                        error_message="persisted calculation is missing the MolOP TS frame",
+                    )
+                    continue
+                pending_tasks.append(
+                    _InferencePersistenceTask(
+                        deferred=deferred,
+                        inferred=inferred,
+                        calculation_frame=calculation_frame,
+                    )
                 )
-            )
+                if len(pending_tasks) >= INFERENCE_PERSIST_BATCH_SIZE:
+                    flush_pending()
+    flush_pending()
 
 
 def _persist_parsed_artifact(
@@ -1741,6 +2742,12 @@ def _persist_parsed_artifact(
     ingestion = ingestion or session.get(ArtifactIngestion, ingestion_id)
     if ingestion is None:
         raise RuntimeError("artifact ingestion disappeared during parsing")
+    # Fast MolOP parsing keeps coordinate-only frames so the expensive graph
+    # work can be shared across the persistence batch.  Single-file uploads
+    # reach this path directly, while batch uploads materialize their files in
+    # ``persist_parsed_files`` before calling us.
+    if not parsed.frame_records and parsed.source_frame_count:
+        parsed = _materialize_parsed_artifacts([parsed])[0]
     artifact = ingestion.artifact_file
     if existing_revision_ids is None:
         existing_revision_ids = {
@@ -1756,10 +2763,20 @@ def _persist_parsed_artifact(
         chem_file=parsed.chem_file,
         records=list(parsed.frame_records),
         source_compression=parsed.source_compression,
+        record_sha256=parsed.record_sha256,
         started_at=started_at,
         completed_at=completed_at,
         force_new_revision=force_new_revision,
-        fast_insert=not existing_revision_ids and not force_new_revision,
+        fast_insert=(
+            _fast_molop_ingestion_enabled()
+            and not existing_revision_ids
+            and not force_new_revision
+        ),
+        parallel_frame_persistence=(
+            _fast_molop_ingestion_enabled()
+            and not existing_revision_ids
+            and not force_new_revision
+        ),
         geometry_context=geometry_context,
         preload_geometry_context=preload_geometry_context,
         defer_reconciliation=defer_reconciliation,
@@ -1783,6 +2800,7 @@ def _persist_parsed_artifact(
     if defer_ingestion_completion:
         return parse_revision_id, revision_created
 
+    _attach_pending_entities(session)
     session.flush()
     outcomes = session.exec(
         select(TransitionStateInference).where(
@@ -1819,6 +2837,8 @@ def _mark_ingestion_failed(
     error_code: str,
     completed_at: datetime,
     ingestion: ArtifactIngestion | None = None,
+    source_frame_count: int | None = None,
+    transition_state_frame_count: int | None = None,
 ) -> None:
     ingestion = ingestion or session.get(ArtifactIngestion, ingestion_id)
     if ingestion is None:
@@ -1833,6 +2853,10 @@ def _mark_ingestion_failed(
         }
     ingestion.error_code = error_code
     ingestion.error_message = str(error) or type(error).__name__
+    if source_frame_count is not None:
+        ingestion.source_frame_count = source_frame_count
+    if transition_state_frame_count is not None:
+        ingestion.transition_state_frame_count = transition_state_frame_count
     session.add(ingestion)
 
 
@@ -2032,6 +3056,8 @@ def _run_mark_ingestion_failed(
     error_code: str,
     completed_at: datetime,
     ingestion: ArtifactIngestion | None = None,
+    source_frame_count: int | None = None,
+    transition_state_frame_count: int | None = None,
 ) -> None:
     _mark_ingestion_failed(
         cast(Session, session),
@@ -2040,6 +3066,8 @@ def _run_mark_ingestion_failed(
         error_code=error_code,
         completed_at=completed_at,
         ingestion=ingestion,
+        source_frame_count=source_frame_count,
+        transition_state_frame_count=transition_state_frame_count,
     )
 
 
@@ -2075,8 +3103,17 @@ def _run_mark_uploads_available(
     )
 
 
-def _run_flush(session: SQLAlchemySession) -> None:
-    cast(Session, session).flush()
+def _run_flush(session: SQLAlchemySession) -> dict[str, object]:
+    typed_session = cast(Session, session)
+    previous_fast_insert = typed_session.info.get("tricycle_fast_insert", False)
+    typed_session.info["tricycle_fast_insert"] = True
+    try:
+        _attach_pending_entities(typed_session)
+        typed_session.flush()
+        diagnostics = typed_session.info.get("_fast_bulk_insert_diagnostics")
+        return dict(diagnostics) if isinstance(diagnostics, dict) else {}
+    finally:
+        typed_session.info["tricycle_fast_insert"] = previous_fast_insert
 
 
 def _run_disable_autoflush(session: SQLAlchemySession) -> None:
@@ -2121,12 +3158,16 @@ def _run_persist_deferred_inferences(
     topology_context: GeometryPersistenceContext,
 ) -> None:
     typed_session = cast(Session, session)
-    for deferred in deferred_inferences:
-        _persist_artifact_inferences(
+    previous_fast_insert = typed_session.info.get("tricycle_fast_insert", False)
+    typed_session.info["tricycle_fast_insert"] = True
+    try:
+        _persist_artifact_inferences_batch(
             typed_session,
-            deferred,
+            deferred_inferences,
             topology_context=topology_context,
         )
+    finally:
+        typed_session.info["tricycle_fast_insert"] = previous_fast_insert
 
 
 def _run_reconcile_molop_geometry_context(
@@ -2142,16 +3183,54 @@ def _run_preload_molecular_geometry_context(
     *,
     parsed_artifacts: list[_ParsedArtifact],
     context: GeometryPersistenceContext,
+    topology_records: list[Any] | None = None,
 ) -> None:
-    preload_molecular_geometry_context(
-        cast(Session, session),
-        [
-            (record.molecule, record.frame.coordinate_decimal_places)
-            for parsed in parsed_artifacts
-            for record in parsed.frame_records
-        ],
-        context=context,
-    )
+    typed_session = cast(Session, session)
+    previous_fast_insert = typed_session.info.get("tricycle_fast_insert", False)
+    # Preload creates the shared Formula/Topology/Derivation identities used by
+    # the frame loop. Give it the same client-ID/deferred-attach mode as the
+    # actual artifact writer so it does not flush one shared row at a time.
+    typed_session.info["tricycle_fast_insert"] = True
+    try:
+        preload_molecular_geometry_context(
+            typed_session,
+            [
+                (record.molecule, record.frame.coordinate_decimal_places)
+                for parsed in parsed_artifacts
+                for record in parsed.frame_records
+            ],
+            context=context,
+            topology_records=topology_records or (),
+        )
+    finally:
+        typed_session.info["tricycle_fast_insert"] = previous_fast_insert
+
+
+def _inference_topology_records(
+    inferred: _SuccessfulInference,
+    *,
+    reaction_records: tuple[Any, ...] | None = None,
+) -> list[Any]:
+    """Build the shared topology identities consumed by TS inference persistence."""
+
+    records: list[Any] = []
+    for endpoint, direction in (
+        (inferred.negative_endpoint, TransitionStateEndpointDirection.NEGATIVE),
+        (inferred.positive_endpoint, TransitionStateEndpointDirection.POSITIVE),
+    ):
+        record, _source_to_topology = _normalize_transition_state_endpoint_topology(
+            endpoint,
+            direction,
+        )
+        records.append(record)
+    if reaction_records is None:
+        with suppress(Exception):
+            reaction_records = tuple(
+                reaction_topology_records(_reaction_from_representation(inferred.reaction_smiles))
+            )
+    if reaction_records:
+        records.extend(reaction_records)
+    return records
 
 
 def _run_result(
@@ -2362,6 +3441,10 @@ class ArtifactUploadService:
 
         try:
             parsed = await _run_molop_file_parser(payload, filename)
+            parsed = await _process_parsed_artifact_frames(
+                parsed,
+                submission_slots=asyncio.Semaphore(_frame_submission_limit()),
+            )
         except Exception as error:
             parse_error = error
             async with session_factory() as session:
@@ -2378,6 +3461,11 @@ class ArtifactUploadService:
                 return await session.run_sync(
                     lambda sync_session: _result(cast(Session, sync_session), ingestion_id)
                 )
+
+        if parsed.source_frame_count == 0:
+            return await _reject_artifact_without_calculation_frames(
+                ingestion_id=ingestion_id,
+            )
 
         try:
             async with session_factory() as session:
@@ -2466,6 +3554,10 @@ class ArtifactUploadService:
 
         try:
             parsed = await _run_molop_file_parser(payload, filename)
+            parsed = await _process_parsed_artifact_frames(
+                parsed,
+                submission_slots=asyncio.Semaphore(_frame_submission_limit()),
+            )
         except Exception as error:
             parse_error = error
             if not had_parse_revision:
@@ -2481,6 +3573,11 @@ class ArtifactUploadService:
                     )
                     await session.commit()
             raise ArtifactUploadError(str(error) or type(error).__name__) from error
+
+        if parsed.source_frame_count == 0 and not had_parse_revision:
+            return await _reject_artifact_without_calculation_frames(
+                ingestion_id=ingestion_id,
+            )
 
         try:
             async with session_factory() as session:
@@ -2539,6 +3636,10 @@ class ArtifactUploadService:
             ProjectPermission.ARTIFACT_UPLOAD,
         )
         parsed = await _run_molop_file_parser(payload, filename)
+        parsed = await _process_parsed_artifact_frames(
+            parsed,
+            submission_slots=asyncio.Semaphore(_frame_submission_limit()),
+        )
         inferences = [
             ArtifactValidationInferenceView(
                 file_frame_index=inference.file_frame_index,
@@ -2773,12 +3874,11 @@ class ArtifactUploadService:
         user_id: UUID,
         on_file_parsed: Callable[[int, bool], Awaitable[None]] | None = None,
     ) -> ArtifactBatchUploadResult:
-        """Prepare once, upload objects concurrently, parse once, then commit once.
+        """Prepare once, then advance files through an asynchronous pipeline.
 
-        Parse failures are already isolated by the MolOP worker boundary. The
-        persistence transaction intentionally has no per-file savepoints: a
-        database error aborts the complete atomic commit and is surfaced to the
-        caller for retry, which avoids hidden partial writes and SQL round trips.
+        Each RustFS completion submits that file to the shared MolOP process
+        pool. A single bounded consumer writes parse results to the database;
+        the final transaction remains atomic for the request.
         """
 
         timings: dict[str, float] = {}
@@ -2815,100 +3915,189 @@ class ArtifactUploadService:
         stored: dict[int, Any] = {}
         storage_errors: dict[int, Exception] = {}
         phase_started = perf_counter()
-        storage_slots = asyncio.Semaphore(get_settings().upload_max_concurrency)
+        storage_pool = _get_storage_process_pool(get_settings().upload_max_concurrency)
+        frame_submission_slots = asyncio.Semaphore(_frame_submission_limit())
+        storage_phase_finished_at: float | None = None
+        storage_completed_count = 0
+        storage_total_count = sum(
+            1 for reservation in prepared.values() if reservation.needs_storage
+        )
+        storage_completion_lock = asyncio.Lock()
+        parse_phase_started_at: float | None = None
+        parse_phase_finished_at: float | None = None
+        molop_file_parse_phase_started_at: float | None = None
+        molop_file_parse_phase_finished_at: float | None = None
+        molop_file_parse_elapsed_ms = 0.0
+        molgr_reconstruction_phase_started_at: float | None = None
+        molgr_reconstruction_phase_finished_at: float | None = None
+        molgr_reconstruction_elapsed_ms = 0.0
 
-        async def store_one(index: int, reservation: _PreparedCalculationUpload) -> None:
-            if not reservation.needs_storage:
-                return
+        async def process_one(
+            index: int,
+            reservation: _PreparedCalculationUpload,
+        ) -> tuple[int, Exception | None, _ParsedArtifact | Exception | None]:
+            """Advance one file through RustFS and MolOP without batch barriers."""
+
+            nonlocal storage_completed_count, storage_phase_finished_at
+            nonlocal parse_phase_started_at, parse_phase_finished_at
+            nonlocal molop_file_parse_phase_started_at, molop_file_parse_phase_finished_at
+            nonlocal molop_file_parse_elapsed_ms
+            nonlocal molgr_reconstruction_phase_started_at
+            nonlocal molgr_reconstruction_phase_finished_at, molgr_reconstruction_elapsed_ms
+            storage_error: Exception | None = None
             try:
-                async with storage_slots:
-                    value = await asyncio.to_thread(
-                        cls._store_payload,
-                        reservation.settings,
-                        reservation.object_key,
-                        reservation.source,
-                        reservation.media_type,
-                        content_sha256=(
+                if reservation.needs_storage:
+                    loop = asyncio.get_running_loop()
+                    store_function = getattr(cls._store_payload, "__func__", cls._store_payload)
+                    if store_function is not _ORIGINAL_STORE_PAYLOAD:
+                        if isinstance(reservation.source, Path):
+                            value = await asyncio.to_thread(
+                                cls._store_payload,
+                                reservation.settings,
+                                reservation.object_key,
+                                reservation.source,
+                                reservation.media_type,
+                                content_sha256=reservation.content_sha256,
+                                size_bytes=reservation.size_bytes,
+                                check_existing_object=reservation.check_existing_object,
+                            )
+                        else:
+                            # Test and extension overrides historically receive
+                            # the original four-argument bytes contract.
+                            value = await asyncio.to_thread(
+                                cls._store_payload,
+                                reservation.settings,
+                                reservation.object_key,
+                                reservation.source,
+                                reservation.media_type,
+                            )
+                    else:
+                        value = await loop.run_in_executor(
+                            storage_pool,
+                            _store_payload_worker,
+                            reservation.settings,
+                            reservation.object_key,
+                            reservation.source,
+                            reservation.media_type,
                             reservation.content_sha256
                             if isinstance(reservation.source, Path)
-                            else None
-                        ),
-                        size_bytes=(
-                            reservation.size_bytes if isinstance(reservation.source, Path) else None
-                        ),
-                        check_existing_object=reservation.check_existing_object,
-                    )
-                if (
-                    value.size != reservation.size_bytes
-                    or value.sha256 != reservation.content_sha256
-                ):
-                    raise ArtifactUploadError("RustFS metadata mismatch for uploaded artifact")
-                stored[index] = value
+                            else None,
+                            reservation.size_bytes
+                            if isinstance(reservation.source, Path)
+                            else None,
+                            reservation.check_existing_object,
+                        )
+                    if (
+                        value.size != reservation.size_bytes
+                        or value.sha256 != reservation.content_sha256
+                    ):
+                        raise ArtifactUploadError("RustFS metadata mismatch for uploaded artifact")
+                    stored[index] = value
             except Exception as error:
-                storage_errors[index] = error
+                storage_error = error
 
-        await asyncio.gather(*(store_one(index, value) for index, value in prepared.items()))
-        timings["storage_ms"] = (perf_counter() - phase_started) * 1000
-
-        # Advance all successful reservations and mark storage failures in one DB round trip.
-        phase_started = perf_counter()
-        async with session_factory() as session:
-            session.info["tricycle_fast_insert"] = True
-            for index, reservation in prepared.items():
-                file = files[index]
-                if index in storage_errors:
-                    error = storage_errors[index]
-                    if reservation.ingestion_id is not None:
-                        await session.run_sync(
-                            partial(
-                                _run_mark_ingestion_failed,
-                                ingestion_id=reservation.ingestion_id,
-                                error=error,
-                                error_code="artifact_storage_failed",
-                                completed_at=datetime.now(UTC),
-                            )
-                        )
-                        result = await session.run_sync(
-                            partial(
-                                _run_result,
-                                ingestion_id=reservation.ingestion_id,
-                            )
-                        )
-                    else:
-                        result = None
-                    item_by_index[index] = ArtifactBatchUploadItem(
-                        filename=file.filename,
-                        succeeded=False,
-                        result=result,
-                        error_code="artifact_storage_failed",
-                        error_message=str(error) or type(error).__name__,
-                    )
-                    continue
-            stored_by_artifact_id = {
-                prepared[index].artifact_id: (prepared[index].object_key, value)
-                for index, value in stored.items()
-            }
-            await session.run_sync(
-                partial(
-                    _run_mark_uploads_available,
-                    stored_by_artifact_id=stored_by_artifact_id,
+            async with storage_completion_lock:
+                if reservation.needs_storage:
+                    storage_completed_count += 1
+                    if storage_completed_count == storage_total_count:
+                        storage_phase_finished_at = perf_counter()
+            if (
+                storage_error is not None
+                or reservation.ingestion_id is None
+                or reservation.skip_parse
+            ):
+                return index, storage_error, None
+            parse_started_at = perf_counter()
+            parsed: _ParsedArtifact | Exception
+            molop_started_at = perf_counter()
+            try:
+                parsed = await _run_molop_source_parser(
+                    reservation.source,
+                    files[index].filename,
+                    artifact_sha256=reservation.content_sha256,
                 )
-            )
-            await session.commit()
-        timings["storage_db_ms"] = (perf_counter() - phase_started) * 1000
+            except Exception as error:
+                parsed = error
+            molop_finished_at = perf_counter()
+            async with storage_completion_lock:
+                if (
+                    molop_file_parse_phase_started_at is None
+                    or molop_started_at < molop_file_parse_phase_started_at
+                ):
+                    molop_file_parse_phase_started_at = molop_started_at
+                molop_file_parse_phase_finished_at = max(
+                    molop_file_parse_phase_finished_at or molop_finished_at,
+                    molop_finished_at,
+                )
+                molop_file_parse_elapsed_ms += (molop_finished_at - molop_started_at) * 1000
+            if isinstance(parsed, _ParsedArtifact):
+                molgr_started_at = perf_counter()
+                try:
+                    parsed = await _process_parsed_artifact_frames(
+                        parsed,
+                        submission_slots=frame_submission_slots,
+                    )
+                except Exception as error:
+                    parsed = error
+                molgr_finished_at = perf_counter()
+                async with storage_completion_lock:
+                    if (
+                        molgr_reconstruction_phase_started_at is None
+                        or molgr_started_at < molgr_reconstruction_phase_started_at
+                    ):
+                        molgr_reconstruction_phase_started_at = molgr_started_at
+                    molgr_reconstruction_phase_finished_at = max(
+                        molgr_reconstruction_phase_finished_at or molgr_finished_at,
+                        molgr_finished_at,
+                    )
+                    molgr_reconstruction_elapsed_ms += (
+                        molgr_finished_at - molgr_started_at
+                    ) * 1000
+            nonlocal_parse_finished_at = perf_counter()
+            # The consumer records the first/last parser completion to expose
+            # MolOP wall time separately from database persistence time.
+            async with storage_completion_lock:
+                if parse_phase_started_at is None or parse_started_at < parse_phase_started_at:
+                    parse_phase_started_at = parse_started_at
+                parse_phase_finished_at = max(
+                    parse_phase_finished_at or nonlocal_parse_finished_at,
+                    nonlocal_parse_finished_at,
+                )
+            return index, None, parsed
 
-        parse_inputs: list[tuple[bytes | Path, str]] = []
+        pipeline_result_queue: asyncio.Queue[
+            tuple[int, Exception | None, _ParsedArtifact | Exception | None]
+        ] = asyncio.Queue(maxsize=PERSISTENCE_PRELOAD_BATCH_SIZE)
+
+        async def enqueue_pipeline_result(
+            index: int,
+            reservation: _PreparedCalculationUpload,
+        ) -> None:
+            # The bounded queue is the backpressure point between CPU parsing
+            # and the single SQLAlchemy persistence consumer.
+            try:
+                result = await process_one(index, reservation)
+            except Exception as error:  # pragma: no cover - defensive task boundary
+                result = (index, error, None)
+            await pipeline_result_queue.put(result)
+
+        pipeline_tasks = [
+            asyncio.create_task(enqueue_pipeline_result(index, reservation))
+            for index, reservation in prepared.items()
+        ]
+
         parse_indices: list[int] = []
         for index, reservation in prepared.items():
             if (
                 reservation.ingestion_id is not None
-                and index not in storage_errors
                 and not reservation.skip_parse
             ):
                 parse_indices.append(index)
-                parse_inputs.append((reservation.source, files[index].filename))
 
-        parsed_by_input: dict[int, _ParsedArtifact | Exception] = {}
+        # Open the single atomic persistence transaction while parser workers
+        # are still running. The bounded queue provides backpressure, while
+        # consuming completed files here lets CPU parsing overlap database
+        # writes instead of creating a full-batch barrier.
         persistence_pipeline_started = perf_counter()
         async with session_factory() as session:
             persist_preload_started = perf_counter()
@@ -2934,6 +4123,8 @@ class ArtifactUploadService:
             completion_by_ingestion_id: dict[UUID, _IngestionCompletion] = {}
             deferred_inferences: list[_DeferredArtifactInferences] = []
             pending_preload: list[tuple[int, _ParsedArtifact]] = []
+            no_frame_indices: set[int] = set()
+            retired_no_frame_objects: dict[UUID, _RetiredArtifactObject] = {}
 
             def normalize_parser_result(parser_result: Any) -> _ParsedArtifact | Exception:
                 if isinstance(parser_result, (_ParsedArtifact, Exception)):
@@ -2951,12 +4142,43 @@ class ArtifactUploadService:
                 parsed_files: list[tuple[int, _ParsedArtifact]],
             ) -> None:
                 nonlocal persist_preload_elapsed_ms, persist_write_elapsed_ms
+                inference_topology_records: list[Any] = []
+                for _, parsed in parsed_files:
+                    for inferred in parsed.inferences:
+                        if not isinstance(inferred, _SuccessfulInference):
+                            continue
+                        try:
+                            cached_reaction_records = (
+                                geometry_context.inferred_reaction_topology_records.get(
+                                    inferred.reaction_smiles
+                                )
+                            )
+                            records = _inference_topology_records(
+                                inferred,
+                                reaction_records=cached_reaction_records,
+                            )
+                            inference_topology_records.extend(records)
+                            if cached_reaction_records is None and len(records) > 2:
+                                geometry_context.inferred_reaction_topology_records.setdefault(
+                                    inferred.reaction_smiles,
+                                    tuple(records[2:]),
+                                )
+                        except Exception:
+                            # Endpoint normalization is retried inside the
+                            # per-inference savepoint below, where it becomes
+                            # inferred_reaction_persistence_failed.
+                            logger.warning(
+                                "failed to preload inferred reaction topology for frame %s",
+                                inferred.file_frame_index,
+                                exc_info=True,
+                            )
                 file_preload_started = perf_counter()
                 await session.run_sync(
                     partial(
                         _run_preload_molecular_geometry_context,
                         parsed_artifacts=[parsed for _, parsed in parsed_files],
                         context=geometry_context,
+                        topology_records=inference_topology_records,
                     )
                 )
                 persist_preload_elapsed_ms += (perf_counter() - file_preload_started) * 1000
@@ -2999,85 +4221,185 @@ class ArtifactUploadService:
                     )
 
             async def persist_completed_file(local_index: int, parser_result: Any) -> None:
-                nonlocal persist_write_elapsed_ms
                 parsed = normalize_parser_result(parser_result)
-                parsed_by_input[local_index] = parsed
                 original_index = parse_indices[local_index]
                 if on_file_parsed is not None:
-                    await on_file_parsed(original_index, isinstance(parsed, _ParsedArtifact))
-                reservation = prepared[original_index]
-                ingestion_id = _require_prepared_ingestion_id(reservation)
-                ingestion = persistence_ingestions_by_id[ingestion_id]
-                if isinstance(parsed, Exception):
-                    persist_write_started = perf_counter()
-                    await session.run_sync(
-                        partial(
-                            _run_mark_ingestion_failed,
-                            ingestion_id=ingestion_id,
-                            error=parsed,
-                            error_code="molop_parse_failed",
-                            completed_at=datetime.now(UTC),
-                            ingestion=ingestion,
-                        )
+                    await on_file_parsed(
+                        original_index,
+                        isinstance(parsed, _ParsedArtifact) and parsed.source_frame_count > 0,
                     )
-                    persist_write_elapsed_ms += (perf_counter() - persist_write_started) * 1000
+                if isinstance(parsed, Exception):
                     parse_errors_by_index[original_index] = parsed
                     return
+                if parsed.source_frame_count == 0:
+                    no_frame_error = NoCalculationFramesError(
+                        "source contains no QM calculation frames; artifact was filtered"
+                    )
+                    no_frame_indices.add(original_index)
+                    parse_errors_by_index[original_index] = no_frame_error
+                    return
                 pending_preload.append((local_index, parsed))
-                if len(pending_preload) >= PERSISTENCE_PRELOAD_BATCH_SIZE:
-                    batch = pending_preload.copy()
-                    pending_preload.clear()
-                    await persist_parsed_files(batch)
 
-            parser_timings_ms: dict[str, float] = {}
-            parse_pipeline_started = perf_counter()
-            parser_results: dict[int, _ParsedArtifact | Exception] = {}
-            if parse_inputs:
-                parser_results = await _run_molop_parser_with_progress(
-                    _parse_calculation_outputs_batch,
-                    parse_inputs,
-                    n_jobs=get_settings().molop_batch_n_jobs,
-                    progress_callback=persist_completed_file,
-                    timings_ms=parser_timings_ms,
+            parse_pipeline_started = persistence_pipeline_started
+            local_index_by_original = {
+                original_index: local_index
+                for local_index, original_index in enumerate(parse_indices)
+            }
+            for _ in pipeline_tasks:
+                index, storage_error, parsed = await pipeline_result_queue.get()
+                if storage_error is not None:
+                    storage_errors[index] = storage_error
+                    local_index = local_index_by_original.get(index)
+                    if local_index is not None:
+                        parse_errors_by_index[index] = storage_error
+                    continue
+                local_index = local_index_by_original.get(index)
+                if local_index is not None:
+                    await persist_completed_file(local_index, parsed)
+                    # Flush a partial microbatch when no later completion is
+                    # already queued, so an early file can enter persistence
+                    # while slower files are still in MolOP.
+                    if pending_preload and (
+                        len(pending_preload) >= PERSISTENCE_PRELOAD_BATCH_SIZE
+                        or pipeline_result_queue.empty()
+                    ):
+                        batch = pending_preload.copy()
+                        pending_preload.clear()
+                        await persist_parsed_files(batch)
+
+            await asyncio.gather(*pipeline_tasks)
+
+            # Failures are accumulated while all process-pool stages drain and
+            # are written only now, inside the same final batch transaction as
+            # successful frame records.
+            for original_index, parse_error in parse_errors_by_index.items():
+                ingestion_id = _require_prepared_ingestion_id(prepared[original_index])
+                ingestion = persistence_ingestions_by_id[ingestion_id]
+                persist_write_started = perf_counter()
+                await session.run_sync(
+                    partial(
+                        _run_mark_ingestion_failed,
+                        ingestion_id=ingestion_id,
+                        error=parse_error,
+                        error_code=(
+                            "artifact_storage_failed"
+                            if original_index in storage_errors
+                            else
+                            "no_calculation_frames"
+                            if original_index in no_frame_indices
+                            else "molop_parse_failed"
+                        ),
+                        completed_at=datetime.now(UTC),
+                        ingestion=ingestion,
+                        source_frame_count=(
+                            0 if original_index in no_frame_indices else None
+                        ),
+                        transition_state_frame_count=(
+                            0 if original_index in no_frame_indices else None
+                        ),
+                    )
                 )
-            timings["parse_ms"] = parser_timings_ms.get(
-                "total_ms", (perf_counter() - parse_pipeline_started) * 1000
+                persist_write_elapsed_ms += (perf_counter() - persist_write_started) * 1000
+            timings["molop_parse_ms"] = (
+                (parse_phase_finished_at - parse_phase_started_at) * 1000
+                if parse_phase_started_at is not None and parse_phase_finished_at is not None
+                else 0.0
             )
+            timings["molop_file_parse_ms"] = (
+                (molop_file_parse_phase_finished_at - molop_file_parse_phase_started_at) * 1000
+                if (
+                    molop_file_parse_phase_started_at is not None
+                    and molop_file_parse_phase_finished_at is not None
+                )
+                else 0.0
+            )
+            timings["molop_file_parse_sum_ms"] = molop_file_parse_elapsed_ms
+            timings["molgr_frame_reconstruction_ms"] = (
+                (
+                    molgr_reconstruction_phase_finished_at
+                    - molgr_reconstruction_phase_started_at
+                )
+                * 1000
+                if (
+                    molgr_reconstruction_phase_started_at is not None
+                    and molgr_reconstruction_phase_finished_at is not None
+                )
+                else 0.0
+            )
+            timings["molgr_frame_reconstruction_sum_ms"] = molgr_reconstruction_elapsed_ms
+            timings["parse_ms"] = timings["molop_parse_ms"]
             timings["parse_persistence_pipeline_ms"] = (
                 perf_counter() - parse_pipeline_started
             ) * 1000
-            for local_index in range(len(parse_indices)):
-                if local_index not in parsed_by_input:
-                    await persist_completed_file(
-                        local_index,
-                        parser_results.get(
-                            local_index,
-                            ArtifactUploadError(
-                                "MolOP did not return a result for this input file"
-                            ),
-                        ),
-                    )
             if pending_preload:
                 batch = pending_preload.copy()
                 pending_preload.clear()
                 await persist_parsed_files(batch)
 
+            storage_phase_finished = storage_phase_finished_at or perf_counter()
+            timings["storage_ms"] = (storage_phase_finished - phase_started) * 1000
+            storage_db_started = perf_counter()
+            await session.run_sync(
+                partial(
+                    _run_mark_uploads_available,
+                    stored_by_artifact_id={
+                        prepared[index].artifact_id: (prepared[index].object_key, value)
+                        for index, value in stored.items()
+                    },
+                )
+            )
+            timings["storage_db_ms"] = (perf_counter() - storage_db_started) * 1000
+
             # Persist the large revision-local tables once across the complete
             # batch before reaction inference introduces shared-identity flushes.
             persist_write_started = perf_counter()
-            await session.run_sync(_run_flush)
+            flush_started = perf_counter()
+            bulk_diagnostics = await session.run_sync(_run_flush)
+            timings["persist_flush_initial_ms"] = (perf_counter() - flush_started) * 1000
+            if isinstance(bulk_diagnostics, dict):
+                timings["persist_bulk_pending_rows"] = float(
+                    bulk_diagnostics.get("pending", 0)
+                )
+                timings["persist_bulk_transient_rows"] = float(
+                    bulk_diagnostics.get("transient", 0)
+                )
+                timings["persist_bulk_prepare_ms"] = float(
+                    bulk_diagnostics.get("prepare_ms", 0.0)
+                )
+                timings["persist_bulk_execute_ms"] = float(
+                    bulk_diagnostics.get("execute_ms", 0.0)
+                )
+            reconcile_started = perf_counter()
             await session.run_sync(
                 partial(
                     _run_reconcile_molop_geometry_context,
                     context=geometry_context,
                 )
             )
+            timings["persist_reconcile_geometry_ms"] = (
+                perf_counter() - reconcile_started
+            ) * 1000
+            inference_started = perf_counter()
             await session.run_sync(
                 partial(
                     _run_persist_deferred_inferences,
                     deferred_inferences=deferred_inferences,
                     topology_context=geometry_context,
                 )
+            )
+            timings["persist_deferred_inferences_ms"] = (
+                perf_counter() - inference_started
+            ) * 1000
+            retire_started = perf_counter()
+            retired_no_frame_objects = await session.run_sync(
+                cast(Any, partial(
+                    _retire_artifacts_without_calculation_frames,
+                    artifact_ids={prepared[index].artifact_id for index in no_frame_indices},
+                ))
+            )
+            timings["persist_retire_no_frame_ms"] = (perf_counter() - retire_started) * 1000
+            timings["persist_inferred_reaction_cache_hits"] = float(
+                geometry_context.inferred_reaction_cache_hits
             )
             persist_write_elapsed_ms += (perf_counter() - persist_write_started) * 1000
             timings["persist_preload_db_ms"] = persist_preload_elapsed_ms
@@ -3094,7 +4416,9 @@ class ArtifactUploadService:
                 parse_revision_created_by_ingestion_id[ingestion_id] = (
                     persisted_revision[1] if persisted_revision is not None else None
                 )
+            flush_started = perf_counter()
             await session.run_sync(_run_flush)
+            timings["persist_flush_results_ms"] = (perf_counter() - flush_started) * 1000
             results_by_ingestion_id = await session.run_sync(
                 partial(
                     _run_batch_results,
@@ -3104,11 +4428,34 @@ class ArtifactUploadService:
                 )
             )
             timings["persist_result_db_ms"] = (perf_counter() - persist_result_started) * 1000
+            lock_stats = await session.run_sync(
+                lambda sync_session: dict(
+                    cast(Session, sync_session).info.get("_identity_lock_stats", {})
+                )
+            )
+            timings["advisory_lock_calls"] = float(lock_stats.get("calls", 0))
+            timings["advisory_lock_requested_ids"] = float(
+                lock_stats.get("requested_ids", 0)
+            )
+            timings["advisory_lock_uncached_ids"] = float(
+                lock_stats.get("uncached_ids", 0)
+            )
+            for prefix, count in sorted(lock_stats.get("prefixes", {}).items()):
+                timings[f"advisory_lock_{prefix}_calls"] = float(count)
             for original_index in parse_indices:
                 reservation = prepared[original_index]
                 ingestion_id = _require_prepared_ingestion_id(reservation)
                 result = results_by_ingestion_id[ingestion_id]
                 parse_error = parse_errors_by_index.get(original_index)
+                error_code = (
+                    "no_calculation_frames"
+                    if original_index in no_frame_indices
+                    else "artifact_storage_failed"
+                    if original_index in storage_errors
+                    else "molop_parse_failed"
+                    if parse_error is not None
+                    else None
+                )
                 item_by_index[original_index] = ArtifactBatchUploadItem(
                     filename=files[original_index].filename,
                     succeeded=(
@@ -3116,7 +4463,7 @@ class ArtifactUploadService:
                         and result.ingestion_status is not ArtifactIngestionStatus.FAILED
                     ),
                     result=result,
-                    error_code="molop_parse_failed" if parse_error is not None else None,
+                    error_code=error_code,
                     error_message=(
                         (str(parse_error) or type(parse_error).__name__)
                         if parse_error is not None
@@ -3124,8 +4471,12 @@ class ArtifactUploadService:
                     ),
                 )
             persist_commit_started = perf_counter()
+            # The retirement helper acquired each content lock in this same
+            # transaction; delete before commit so an unversioned retry cannot
+            # replace the object between retirement and cleanup.
+            await _delete_retired_artifact_objects(retired_no_frame_objects)
             await session.commit()
-            timings["persist_commit_db_ms"] = (perf_counter() - persist_commit_started) * 1000
+        timings["persist_commit_db_ms"] = (perf_counter() - persist_commit_started) * 1000
         timings["persist_pipeline_wall_ms"] = (perf_counter() - persistence_pipeline_started) * 1000
         timings["persist_db_ms"] = sum(
             timings.get(key, 0.0)
@@ -3286,6 +4637,10 @@ class ArtifactUploadService:
 _ORIGINAL_PREPARE_UPLOAD = cast(
     Any,
     ArtifactUploadService.__dict__["_prepare_upload"],
+).__func__
+_ORIGINAL_STORE_PAYLOAD = cast(
+    Any,
+    ArtifactUploadService.__dict__["_store_payload"],
 ).__func__
 
 

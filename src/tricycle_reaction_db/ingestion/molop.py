@@ -17,7 +17,7 @@ MOLGR_VERSION = version("molgr")
 MOLECULAR_GRAPH_RECONSTRUCTION_FAILURE_POLICY: Literal["return_suspicious"] = "return_suspicious"
 
 
-def configure_molecular_graph_reconstruction() -> None:
+def configure_molecular_graph_reconstruction(*, allow_native_parallel: bool = False) -> None:
     """Keep calculation frames when MolGR can only return an untrusted topology.
 
     MolOP 0.2.9 reads the policy from its own process-global ``molopconfig`` and
@@ -27,6 +27,21 @@ def configure_molecular_graph_reconstruction() -> None:
 
     molopconfig.reconstruction_failure_policy = MOLECULAR_GRAPH_RECONSTRUCTION_FAILURE_POLICY
     molopconfig.apply_molgr_reconstruction_policy()
+    cpp_backend = MOLGR_CONFIG.cpp_backend
+    if allow_native_parallel:
+        # Parent-process prewarming is the outermost MolGR boundary. Let its
+        # native batch scheduler flatten all frame reconstructions across cores.
+        cpp_backend.max_threads = None
+        cpp_backend.enable_target_bucket_parallelism = True
+        cpp_backend.target_bucket_parallel_max_threads = None
+    else:
+        # MolGR may enter native OpenMP/thread pools from each MolOP worker. The
+        # ingestion process already owns the outer process pool, so nested native
+        # parallelism causes oversubscription and can crash with BrokenProcessPool.
+        cpp_backend.max_threads = 1
+        cpp_backend.enable_target_bucket_parallelism = False
+        cpp_backend.target_bucket_parallel_max_threads = 1
+    cpp_backend.enable_candidate_scoring_parallelism = False
     MOLGR_CONFIG.interface.reconstruction_failure_policy = (
         MOLECULAR_GRAPH_RECONSTRUCTION_FAILURE_POLICY
     )

@@ -16,6 +16,7 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
 from tricycle_reaction_db.core.config import Settings
 from tricycle_reaction_db.dev.import_artifacts import (
     ImportCandidate,
+    ImportMetrics,
     ImportState,
     discover_files,
     file_fingerprint,
@@ -122,6 +123,7 @@ def test_import_files_passes_local_paths_to_upload_service(monkeypatch, tmp_path
         "tricycle_reaction_db.dev.import_artifacts.get_settings",
         lambda: Settings.model_validate({"max_batch_files": 10, "max_batch_bytes": 1024}),
     )
+    metrics = ImportMetrics()
     summary = asyncio.run(
         import_files(
             discover_files([source]),
@@ -130,12 +132,82 @@ def test_import_files_passes_local_paths_to_upload_service(monkeypatch, tmp_path
             artifact_kind=ArtifactKind.INPUT,
             state=ImportState(None),
             dry_run=False,
+            metrics=metrics,
         )
     )
 
     assert summary.succeeded == 1
     assert len(calls) == 1
     assert calls[0][0].spool_path == source.resolve()
+    assert metrics.steps[0]["batch_size"] == 1
+    assert metrics.step_timings_ms["fingerprint"] >= 0
+    assert metrics.step_timings_ms["upload_batches"] >= 0
+    assert metrics.sql_statement_count >= 0
+
+
+def test_import_files_records_zero_frame_outputs_as_filtered(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    source = tmp_path / "not-a-qm-output.log"
+    source.write_text("no calculation frames", encoding="utf-8")
+    state_path = tmp_path / "state.jsonl"
+
+    async def fake_upload_batch(**_: object) -> ArtifactBatchUploadResult:
+        return ArtifactBatchUploadResult(
+            total_count=1,
+            succeeded_count=0,
+            failed_count=1,
+            source_frame_count=0,
+            transition_state_frame_count=0,
+            inferred_reaction_count=0,
+            items=[
+                ArtifactBatchUploadItem(
+                    filename=source.name,
+                    succeeded=False,
+                    error_code="no_calculation_frames",
+                    error_message="source contains no QM calculation frames; artifact was filtered",
+                    result=ArtifactUploadResult(
+                        artifact_id=UUID("00000000-0000-7000-0000-000000000301"),
+                        artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+                        storage_status=StorageStatus.RETIRED,
+                        ingestion_status=ArtifactIngestionStatus.FAILED,
+                        source_frame_count=0,
+                        transition_state_frame_count=0,
+                        inferred_reaction_count=0,
+                        inferences=[],
+                    ),
+                )
+            ],
+        )
+
+    monkeypatch.setattr(ArtifactUploadService, "upload_batch", fake_upload_batch)
+    monkeypatch.setattr(
+        "tricycle_reaction_db.dev.import_artifacts.get_settings",
+        lambda: Settings.model_validate({"max_batch_files": 10, "max_batch_bytes": 1024}),
+    )
+
+    summary = asyncio.run(
+        import_files(
+            discover_files([source]),
+            project_id=UUID("00000000-0000-7000-8000-000000000201"),
+            user_id=UUID("00000000-0000-7000-8000-000000000002"),
+            artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+            state=ImportState(state_path),
+            dry_run=False,
+        )
+    )
+
+    record = json.loads(state_path.read_text(encoding="utf-8"))
+    assert summary.filtered == 1
+    assert summary.failed == 0
+    assert record["status"] == "filtered"
+    assert ImportState(state_path).terminal(
+        source.resolve(),
+        project_id=UUID("00000000-0000-7000-8000-000000000201"),
+        artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+        fingerprint=file_fingerprint(source),
+    )
 
 
 def test_import_files_isolates_deterministic_batch_failures(monkeypatch, tmp_path: Path) -> None:

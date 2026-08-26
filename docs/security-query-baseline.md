@@ -76,6 +76,7 @@ Contributor、Manager。Viewer/Contributor/Manager 的项目内响应均为 200 
 
 ```bash
 uv run --frozen python scripts/benchmark_upload_resources.py \
+  --fixture /srv/reaction-database/real-data/gaussian-orca \
   --output /srv/reaction-database/acceptance/capacity/upload-benchmark.json
 ```
 
@@ -87,17 +88,14 @@ validator 会复核三个批次均为零失败、`n_jobs` 与容量配置一致�
 至少两次大于 `TRICYCLE_MAX_UPLOAD_BYTES` 的请求，并记录稳定 HTTP 413、
 `X-Upload-Rejection-Stage: preflight` 和包含配置上限的错误消息，证明请求未进入 RustFS 或解析器。
 
-固定输入为 `tests/fixtures/qm/minimal_orca_water_sp.orcaout`，`n_jobs=2`。每个批次在独立父
+固定输入必须是部署方提供的真实 Gaussian/ORCA 文件或目录，`n_jobs=2`。每个批次在独立父
 进程运行，监测 `/proc` 中整个进程树；峰值子进程包含 loky worker 和辅助进程。
 
-| 文件数 | 时间 | 进程树峰值 RSS | 子进程峰值 | 成功/失败 |
-| ---: | ---: | ---: | ---: | ---: |
-| 1 | 0.564s | 313.6 MiB | 0 | 1/0 |
-| 8 | 1.456s | 744.5 MiB | 4 | 8/0 |
-| 32 | 1.541s | 752.3 MiB | 4 | 32/0 |
+本地仓库不提供合成吞吐基线；部署验收必须用上面指定的真实文件重新生成 1/8/32
+结果，并将报告作为验收附件。
 
 资源边界由 service 入口在授权、RustFS 和解析前检查文件数、单文件和累计字节；解析 semaphore
-测试证明 `molop_parse_slots=1` 时四个并发调用峰值为 1。数据库/RustFS 集成测试覆盖逐文件
+测试证明解析进程池按配置的 worker 数限制并发。数据库/RustFS 集成测试覆盖逐文件
 失败保留、pending reservation 删除、对象写入失败即时补偿和 stale object GC。原始计算文件
 内容不写入日志。
 

@@ -10,7 +10,11 @@ from typing import Any
 
 from sqlmodel import Session
 
-from tricycle_reaction_db.application.dtos import ParseRevisionCompletionRecord
+from tricycle_reaction_db.application.dtos import (
+    CalculationSegmentRecord,
+    ParseRevisionCompletionRecord,
+)
+from tricycle_reaction_db.application.services._persistence import _attach_pending_entities
 from tricycle_reaction_db.application.services.calculations import (
     finalize_parse_revision,
     persist_atomic_population_series,
@@ -63,6 +67,7 @@ from tricycle_reaction_db.db.models import (
 from tricycle_reaction_db.domain.enums import (
     ElectronicStateSetKind,
     GeometryAssignmentKind,
+    ParseCompleteness,
     ScientificArrayOwnerKind,
 )
 from tricycle_reaction_db.ingestion import (
@@ -88,13 +93,16 @@ def _json_sha256(value: object) -> str:
 
 
 def _revision_record_hash(
-    artifact: ArtifactFile,
+    artifact: ArtifactFile | str,
     chem_file: Any,
     records: list[MolOPFrameRecords],
 ) -> str:
+    artifact_sha256 = (
+        artifact.content_sha256 if isinstance(artifact, ArtifactFile) else artifact
+    )
     return _json_sha256(
         {
-            "artifact_sha256": artifact.content_sha256,
+            "artifact_sha256": artifact_sha256,
             "export_schema_version": chem_file.schema_version,
             "segments": [
                 segment.model_dump(mode="json", exclude_none=True)
@@ -283,8 +291,10 @@ def persist_molop_calculation_artifact(
     completed_at: datetime,
     records: list[MolOPFrameRecords] | None = None,
     source_compression: str | None = None,
+    record_sha256: str | None = None,
     force_new_revision: bool = False,
     fast_insert: bool = False,
+    parallel_frame_persistence: bool = False,
     geometry_context: GeometryPersistenceContext | None = None,
     preload_geometry_context: bool = True,
     defer_reconciliation: bool = False,
@@ -292,18 +302,31 @@ def persist_molop_calculation_artifact(
     """Persist every parsed segment, frame, graph, coordinate, scalar, and array."""
 
     if source_compression is None:
-        if chem_file.artifact_sha256 != artifact.content_sha256:
+        if (
+            chem_file.artifact_sha256 is not None
+            and chem_file.artifact_sha256 != artifact.content_sha256
+        ):
             raise ValueError("MolOP source bytes do not match the stored ArtifactFile SHA-256")
-        if chem_file.artifact_size_bytes != artifact.size_bytes:
+        if (
+            chem_file.artifact_size_bytes is not None
+            and chem_file.artifact_size_bytes != artifact.size_bytes
+        ):
             raise ValueError("MolOP source byte size does not match the stored ArtifactFile")
     frame_records = records or [
         frame_records_from_molop(frame, export_schema_version=chem_file.schema_version)
         for frame in chem_file
     ]
+    # Parallel frame persistence here means batched, revision-local writes in
+    # one transaction. A shared SQLAlchemy Session cannot be forked safely;
+    # client-side IDs and deferred flushes provide multi-row batching without
+    # weakening rollback or idempotency guarantees.
+    effective_fast_insert = fast_insert or (
+        parallel_frame_persistence and not force_new_revision
+    )
     previous_fast_insert = session.info.get("tricycle_fast_insert", False)
     previous_autoflush = session.autoflush
-    session.info["tricycle_fast_insert"] = fast_insert
-    if fast_insert:
+    session.info["tricycle_fast_insert"] = effective_fast_insert
+    if effective_fast_insert:
         session.autoflush = False
     try:
         revision = persist_parse_revision(
@@ -313,6 +336,8 @@ def persist_molop_calculation_artifact(
                 chem_file,
                 started_at=started_at,
                 source_compression=source_compression,
+                artifact_sha256=artifact.content_sha256,
+                artifact_size_bytes=artifact.size_bytes,
             ),
             force_new_revision=force_new_revision,
         )
@@ -328,8 +353,21 @@ def persist_molop_calculation_artifact(
                 ],
                 context=active_geometry_context,
             )
-        for source_segment in chem_file.source_segments:
-            protocol_record = protocol_record_from_molop_segment(source_segment)
+        records_by_segment: dict[int, list[MolOPFrameRecords]] = {}
+        for record in frame_records:
+            records_by_segment.setdefault(record.segment_index, []).append(record)
+        source_segments = tuple(chem_file.source_segments)
+        if not source_segments and frame_records:
+            # MolOP omits source segments when evidence capture is disabled.
+            # Keep the relational segment required by the schema, but leave all
+            # source-location fields NULL rather than manufacturing offsets.
+            source_segments = (None,)
+        for source_segment in source_segments:
+            protocol_record = (
+                protocol_record_from_molop_segment(source_segment)
+                if source_segment is not None
+                else None
+            )
             protocol = (
                 persist_calculation_protocol(session, protocol_record)
                 if protocol_record is not None
@@ -339,16 +377,25 @@ def persist_molop_calculation_artifact(
                 session,
                 revision,
                 protocol,
-                segment_record_from_molop(source_segment),
+                (
+                    segment_record_from_molop(source_segment)
+                    if source_segment is not None
+                    else CalculationSegmentRecord(
+                        segment_index=0,
+                        source_frame_count=len(frame_records),
+                        parse_completeness=ParseCompleteness.NOT_ASSESSED,
+                        program_metadata={"source_evidence_captured": False},
+                    )
+                ),
             )
-            segment_frames = [
-                frame for frame in chem_file if frame.segment_index == source_segment.segment_index
-            ]
-            for source_frame in segment_frames:
-                file_frame_index = source_frame.file_frame_index
-                if file_frame_index is None or source_frame.segment_frame_index is None:
+            segment_frames = records_by_segment.get(
+                source_segment.segment_index if source_segment is not None else 0,
+                [],
+            )
+            for record in segment_frames:
+                file_frame_index = record.frame.file_frame_index
+                if file_frame_index is None or record.frame.frame_index is None:
                     raise ValueError("MolOP frame is missing stable source indices")
-                record = frame_records[file_frame_index]
                 molecule = persist_molecular_geometry(
                     session,
                     record.molecule,
@@ -412,8 +459,9 @@ def persist_molop_calculation_artifact(
         # Batch ingestion can keep revision-local rows pending across files.
         # The shared context owns their identities, and the final reconciliation
         # flush groups each table across the complete batch.
-        defer_batch_flush = defer_reconciliation and fast_insert
+        defer_batch_flush = defer_reconciliation and effective_fast_insert
         if not defer_batch_flush:
+            _attach_pending_entities(session)
             session.flush()
         if not defer_reconciliation:
             reconcile_molop_geometry_context(session, active_geometry_context)
@@ -422,7 +470,11 @@ def persist_molop_calculation_artifact(
             session,
             revision,
             ParseRevisionCompletionRecord(
-                record_sha256=_revision_record_hash(artifact, chem_file, frame_records),
+                record_sha256=record_sha256 or _revision_record_hash(
+                    artifact,
+                    chem_file,
+                    frame_records,
+                ),
                 completed_at=completed_at,
             ),
             defer_flush=defer_batch_flush,
@@ -444,6 +496,7 @@ def reconcile_molop_geometry_context(
 ) -> None:
     """Reconcile all geometries from a batch after their rows are flushed."""
 
+    _attach_pending_entities(session)
     session.flush()
     reconcilable_ids = reconcilable_geometry_ids(
         session,
@@ -477,6 +530,7 @@ def reconcile_molop_geometry_context(
                     mapped_reactions_by_id=context.mapped_reactions_by_id,
                     cache=reconciliation_cache,
                 )
+        _attach_pending_entities(session)
         session.flush()
         for mapped_reaction in reconciliation_cache.affected_reactions_by_id.values():
             refresh_mapped_reaction_thermodynamics(session, mapped_reaction)

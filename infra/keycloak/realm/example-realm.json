@@ -24,7 +24,8 @@
         "http://127.0.0.1:8002/api/auth/callback",
         "http://localhost:8002/api/auth/callback",
         "http://127.0.0.1:8003/api/auth/callback",
-        "http://localhost:8003/api/auth/callback"
+        "http://localhost:8003/api/auth/callback",
+        "https://61.151.139.69:10443/api/auth/callback"
       ],
       "webOrigins": [
         "http://127.0.0.1:5173",
@@ -34,7 +35,8 @@
         "http://127.0.0.1:5176",
         "http://localhost:5176",
         "http://127.0.0.1:5177",
-        "http://localhost:5177"
+        "http://localhost:5177",
+        "https://61.151.139.69:10443"
       ],
       "protocol": "openid-connect",
       "publicClient": false,
@@ -43,7 +45,7 @@
       "serviceAccountsEnabled": false,
       "frontchannelLogout": true,
       "attributes": {
-        "post.logout.redirect.uris": "http://127.0.0.1:5173/*##http://localhost:5173/*##http://127.0.0.1:5174/*##http://localhost:5174/*##http://127.0.0.1:5176/*##http://localhost:5176/*##http://127.0.0.1:5177/*##http://localhost:5177/*"
+        "post.logout.redirect.uris": "http://127.0.0.1:5173/*##http://localhost:5173/*##http://127.0.0.1:5174/*##http://localhost:5174/*##http://127.0.0.1:5176/*##http://localhost:5176/*##http://127.0.0.1:5177/*##http://localhost:5177/*##https://61.151.139.69:10443/*"
       }
     }
   ],

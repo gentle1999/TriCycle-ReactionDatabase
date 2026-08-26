@@ -42,6 +42,7 @@ def test_compose_gates_api_and_https_edge_on_health_and_initialization() -> None
     assert "caddy-config:" in compose
     assert "auto_https disable_redirects" in caddyfile
     assert '"${CADDY_SERVER_NAME:-localhost}:127.0.0.1"' in compose
+    assert '"host.docker.internal:host-gateway"' in compose
     assert "https://$${CADDY_SERVER_NAME}:$${CADDY_HTTPS_PORT}/health/live" in compose
 
 

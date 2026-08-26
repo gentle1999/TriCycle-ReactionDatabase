@@ -1,13 +1,13 @@
 import asyncio
 import gzip
 import threading
-import time
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from molgr import interface as molgr_interface
+from molgr.config import CONFIG as molgr_config
 from molop import molopconfig
 from rdkit.Chem import rdChemReactions
 
@@ -19,11 +19,12 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
     ArtifactUploadPayload,
     ArtifactUploadService,
     _FailedInference,
+    _materialize_parsed_artifacts,
     _parse_calculation_output,
     _parse_calculation_outputs_batch,
     _parser_payload,
     _require_batch_upload_budget,
-    _run_molop_parser,
+    _run_molop_file_parser,
     _run_molop_parser_with_progress,
     _SuccessfulInference,
 )
@@ -66,6 +67,9 @@ def test_molop_infers_one_reaction_for_each_detected_ts_frame() -> None:
         ]
         == "return_suspicious"
     )
+    assert molgr_config.cpp_backend.max_threads == 1
+    assert molgr_config.cpp_backend.enable_target_bucket_parallelism is False
+    assert molgr_config.cpp_backend.enable_candidate_scoring_parallelism is False
     assert parsed.source_frame_count == 23
     assert parsed.source_format == "g16log"
     assert len(parsed.inferences) == 1
@@ -98,6 +102,24 @@ def test_non_ts_calculation_frames_do_not_infer_reactions() -> None:
 
     assert parsed.source_frame_count > 0
     assert parsed.inferences == ()
+
+
+def test_fast_molop_parse_defers_topology_reconstruction_until_materialization() -> None:
+    molopconfig.show_progress_bar = False
+    parsed = asyncio.run(_run_molop_file_parser(TS_FIXTURE.read_bytes(), TS_FIXTURE.name))
+
+    assert parsed.source_frame_count == 23
+    assert parsed.frame_records == ()
+    assert parsed.inferences == ()
+    assert all(frame.topology_reconstruction_status is None for frame in parsed.chem_file)
+
+    materialized = _materialize_parsed_artifacts([parsed])[0]
+    assert len(materialized.frame_records) == 23
+    assert len(materialized.inferences) == 1
+    assert all(
+        frame.topology_reconstruction_status in {"succeeded", "suspicious_fallback"}
+        for frame in materialized.chem_file
+    )
 
 
 def test_reconstruction_failure_persists_suspicious_topology(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -552,34 +574,6 @@ def test_batch_service_rejects_resource_limits_before_authorization_or_storage(
                 user_id=DEVELOPMENT_USER_ID,
             )
         )
-
-
-def test_molop_parse_semaphore_enforces_process_level_slot_budget(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    settings = Settings(_env_file=None, molop_parse_slots=1)
-    lock = threading.Lock()
-    active = 0
-    peak = 0
-
-    def blocking_parser(value: int) -> int:
-        nonlocal active, peak
-        with lock:
-            active += 1
-            peak = max(peak, active)
-        time.sleep(0.03)
-        with lock:
-            active -= 1
-        return value
-
-    async def run() -> list[int]:
-        return await asyncio.gather(
-            *(_run_molop_parser(blocking_parser, index) for index in range(4))
-        )
-
-    monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
-    assert asyncio.run(run()) == [0, 1, 2, 3]
-    assert peak == 1
 
 
 def test_molop_progress_callback_runs_before_parser_batch_finishes() -> None:

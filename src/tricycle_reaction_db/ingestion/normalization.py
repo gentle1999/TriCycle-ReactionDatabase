@@ -55,8 +55,16 @@ def _clear_rdkit_properties(mol: Chem.Mol) -> None:
             bond.ClearProp(prop_name)
 
 
+def _initialize_ring_info(mol: Chem.Mol) -> None:
+    """Populate graph ring metadata without requiring chemical sanitization."""
+
+    Chem.FastFindRings(mol)
+
+
 def _canonical_topology(
     mol: Chem.Mol,
+    *,
+    skip_sanitization: bool = False,
 ) -> tuple[Chem.Mol, list[int], TopologySanitizationStatus, str | None]:
     source_topology = Chem.Mol(mol)
     source_topology.RemoveAllConformers()
@@ -66,38 +74,49 @@ def _canonical_topology(
         raise ValueError("molecular topology must contain at least one atom")
 
     topology = Chem.Mol(source_topology)
-    try:
-        Chem.SanitizeMol(topology)
-        Chem.AssignStereochemistry(topology, cleanIt=True, force=True)
-        ranks = list(
-            Chem.CanonicalRankAtoms(
-                topology,
-                breakTies=True,
-                includeChirality=True,
-                includeIsotopes=True,
-                includeAtomMaps=False,
-                includeChiralPresence=True,
-            )
-        )
-        canonical_order = sorted(range(atom_count), key=ranks.__getitem__)
-        sanitization_status = TopologySanitizationStatus.SANITIZED
-        sanitization_error = None
-    except Exception as error:
-        # Keep the source-order connectivity graph. PostgreSQL RDKit can store
-        # and substructure-search this binary Mol even when chemical
-        # sanitization, descriptors, and Morgan fingerprints are unavailable.
-        topology = source_topology
+    if skip_sanitization:
+        # MolGR's OpenBabel fallback is explicitly untrusted.  In particular,
+        # do not probe it with RDKit sanitization: valence repair can mutate the
+        # graph and hides the charge/spin provenance we need to persist.
         canonical_order = list(range(atom_count))
         sanitization_status = TopologySanitizationStatus.FAILED
-        sanitization_error = f"{type(error).__name__}: {error}"
+        sanitization_error = (
+            "MolGR suspicious_fallback topology; RDKit sanitization was intentionally skipped "
+            "(potential AtomValenceException)"
+        )
     else:
-        if any(
-            atom.GetNumImplicitHs()
-            for atom in topology.GetAtoms()  # type: ignore[no-untyped-call]
-        ):
-            raise ValueError(
-                "QM topology must contain every coordinate-bearing hydrogen explicitly"
+        try:
+            Chem.SanitizeMol(topology)
+            Chem.AssignStereochemistry(topology, cleanIt=True, force=True)
+            ranks = list(
+                Chem.CanonicalRankAtoms(
+                    topology,
+                    breakTies=True,
+                    includeChirality=True,
+                    includeIsotopes=True,
+                    includeAtomMaps=False,
+                    includeChiralPresence=True,
+                )
             )
+            canonical_order = sorted(range(atom_count), key=ranks.__getitem__)
+            sanitization_status = TopologySanitizationStatus.SANITIZED
+            sanitization_error = None
+        except Exception as error:
+            # Keep the source-order connectivity graph. PostgreSQL RDKit can store
+            # and substructure-search this binary Mol even when chemical
+            # sanitization, descriptors, and Morgan fingerprints are unavailable.
+            topology = source_topology
+            canonical_order = list(range(atom_count))
+            sanitization_status = TopologySanitizationStatus.FAILED
+            sanitization_error = f"{type(error).__name__}: {error}"
+        else:
+            if any(
+                atom.GetNumImplicitHs()
+                for atom in topology.GetAtoms()  # type: ignore[no-untyped-call]
+            ):
+                raise ValueError(
+                    "QM topology must contain every coordinate-bearing hydrogen explicitly"
+                )
 
     source_to_topology = [0] * atom_count
     for topology_index, source_index in enumerate(canonical_order):
@@ -105,6 +124,11 @@ def _canonical_topology(
 
     canonical = Chem.RenumberAtoms(topology, canonical_order)
     canonical.RemoveAllConformers()
+    if sanitization_status is TopologySanitizationStatus.FAILED:
+        # OpenBabel fallback graphs can fail valence sanitization while still
+        # carrying usable connectivity. PostgreSQL RDKit requires initialized
+        # RingInfo even for those deliberately unsanitized molecules.
+        _initialize_ring_info(canonical)
     return canonical, source_to_topology, sanitization_status, sanitization_error
 
 
@@ -194,12 +218,15 @@ def _normalized_topology_records(
     reconstruction_version: str,
     reconstruction_metadata: dict[str, Any] | None,
 ) -> tuple[NormalizedTopologyRecord, list[int]]:
+    suspicious_fallback = (reconstruction_metadata or {}).get(
+        "molgr_status"
+    ) == "suspicious_fallback"
     (
         topology_mol,
         source_to_topology,
         sanitization_status,
         sanitization_error,
-    ) = _canonical_topology(mol)
+    ) = _canonical_topology(mol, skip_sanitization=suspicious_fallback)
     composition, hill_formula = _formula_components(topology_mol)
     composition_hash = _digest(
         {"schema_version": FORMULA_COMPOSITION_VERSION, "composition": composition}
@@ -213,7 +240,9 @@ def _normalized_topology_records(
         element_count_vector=element_count_vector_from_composition(composition),
     )
 
-    explicit_graph_smiles = _graph_smiles(topology_mol, all_hydrogens_explicit=True)
+    explicit_graph_smiles = (
+        None if suspicious_fallback else _graph_smiles(topology_mol, all_hydrogens_explicit=True)
+    )
     if sanitization_status is TopologySanitizationStatus.SANITIZED:
         display_mol = Chem.RemoveHs(Chem.Mol(topology_mol))
         canonical_isomeric_smiles = _graph_smiles(
@@ -221,10 +250,7 @@ def _normalized_topology_records(
             all_hydrogens_explicit=False,
         )
     else:
-        canonical_isomeric_smiles = _graph_smiles(
-            topology_mol,
-            all_hydrogens_explicit=False,
-        )
+        canonical_isomeric_smiles = None
     identity_schema_version = (
         TOPOLOGY_IDENTITY_VERSION
         if explicit_graph_smiles is not None
@@ -332,7 +358,11 @@ def normalize_topology_with_mapping(
     """
 
     source = Chem.Mol(mol)
-    Chem.SanitizeMol(source)
+    suspicious_fallback = (reconstruction_metadata or {}).get(
+        "molgr_status"
+    ) == "suspicious_fallback"
+    if not suspicious_fallback:
+        Chem.SanitizeMol(source)
     if add_hydrogens:
         source = Chem.AddHs(source)
     return _normalized_topology_records(
@@ -356,6 +386,7 @@ def _ordered_geometry_mol(
     for atom_index, (x, y, z) in enumerate(coordinates):
         conformer.SetAtomPosition(atom_index, Point3D(float(x), float(y), float(z)))
     geometry_mol.AddConformer(conformer, assignId=False)
+    _initialize_ring_info(geometry_mol)
     return geometry_mol
 
 

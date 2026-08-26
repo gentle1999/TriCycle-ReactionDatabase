@@ -167,7 +167,7 @@ curl -fsS http://127.0.0.1:8000/health/ready
 
 - 继续使用数据库 statement timeout、GraphQL 深度/复杂度、结构候选集和分页上限。
 - 多 worker 使用 Redis 共享固定窗口限流；HTTP 与 MCP 共用 Lua 原子 `INCR + EXPIRE` 预算，生产只接受 `rediss://`，后端故障返回 503。
-- 按 `Uvicorn worker 数 × n_jobs` 计算 MolOP 解析池的 CPU/内存；`parse slots` 只限制请求级排队。
+- 按 `Uvicorn worker 数 × n_jobs` 计算 MolOP 解析池的 CPU/内存；并发只由阶段进程池控制。
   压缩输入同时限制解压后大小；上传采用受控 spool，避免整批 bytes 常驻内存。
 - 为 Topology、Artifact、Geometry 和 reaction 搜索保存代表性 `EXPLAIN (ANALYZE, BUFFERS)`。
 
@@ -438,7 +438,8 @@ R3/R4/R6 的仓库验收工具增量（2026-08-20）：`tricycle-deployment-smok
 `upload-limit-probe-v1`、`query-plan-evidence-v1`、`shared-rate-limit-v1`、
 `rate-limit-fail-closed-v1`，不接受人工自报字段。validator 会从完整计划树和逐节点 HTTP 观察
 重新计算 accepted/index/scan、共享预算和 503 fail-closed，而不是信任布尔字段。相关
-validator/probe/capture 测试为 `26 passed`，本地上传报告为 1/8/32 全部零失败；
+validator/probe/capture 测试为 `26 passed`；上传报告必须使用部署方真实 Gaussian/ORCA 数据，
+不接受仓库合成 fixture 结果；
 默认 PostgreSQL 连接因运行容器仍使用 `tricycle` 而示例配置使用 `example_user`，目标 query-plan
 capture 明确失败并保留该环境阻塞，未修改容器或数据库。
 

@@ -70,6 +70,23 @@ def test_segment_source_span_must_be_a_nonempty_half_open_interval() -> None:
         )
 
 
+def test_source_evidence_fields_can_be_absent_in_fast_ingestion_mode() -> None:
+    segment = CalculationSegmentRecord(segment_index=0)
+    frame = _frame_record(
+        source_start_byte=None,
+        source_end_byte=None,
+        source_start_char=None,
+        source_end_char=None,
+        source_start_line=None,
+        source_end_line=None,
+        source_block_sha256=None,
+    )
+
+    assert segment.source_block_sha256 is None
+    assert frame.source_start_byte is None
+    assert frame.source_block_sha256 is None
+
+
 def test_parse_revision_timestamps_must_be_timezone_aware() -> None:
     with pytest.raises(ValidationError, match="timezone"):
         ParseRevisionRecord(

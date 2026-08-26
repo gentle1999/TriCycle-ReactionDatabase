@@ -96,10 +96,13 @@ def _append_quantity(
 
 def _scientific_array_export_from_molop_frame(
     frame: BaseCalcFrame[Any],
+    *,
+    frame_payload: dict[str, Any] | None = None,
 ) -> tuple[list[ScientificArrayRecord], list[ScientificArrayAssignmentRecord]]:
     """Return every supported, non-empty numerical array exposed by one MolOP frame."""
 
-    frame_payload = frame.model_dump(mode="python", exclude_none=False)
+    if frame_payload is None:
+        frame_payload = frame.model_dump(mode="python", exclude_none=False)
     records: list[ScientificArrayRecord] = []
     assignments: list[ScientificArrayAssignmentRecord] = []
     thermal = frame_payload["thermal_informations"]
@@ -130,7 +133,7 @@ def _scientific_array_export_from_molop_frame(
         },
     )
     rotation_metadata: dict[str, Any] = {}
-    if thermal is not None and thermal["rotational_constants"] is not None:
+    if thermal is not None and thermal.get("rotational_constants") is not None:
         frame_constants = _quantity_array(frame_payload["rotation_constants"], "gigahertz")
         thermal_constants = _quantity_array(thermal["rotational_constants"], "gigahertz")
         if frame_constants.shape != thermal_constants.shape or not np.allclose(
@@ -215,7 +218,7 @@ def _scientific_array_export_from_molop_frame(
     if thermal is not None:
         _append_quantity(
             records,
-            thermal["moments_of_inertia"],
+            thermal.get("moments_of_inertia"),
             kind=ScientificArrayKind.MOMENTS_OF_INERTIA,
             pint_unit="unified_atomic_mass_unit * bohr ** 2",
             database_unit="amu*bohr^2",
@@ -223,13 +226,13 @@ def _scientific_array_export_from_molop_frame(
         )
         _append_quantity(
             records,
-            thermal["rotational_temperatures"],
+            thermal.get("rotational_temperatures"),
             kind=ScientificArrayKind.ROTATIONAL_TEMPERATURES,
             pint_unit="kelvin",
             database_unit="kelvin",
             source_field="thermal_informations.rotational_temperatures",
         )
-        vibrational_temperatures = thermal["vibrational_temperatures"]
+        vibrational_temperatures = thermal.get("vibrational_temperatures")
         if vibrational_temperatures is not None:
             data = _quantity_array(vibrational_temperatures, "kelvin")
             if data.size:
@@ -529,10 +532,12 @@ def scientific_array_records_from_molop_frame(
 
 def scientific_array_export_from_molop_frame(
     frame: BaseCalcFrame[Any],
+    *,
+    frame_payload: dict[str, Any] | None = None,
 ) -> tuple[list[ScientificArrayRecord], list[ScientificArrayAssignmentRecord]]:
     """Return numerical arrays together with their explicit result ownership."""
 
-    return _scientific_array_export_from_molop_frame(frame)
+    return _scientific_array_export_from_molop_frame(frame, frame_payload=frame_payload)
 
 
 __all__ = [

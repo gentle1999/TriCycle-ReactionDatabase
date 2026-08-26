@@ -32,6 +32,17 @@ def _unsanitizable_molecule() -> Chem.Mol:
     return molecule.GetMol()
 
 
+def _unsanitizable_ring_molecule() -> Chem.Mol:
+    molecule = Chem.RWMol()
+    ring_atoms = [molecule.AddAtom(Chem.Atom(6)) for _ in range(3)]
+    for begin, end in zip(ring_atoms, ring_atoms[1:] + ring_atoms[:1], strict=True):
+        molecule.AddBond(begin, end, Chem.BondType.SINGLE)
+    for _ in range(3):
+        hydrogen_index = molecule.AddAtom(Chem.Atom(1))
+        molecule.AddBond(ring_atoms[0], hydrogen_index, Chem.BondType.SINGLE)
+    return molecule.GetMol()
+
+
 def test_normalization_separates_formula_topology_and_geometry() -> None:
     mol = _explicit_molecule()
     record = normalize_molecule(
@@ -101,9 +112,14 @@ def test_topology_identity_is_independent_of_source_atom_order() -> None:
     np.testing.assert_array_equal(second.observed_coordinates, coordinates[order])
 
 
-def test_unsanitizable_topology_retains_searchable_connectivity_and_geometry() -> None:
+def test_unsanitizable_topology_retains_searchable_connectivity_and_geometry(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     molecule = _unsanitizable_molecule()
     coordinates = _coordinates(molecule.GetNumAtoms())
+
+    def forbidden_sanitize(*_: object, **__: object) -> object:
+        raise AssertionError("fallback topology must not be sanitized")
+
+    monkeypatch.setattr(Chem, "SanitizeMol", forbidden_sanitize)
 
     record = normalize_molecule(
         molecule,
@@ -124,6 +140,26 @@ def test_unsanitizable_topology_retains_searchable_connectivity_and_geometry() -
         "topology_sanitization_status": "failed",
         "topology_sanitization_error": record.topology.sanitization_error,
     }
+
+
+def test_unsanitizable_fallback_initializes_ring_info_for_postgresql_rdkit() -> None:
+    molecule = _unsanitizable_ring_molecule()
+
+    record = normalize_molecule(
+        molecule,
+        _coordinates(molecule.GetNumAtoms()),
+        charge=0,
+        multiplicity=2,
+        reconstruction_method="molgr/openbabel-fallback",
+        reconstruction_version="1",
+        reconstruction_metadata={"molgr_status": "suspicious_fallback"},
+    )
+
+    assert record.topology.sanitization_status is TopologySanitizationStatus.FAILED
+    assert record.topology.mol.GetRingInfo().NumRings() == 1
+    assert record.geometry.mol.GetRingInfo().NumRings() == 1
+    assert Chem.Mol(record.topology.mol.ToBinary()).GetRingInfo().NumRings() == 1
+    assert Chem.Mol(record.geometry.mol.ToBinary()).GetRingInfo().NumRings() == 1
 
 
 def test_graph_only_normalization_adds_implicit_hydrogens_without_geometry() -> None:

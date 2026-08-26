@@ -12,7 +12,7 @@ from sqlalchemy import Float, SmallInteger, String, and_, func, literal, text
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import load_only
-from sqlmodel import Session, select
+from sqlmodel import Session, col, select
 
 from tricycle_reaction_db.application.dtos.chemistry import (
     NormalizedMoleculeRecord,
@@ -22,6 +22,7 @@ from tricycle_reaction_db.application.services._persistence import (
     _acquire_identity_locks,
     _assert_record_matches,
     _flush_shared_entity,
+    _new_entity,
     _require_id,
 )
 from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
@@ -80,6 +81,11 @@ class GeometryPersistenceContext:
     """File-transaction caches for normalized identities and Geometry matching."""
 
     topologies: dict[tuple[str, ...], PersistedMolecularTopology] = field(default_factory=dict)
+    formulas_by_hash: dict[str, MolecularFormula] = field(default_factory=dict)
+    topologies_by_identity: dict[tuple[str, str], MolecularTopology] = field(default_factory=dict)
+    topology_derivations_by_key: dict[
+        tuple[UUID, str, str], MolecularTopologyDerivation
+    ] = field(default_factory=dict)
     geometries_by_hash: dict[tuple[UUID, str, str], Geometry] = field(default_factory=dict)
     # Keys populated by one PostgreSQL bulk lookup. A missing key is useful
     # information too: it lets the frame loop skip a per-Geometry SELECT.
@@ -97,6 +103,12 @@ class GeometryPersistenceContext:
         default_factory=dict
     )
     mapped_reactions_by_id: dict[UUID, MappedReaction] = field(default_factory=dict)
+    # TS inference commonly repeats the same mapped reaction across files. The
+    # reaction identity is immutable, so reuse the first successful creation
+    # result while still binding each source frame independently.
+    inferred_reaction_ids_by_smiles: dict[str, tuple[UUID, UUID]] = field(default_factory=dict)
+    inferred_reaction_topology_records: dict[str, tuple[Any, ...]] = field(default_factory=dict)
+    inferred_reaction_cache_hits: int = 0
     # Created lazily by batch reconciliation to avoid a module import cycle.
     reconciliation_cache: Any = None
 
@@ -269,6 +281,194 @@ def _validate_cached_topology(
     )
 
 
+def _preload_molecular_topologies(
+    session: Session,
+    records: Sequence[NormalizedTopologyRecord],
+    *,
+    context: GeometryPersistenceContext,
+) -> None:
+    """Resolve a batch of shared molecular identities with set-based reads."""
+
+    pending: dict[tuple[str, ...], NormalizedTopologyRecord] = {}
+    for record in records:
+        context_key = _topology_context_key(record)
+        if context_key not in context.topologies:
+            pending.setdefault(context_key, record)
+    if not pending:
+        return
+
+    formula_hashes = {
+        record.formula.composition_hash
+        for record in pending.values()
+        if record.formula.composition_hash not in context.formulas_by_hash
+    }
+    topology_identity_keys = {
+        (record.topology.identity_schema_version, record.topology.graph_hash)
+        for record in pending.values()
+        if (
+            record.topology.identity_schema_version,
+            record.topology.graph_hash,
+        )
+        not in context.topologies_by_identity
+    }
+    if formula_hashes or topology_identity_keys:
+        _acquire_identity_locks(
+            session,
+            *(
+                ('molecular_formula', composition_hash)
+                for composition_hash in sorted(formula_hashes)
+            ),
+            *(
+                ('molecular_topology', schema_version, graph_hash)
+                for schema_version, graph_hash in sorted(topology_identity_keys)
+            ),
+        )
+
+    if formula_hashes:
+        for formula in session.exec(
+            select(MolecularFormula).where(col(MolecularFormula.composition_hash).in_(formula_hashes))
+        ).all():
+            context.formulas_by_hash[formula.composition_hash] = formula
+    for record in pending.values():
+        composition_hash = record.formula.composition_hash
+        formula = context.formulas_by_hash.get(composition_hash)
+        if formula is not None:
+            continue
+        formula = _new_entity(session, MolecularFormula, **record.formula.model_dump())
+        _flush_shared_entity(
+            session,
+            formula,
+            label="MolecularFormula",
+            defer_if_fast=True,
+        )
+        context.formulas_by_hash[composition_hash] = formula
+
+    if topology_identity_keys:
+        for topology in session.exec(
+            select(MolecularTopology).where(
+                col(MolecularTopology.identity_schema_version).in_(
+                    {schema_version for schema_version, _ in topology_identity_keys}
+                ),
+                col(MolecularTopology.graph_hash).in_(
+                    {graph_hash for _, graph_hash in topology_identity_keys}
+                ),
+            )
+        ).all():
+            context.topologies_by_identity[
+                (topology.identity_schema_version, topology.graph_hash)
+            ] = topology
+    for record in pending.values():
+        identity_key = (
+            record.topology.identity_schema_version,
+            record.topology.graph_hash,
+        )
+        formula = context.formulas_by_hash[record.formula.composition_hash]
+        topology = context.topologies_by_identity.get(identity_key)
+        if topology is not None:
+            if topology.formula_id != formula.id:
+                raise ValueError("topology identity resolved to a different molecular formula")
+            continue
+        topology = _new_entity(
+            session, MolecularTopology, formula=formula, **record.topology.model_dump()
+        )
+        _flush_shared_entity(
+            session,
+            topology,
+            label="MolecularTopology",
+            defer_if_fast=True,
+        )
+        context.topologies_by_identity[identity_key] = topology
+
+    derivation_keys = {
+        (
+            _require_id(
+                context.topologies_by_identity[
+                    (record.topology.identity_schema_version, record.topology.graph_hash)
+                ],
+                label="MolecularTopology",
+            ),
+            record.topology_derivation.provenance_schema_version,
+            record.topology_derivation.provenance_hash,
+        )
+        for record in pending.values()
+    }
+    missing_derivation_keys = {
+        key for key in derivation_keys if key not in context.topology_derivations_by_key
+    }
+    if missing_derivation_keys:
+        _acquire_identity_locks(
+            session,
+            *(
+                (
+                    'molecular_topology_derivation',
+                    topology_id,
+                    provenance_schema_version,
+                    provenance_hash,
+                )
+                for topology_id, provenance_schema_version, provenance_hash in sorted(
+                    missing_derivation_keys,
+                    key=str,
+                )
+            ),
+        )
+        for derivation in session.exec(
+            select(MolecularTopologyDerivation).where(
+                col(MolecularTopologyDerivation.topology_id).in_(
+                    {key[0] for key in missing_derivation_keys}
+                ),
+                col(MolecularTopologyDerivation.provenance_schema_version).in_(
+                    {key[1] for key in missing_derivation_keys}
+                ),
+                col(MolecularTopologyDerivation.provenance_hash).in_(
+                    {key[2] for key in missing_derivation_keys}
+                ),
+            )
+        ).all():
+            context.topology_derivations_by_key[
+                (
+                    derivation.topology_id,
+                    derivation.provenance_schema_version,
+                    derivation.provenance_hash,
+                )
+            ] = derivation
+    for context_key, record in pending.items():
+        topology = context.topologies_by_identity[
+            (record.topology.identity_schema_version, record.topology.graph_hash)
+        ]
+        topology_id = _require_id(topology, label="MolecularTopology")
+        derivation_key = (
+            topology_id,
+            record.topology_derivation.provenance_schema_version,
+            record.topology_derivation.provenance_hash,
+        )
+        topology_derivation = context.topology_derivations_by_key.get(derivation_key)
+        if topology_derivation is None:
+            topology_derivation = _new_entity(
+                session,
+                MolecularTopologyDerivation,
+                topology=topology,
+                **record.topology_derivation.model_dump(),
+            )
+            _flush_shared_entity(
+                session,
+                topology_derivation,
+                label="MolecularTopologyDerivation",
+                defer_if_fast=True,
+            )
+            context.topology_derivations_by_key[derivation_key] = topology_derivation
+        else:
+            _assert_record_matches(
+                topology_derivation,
+                record.topology_derivation,
+                label="MolecularTopologyDerivation",
+            )
+        context.topologies[context_key] = PersistedMolecularTopology(
+            formula=context.formulas_by_hash[record.formula.composition_hash],
+            topology=topology,
+            topology_derivation=topology_derivation,
+        )
+
+
 def persist_molecular_topology(
     session: Session,
     record: NormalizedTopologyRecord,
@@ -282,40 +482,61 @@ def persist_molecular_topology(
         _validate_cached_topology(cached, record)
         return cached
 
-    _acquire_identity_locks(
-        session,
-        ("molecular_formula", record.formula.composition_hash),
-        (
-            "molecular_topology",
-            record.topology.identity_schema_version,
-            record.topology.graph_hash,
-        ),
+    formula = (
+        context.formulas_by_hash.get(record.formula.composition_hash)
+        if context is not None
+        else None
     )
-    formula = session.exec(
-        select(MolecularFormula).where(
-            MolecularFormula.composition_hash == record.formula.composition_hash
-        )
-    ).first()
+    topology_identity = (
+        record.topology.identity_schema_version,
+        record.topology.graph_hash,
+    )
+    topology = (
+        context.topologies_by_identity.get(topology_identity)
+        if context is not None
+        else None
+    )
+    if formula is None or topology is None:
+        lock_keys: list[tuple[object, ...]] = []
+        if formula is None:
+            lock_keys.append(("molecular_formula", record.formula.composition_hash))
+        if topology is None:
+            lock_keys.append(("molecular_topology", *topology_identity))
+        _acquire_identity_locks(session, *lock_keys)
     if formula is None:
-        formula = MolecularFormula(**record.formula.model_dump())
+        formula = session.exec(
+            select(MolecularFormula).where(
+                MolecularFormula.composition_hash == record.formula.composition_hash
+            )
+        ).first()
+    if formula is None:
+        formula = _new_entity(session, MolecularFormula, **record.formula.model_dump())
         _flush_shared_entity(session, formula, label="MolecularFormula", defer_if_fast=True)
+    if context is not None:
+        context.formulas_by_hash[record.formula.composition_hash] = formula
     if formula.id is None:
         raise RuntimeError("database did not generate MolecularFormula.id")
 
-    topology = session.exec(
-        select(MolecularTopology).where(
-            MolecularTopology.identity_schema_version == record.topology.identity_schema_version,
-            MolecularTopology.graph_hash == record.topology.graph_hash,
-        )
-    ).first()
     if topology is None:
-        topology = MolecularTopology(
+        topology = session.exec(
+            select(MolecularTopology).where(
+                MolecularTopology.identity_schema_version
+                == record.topology.identity_schema_version,
+                MolecularTopology.graph_hash == record.topology.graph_hash,
+            )
+        ).first()
+    if topology is None:
+        topology = _new_entity(
+            session,
+            MolecularTopology,
             formula=formula,
             **record.topology.model_dump(),
         )
         _flush_shared_entity(session, topology, label="MolecularTopology", defer_if_fast=True)
     elif topology.formula_id != formula.id:
         raise ValueError("topology identity resolved to a different molecular formula")
+    if context is not None:
+        context.topologies_by_identity[topology_identity] = topology
     # The graph identity is canonical, but the stored descriptors are one
     # projection of that graph.  A batch may legitimately produce another
     # projection for the same identity, so the first persisted projection wins.
@@ -323,26 +544,39 @@ def persist_molecular_topology(
         raise RuntimeError("database did not generate MolecularTopology.id")
     topology_id = _require_id(topology, label="MolecularTopology")
 
-    _acquire_identity_locks(
-        session,
-        (
-            "molecular_topology_derivation",
-            topology_id,
-            record.topology_derivation.provenance_schema_version,
-            record.topology_derivation.provenance_hash,
-        ),
+    derivation_key = (
+        topology_id,
+        record.topology_derivation.provenance_schema_version,
+        record.topology_derivation.provenance_hash,
     )
-    topology_derivation = session.exec(
-        select(MolecularTopologyDerivation).where(
-            MolecularTopologyDerivation.topology_id == topology_id,
-            MolecularTopologyDerivation.provenance_schema_version
-            == record.topology_derivation.provenance_schema_version,
-            MolecularTopologyDerivation.provenance_hash
-            == record.topology_derivation.provenance_hash,
-        )
-    ).first()
+    topology_derivation = (
+        context.topology_derivations_by_key.get(derivation_key)
+        if context is not None
+        else None
+    )
     if topology_derivation is None:
-        topology_derivation = MolecularTopologyDerivation(
+        _acquire_identity_locks(
+            session,
+            (
+                "molecular_topology_derivation",
+                topology_id,
+                record.topology_derivation.provenance_schema_version,
+                record.topology_derivation.provenance_hash,
+            ),
+        )
+        topology_derivation = session.exec(
+            select(MolecularTopologyDerivation).where(
+                MolecularTopologyDerivation.topology_id == topology_id,
+                MolecularTopologyDerivation.provenance_schema_version
+                == record.topology_derivation.provenance_schema_version,
+                MolecularTopologyDerivation.provenance_hash
+                == record.topology_derivation.provenance_hash,
+            )
+        ).first()
+    if topology_derivation is None:
+        topology_derivation = _new_entity(
+            session,
+            MolecularTopologyDerivation,
             topology=topology,
             **record.topology_derivation.model_dump(),
         )
@@ -358,6 +592,8 @@ def persist_molecular_topology(
             record.topology_derivation,
             label="MolecularTopologyDerivation",
         )
+    if context is not None:
+        context.topology_derivations_by_key[derivation_key] = topology_derivation
     persisted = PersistedMolecularTopology(
         formula=formula,
         topology=topology,
@@ -462,7 +698,9 @@ def persist_molecular_geometry(
         distances, angles, dihedrals = _internal_coordinate_projection(
             record.geometry.internal_coordinates
         )
-        geometry = Geometry(
+        geometry = _new_entity(
+            session,
+            Geometry,
             topology=topology,
             **record.geometry.model_dump(),
             internal_coordinate_distances_angstrom=distances,
@@ -508,6 +746,7 @@ def preload_molecular_geometry_context(
     records: Sequence[tuple[NormalizedMoleculeRecord, int | None]],
     *,
     context: GeometryPersistenceContext,
+    topology_records: Sequence[NormalizedTopologyRecord] = (),
 ) -> None:
     """Resolve shared topology identities, then bulk-load exact Geometry rows.
 
@@ -517,16 +756,31 @@ def preload_molecular_geometry_context(
     round trip.
     """
 
+    frame_topology_records = [
+        NormalizedTopologyRecord(
+            formula=record.formula,
+            topology=record.topology,
+            topology_derivation=record.topology_derivation,
+        )
+        for record, _coordinate_decimal_places in records
+    ]
+    _preload_molecular_topologies(
+        session,
+        [*frame_topology_records, *topology_records],
+        context=context,
+    )
+
     keys: set[tuple[UUID, str, str]] = set()
     records_by_key: dict[tuple[UUID, str, str], tuple[NormalizedMoleculeRecord, int | None]] = {}
     for record, coordinate_decimal_places in records:
+        topology_record = NormalizedTopologyRecord(
+            formula=record.formula,
+            topology=record.topology,
+            topology_derivation=record.topology_derivation,
+        )
         persisted_topology = persist_molecular_topology(
             session,
-            NormalizedTopologyRecord(
-                formula=record.formula,
-                topology=record.topology,
-                topology_derivation=record.topology_derivation,
-            ),
+            topology_record,
             context=context,
         )
         key = (

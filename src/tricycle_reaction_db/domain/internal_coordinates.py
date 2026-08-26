@@ -5,8 +5,6 @@ from typing import Final
 
 import numpy as np
 import numpy.typing as npt
-from molop.io.base_models.DataClasses import AtomInInternalCoords, InternalCoords
-from molop.unit import atom_ureg
 
 INTERNAL_COORDINATE_DECIMAL_PLACES: Final = 12
 
@@ -35,22 +33,36 @@ def internal_coordinates_from_cartesian(
 ) -> npt.NDArray[np.float64]:
     """Convert ordered Cartesian coordinates to a stable ``[r, angle, dihedral]`` matrix."""
 
-    internal = InternalCoords.from_cartesian_coords(
-        symbols,
-        coordinates * atom_ureg.angstrom,
-    )
-    values = np.asarray(
-        [
-            [
-                float(atom.distance.to(atom_ureg.angstrom).magnitude),
-                float(atom.angle.to(atom_ureg.degree).magnitude),
-                float(atom.dihedral.to(atom_ureg.degree).magnitude),
-            ]
-            for atom in internal
-        ],
-        dtype=np.float64,
-    )
-    if values.shape != (len(symbols), 3) or not np.isfinite(values).all():
+    expected_atom_count = len(symbols)
+    xyz = np.asarray(coordinates, dtype=np.float64)
+    atom_count = xyz.shape[0]
+    values = np.zeros((atom_count, 3), dtype=np.float64)
+    if atom_count > 1:
+        values[1:, 0] = np.linalg.norm(xyz[1:] - xyz[:-1], axis=1)
+    if atom_count > 2:
+        first = xyz[:-2] - xyz[1:-1]
+        second = xyz[2:] - xyz[1:-1]
+        denominator = np.linalg.norm(first, axis=1) * np.linalg.norm(second, axis=1)
+        cosine = np.divide(
+            np.sum(first * second, axis=1),
+            denominator,
+            out=np.ones_like(denominator),
+            where=denominator != 0,
+        )
+        values[2:, 1] = np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+    for index in range(3, atom_count):
+        p0, p1, p2, p3 = xyz[index - 3 : index + 1]
+        b0 = p1 - p0
+        b1 = p2 - p1
+        b2 = p3 - p2
+        b1_norm = np.linalg.norm(b1)
+        if b1_norm == 0:
+            continue
+        b1_unit = b1 / b1_norm
+        v = b0 - np.dot(b0, b1_unit) * b1_unit
+        w = b2 - np.dot(b2, b1_unit) * b1_unit
+        values[index, 2] = np.degrees(np.arctan2(np.dot(np.cross(b1_unit, v), w), np.dot(v, w)))
+    if values.shape != (expected_atom_count, 3) or not np.isfinite(values).all():
         raise ValueError("MolOP produced invalid internal coordinates")
 
     if len(values):
@@ -61,9 +73,9 @@ def internal_coordinates_from_cartesian(
         values[2, 2] = 0.0
     if len(values) > 3:
         values[3:, 2] = (values[3:, 2] + 180.0) % 360.0 - 180.0
-    values = np.round(values, decimals=INTERNAL_COORDINATE_DECIMAL_PLACES)
+    values[...] = np.round(values, decimals=INTERNAL_COORDINATE_DECIMAL_PLACES)
     values[values == 0] = 0.0
-    values = np.array(values, dtype="<f8", order="C", copy=True)
+    values = np.array(values, dtype="<f8", order="C", copy=True)  # type: ignore[assignment]
     values.setflags(write=False)
     return values
 
@@ -82,30 +94,44 @@ def cartesian_from_internal_coordinates(
     if not np.isfinite(values).all():
         raise ValueError("internal_coordinates must contain only finite values")
 
-    atoms: list[AtomInInternalCoords] = []
-    for index, (symbol, row) in enumerate(zip(symbols, values, strict=True)):
-        dihedral = float(row[2])
-        if index > 2:
-            # MolOP's forward and reverse standard-dihedral conventions
-            # differ by 180 degrees. Keep the persisted values in the forward
-            # convention and adapt only the reverse conversion.
-            dihedral -= 180.0
-        atoms.append(
-            AtomInInternalCoords(
-                symbol=symbol,
-                distance_to_index=max(index - 1, 0),
-                distance=float(row[0]) * atom_ureg.angstrom,
-                angle_to_index=max(index - 2, 0),
-                angle=float(row[1]) * atom_ureg.degree,
-                dihedral_to_index=max(index - 3, 0),
-                dihedral=dihedral * atom_ureg.degree,
-            )
+    del symbols  # All rows use the standard (non-alternate) Z-matrix form.
+    atom_count = len(values)
+    coordinates = np.zeros((atom_count, 3), dtype=np.float64)
+    if atom_count > 1:
+        coordinates[1, 0] = values[1, 0]
+    if atom_count > 2:
+        r = values[2, 0]
+        theta = np.radians(values[2, 1])
+        e1 = np.array([1.0, 0.0, 0.0])
+        e2 = np.array([0.0, 1.0, 0.0])
+        coordinates[2] = coordinates[1] + r * (-np.cos(theta) * e1 + np.sin(theta) * e2)
+    for index in range(3, atom_count):
+        r = values[index, 0]
+        theta = np.radians(values[index, 1])
+        phi = np.radians(values[index, 2] - 180.0)
+        rc = coordinates[index - 1]
+        rb = coordinates[index - 2]
+        ra = coordinates[index - 3]
+        e1 = rc - rb
+        e1_norm = np.linalg.norm(e1)
+        e1 = np.array([1.0, 0.0, 0.0]) if np.isclose(e1_norm, 0.0) else e1 / e1_norm
+        normal = np.cross(rb - ra, e1)
+        normal_norm = np.linalg.norm(normal)
+        if np.isclose(normal_norm, 0.0):
+            trial = np.array([0.0, 0.0, 1.0])
+            if np.linalg.norm(np.cross(e1, trial)) < 1e-8:
+                trial = np.array([0.0, 1.0, 0.0])
+            normal = np.cross(e1, trial)
+            normal_norm = np.linalg.norm(normal)
+        e3 = normal / normal_norm
+        e2 = np.cross(e3, e1)
+        e2 = e2 / np.linalg.norm(e2)
+        coordinates[index] = rc + r * (
+            -np.cos(theta) * e1
+            + np.sin(theta) * np.cos(phi) * e2
+            + np.sin(theta) * np.sin(phi) * e3
         )
-    coordinates = InternalCoords.from_atoms(atoms).to_cartesian_coords()
-    return canonical_cartesian_coordinates(
-        coordinates.to(atom_ureg.angstrom).magnitude,
-        atom_count=len(symbols),
-    )
+    return canonical_cartesian_coordinates(coordinates, atom_count=atom_count)
 
 
 def internal_coordinate_hash(internal_coordinates: npt.NDArray[np.float64]) -> str:

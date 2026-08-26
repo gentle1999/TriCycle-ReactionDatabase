@@ -32,6 +32,7 @@ from tricycle_reaction_db.application.services.reaction_geometry_reconciliation 
     resolve_endpoint_node,
 )
 from tricycle_reaction_db.application.services.reactions import (
+    _canonical_mapped_reaction_smiles,
     _reaction_from_representation,
     persist_logical_reaction,
     persist_logical_reaction_participant,
@@ -70,24 +71,35 @@ def _resolve_components(
     *,
     topology_context: GeometryPersistenceContext | None = None,
     include_creation_metadata: bool = True,
+    precomputed_topology_records: tuple[object, ...] | None = None,
 ) -> tuple[list[_ResolvedComponent], int]:
     components: list[_ResolvedComponent] = []
     topologies_created = 0
+    component_index = 0
     for side, templates in (
         (LogicalReactionParticipantSide.REACTANT, definition.GetReactants()),
         (LogicalReactionParticipantSide.PRODUCT, definition.GetProducts()),
     ):
         for template_index, template in enumerate(templates):
-            normalized = normalize_topology(
-                template,
-                add_hydrogens=True,
-                reconstruction_method="rdkit/reaction-representation",
-                reconstruction_version=rdkit_version,
-                reconstruction_metadata={
-                    "side": side.value,
-                    "template_index": template_index,
-                },
-            )
+            if precomputed_topology_records is not None:
+                try:
+                    normalized = precomputed_topology_records[component_index]
+                except IndexError as error:
+                    raise ValueError(
+                        "precomputed reaction topology record count mismatch"
+                    ) from error
+                component_index += 1
+            else:
+                normalized = normalize_topology(
+                    template,
+                    add_hydrogens=True,
+                    reconstruction_method="rdkit/reaction-representation",
+                    reconstruction_version=rdkit_version,
+                    reconstruction_metadata={
+                        "side": side.value,
+                        "template_index": template_index,
+                    },
+                )
             existing = (
                 session.exec(
                     select(MolecularTopology).where(
@@ -115,7 +127,35 @@ def _resolve_components(
                     topology=persisted.topology,
                 )
             )
+    if precomputed_topology_records is not None and component_index != len(
+        precomputed_topology_records
+    ):
+        raise ValueError("precomputed reaction topology record count mismatch")
     return components, topologies_created
+
+
+def reaction_topology_records(
+    definition: rdChemReactions.ChemicalReaction,
+) -> list[object]:
+    """Build the exact topology records used by reaction component resolution."""
+
+    return [
+        normalize_topology(
+            template,
+            add_hydrogens=True,
+            reconstruction_method="rdkit/reaction-representation",
+            reconstruction_version=rdkit_version,
+            reconstruction_metadata={
+                "side": side.value,
+                "template_index": template_index,
+            },
+        )
+        for side, templates in (
+            (LogicalReactionParticipantSide.REACTANT, definition.GetReactants()),
+            (LogicalReactionParticipantSide.PRODUCT, definition.GetProducts()),
+        )
+        for template_index, template in enumerate(templates)
+    ]
 
 
 def _has_complete_mapping(components: list[_ResolvedComponent]) -> bool:
@@ -187,6 +227,7 @@ def _create_reaction(
     topology_context: GeometryPersistenceContext | None = None,
     include_creation_metadata: bool = True,
     reconciliation_cache: ReconciliationBatchCache | None = None,
+    precomputed_topology_records: tuple[object, ...] | None = None,
 ) -> CreateReactionResult:
     definition = _reaction_from_representation(command.reaction)
     components, topologies_created = _resolve_components(
@@ -194,6 +235,7 @@ def _create_reaction(
         definition,
         topology_context=topology_context,
         include_creation_metadata=include_creation_metadata,
+        precomputed_topology_records=precomputed_topology_records,
     )
     mapping_complete = _has_complete_mapping(components)
     identities = [(component.side, component.topology, 1) for component in components]
@@ -243,7 +285,7 @@ def _create_reaction(
             mapped_reaction_created=False,
         )
 
-    canonical_smiles = rdChemReactions.ReactionToSmiles(definition, True)
+    canonical_smiles = _canonical_mapped_reaction_smiles(definition)
     mapping_hash = sha256(canonical_smiles.encode("utf-8")).hexdigest()
     existing_mapped = (
         session.exec(
@@ -353,4 +395,4 @@ class ReactionCommandService(UseCaseService):  # type: ignore[misc]
 create_reaction_in_session = _create_reaction
 
 
-__all__ = ["ReactionCommandService", "create_reaction_in_session"]
+__all__ = ["ReactionCommandService", "create_reaction_in_session", "reaction_topology_records"]

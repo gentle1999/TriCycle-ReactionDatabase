@@ -367,8 +367,8 @@ class CalculationSegmentSummary(QueryView):
     parse_completeness: str
     termination_status: str
     scf_status: str
-    source_start_line: int
-    source_end_line: int
+    source_start_line: int | None = None
+    source_end_line: int | None = None
 
 
 class CalculationSegmentPage(QueryView):
@@ -377,13 +377,13 @@ class CalculationSegmentPage(QueryView):
 
 
 class SourceSpanView(QueryView):
-    start_byte: int
-    end_byte: int
+    start_byte: int | None = None
+    end_byte: int | None = None
     start_char: int | None = None
     end_char: int | None = None
-    start_line: int
-    end_line: int
-    block_sha256: str
+    start_line: int | None = None
+    end_line: int | None = None
+    block_sha256: str | None = None
 
 
 class MolecularTopologyDerivationView(QueryView):
@@ -797,7 +797,7 @@ class MolecularTopologyDerivationDetail(MolecularTopologyDerivationSummary):
 
 
 class CalculationFrameDetail(CalculationFrameSummary):
-    source_span: SourceSpanView
+    source_span: SourceSpanView | None = None
     parse_completeness: str
     geometry_assignment_kind: str
     observed_coordinate_hash: str

@@ -10,17 +10,21 @@ import os
 import sys
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 from uuid import UUID
+
+from sqlalchemy import event
 
 from tricycle_reaction_db.application.services.artifact_uploads import (
     ArtifactUploadPayload,
     ArtifactUploadService,
 )
 from tricycle_reaction_db.core.config import get_settings
+from tricycle_reaction_db.db.session import engine
 from tricycle_reaction_db.domain.enums import ArtifactKind
 
 HASH_CHUNK_BYTES = 1024 * 1024
@@ -47,6 +51,7 @@ class ImportSummary:
     skipped: int = 0
     attempted: int = 0
     succeeded: int = 0
+    filtered: int = 0
     failed: int = 0
     bytes_succeeded: int = 0
 
@@ -56,8 +61,86 @@ class ImportSummary:
             skipped=self.skipped + other.skipped,
             attempted=self.attempted + other.attempted,
             succeeded=self.succeeded + other.succeeded,
+            filtered=self.filtered + other.filtered,
             failed=self.failed + other.failed,
             bytes_succeeded=self.bytes_succeeded + other.bytes_succeeded,
+        )
+
+
+@dataclass(slots=True)
+class ImportMetrics:
+    """Wall-clock and database measurements for one import invocation."""
+
+    step_timings_ms: dict[str, float] = field(default_factory=dict)
+    phase_timings_ms: dict[str, float] = field(default_factory=dict)
+    steps: list[dict[str, Any]] = field(default_factory=list)
+    sql_statement_count: int = 0
+    sql_executemany_count: int = 0
+    sql_elapsed_ms_by_operation: dict[str, float] = field(default_factory=dict)
+
+    def add_step_timing(self, name: str, elapsed_ms: float) -> None:
+        self.step_timings_ms[name] = self.step_timings_ms.get(name, 0.0) + elapsed_ms
+
+    def add_phase_timing(self, name: str, elapsed_ms: float) -> None:
+        self.phase_timings_ms[name] = self.phase_timings_ms.get(name, 0.0) + elapsed_ms
+
+    def as_dict(self, *, total_ms: float) -> dict[str, Any]:
+        return {
+            "total_ms": round(total_ms, 3),
+            "step_timings_ms": {
+                key: round(value, 3) for key, value in sorted(self.step_timings_ms.items())
+            },
+            "phase_timings_ms": {
+                key: round(value, 3) for key, value in sorted(self.phase_timings_ms.items())
+            },
+            "steps": self.steps,
+            "sql_statement_count": self.sql_statement_count,
+            "sql_executemany_count": self.sql_executemany_count,
+            "sql_elapsed_ms_by_operation": {
+                key: round(value, 3)
+                for key, value in sorted(self.sql_elapsed_ms_by_operation.items())
+            },
+        }
+
+
+class _SQLStats:
+    """Collect aggregate statement counts and elapsed time for an import."""
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.executemany_count = 0
+        self.elapsed_ms_by_operation: dict[str, float] = {}
+
+    def before_cursor_execute(
+        self,
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        context: Any,
+        executemany: bool,
+    ) -> None:
+        self.count += 1
+        if executemany:
+            self.executemany_count += 1
+        context._import_timing_started_at = perf_counter()
+
+    def after_cursor_execute(
+        self,
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        context: Any,
+        _executemany: bool,
+    ) -> None:
+        started_at = getattr(context, "_import_timing_started_at", None)
+        if started_at is None:
+            return
+        elapsed_ms = (perf_counter() - float(started_at)) * 1000
+        operation = statement.lstrip().split(None, 1)[0].upper() if statement.strip() else "EMPTY"
+        self.elapsed_ms_by_operation[operation] = (
+            self.elapsed_ms_by_operation.get(operation, 0.0) + elapsed_ms
         )
 
 
@@ -166,6 +249,25 @@ class ImportState:
             and record.get("sha256") == fingerprint.sha256
         )
 
+    def terminal(
+        self,
+        path: Path,
+        *,
+        project_id: UUID,
+        artifact_kind: ArtifactKind,
+        fingerprint: ImportFingerprint,
+    ) -> bool:
+        record = self._records.get(str(path))
+        return bool(
+            record
+            and record.get("status") in {"succeeded", "filtered"}
+            and record.get("project_id") == str(project_id)
+            and record.get("artifact_kind") == artifact_kind.value
+            and record.get("size_bytes") == fingerprint.size_bytes
+            and record.get("mtime_ns") == fingerprint.mtime_ns
+            and record.get("sha256") == fingerprint.sha256
+        )
+
     def append(self, record: dict[str, Any]) -> None:
         source = record["source"]
         self._records[source] = record
@@ -216,12 +318,15 @@ async def import_files(
     state: ImportState,
     dry_run: bool,
     fingerprint_workers: int | None = None,
+    metrics: ImportMetrics | None = None,
 ) -> ImportSummary:
+    metrics = metrics or ImportMetrics()
     settings = get_settings()
     summary = ImportSummary(scanned=len(candidates))
     workers = fingerprint_workers or min(MAX_FINGERPRINT_WORKERS, max(4, os.cpu_count() or 4))
     if workers < 1:
         raise ValueError("fingerprint_workers must be positive")
+    step_started = perf_counter()
     with ThreadPoolExecutor(max_workers=workers) as executor:
         fingerprints = dict(
             zip(
@@ -230,10 +335,12 @@ async def import_files(
                 strict=True,
             )
         )
+    metrics.add_step_timing("fingerprint", (perf_counter() - step_started) * 1000)
+    step_started = perf_counter()
     pending: list[tuple[ImportCandidate, ImportFingerprint]] = []
     for candidate in candidates:
         fingerprint = fingerprints[candidate]
-        if state.path is not None and state.succeeded(
+        if state.path is not None and state.terminal(
             candidate.path,
             project_id=project_id,
             artifact_kind=artifact_kind,
@@ -242,8 +349,10 @@ async def import_files(
             summary = summary.add(ImportSummary(skipped=1))
             continue
         pending.append((candidate, fingerprint))
+    metrics.add_step_timing("state_filter", (perf_counter() - step_started) * 1000)
 
     if dry_run:
+        metrics.add_step_timing("dry_run", 0.0)
         return summary.add(
             ImportSummary(
                 attempted=len(pending),
@@ -253,7 +362,12 @@ async def import_files(
 
     fingerprints = dict(pending)
 
+    sql_stats = _SQLStats()
+    event.listen(engine.sync_engine, "before_cursor_execute", sql_stats.before_cursor_execute)
+    event.listen(engine.sync_engine, "after_cursor_execute", sql_stats.after_cursor_execute)
+
     async def import_batch(batch: list[ImportCandidate]) -> ImportSummary:
+        batch_started = perf_counter()
         payloads = [
             ArtifactUploadPayload(
                 filename=candidate.path.name,
@@ -268,11 +382,29 @@ async def import_files(
             file=sys.stderr,
         )
         try:
+            service_started = perf_counter()
             result = await ArtifactUploadService.upload_batch(
                 files=payloads,
                 artifact_kind=artifact_kind,
                 project_id=project_id,
                 user_id=user_id,
+            )
+            service_elapsed_ms = (perf_counter() - service_started) * 1000
+            metrics.add_phase_timing("upload_batch_service_ms", service_elapsed_ms)
+            for phase, elapsed_ms in result.timings_ms.items():
+                metrics.add_phase_timing(f"upload_batch_{phase}", elapsed_ms)
+            metrics.steps.append(
+                {
+                    "batch_size": len(batch),
+                    "source_bytes": sum(item.size_bytes for item in batch),
+                    "elapsed_ms": round((perf_counter() - batch_started) * 1000, 3),
+                    "service_elapsed_ms": round(service_elapsed_ms, 3),
+                    "succeeded": result.succeeded_count,
+                    "failed": result.failed_count,
+                    "timings_ms": {
+                        key: round(value, 3) for key, value in sorted(result.timings_ms.items())
+                    },
+                }
             )
         except ValueError as error:
             if len(batch) > 1:
@@ -316,7 +448,13 @@ async def import_files(
         for candidate, item in zip(batch, result.items, strict=True):
             fingerprint = fingerprints[candidate]
             artifact_id = item.result.artifact_id if item.result is not None else None
-            if item.succeeded:
+            filtered = item.error_code == "no_calculation_frames" or (
+                item.result is not None and item.result.source_frame_count == 0
+            )
+            if filtered:
+                batch_summary = batch_summary.add(ImportSummary(filtered=1))
+                status = "filtered"
+            elif item.succeeded:
                 batch_summary = batch_summary.add(
                     ImportSummary(succeeded=1, bytes_succeeded=candidate.size_bytes)
                 )
@@ -342,12 +480,21 @@ async def import_files(
             )
         return batch_summary
 
-    for batch in iter_batches(
-        [candidate for candidate, _ in pending],
-        max_files=settings.max_batch_files,
-        max_bytes=settings.max_batch_bytes,
-    ):
-        summary = summary.add(await import_batch(batch))
+    batches_started_at = perf_counter()
+    try:
+        for batch in iter_batches(
+            [candidate for candidate, _ in pending],
+            max_files=settings.max_batch_files,
+            max_bytes=settings.max_batch_bytes,
+        ):
+            summary = summary.add(await import_batch(batch))
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", sql_stats.before_cursor_execute)
+        event.remove(engine.sync_engine, "after_cursor_execute", sql_stats.after_cursor_execute)
+    metrics.sql_statement_count = sql_stats.count
+    metrics.sql_executemany_count = sql_stats.executemany_count
+    metrics.sql_elapsed_ms_by_operation = sql_stats.elapsed_ms_by_operation
+    metrics.add_step_timing("upload_batches", (perf_counter() - batches_started_at) * 1000)
     return summary
 
 
@@ -391,7 +538,11 @@ async def _run(args: argparse.Namespace) -> int:
     if settings.environment == "production" and args.user_id is None:
         raise ValueError("--user-id is required when TRICYCLE_ENVIRONMENT=production")
     artifact_kind = ArtifactKind(args.artifact_kind)
+    started_at = perf_counter()
+    metrics = ImportMetrics()
+    discover_started = perf_counter()
     candidates = discover_files(args.roots)
+    metrics.add_step_timing("discover", (perf_counter() - discover_started) * 1000)
     state = ImportState(args.state_file)
     summary = await import_files(
         candidates,
@@ -400,8 +551,11 @@ async def _run(args: argparse.Namespace) -> int:
         artifact_kind=artifact_kind,
         state=state,
         dry_run=args.dry_run,
+        metrics=metrics,
     )
-    print(json.dumps(asdict(summary), ensure_ascii=False, sort_keys=True))
+    payload = asdict(summary)
+    payload["timings"] = metrics.as_dict(total_ms=(perf_counter() - started_at) * 1000)
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return 1 if summary.failed else 0
 
 

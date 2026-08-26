@@ -31,7 +31,7 @@ function energySourceLabel(id: string | null): string {
       </RouterLink>
     </nav>
     <ChemDoodleGeometry3D :geometry-id="geometry.id" :project-id="projectId" :label="geometry.canonical_isomeric_smiles ?? undefined" :height="320" />
-    <header class="geometry-detail-identity"><strong>{{ geometry.canonical_isomeric_smiles ?? "SMILES 不可用" }}</strong><code :title="geometry.id">{{ geometry.id }}</code></header>
+    <header class="geometry-detail-identity"><strong class="geometry-detail-smiles">{{ geometry.canonical_isomeric_smiles ?? "SMILES 不可用" }}</strong><code :title="geometry.id">{{ geometry.id }}</code></header>
     <dl class="energy-facts">
       <div><dt>电子能</dt><dd>{{ formatEnergy(geometry.energy_view.electronic_energy_hartree) }}</dd></div>
       <div><dt>焓 H</dt><dd>{{ formatEnergy(geometry.energy_view.enthalpy_hartree) }}</dd></div>

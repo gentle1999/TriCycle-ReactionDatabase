@@ -11,6 +11,7 @@ from tricycle_reaction_db.application.dtos import (
     WorkflowManifestRecord,
 )
 from tricycle_reaction_db.application.services.reactions import (
+    _canonical_mapped_reaction_smiles,
     _mapped_reaction_from_smiles,
 )
 from tricycle_reaction_db.domain.enums import (
@@ -133,3 +134,30 @@ def test_mapped_reaction_uses_rdkit_reaction_parser_with_agents() -> None:
 
     with pytest.raises(ValueError, match="RDKit could not parse"):
         _mapped_reaction_from_smiles("not-a-reaction")
+
+
+def test_mapped_reaction_canonicalization_is_stable_for_metal_stereo() -> None:
+    reaction = (
+        "[Cl-:1]->[Ru@OH17+2]([Cl-:2])"
+        "([P:3]([H:4])([H:5])[H:6])=[C:7]([H:8])[H:9]"
+        ">>"
+        "[Cl-:1]->[Ru@OH17+2]([Cl-:2])"
+        "([P:3]([H:4])([H:5])[H:6])=[C:7]([H:8])[H:9]"
+    )
+
+    canonical = _canonical_mapped_reaction_smiles(_mapped_reaction_from_smiles(reaction))
+    reparsed = _canonical_mapped_reaction_smiles(_mapped_reaction_from_smiles(canonical))
+
+    assert canonical == reparsed
+    assert "[Ru@" not in canonical
+
+
+@pytest.mark.parametrize("element", ["As", "Se", "Te"])
+def test_mapped_reaction_preserves_nonmetal_heavy_atom_stereo(element: str) -> None:
+    at = f"[C:1][{element}@:2]([C:3])([C:4])[C:5]>>[C:1][{element}@:2]([C:3])([C:4])[C:5]"
+    aat = at.replace(f"[{element}@:2]", f"[{element}@@:2]")
+
+    canonical_at = _canonical_mapped_reaction_smiles(_mapped_reaction_from_smiles(at))
+    canonical_aat = _canonical_mapped_reaction_smiles(_mapped_reaction_from_smiles(aat))
+
+    assert canonical_at != canonical_aat

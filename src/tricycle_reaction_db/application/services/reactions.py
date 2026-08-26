@@ -24,7 +24,9 @@ from tricycle_reaction_db.application.dtos.reactions import (
 from tricycle_reaction_db.application.services._persistence import (
     _acquire_identity_locks,
     _assert_record_matches,
+    _attach_pending_entities,
     _flush_new_entity,
+    _new_entity,
     _require_id,
 )
 from tricycle_reaction_db.application.services.reaction_geometry_policy import (
@@ -67,6 +69,7 @@ def _canonical_json(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
 
 
+@lru_cache(maxsize=1024)
 def _reaction_from_representation(
     reaction_representation: str,
 ) -> rdChemReactions.ChemicalReaction:
@@ -93,6 +96,76 @@ def _reaction_from_representation(
     if reaction.GetNumReactantTemplates() == 0 or reaction.GetNumProductTemplates() == 0:
         raise ValueError("reaction representation requires reactant and product templates")
     return reaction
+
+
+def _canonical_mapped_reaction_smiles(
+    definition: rdChemReactions.ChemicalReaction,
+) -> str:
+    """Canonicalize mapped reactions while avoiding unstable metal stereo tags."""
+
+    stable = rdChemReactions.ChemicalReaction()
+    for templates, add_template in (
+        (definition.GetReactants(), stable.AddReactantTemplate),
+        (definition.GetAgents(), stable.AddAgentTemplate),
+        (definition.GetProducts(), stable.AddProductTemplate),
+    ):
+        for template in templates:
+            normalized = Chem.Mol(template)
+            # RDKit's unsupported metal stereo annotations are not stable across
+            # a parse/serialize round trip. Supported non-metal stereo stays.
+            for atom in normalized.GetAtoms():  # type: ignore[no-untyped-call]
+                if _is_metal_atomic_number(atom.GetAtomicNum()):
+                    atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
+            add_template(normalized)
+    return rdChemReactions.ReactionToSmiles(stable, True)
+
+
+_METAL_ATOMIC_NUMBERS = frozenset(
+    {
+        3,
+        4,
+        11,
+        12,
+        13,
+        19,
+        20,
+        *range(21, 32),
+        *range(37, 51),
+        *range(55, 85),
+        *range(87, 117),
+    }
+)
+
+
+def _is_metal_atomic_number(atomic_number: int) -> bool:
+    """Return whether RDKit's atomic number denotes a chemical metal."""
+
+    return atomic_number in _METAL_ATOMIC_NUMBERS
+
+
+def _reaction_graph_smiles(definition: rdChemReactions.ChemicalReaction) -> str:
+    """Render a reaction identity without unstable metal stereochemistry."""
+
+    sides: list[str] = []
+    for templates in (
+        definition.GetReactants(),
+        definition.GetAgents(),
+        definition.GetProducts(),
+    ):
+        sides.append(
+            ".".join(
+                sorted(
+                    Chem.MolToSmiles(
+                        template,
+                        canonical=True,
+                        isomericSmiles=False,
+                        allHsExplicit=True,
+                    )
+                    for template in templates
+                )
+            )
+        )
+    return ">".join(sides)
 
 
 _mapped_reaction_from_smiles = _reaction_from_representation
@@ -238,6 +311,12 @@ def _mapping_assignment_for_topology(
         isomericSmiles=True,
         allHsExplicit=True,
     )
+    expected_graph_smiles = Chem.MolToSmiles(
+        template,
+        canonical=True,
+        isomericSmiles=False,
+        allHsExplicit=True,
+    )
     query = Chem.Mol(template)
     for atom in query.GetAtoms():  # type: ignore[no-untyped-call]
         atom.SetAtomMapNum(0)
@@ -253,8 +332,33 @@ def _mapping_assignment_for_topology(
         topology_maps = [0] * topology.atom_count
         for template_index, topology_index in enumerate(match):
             topology_maps[topology_index] = template_maps[template_index]
-        mapped_smiles = mapped_smiles_for_topology(topology, topology_maps)
+        mapped_topology = Chem.Mol(topology.mol)
+        mapped_atoms = list(mapped_topology.GetAtoms())  # type: ignore[no-untyped-call]
+        for atom, map_number in zip(
+            mapped_atoms,
+            topology_maps,
+            strict=True,
+        ):
+            atom.SetAtomMapNum(map_number)
+        mapped_smiles = Chem.MolToSmiles(
+            mapped_topology,
+            canonical=True,
+            isomericSmiles=True,
+            allHsExplicit=True,
+        )
         if mapped_smiles == expected_smiles:
+            return topology_maps, mapped_smiles
+        # Some metal stereochemistry is graph-equivalent but serialized with
+        # different unsupported tetrahedral/octahedral annotations after
+        # topology canonicalization. The substructure match above still keeps
+        # chirality constraints; compare only the graph as a final fallback.
+        mapped_graph_smiles = Chem.MolToSmiles(
+            mapped_topology,
+            canonical=True,
+            isomericSmiles=False,
+            allHsExplicit=True,
+        )
+        if mapped_graph_smiles == expected_graph_smiles:
             return topology_maps, mapped_smiles
     raise ValueError("mapped reaction template is not isomorphic to its referenced Topology")
 
@@ -384,7 +488,9 @@ def persist_manifest_artifact_binding(
         _assert_record_matches(binding, record, label="ManifestArtifactBinding")
         return binding
 
-    binding = ManifestArtifactBinding(
+    binding = _new_entity(
+        session,
+        ManifestArtifactBinding,
         workflow_manifest=workflow_manifest,
         artifact_file=artifact_file,
         **record.model_dump(),
@@ -407,7 +513,7 @@ def persist_logical_reaction(
     ).first()
     if reaction is not None:
         return reaction
-    reaction = LogicalReaction(**record.model_dump())
+    reaction = _new_entity(session, LogicalReaction, **record.model_dump())
     _flush_new_entity(session, reaction, label="LogicalReaction")
     return reaction
 
@@ -447,6 +553,7 @@ def persist_logical_reaction_participant(
             if participant.role is None:
                 participant.role = record.role
                 session.add(participant)
+                _attach_pending_entities(session)
                 session.flush()
             elif participant.role is not record.role:
                 raise ValueError(
@@ -519,10 +626,16 @@ def persist_mapped_reaction(
 
     reaction_id = _require_id(reaction, label="LogicalReaction")
     definition = _reaction_from_representation(record.mapped_reaction_smiles)
-    canonical_smiles = rdChemReactions.ReactionToSmiles(definition, True)
+    canonical_smiles = _canonical_mapped_reaction_smiles(definition)
     expected_hash = sha256(canonical_smiles.encode("utf-8")).hexdigest()
     if record.mapped_reaction_smiles != canonical_smiles:
-        raise ValueError("mapped_reaction_smiles must use canonical RDKit serialization")
+        canonical_definition = _reaction_from_representation(canonical_smiles)
+        if _reaction_graph_smiles(definition) != _reaction_graph_smiles(canonical_definition):
+            raise ValueError("mapped_reaction_smiles must use canonical RDKit serialization")
+        # RDKit can rewrite unsupported metal stereochemistry differently on
+        # each parse. Keep the graph-equivalent canonical projection in storage.
+        record = record.model_copy(update={"mapped_reaction_smiles": canonical_smiles})
+        definition = canonical_definition
     if record.mapping_hash != expected_hash:
         raise ValueError("mapping_hash does not match mapped_reaction_smiles")
 
@@ -537,7 +650,9 @@ def persist_mapped_reaction(
         )
     ).first()
     if mapped_reaction is None:
-        mapped_reaction = MappedReaction(logical_reaction=reaction, **record.model_dump())
+        mapped_reaction = _new_entity(
+            session, MappedReaction, logical_reaction=reaction, **record.model_dump()
+        )
         _flush_new_entity(session, mapped_reaction, label="MappedReaction")
 
     for side, templates in (
@@ -610,7 +725,9 @@ def persist_mapped_reaction_participant(
         if set(assignment.atom_map_numbers) != set(atom_map_numbers):
             raise ValueError("mapped participant resolved to a different atom-map set")
         return assignment
-    assignment = MappedReactionParticipant(
+    assignment = _new_entity(
+        session,
+        MappedReactionParticipant,
         mapped_reaction=mapped_reaction,
         mapped_reaction_id=mapped_reaction_id,
         logical_reaction_participant=logical_participant,
@@ -688,6 +805,7 @@ def persist_mapped_reaction_node(
                 session.flush()
             node.node_index = record.node_index
             session.add(node)
+            _attach_pending_entities(session)
             session.flush()
         return node
     if indexed is not None:
@@ -704,8 +822,11 @@ def persist_mapped_reaction_node(
             session.add(later_node)
             # Descending updates leave each target slot free before the next
             # row moves, satisfying the non-deferrable unique constraint.
+            _attach_pending_entities(session)
             session.flush()
-    node = MappedReactionNode(mapped_reaction=mapped_reaction, **record.model_dump())
+    node = _new_entity(
+        session, MappedReactionNode, mapped_reaction=mapped_reaction, **record.model_dump()
+    )
     _flush_new_entity(session, node, label="MappedReactionNode")
     return node
 
@@ -851,7 +972,9 @@ def persist_mapped_reaction_node_geometry(
     if binding is not None:
         raise ValueError("node component coordinate is already assigned to a different Geometry")
 
-    binding = MappedReactionNodeGeometry(
+    binding = _new_entity(
+        session,
+        MappedReactionNodeGeometry,
         mapped_reaction_node=node,
         geometry=geometry,
         mapped_reaction_participant=mapped_reaction_participant,
@@ -889,10 +1012,12 @@ def _promote_mapped_reaction_node_geometry(
     if any(primary.id != binding_id for primary in current_primaries):
         # The partial unique index requires former primaries to be cleared
         # before promoting the requested Geometry.
+        _attach_pending_entities(session)
         session.flush()
     if not binding.is_primary:
         binding.is_primary = True
         session.add(binding)
+        _attach_pending_entities(session)
         session.flush()
 
 
@@ -952,7 +1077,9 @@ def persist_mapped_reaction_node_geometry_mapping(
         # order.  Source atom order and its permutation belong to each Frame,
         # so an equivalent mapping is reusable across QM programs and files.
         return binding
-    binding = MappedReactionNodeGeometryMapping(
+    binding = _new_entity(
+        session,
+        MappedReactionNodeGeometryMapping,
         mapped_reaction_node_geometry=node_geometry,
         **record.model_dump(),
     )
@@ -1009,7 +1136,9 @@ def persist_mapped_reaction_edge(
         _assert_record_matches(edge, record, label="MappedReactionEdge")
         return edge
 
-    edge = MappedReactionEdge(
+    edge = _new_entity(
+        session,
+        MappedReactionEdge,
         mapped_reaction=mapped_reaction,
         source_node=source_node,
         target_node=target_node,

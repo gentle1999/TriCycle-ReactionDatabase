@@ -40,6 +40,24 @@ def test_settings_accept_psycopg_database_url() -> None:
 
     assert settings.database_url.startswith("postgresql+psycopg://")
     assert settings.api_port == 8000
+    assert settings.molop_capture_source_evidence is False
+    assert settings.molop_parallel_frame_persistence is True
+
+
+def test_molop_source_evidence_can_be_enabled_for_audit_ingestion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE", "true")
+
+    assert Settings(_env_file=None).molop_capture_source_evidence is True
+
+
+def test_molop_parallel_frame_persistence_can_be_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRICYCLE_MOLOP_PARALLEL_FRAME_PERSISTENCE", "false")
+
+    assert Settings(_env_file=None).molop_parallel_frame_persistence is False
 
 
 def test_deployment_names_are_overridable_from_environment(

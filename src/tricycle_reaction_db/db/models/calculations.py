@@ -281,13 +281,13 @@ class CalculationSegment(SQLModel, table=True):
     )
     segment_index: int = Field(nullable=False)
     segment_label: str | None = Field(default=None, sa_type=Text)
-    source_start_byte: int = Field(sa_type=BigInteger, nullable=False)
-    source_end_byte: int = Field(sa_type=BigInteger, nullable=False)
+    source_start_byte: int | None = Field(sa_type=BigInteger, nullable=True)
+    source_end_byte: int | None = Field(sa_type=BigInteger, nullable=True)
     source_start_char: int | None = Field(default=None, sa_type=BigInteger)
     source_end_char: int | None = Field(default=None, sa_type=BigInteger)
-    source_start_line: int = Field(nullable=False)
-    source_end_line: int = Field(nullable=False)
-    source_block_sha256: str = Field(max_length=64, nullable=False)
+    source_start_line: int | None = Field(default=None, nullable=True)
+    source_end_line: int | None = Field(default=None, nullable=True)
+    source_block_sha256: str | None = Field(default=None, max_length=64, nullable=True)
     source_frame_count: int | None = Field(default=None)
     parse_presence: dict[str, str] = Field(
         default_factory=dict,
@@ -559,13 +559,13 @@ class CalculationFrame(SQLModel, table=True):
             index=True,
         )
     )
-    source_start_byte: int = Field(sa_type=BigInteger, nullable=False)
-    source_end_byte: int = Field(sa_type=BigInteger, nullable=False)
+    source_start_byte: int | None = Field(sa_type=BigInteger, nullable=True)
+    source_end_byte: int | None = Field(sa_type=BigInteger, nullable=True)
     source_start_char: int | None = Field(default=None, sa_type=BigInteger)
     source_end_char: int | None = Field(default=None, sa_type=BigInteger)
-    source_start_line: int = Field(nullable=False)
-    source_end_line: int = Field(nullable=False)
-    source_block_sha256: str = Field(max_length=64, nullable=False)
+    source_start_line: int | None = Field(default=None, nullable=True)
+    source_end_line: int | None = Field(default=None, nullable=True)
+    source_block_sha256: str | None = Field(default=None, max_length=64, nullable=True)
     parse_presence: dict[str, str] = Field(
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default="{}"),

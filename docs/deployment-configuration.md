@@ -352,7 +352,6 @@ TRICYCLE_RATE_LIMIT_BACKEND=redis
 TRICYCLE_RATE_LIMIT_REDIS_URL=rediss://:<redis-password>@redis-rw.internal.example:6380/0?ssl_ca_certs=/etc/reaction-database/ca/internal-ca.pem
 TRICYCLE_RATE_LIMIT_KEY_PREFIX=reaction-database
 
-TRICYCLE_MOLOP_PARSE_SLOTS=1
 TRICYCLE_MOLOP_BATCH_N_JOBS=2
 ~~~
 
@@ -691,7 +690,7 @@ API 默认只监听 127.0.0.1:8000，由反向代理对外提供 HTTPS。`infra/
 指标是进程内状态，不应在同一个监听端口启动 Uvicorn 多 worker，否则抓取请求只会随机命中
 其中一个 worker。若未来引入 Prometheus multiprocess 聚合，同机多 worker 仍必须按
 “Uvicorn worker 数 × TRICYCLE_MOLOP_BATCH_N_JOBS”评估 MolOP 解析进程的 CPU 和内存；
-`TRICYCLE_MOLOP_PARSE_SLOTS` 是每个 API worker 的请求级并发闸门，只决定排队，不会额外创建解析进程。
+MolOP 解析并发由解析进程池 worker 数控制；请求不会再经过额外的 slot 闸门。
 生产不得设置 `TRICYCLE_MOLOP_BATCH_N_JOBS=-1`。
 
 ## 12. 定时任务、备份与验收

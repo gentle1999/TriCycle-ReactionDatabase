@@ -183,7 +183,6 @@ def _valid_record(root: Path) -> dict[str, Any]:
             "dataset_scale": "DA benchmark + target-scale snapshot",
             "api_node_count": 2,
             "workers_per_node": 2,
-            "parse_slots_per_worker": 1,
             "n_jobs": 2,
             "benchmark": _write_json(
                 root,

@@ -4986,9 +4986,17 @@ table.data-table {
     display: none;
   }
 }
-.geometry-card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 14px; padding-top: 16px; }
+.geometry-card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(250px, 100%), 1fr)); gap: 14px; padding-top: 16px; }
+
+.geometry-card-grid > .geometry-card-shell {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}
 
 .geometry-card {
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
   display: block;
   overflow: hidden;
@@ -5046,7 +5054,7 @@ table.data-table {
 .geometry-card .molecule-canvas,
 .geometry-card .geometry-dof-preview { background: #f8faf7; border-bottom: 1px solid var(--line); }
 .geometry-card-placeholder { height: 210px; display: grid; place-items: center; color: var(--ink-soft); background: #f8faf7; border-bottom: 1px solid var(--line); font-family: var(--mono); font-size: 10px; }
-.geometry-card-title { width: 100%; max-width: 100%; min-width: 0; display: block; overflow: hidden; padding: 12px 13px 0; font-family: var(--mono); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.geometry-card-title { display: block; width: 100%; max-width: 100%; min-width: 0; overflow: hidden; padding: 12px 13px 0; font-family: var(--mono); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .geometry-card-facts { display: flex; flex-wrap: wrap; gap: 6px 13px; padding: 8px 13px; color: var(--ink-soft); font-size: 10px; }
 .geometry-card-facts span + span { position: relative; }
 .geometry-card-facts span + span::before { content: ""; position: absolute; top: 50%; left: -8px; width: 3px; height: 3px; background: var(--line-strong); border-radius: 50%; transform: translateY(-50%); }
@@ -5076,7 +5084,8 @@ table.data-table {
 
 .geometry-detail-drawer .drawer-header { position: sticky; top: 0; z-index: 1; margin: 0 -22px 18px; padding: 18px 22px 14px; background: rgb(255 255 255 / 96%); border-bottom: 1px solid var(--line); backdrop-filter: blur(10px); }
 .geometry-detail-content .geometry-canvas-3d { background: #f8faf7; }
-.geometry-detail-identity { display: grid; gap: 5px; margin: 14px 0; }
+.geometry-detail-identity { display: grid; gap: 5px; min-width: 0; margin: 14px 0; }
+.geometry-detail-smiles { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
 .geometry-detail-identity code { color: var(--ink-soft); font-size: 9px; overflow-wrap: anywhere; }
 .geometry-detail-content .energy-facts { border: 1px solid var(--line); border-radius: 5px; }
 .geometry-frame-section { margin-top: 24px; border-top: 1px solid var(--line-strong); }

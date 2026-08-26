@@ -181,7 +181,6 @@ class CapacityEvidence(_AcceptanceModel):
     dataset_scale: str = Field(min_length=1)
     api_node_count: int = Field(ge=2)
     workers_per_node: int = Field(ge=1)
-    parse_slots_per_worker: int = Field(ge=1)
     n_jobs: int = Field(ge=1)
     benchmark: EvidenceFile
     upload_limit: EvidenceFile

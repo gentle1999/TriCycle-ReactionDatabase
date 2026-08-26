@@ -210,13 +210,13 @@ class CalculationSegmentRecord(BaseModel):
 
     segment_index: int = Field(ge=0)
     segment_label: str | None = None
-    source_start_byte: int = Field(ge=0)
-    source_end_byte: int = Field(ge=0)
+    source_start_byte: int | None = Field(default=None, ge=0)
+    source_end_byte: int | None = Field(default=None, ge=0)
     source_start_char: int | None = Field(default=None, ge=0)
     source_end_char: int | None = Field(default=None, ge=0)
-    source_start_line: int = Field(ge=1)
-    source_end_line: int = Field(ge=1)
-    source_block_sha256: str = Field(pattern=_SHA256_PATTERN)
+    source_start_line: int | None = Field(default=None, ge=1)
+    source_end_line: int | None = Field(default=None, ge=1)
+    source_block_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     source_frame_count: int | None = Field(default=None, ge=0)
     parse_presence: dict[str, str] = Field(default_factory=dict)
     parse_completeness: ParseCompleteness = ParseCompleteness.NOT_ASSESSED
@@ -230,14 +230,33 @@ class CalculationSegmentRecord(BaseModel):
 
     @model_validator(mode="after")
     def validate_source_span(self) -> Self:
-        _validate_source_span(
-            start_byte=self.source_start_byte,
-            end_byte=self.source_end_byte,
-            start_char=self.source_start_char,
-            end_char=self.source_end_char,
-            start_line=self.source_start_line,
-            end_line=self.source_end_line,
+        span_values = (
+            self.source_start_byte,
+            self.source_end_byte,
+            self.source_start_line,
+            self.source_end_line,
         )
+        if any(value is not None for value in span_values):
+            if any(value is None for value in span_values):
+                raise ValueError("source span fields must either all be set or all be absent")
+            assert (
+                self.source_start_byte is not None
+                and self.source_end_byte is not None
+                and self.source_start_line is not None
+                and self.source_end_line is not None
+            )
+            _validate_source_span(
+                start_byte=self.source_start_byte,
+                end_byte=self.source_end_byte,
+                start_char=self.source_start_char,
+                end_char=self.source_end_char,
+                start_line=self.source_start_line,
+                end_line=self.source_end_line,
+            )
+        elif self.source_start_char is not None or self.source_end_char is not None:
+            raise ValueError("source character offsets require a source byte span")
+        if self.source_block_sha256 is not None and self.source_start_byte is None:
+            raise ValueError("source block hash requires a source span")
         return self
 
 
@@ -249,13 +268,13 @@ class CalculationFrameRecord(BaseModel):
     frame_index: int = Field(ge=0)
     file_frame_index: int = Field(ge=0)
     frame_role: FrameRole
-    source_start_byte: int = Field(ge=0)
-    source_end_byte: int = Field(ge=0)
+    source_start_byte: int | None = Field(default=None, ge=0)
+    source_end_byte: int | None = Field(default=None, ge=0)
     source_start_char: int | None = Field(default=None, ge=0)
     source_end_char: int | None = Field(default=None, ge=0)
-    source_start_line: int = Field(ge=1)
-    source_end_line: int = Field(ge=1)
-    source_block_sha256: str = Field(pattern=_SHA256_PATTERN)
+    source_start_line: int | None = Field(default=None, ge=1)
+    source_end_line: int | None = Field(default=None, ge=1)
+    source_block_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     parse_presence: dict[str, str] = Field(default_factory=dict)
     parse_completeness: ParseCompleteness = ParseCompleteness.NOT_ASSESSED
     parse_diagnostics: list[dict[str, Any]] = Field(default_factory=list)
@@ -313,14 +332,33 @@ class CalculationFrameRecord(BaseModel):
 
     @model_validator(mode="after")
     def validate_frame(self) -> Self:
-        _validate_source_span(
-            start_byte=self.source_start_byte,
-            end_byte=self.source_end_byte,
-            start_char=self.source_start_char,
-            end_char=self.source_end_char,
-            start_line=self.source_start_line,
-            end_line=self.source_end_line,
+        span_values = (
+            self.source_start_byte,
+            self.source_end_byte,
+            self.source_start_line,
+            self.source_end_line,
         )
+        if any(value is not None for value in span_values):
+            if any(value is None for value in span_values):
+                raise ValueError("source span fields must either all be set or all be absent")
+            assert (
+                self.source_start_byte is not None
+                and self.source_end_byte is not None
+                and self.source_start_line is not None
+                and self.source_end_line is not None
+            )
+            _validate_source_span(
+                start_byte=self.source_start_byte,
+                end_byte=self.source_end_byte,
+                start_char=self.source_start_char,
+                end_char=self.source_end_char,
+                start_line=self.source_start_line,
+                end_line=self.source_end_line,
+            )
+        elif self.source_start_char is not None or self.source_end_char is not None:
+            raise ValueError("source character offsets require a source byte span")
+        if self.source_block_sha256 is not None and self.source_start_byte is None:
+            raise ValueError("source block hash requires a source span")
         if (
             self.electronic_state_kind is not ElectronicStateKind.GROUND
             or self.electronic_state_index != 0

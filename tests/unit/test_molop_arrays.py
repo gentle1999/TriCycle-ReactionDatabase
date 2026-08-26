@@ -10,6 +10,36 @@ from tricycle_reaction_db.domain.enums import ScientificArrayKind
 from tricycle_reaction_db.ingestion import scientific_array_records_from_molop_frame
 
 
+class _FrameWithPartialThermochemistry:
+    def model_dump(self, *, mode: str, exclude_none: bool) -> dict[str, Any]:
+        del mode, exclude_none
+        return {
+            "thermal_informations": {
+                "G_T": 0.0,
+                "rotational_temperatures": None,
+                # MolOP may omit this optional field instead of serializing None.
+            },
+            "forces": None,
+            "hessian": None,
+            "rotation_constants": None,
+            "vibrations": None,
+            "molecular_orbitals": None,
+            "charge_spin_populations": None,
+            "polarizability": None,
+            "nmr": None,
+            "bond_orders": None,
+            "single_point_properties": None,
+            "electronic_states": None,
+            "multireference_result": None,
+        }
+
+
+def test_partial_thermal_information_without_moments_of_inertia_is_accepted() -> None:
+    records = scientific_array_records_from_molop_frame(_FrameWithPartialThermochemistry())
+
+    assert records == []
+
+
 def test_da_bench_exports_every_supported_molop_array(
     da_bench_log_paths: dict[str, Path],
     da_bench_manifest: dict[str, Any],

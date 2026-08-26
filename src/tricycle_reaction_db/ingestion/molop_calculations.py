@@ -59,6 +59,7 @@ from tricycle_reaction_db.ingestion.molop_arrays import scientific_array_export_
 
 @dataclass(frozen=True, slots=True)
 class MolOPFrameRecords:
+    segment_index: int
     molecule: NormalizedMoleculeRecord
     frame: CalculationFrameRecord
     energy: FrameEnergyResultRecord | None
@@ -86,12 +87,12 @@ class MolOPFrameRecords:
 
 
 class _SourceSpanValues(TypedDict):
-    source_start_byte: int
-    source_end_byte: int
-    source_start_char: int
-    source_end_char: int
-    source_start_line: int
-    source_end_line: int
+    source_start_byte: int | None
+    source_end_byte: int | None
+    source_start_char: int | None
+    source_end_char: int | None
+    source_start_line: int | None
+    source_end_line: int | None
 
 
 def _enum_value(value: Any) -> str:
@@ -103,6 +104,7 @@ def _model_dump(
     *,
     mode: str = "python",
     computed_fields: tuple[str, ...] = (),
+    include: set[str] | None = None,
 ) -> dict[str, Any]:
     """Take the public MolOP/Pydantic dump as the adapter's source payload."""
 
@@ -111,7 +113,10 @@ def _model_dump(
     dump = getattr(value, "model_dump", None)
     if not callable(dump):
         raise TypeError(f"expected a mapping or Pydantic model, got {type(value)!r}")
-    payload = cast(dict[str, Any], dump(mode=mode, exclude_none=False))
+    dump_kwargs: dict[str, Any] = {"mode": mode, "exclude_none": False}
+    if include is not None:
+        dump_kwargs["include"] = include
+    payload = cast(dict[str, Any], dump(**dump_kwargs))
     for field_name in computed_fields:
         payload.setdefault(field_name, getattr(value, field_name))
     return payload
@@ -135,10 +140,31 @@ def _optional_model_dump(
     value: Any,
     *,
     computed_fields: tuple[str, ...] = (),
+    include: set[str] | None = None,
 ) -> dict[str, Any] | None:
     if value is None:
         return None
-    return _model_dump(value, computed_fields=computed_fields)
+    return _model_dump(value, computed_fields=computed_fields, include=include)
+
+
+def _child_payload(
+    frame_payload: dict[str, Any],
+    name: str,
+    model: Any,
+    *,
+    computed_fields: tuple[str, ...] = (),
+) -> dict[str, Any] | None:
+    """Reuse the parent dump and fill only Pydantic computed child fields."""
+
+    payload = frame_payload[name]
+    if payload is None:
+        return None
+    if computed_fields:
+        if not isinstance(payload, dict):
+            raise TypeError(f"MolOP child payload {name!r} is not a mapping")
+        for field_name in computed_fields:
+            payload.setdefault(field_name, getattr(model, field_name))
+    return cast(dict[str, Any], payload)
 
 
 def _diagnostics(values: list[Any]) -> list[dict[str, Any]]:
@@ -150,6 +176,15 @@ def _parse_presence(values: dict[str, Any]) -> dict[str, str]:
 
 
 def _span_values(span: Any) -> _SourceSpanValues:
+    if span is None:
+        return {
+            "source_start_byte": None,
+            "source_end_byte": None,
+            "source_start_char": None,
+            "source_end_char": None,
+            "source_start_line": None,
+            "source_end_line": None,
+        }
     if isinstance(span, dict):
         return {
             "source_start_byte": span["start_byte"],
@@ -174,6 +209,8 @@ def parse_revision_record_from_molop(
     *,
     started_at: datetime | None,
     source_compression: str | None = None,
+    artifact_sha256: str | None = None,
+    artifact_size_bytes: int | None = None,
 ) -> ParseRevisionRecord:
     """Map MolOP file-level provenance and parse evidence without reparsing source text."""
 
@@ -181,7 +218,9 @@ def parse_revision_record_from_molop(
     provenance_value = file_payload["parser_provenance"]
     if provenance_value is None:
         raise ValueError("MolOP source capture did not provide parser provenance")
-    provenance = _model_dump(provenance_value)
+    provenance = dict(_model_dump(provenance_value))
+    source_evidence_captured = bool(chem_file.source_segments)
+    provenance["source_evidence_captured"] = source_evidence_captured
     source_format = {
         "g16log": SourceFormat.GAUSSIAN_LOG,
         "orcalog": SourceFormat.ORCA_OUTPUT,
@@ -193,6 +232,7 @@ def parse_revision_record_from_molop(
         "molgr_version": provenance["molgr_version"],
         "molop": provenance["effective_config"].get("molop", {}),
         "molgr": provenance["effective_config"].get("molgr", {}),
+        "source_evidence_captured": source_evidence_captured,
     }
     return ParseRevisionRecord(
         export_schema_version=file_payload["schema_version"],
@@ -206,13 +246,23 @@ def parse_revision_record_from_molop(
         parser_config_hash=provenance["effective_config_sha256"],
         reconstruction_config_hash=_canonical_json_sha256(reconstruction_config),
         source_format=source_format,
-        source_encoding=file_payload["source_encoding"],
-        source_content_sha256=file_payload["artifact_sha256"],
-        source_size_bytes=file_payload["artifact_size_bytes"],
+        source_encoding=file_payload.get("source_encoding") or "utf-8",
+        source_content_sha256=(
+            artifact_sha256
+            if artifact_sha256 is not None
+            else file_payload.get("artifact_sha256")
+        ),
+        source_size_bytes=(
+            artifact_size_bytes
+            if artifact_size_bytes is not None
+            else file_payload.get("artifact_size_bytes")
+        ),
         source_compression=source_compression,
-        source_complete=file_payload["source_complete"],
-        parse_completeness=ParseCompleteness(_enum_value(file_payload["parse_completeness"])),
-        parse_diagnostics=_diagnostics(file_payload["source_diagnostics"]),
+        source_complete=file_payload.get("source_complete"),
+        parse_completeness=ParseCompleteness(
+            _enum_value(file_payload.get("parse_completeness") or ParseCompleteness.NOT_ASSESSED)
+        ),
+        parse_diagnostics=_diagnostics(file_payload.get("source_diagnostics") or []),
         started_at=started_at,
     )
 
@@ -265,7 +315,7 @@ def segment_record_from_molop(segment: Any) -> CalculationSegmentRecord:
     segment_payload = _model_dump(segment)
     return CalculationSegmentRecord(
         segment_index=segment_payload["segment_index"],
-        source_block_sha256=segment_payload["source_block_sha256"],
+        source_block_sha256=segment_payload.get("source_block_sha256"),
         source_frame_count=segment_payload["frame_count"],
         parse_presence=_parse_presence(segment_payload["parse_presence"]),
         parse_completeness=ParseCompleteness(_enum_value(segment_payload["parse_completeness"])),
@@ -279,7 +329,7 @@ def segment_record_from_molop(segment: Any) -> CalculationSegmentRecord:
             "molop_task_types": list(segment_payload["task_types"]),
             "molop_captured_frame_indices": list(segment_payload["captured_frame_indices"]),
         },
-        **_span_values(segment_payload["source_span"]),
+        **_span_values(segment_payload.get("source_span")),
     )
 
 
@@ -287,6 +337,7 @@ def frame_records_from_molop(
     frame: Any,
     *,
     export_schema_version: str,
+    fallback_index: int | None = None,
 ) -> MolOPFrameRecords:
     """Map one validated MolOP frame and its public scientific submodels."""
 
@@ -310,27 +361,30 @@ def frame_records_from_molop(
             source_label=observation["source_label"],
         )
         for index, observation in enumerate(
-            frame_payload["energies"]["observations"] if frame_payload["energies"] else []
+            (frame_payload["energies"].get("observations") or [])
+            if frame_payload["energies"]
+            else []
         )
     )
-    optimization_model = frame.geometry_optimization_status
-    optimization_payload = (
-        _model_dump(
-            optimization_model,
-            computed_fields=(
-                "energy_change_threshold",
-                "energy_change_converged",
-                "rms_force_converged",
-                "max_force_converged",
-                "rms_displacement_converged",
-                "max_displacement_converged",
-            ),
-        )
-        if optimization_model is not None
-        else None
+    # Pydantic's top-level dump already serializes every nested public MolOP
+    # model. Re-dumping each child here was a large per-frame CPU multiplier.
+    optimization_payload = _child_payload(
+        frame_payload,
+        "geometry_optimization_status",
+        frame.geometry_optimization_status,
+        computed_fields=(
+            "energy_change_threshold",
+            "energy_change_converged",
+            "rms_force_converged",
+            "max_force_converged",
+            "rms_displacement_converged",
+            "max_displacement_converged",
+        ),
     )
     optimization = _optimization_record(optimization_payload, export_schema_version)
-    vibration_payload = _optional_model_dump(
+    vibration_payload = _child_payload(
+        frame_payload,
+        "vibrations",
         frame.vibrations,
         computed_fields=(
             "mode_indices",
@@ -341,53 +395,62 @@ def frame_records_from_molop(
         ),
     )
     vibration = _vibration_record(vibration_payload, export_schema_version)
-    thermochemistry_payload = dict(frame_payload)
-    thermochemistry_payload["thermal_informations"] = _optional_model_dump(
-        frame.thermal_informations
-    )
-    thermochemistry = _thermochemistry_record(thermochemistry_payload, export_schema_version)
-    status_model = frame.status
-    status_payload = (
-        _model_dump(status_model, computed_fields=("normal_terminated",))
-        if status_model is not None
-        else None
-    )
+    thermochemistry = _thermochemistry_record(frame_payload, export_schema_version)
+    status_payload = frame_payload["status"]
     status = _status_record(status_payload, export_schema_version)
-    molecular_orbitals_payload = _optional_model_dump(frame.molecular_orbitals)
+    molecular_orbitals_payload = frame_payload["molecular_orbitals"]
     molecular_orbitals = _molecular_orbital_record(
         molecular_orbitals_payload, export_schema_version
     )
-    populations_payload = _optional_model_dump(frame.charge_spin_populations)
+    populations_payload = frame_payload["charge_spin_populations"]
     population_result, population_series = _population_records(
         populations_payload, export_schema_version
     )
-    polarizability_payload = _optional_model_dump(
+    polarizability_payload = _child_payload(
+        frame_payload,
+        "polarizability",
         frame.polarizability,
         computed_fields=("isotropic_polarizability", "anisotropic_polarizability"),
     )
     polarizability = _polarizability_record(polarizability_payload, export_schema_version)
-    nmr_payload = _optional_model_dump(
+    nmr_payload = _child_payload(
+        frame_payload,
+        "nmr",
         frame.nmr,
         computed_fields=("coupling_atom_indices",),
     )
     nmr, shielding_tensors = _nmr_records(nmr_payload, export_schema_version)
-    bond_orders_payload = _optional_model_dump(frame.bond_orders)
+    bond_orders_payload = frame_payload["bond_orders"]
     bond_orders = _bond_order_record(bond_orders_payload, export_schema_version)
-    total_spin_payload = _optional_model_dump(frame.total_spin)
+    total_spin_payload = frame_payload["total_spin"]
     total_spin = _total_spin_record(total_spin_payload, export_schema_version)
-    single_point_payload = _optional_model_dump(frame.single_point_properties)
+    single_point_payload = frame_payload["single_point_properties"]
     single_point = _single_point_record(single_point_payload, export_schema_version)
     state_sets, states, configurations = _electronic_state_records(
         frame_payload, export_schema_version
     )
-    multireference_payload = _optional_model_dump(frame.multireference_result)
+    multireference_payload = frame_payload["multireference_result"]
     multireference = _multireference_record(multireference_payload, export_schema_version)
-    solvent_payload = _optional_model_dump(frame.solvent)
+    solvent_payload = frame_payload["solvent"]
     implicit_solvation = _implicit_solvation_record(solvent_payload, export_schema_version)
-    arrays, array_assignments = scientific_array_export_from_molop_frame(frame)
+    arrays, array_assignments = scientific_array_export_from_molop_frame(
+        frame,
+        frame_payload=frame_payload,
+    )
+    segment_index = frame_payload.get("segment_index")
+    if segment_index is None:
+        segment_index = 0
     return MolOPFrameRecords(
+        segment_index=segment_index,
         molecule=molecule,
-        frame=_frame_record(frame_payload, molecule, energy, optimization, vibration),
+        frame=_frame_record(
+            frame_payload,
+            molecule,
+            energy,
+            optimization,
+            vibration,
+            fallback_index=fallback_index,
+        ),
         energy=energy,
         energy_observations=observations,
         optimization=optimization,
@@ -463,40 +526,40 @@ def _optimization_record(
     if optimization is None:
         return None
     return GeometryOptimizationResultRecord(
-        geometry_optimized=optimization["geometry_optimized"],
-        convergence_multiplier=optimization["convergence_multiplier"],
-        source_converged=optimization["source_converged"],
-        source_labels=optimization["source_labels"],
-        energy_change_hartree=_quantity(optimization["energy_change"], "hartree"),
+        geometry_optimized=optimization.get("geometry_optimized"),
+        convergence_multiplier=optimization.get("convergence_multiplier") or 2.0,
+        source_converged=optimization.get("source_converged"),
+        source_labels=optimization.get("source_labels", {}),
+        energy_change_hartree=_quantity(optimization.get("energy_change"), "hartree"),
         energy_change_threshold_hartree=_quantity(
-            optimization["energy_change_threshold"],
+            optimization.get("energy_change_threshold"),
             "hartree",
         ),
-        energy_change_converged=optimization["energy_change_converged"],
-        rms_force_hartree_per_bohr=_quantity(optimization["rms_force"], "hartree/bohr"),
+        energy_change_converged=optimization.get("energy_change_converged"),
+        rms_force_hartree_per_bohr=_quantity(optimization.get("rms_force"), "hartree/bohr"),
         rms_force_threshold_hartree_per_bohr=_quantity(
-            optimization["rms_force_threshold"],
+            optimization.get("rms_force_threshold"),
             "hartree/bohr",
         ),
-        rms_force_converged=optimization["rms_force_converged"],
-        max_force_hartree_per_bohr=_quantity(optimization["max_force"], "hartree/bohr"),
+        rms_force_converged=optimization.get("rms_force_converged"),
+        max_force_hartree_per_bohr=_quantity(optimization.get("max_force"), "hartree/bohr"),
         max_force_threshold_hartree_per_bohr=_quantity(
-            optimization["max_force_threshold"],
+            optimization.get("max_force_threshold"),
             "hartree/bohr",
         ),
-        max_force_converged=optimization["max_force_converged"],
-        rms_displacement_bohr=_quantity(optimization["rms_displacement"], "bohr"),
+        max_force_converged=optimization.get("max_force_converged"),
+        rms_displacement_bohr=_quantity(optimization.get("rms_displacement"), "bohr"),
         rms_displacement_threshold_bohr=_quantity(
-            optimization["rms_displacement_threshold"],
+            optimization.get("rms_displacement_threshold"),
             "bohr",
         ),
-        rms_displacement_converged=optimization["rms_displacement_converged"],
-        max_displacement_bohr=_quantity(optimization["max_displacement"], "bohr"),
+        rms_displacement_converged=optimization.get("rms_displacement_converged"),
+        max_displacement_bohr=_quantity(optimization.get("max_displacement"), "bohr"),
         max_displacement_threshold_bohr=_quantity(
-            optimization["max_displacement_threshold"],
+            optimization.get("max_displacement_threshold"),
             "bohr",
         ),
-        max_displacement_converged=optimization["max_displacement_converged"],
+        max_displacement_converged=optimization.get("max_displacement_converged"),
         source_schema_version=schema_version,
     )
 
@@ -846,10 +909,16 @@ def _frame_record(
     energy: FrameEnergyResultRecord | None,
     optimization: GeometryOptimizationResultRecord | None,
     vibration: VibrationResultRecord | None,
+    *,
+    fallback_index: int | None = None,
 ) -> CalculationFrameRecord:
-    if frame["source_span"] is None or frame["source_block_sha256"] is None:
-        raise ValueError("MolOP frame is missing source evidence")
-    if frame["segment_frame_index"] is None or frame["file_frame_index"] is None:
+    segment_frame_index = frame.get("segment_frame_index")
+    file_frame_index = frame.get("file_frame_index")
+    if segment_frame_index is None:
+        segment_frame_index = fallback_index
+    if file_frame_index is None:
+        file_frame_index = fallback_index
+    if segment_frame_index is None or file_frame_index is None:
         raise ValueError("MolOP frame is missing stable source indices")
     selected_energy, selected_kind = _selected_energy(energy)
     optimization_status = OptimizationStatus.UNKNOWN
@@ -858,16 +927,18 @@ def _frame_record(
             optimization_status = OptimizationStatus.CONVERGED
         elif optimization.geometry_optimized is False:
             optimization_status = OptimizationStatus.NOT_CONVERGED
-    elif _parse_presence(frame["parse_presence"]).get("optimization") == "not_requested":
+    elif _parse_presence(frame.get("parse_presence") or {}).get("optimization") == "not_requested":
         optimization_status = OptimizationStatus.NOT_REQUESTED
     return CalculationFrameRecord(
-        frame_index=frame["segment_frame_index"],
-        file_frame_index=frame["file_frame_index"],
-        frame_role=FrameRole(frame["frame_role"]),
-        source_block_sha256=frame["source_block_sha256"],
-        parse_presence=_parse_presence(frame["parse_presence"]),
-        parse_completeness=ParseCompleteness(_enum_value(frame["parse_completeness"])),
-        parse_diagnostics=_diagnostics(frame["parse_diagnostics"]),
+        frame_index=segment_frame_index,
+        file_frame_index=file_frame_index,
+        frame_role=FrameRole(frame.get("frame_role") or FrameRole.SINGLE_POINT),
+        source_block_sha256=frame.get("source_block_sha256"),
+        parse_presence=_parse_presence(frame.get("parse_presence") or {}),
+        parse_completeness=ParseCompleteness(
+            _enum_value(frame.get("parse_completeness") or ParseCompleteness.NOT_ASSESSED)
+        ),
+        parse_diagnostics=_diagnostics(frame.get("parse_diagnostics") or []),
         charge=frame["charge"],
         multiplicity=frame["multiplicity"],
         coordinate_decimal_places=frame["coordinate_decimal_places"],
@@ -900,11 +971,20 @@ def _frame_record(
         running_time_seconds=_quantity(frame["running_time"], "second"),
         program_metadata_schema_version="molop-frame-evidence-v1",
         program_metadata={
-            "molop_frame_id": frame["frame_id"],
-            "coordinate_source": frame["coordinate_source"],
-            "coordinate_provenance": frame["coordinate_provenance"],
-            "force_source_field": frame["force_source_field"],
-            "force_transformation": frame["force_transformation"],
+            "molop_frame_id": frame.get("frame_id", fallback_index),
+            "coordinate_source": frame.get("coordinate_source"),
+            "coordinate_provenance": frame.get("coordinate_provenance"),
+            "force_source_field": frame.get("force_source_field"),
+            "force_transformation": frame.get("force_transformation"),
+            # Keep the graph-reconstruction trust decision next to the frame
+            # evidence so charge/spin values from an OpenBabel fallback are
+            # queryable without inspecting the derived topology row.
+            "topology_reconstruction_backend": _enum_value(
+                frame.get("topology_reconstruction_backend")
+            ),
+            "topology_reconstruction_status": _enum_value(
+                frame.get("topology_reconstruction_status")
+            ),
         },
         **(
             optimization.model_dump(
@@ -929,7 +1009,7 @@ def _frame_record(
             if optimization is not None
             else {}
         ),
-        **_span_values(frame["source_span"]),
+        **_span_values(frame.get("source_span")),
     )
 
 

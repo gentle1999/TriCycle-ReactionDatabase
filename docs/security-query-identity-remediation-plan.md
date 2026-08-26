@@ -168,7 +168,7 @@
 - 增加进程级 MolOP 解析 semaphore，默认同时只运行一个解析请求。每个 Uvicorn worker
   维护一个可复用的 MolOP 进程池；多 worker 部署必须按
   `Uvicorn worker 数 x TRICYCLE_MOLOP_BATCH_N_JOBS` 计算全机进程和内存上限。
-  `TRICYCLE_MOLOP_PARSE_SLOTS` 只限制每个 API worker 的请求级排队并发，不会额外创建进程。
+MolOP 解析并发只由显式解析进程池的 worker 数控制，不再设置请求级 slot 闸门。
 - gzip 等压缩输入在解压前后都检查大小；禁止仅按上传压缩包大小判断资源预算。
 - 中期把批量接口从“全部读取为 `bytes` 后再写临时文件”改为受控 spool/path 流程；
   immediate fix 不能等待该重构完成。

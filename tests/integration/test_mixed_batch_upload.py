@@ -88,19 +88,37 @@ async def test_mixed_raw_batch_persists_independently_and_failed_reparse_preserv
     individual_ingestion_reads: list[str] = []
     individual_revision_id_reads: list[str] = []
     parse_revision_selects: list[str] = []
-    original_parse_batch = uploads._parse_calculation_outputs_batch
+    original_parse_source = uploads._run_molop_source_parser
+    original_process_frames = uploads._process_parsed_artifact_frames
     original_store = ArtifactUploadService._store_payload
 
-    def track_parse_batch(
-        files: list[tuple[bytes, str]], *, n_jobs: int
-    ) -> dict[int, uploads._ParsedArtifact | Exception]:
-        parsed_items = original_parse_batch(files, n_jobs=n_jobs)
-        parsed_gaussian.extend(
-            parsed
-            for parsed in parsed_items.values()
-            if isinstance(parsed, uploads._ParsedArtifact) and parsed.source_format == "g16log"
+    async def track_parse_source(
+        source: bytes | Path,
+        filename: str,
+        *,
+        artifact_sha256: str | None = None,
+    ) -> uploads._ParsedArtifact:
+        parsed = await original_parse_source(
+            source,
+            filename,
+            artifact_sha256=artifact_sha256,
         )
-        return parsed_items
+        if parsed.source_format == "g16log":
+            parsed_gaussian.append(parsed)
+        return parsed
+
+    async def track_process_frames(
+        parsed: uploads._ParsedArtifact,
+        *,
+        submission_slots: asyncio.Semaphore,
+    ) -> uploads._ParsedArtifact:
+        materialized = await original_process_frames(
+            parsed,
+            submission_slots=submission_slots,
+        )
+        if materialized.source_format == "g16log":
+            parsed_gaussian.append(materialized)
+        return materialized
 
     def track_store(
         settings: RustFSSettings,
@@ -112,7 +130,8 @@ async def test_mixed_raw_batch_persists_independently_and_failed_reparse_preserv
         written_keys.add(object_key)
         return stored
 
-    monkeypatch.setattr(uploads, "_parse_calculation_outputs_batch", track_parse_batch)
+    monkeypatch.setattr(uploads, "_run_molop_source_parser", track_parse_source)
+    monkeypatch.setattr(uploads, "_process_parsed_artifact_frames", track_process_frames)
     monkeypatch.setattr(ArtifactUploadService, "_store_payload", staticmethod(track_store))
 
     def capture_completed_result_query(
@@ -212,7 +231,7 @@ async def test_mixed_raw_batch_persists_independently_and_failed_reparse_preserv
                 # One ingestion/artifact preload, then one ingestion/artifact
                 # result read and one inference result read cover every item.
                 assert len(completed_result_queries) == 3
-                assert len(parsed_gaussian) == 1
+                assert len(parsed_gaussian) == 2
                 expected_timing_phases = {
                     "validate_budget_ms",
                     "authorize_ms",
@@ -265,10 +284,15 @@ async def test_mixed_raw_batch_persists_independently_and_failed_reparse_preserv
                     == before
                 )
 
+                materialized_gaussian = parsed_gaussian[-1]
+
                 monkeypatch.setattr(
                     uploads,
                     "_run_molop_file_parser",
-                    lambda *_args, **_kwargs: asyncio.sleep(0, result=parsed_gaussian[0]),
+                    lambda *_args, **_kwargs: asyncio.sleep(
+                        0,
+                        result=materialized_gaussian,
+                    ),
                 )
 
                 def fail_persistence(*_: object, **__: object) -> tuple[object, bool]:

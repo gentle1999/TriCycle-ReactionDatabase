@@ -2724,14 +2724,18 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
         summary = _frame_summary(frame, segment, revision, artifact, geometry, topology)
         return CalculationFrameDetail(
             **summary.model_dump(),
-            source_span=SourceSpanView(
-                start_byte=frame.source_start_byte,
-                end_byte=frame.source_end_byte,
-                start_char=frame.source_start_char,
-                end_char=frame.source_end_char,
-                start_line=frame.source_start_line,
-                end_line=frame.source_end_line,
-                block_sha256=frame.source_block_sha256,
+            source_span=(
+                SourceSpanView(
+                    start_byte=frame.source_start_byte,
+                    end_byte=frame.source_end_byte,
+                    start_char=frame.source_start_char,
+                    end_char=frame.source_end_char,
+                    start_line=frame.source_start_line,
+                    end_line=frame.source_end_line,
+                    block_sha256=frame.source_block_sha256,
+                )
+                if frame.source_start_byte is not None
+                else None
             ),
             parse_completeness=_enum_value(frame.parse_completeness),
             geometry_assignment_kind=_enum_value(frame.geometry_assignment_kind),

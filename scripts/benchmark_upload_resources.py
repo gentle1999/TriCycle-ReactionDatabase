@@ -20,7 +20,6 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
 )
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
-DEFAULT_FIXTURE = REPOSITORY_ROOT / "tests/fixtures/qm/minimal_orca_water_sp.orcaout"
 UPLOAD_BENCHMARK_SCHEMA_VERSION = "upload-resource-benchmark-v2"
 
 
@@ -116,15 +115,33 @@ def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 8, 32])
     parser.add_argument("--n-jobs", type=int, default=2)
-    parser.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE)
+    parser.add_argument(
+        "--fixture",
+        type=Path,
+        required=True,
+        help="real Gaussian/ORCA file; synthetic repository fixtures are not allowed",
+    )
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--child-size", type=int, default=None, help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
+def _reject_synthetic_fixture(fixture: Path) -> Path:
+    resolved = fixture.resolve()
+    synthetic_root = (REPOSITORY_ROOT / "tests/fixtures").resolve()
+    try:
+        resolved.relative_to(synthetic_root)
+    except ValueError:
+        return resolved
+    raise ValueError(
+        "synthetic repository fixtures are not allowed; provide a real Gaussian/ORCA file "
+        "with --fixture"
+    )
+
+
 def main() -> None:
     arguments = _arguments()
-    fixture = arguments.fixture.resolve()
+    fixture = _reject_synthetic_fixture(arguments.fixture)
     if arguments.child_size is not None:
         print(json.dumps(_child(arguments.child_size, arguments.n_jobs, fixture), sort_keys=True))
         return

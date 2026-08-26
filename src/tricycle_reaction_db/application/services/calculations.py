@@ -39,8 +39,10 @@ from tricycle_reaction_db.application.dtos.calculations import (
 from tricycle_reaction_db.application.services._persistence import (
     _acquire_identity_locks,
     _assert_record_matches,
+    _attach_pending_entities,
     _fast_insert_enabled,
     _flush_new_entity,
+    _new_entity,
     _require_id,
 )
 from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
@@ -102,10 +104,21 @@ _PARSE_REVISION_WORKFLOW_FIELDS = {
 }
 
 
+def _dto_values(record: Any, *, exclude: set[str] | None = None) -> dict[str, Any]:
+    """Return validated DTO values without rebuilding them through Pydantic."""
+
+    values = record.__dict__
+    if not exclude:
+        return values.copy()
+    return {key: value for key, value in values.items() if key not in exclude}
+
+
 def _validate_segment_source_bounds(
     parse_revision: ParseRevision,
     record: CalculationSegmentRecord,
 ) -> None:
+    if record.source_start_byte is None or record.source_end_byte is None:
+        return
     source_size_bytes = parse_revision.source_size_bytes
     if source_size_bytes is None:
         source_size_bytes = parse_revision.artifact_file.size_bytes
@@ -129,6 +142,18 @@ def _validate_frame_source_bounds(
     segment: CalculationSegment,
     record: CalculationFrameRecord,
 ) -> None:
+    frame_has_byte_span = record.source_start_byte is not None
+    segment_has_byte_span = segment.source_start_byte is not None
+    if frame_has_byte_span != segment_has_byte_span:
+        raise ValueError("CalculationFrame and segment must use the same source-span policy")
+    if not frame_has_byte_span:
+        return
+    assert (
+        segment.source_start_byte is not None
+        and segment.source_end_byte is not None
+        and record.source_start_byte is not None
+        and record.source_end_byte is not None
+    )
     if not (
         segment.source_start_byte <= record.source_start_byte
         and record.source_end_byte <= segment.source_end_byte
@@ -149,6 +174,12 @@ def _validate_frame_source_bounds(
         )
     ):
         raise ValueError("CalculationFrame character span must be contained by its segment")
+    assert (
+        segment.source_start_line is not None
+        and segment.source_end_line is not None
+        and record.source_start_line is not None
+        and record.source_end_line is not None
+    )
     if not (
         segment.source_start_line <= record.source_start_line
         and record.source_end_line <= segment.source_end_line
@@ -263,10 +294,10 @@ def persist_parse_revision(
 
     artifact_file_id = _require_id(artifact_file, label="ArtifactFile")
     if _fast_insert_enabled(session) and not force_new_revision:
-        new_revision = ParseRevision(
+        new_revision = _new_entity(session, ParseRevision,
             artifact_file=artifact_file,
             revision_number=1,
-            **record.model_dump(),
+            **_dto_values(record),
         )
         _flush_new_entity(session, new_revision, label="ParseRevision")
         return new_revision
@@ -330,7 +361,7 @@ def persist_parse_revision(
         .order_by(col(ParseRevision.revision_number).desc())
     ).first()
 
-    revision = ParseRevision(
+    revision = _new_entity(session, ParseRevision,
         artifact_file=artifact_file,
         revision_number=(latest_revision.revision_number + 1 if latest_revision is not None else 1),
         reparse_of_id=(
@@ -338,7 +369,7 @@ def persist_parse_revision(
             if force_new_revision and latest_revision is not None
             else None
         ),
-        **record.model_dump(),
+        **_dto_values(record),
     )
     _flush_new_entity(session, revision, label="ParseRevision")
     return revision
@@ -375,10 +406,10 @@ def persist_calculation_segment(
         _assert_record_matches(segment, record, label="CalculationSegment")
         return segment
 
-    segment = CalculationSegment(
+    segment = _new_entity(session, CalculationSegment,
         parse_revision=parse_revision,
         protocol=protocol,
-        **record.model_dump(),
+        **_dto_values(record),
     )
     _flush_new_entity(session, segment, label="CalculationSegment")
     return segment
@@ -422,11 +453,11 @@ def persist_calculation_frame(
         raise ValueError("observed coordinates must match the Geometry atom count")
 
     if _fast_insert_enabled(session):
-        new_frame = CalculationFrame(
+        new_frame = _new_entity(session, CalculationFrame,
             segment=segment,
             geometry=geometry,
             topology_derivation=topology_derivation,
-            **record.model_dump(),
+            **_dto_values(record),
         )
         _flush_new_entity(session, new_frame, label="CalculationFrame")
         return new_frame
@@ -464,11 +495,11 @@ def persist_calculation_frame(
     if file_frame is not None:
         raise ValueError("file_frame_index is already assigned to a different segment frame")
 
-    frame = CalculationFrame(
+    frame = _new_entity(session, CalculationFrame,
         segment=segment,
         geometry=geometry,
         topology_derivation=topology_derivation,
-        **record.model_dump(),
+        **_dto_values(record),
     )
     _flush_new_entity(session, frame, label="CalculationFrame")
     if reconcile:
@@ -485,7 +516,7 @@ def persist_frame_energy_result(
 
     frame_id = _require_id(frame, label="CalculationFrame")
     if _fast_insert_enabled(session):
-        new_result = FrameEnergyResult(frame=frame, **record.model_dump())
+        new_result = _new_entity(session, FrameEnergyResult, frame=frame, **_dto_values(record))
         _flush_new_entity(session, new_result, label="FrameEnergyResult")
         return new_result
     _acquire_identity_locks(session, ("frame_energy_result", frame_id))
@@ -495,7 +526,7 @@ def persist_frame_energy_result(
     if result is not None:
         _assert_record_matches(result, record, label="FrameEnergyResult")
         return result
-    result = FrameEnergyResult(frame=frame, **record.model_dump())
+    result = _new_entity(session, FrameEnergyResult, frame=frame, **_dto_values(record))
     _flush_new_entity(session, result, label="FrameEnergyResult")
     return result
 
@@ -509,7 +540,9 @@ def persist_energy_observation(
 
     energy_result_id = _require_id(energy_result, label="FrameEnergyResult")
     if _fast_insert_enabled(session):
-        new_observation = EnergyObservation(energy_result=energy_result, **record.model_dump())
+        new_observation = _new_entity(
+            session, EnergyObservation, energy_result=energy_result, **_dto_values(record)
+        )
         _flush_new_entity(session, new_observation, label="EnergyObservation")
         return new_observation
     _acquire_identity_locks(
@@ -525,7 +558,9 @@ def persist_energy_observation(
     if observation is not None:
         _assert_record_matches(observation, record, label="EnergyObservation")
         return observation
-    observation = EnergyObservation(energy_result=energy_result, **record.model_dump())
+    observation = _new_entity(
+        session, EnergyObservation, energy_result=energy_result, **_dto_values(record)
+    )
     _flush_new_entity(session, observation, label="EnergyObservation")
     return observation
 
@@ -539,7 +574,9 @@ def persist_geometry_optimization_result(
 
     frame_id = _require_id(frame, label="CalculationFrame")
     if _fast_insert_enabled(session):
-        new_result = GeometryOptimizationResult(frame=frame, **record.model_dump())
+        new_result = _new_entity(
+            session, GeometryOptimizationResult, frame=frame, **_dto_values(record)
+        )
         _flush_new_entity(session, new_result, label="GeometryOptimizationResult")
         return new_result
     _acquire_identity_locks(session, ("geometry_optimization_result", frame_id))
@@ -549,7 +586,7 @@ def persist_geometry_optimization_result(
     if result is not None:
         _assert_record_matches(result, record, label="GeometryOptimizationResult")
         return result
-    result = GeometryOptimizationResult(frame=frame, **record.model_dump())
+    result = _new_entity(session, GeometryOptimizationResult, frame=frame, **_dto_values(record))
     _flush_new_entity(session, result, label="GeometryOptimizationResult")
     return result
 
@@ -563,7 +600,7 @@ def persist_vibration_result(
 
     frame_id = _require_id(frame, label="CalculationFrame")
     if _fast_insert_enabled(session):
-        new_result = VibrationResult(frame=frame, **record.model_dump())
+        new_result = _new_entity(session, VibrationResult, frame=frame, **_dto_values(record))
         _flush_new_entity(session, new_result, label="VibrationResult")
         return new_result
     _acquire_identity_locks(session, ("vibration_result", frame_id))
@@ -573,7 +610,7 @@ def persist_vibration_result(
     if result is not None:
         _assert_record_matches(result, record, label="VibrationResult")
         return result
-    result = VibrationResult(frame=frame, **record.model_dump())
+    result = _new_entity(session, VibrationResult, frame=frame, **_dto_values(record))
     _flush_new_entity(session, result, label="VibrationResult")
     return result
 
@@ -587,7 +624,9 @@ def persist_calculation_status_result(
 
     frame_id = _require_id(frame, label="CalculationFrame")
     if _fast_insert_enabled(session):
-        new_result = CalculationStatusResult(frame=frame, **record.model_dump())
+        new_result = _new_entity(
+            session, CalculationStatusResult, frame=frame, **_dto_values(record)
+        )
         _flush_new_entity(session, new_result, label="CalculationStatusResult")
         return new_result
     _acquire_identity_locks(session, ("calculation_status_result", frame_id))
@@ -597,7 +636,7 @@ def persist_calculation_status_result(
     if result is not None:
         _assert_record_matches(result, record, label="CalculationStatusResult")
         return result
-    result = CalculationStatusResult(frame=frame, **record.model_dump())
+    result = _new_entity(session, CalculationStatusResult, frame=frame, **_dto_values(record))
     _flush_new_entity(session, result, label="CalculationStatusResult")
     return result
 
@@ -651,10 +690,12 @@ def persist_scientific_array(
     _validate_scientific_array_shape(frame, record)
     if _fast_insert_enabled(session):
         data = _validated_array_copy(record)
-        new_array = ScientificArray(
+        new_array = _new_entity(
+            session,
+            ScientificArray,
             frame=frame,
             data=data,
-            **record.model_dump(exclude={"data"}),
+            **_dto_values(record, exclude={"data"}),
         )
         _flush_new_entity(session, new_array, label="ScientificArray")
         return new_array
@@ -679,10 +720,12 @@ def persist_scientific_array(
         )
         return scientific_array
 
-    scientific_array = ScientificArray(
+    scientific_array = _new_entity(
+        session,
+        ScientificArray,
         frame=frame,
         data=data,
-        **record.model_dump(exclude={"data"}),
+        **_dto_values(record, exclude={"data"}),
     )
     _flush_new_entity(session, scientific_array, label="ScientificArray")
     return scientific_array
@@ -708,7 +751,9 @@ def persist_thermochemistry_result(
     if record.source_schema_version != segment.parse_revision.export_schema_version:
         raise ValueError("thermochemistry source schema must match its ParseRevision export schema")
     if _fast_insert_enabled(session):
-        new_result = ThermochemistryResult(frame=frame, **record.model_dump())
+        new_result = _new_entity(
+            session, ThermochemistryResult, frame=frame, **_dto_values(record)
+        )
         _flush_new_entity(session, new_result, label="ThermochemistryResult")
         return new_result
     _acquire_identity_locks(session, ("thermochemistry_result", frame_id))
@@ -719,9 +764,11 @@ def persist_thermochemistry_result(
         _assert_record_matches(result, record, label="ThermochemistryResult")
         return result
 
-    result = ThermochemistryResult(
+    result = _new_entity(
+        session,
+        ThermochemistryResult,
         frame=frame,
-        **record.model_dump(),
+        **_dto_values(record),
     )
     _flush_new_entity(session, result, label="ThermochemistryResult")
     if reconcile:
@@ -740,7 +787,7 @@ def _persist_frame_result[FrameResultT](
     frame_id = _require_id(frame, label="CalculationFrame")
     model_with_columns = cast(Any, model)
     if _fast_insert_enabled(session):
-        new_result = model_with_columns(frame=frame, **record.model_dump())
+        new_result = _new_entity(session, model, frame=frame, **_dto_values(record))
         _flush_new_entity(session, new_result, label=label)
         return cast(FrameResultT, new_result)
     _acquire_identity_locks(session, (label, frame_id))
@@ -748,7 +795,7 @@ def _persist_frame_result[FrameResultT](
     if result is not None:
         _assert_record_matches(result, record, label=label)
         return result
-    result = model_with_columns(frame=frame, **record.model_dump())
+    result = _new_entity(session, model, frame=frame, **_dto_values(record))
     _flush_new_entity(session, result, label=label)
     return cast(FrameResultT, result)
 
@@ -782,7 +829,9 @@ def persist_atomic_population_series(
     if record.value_count != result.frame.geometry.atom_count:
         raise ValueError("atomic population length must match the source Geometry atom count")
     if _fast_insert_enabled(session):
-        new_series = AtomicPopulationSeries(result=result, **record.model_dump())
+        new_series = _new_entity(
+            session, AtomicPopulationSeries, result=result, **_dto_values(record)
+        )
         _flush_new_entity(session, new_series, label="AtomicPopulationSeries")
         return new_series
     _acquire_identity_locks(session, ("AtomicPopulationSeries", result_id, record.series_key))
@@ -795,7 +844,7 @@ def persist_atomic_population_series(
     if series is not None:
         _assert_record_matches(series, record, label="AtomicPopulationSeries")
         return series
-    series = AtomicPopulationSeries(result=result, **record.model_dump())
+    series = _new_entity(session, AtomicPopulationSeries, result=result, **_dto_values(record))
     _flush_new_entity(session, series, label="AtomicPopulationSeries")
     return series
 
@@ -825,7 +874,9 @@ def persist_nmr_shielding_tensor(
     if record.atom_index >= result.frame.geometry.atom_count:
         raise ValueError("NMR shielding atom index exceeds the source Geometry atom count")
     if _fast_insert_enabled(session):
-        new_tensor = NMRShieldingTensor(result=result, **record.model_dump())
+        new_tensor = _new_entity(
+            session, NMRShieldingTensor, result=result, **_dto_values(record)
+        )
         _flush_new_entity(session, new_tensor, label="NMRShieldingTensor")
         return new_tensor
     _acquire_identity_locks(session, ("NMRShieldingTensor", result_id, record.atom_index))
@@ -838,7 +889,7 @@ def persist_nmr_shielding_tensor(
     if tensor is not None:
         _assert_record_matches(tensor, record, label="NMRShieldingTensor")
         return tensor
-    tensor = NMRShieldingTensor(result=result, **record.model_dump())
+    tensor = _new_entity(session, NMRShieldingTensor, result=result, **_dto_values(record))
     _flush_new_entity(session, tensor, label="NMRShieldingTensor")
     return tensor
 
@@ -872,7 +923,9 @@ def persist_electronic_state_set(
 ) -> ElectronicStateSet:
     frame_id = _require_id(frame, label="CalculationFrame")
     if _fast_insert_enabled(session):
-        new_state_set = ElectronicStateSet(frame=frame, **record.model_dump())
+        new_state_set = _new_entity(
+            session, ElectronicStateSet, frame=frame, **_dto_values(record)
+        )
         _flush_new_entity(session, new_state_set, label="ElectronicStateSet")
         return new_state_set
     _acquire_identity_locks(session, ("ElectronicStateSet", frame_id, record.kind.value))
@@ -885,7 +938,7 @@ def persist_electronic_state_set(
     if state_set is not None:
         _assert_record_matches(state_set, record, label="ElectronicStateSet")
         return state_set
-    state_set = ElectronicStateSet(frame=frame, **record.model_dump())
+    state_set = _new_entity(session, ElectronicStateSet, frame=frame, **_dto_values(record))
     _flush_new_entity(session, state_set, label="ElectronicStateSet")
     return state_set
 
@@ -900,7 +953,7 @@ def persist_electronic_state(
         raise ValueError("ElectronicState record kind does not match its state set")
     values = record.model_dump(exclude={"set_kind"})
     if _fast_insert_enabled(session):
-        new_state = ElectronicState(state_set=state_set, **values)
+        new_state = _new_entity(session, ElectronicState, state_set=state_set, **values)
         _flush_new_entity(session, new_state, label="ElectronicState")
         return new_state
     _acquire_identity_locks(session, ("ElectronicState", state_set_id, record.state_ordinal))
@@ -918,7 +971,7 @@ def persist_electronic_state(
             exclude={"set_kind"},
         )
         return state
-    state = ElectronicState(state_set=state_set, **values)
+    state = _new_entity(session, ElectronicState, state_set=state_set, **values)
     _flush_new_entity(session, state, label="ElectronicState")
     return state
 
@@ -936,7 +989,9 @@ def persist_electronic_configuration(
         raise ValueError("ElectronicConfiguration record does not match its state")
     values = record.model_dump(exclude={"set_kind", "state_ordinal"})
     if _fast_insert_enabled(session):
-        new_configuration = ElectronicConfiguration(electronic_state=electronic_state, **values)
+        new_configuration = _new_entity(
+            session, ElectronicConfiguration, electronic_state=electronic_state, **values
+        )
         _flush_new_entity(session, new_configuration, label="ElectronicConfiguration")
         return new_configuration
     _acquire_identity_locks(
@@ -956,7 +1011,9 @@ def persist_electronic_configuration(
             exclude={"set_kind", "state_ordinal"},
         )
         return configuration
-    configuration = ElectronicConfiguration(electronic_state=electronic_state, **values)
+    configuration = _new_entity(
+        session, ElectronicConfiguration, electronic_state=electronic_state, **values
+    )
     _flush_new_entity(session, configuration, label="ElectronicConfiguration")
     return configuration
 
@@ -982,10 +1039,12 @@ def persist_multireference_result(
             raise ValueError("MultireferenceResult resolved to a different electronic state set")
         _assert_record_matches(result, record, label="MultireferenceResult")
         return result
-    result = MultireferenceResult(
+    result = _new_entity(
+        session,
+        MultireferenceResult,
         frame=frame,
         electronic_state_set=electronic_state_set,
-        **record.model_dump(),
+        **_dto_values(record),
     )
     _flush_new_entity(session, result, label="MultireferenceResult")
     return result
@@ -1071,7 +1130,9 @@ def persist_scientific_array_assignment(
     ):
         raise ValueError("ScientificArrayAssignment locator does not match its array")
     if _fast_insert_enabled(session):
-        new_assignment = ScientificArrayAssignment(
+        new_assignment = _new_entity(
+            session,
+            ScientificArrayAssignment,
             scientific_array=scientific_array,
             slot=record.slot,
             slot_ordinal=record.slot_ordinal,
@@ -1089,7 +1150,9 @@ def persist_scientific_array_assignment(
         if assignment.slot != record.slot or assignment.slot_ordinal != record.slot_ordinal:
             raise ValueError("ScientificArray is already assigned to a different semantic slot")
         return assignment
-    assignment = ScientificArrayAssignment(
+    assignment = _new_entity(
+        session,
+        ScientificArrayAssignment,
         scientific_array=scientific_array,
         slot=record.slot,
         slot_ordinal=record.slot_ordinal,
@@ -1139,6 +1202,7 @@ def finalize_parse_revision(
     revision.error_metadata = None
     session.add(revision)
     if not defer_flush:
+        _attach_pending_entities(session)
         session.flush()
     return revision
 
