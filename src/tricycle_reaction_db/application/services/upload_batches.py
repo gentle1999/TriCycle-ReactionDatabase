@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID
@@ -13,6 +14,7 @@ from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from tricycle_reaction_db.application.dtos import (
+    ArtifactBatchUploadItem,
     UploadBatchCreate,
     UploadBatchItemPage,
     UploadBatchItemView,
@@ -55,6 +57,7 @@ class UploadBatchLimitError(UploadBatchError):
 
 
 UPLOAD_PROGRESS_METADATA_KEY = "__tricycle_upload_progress"
+logger = logging.getLogger(__name__)
 
 
 def _with_upload_progress(
@@ -672,12 +675,60 @@ class UploadBatchService:
         if not pending_files:
             return [completed_items[client_file_id] for client_file_id in client_file_ids]
 
+        committed_client_ids: set[UUID] = set()
+
+        async def on_file_committed(index: int, outcome: ArtifactBatchUploadItem) -> None:
+            """Expose local-import-style commit progress to queue clients.
+
+            ``ArtifactUploadService`` invokes this callback only after the
+            corresponding persistence microbatch is committed. Updating the
+            queue row here makes polling useful during long MolOP requests;
+            the final reconciliation below remains authoritative and is
+            idempotent for rows already advanced by this callback.
+            """
+
+            if index < 0 or index >= len(pending_files):
+                logger.warning("artifact upload callback returned invalid file index %s", index)
+                return
+            client_file_id = pending_files[index][0]
+            if client_file_id in committed_client_ids:
+                return
+            try:
+                await cls._finish_items(
+                    batch_id,
+                    outcomes=[
+                        _UploadItemOutcome(
+                            client_file_id=client_file_id,
+                            succeeded=outcome.succeeded,
+                            artifact_file_id=(
+                                outcome.result.artifact_id if outcome.result is not None else None
+                            ),
+                            error_code=outcome.error_code,
+                            error_message=outcome.error_message,
+                        )
+                    ],
+                    user_id=user_id,
+                )
+            except Exception:
+                # A progress update must not turn a successfully persisted
+                # artifact batch into a parser failure. The final reconciliation
+                # retries the row after the service returns.
+                logger.exception(
+                    "failed to publish upload progress for batch %s file %s",
+                    batch_id,
+                    client_file_id,
+                )
+            else:
+                committed_client_ids.add(client_file_id)
+
         try:
             result = await ArtifactUploadService.upload_batch(
                 files=[upload for _, upload in pending_files],
                 artifact_kind=artifact_kind,
                 project_id=project_id,
                 user_id=user_id,
+                on_file_committed=on_file_committed,
+                streaming=True,
             )
         except asyncio.CancelledError:
             await cls._finish_items(

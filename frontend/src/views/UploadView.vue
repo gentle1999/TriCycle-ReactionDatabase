@@ -66,8 +66,11 @@ interface DroppedFile {
 
 const MAX_QUEUE_FILES = 20_000;
 const MAX_AUTOMATIC_ATTEMPTS = 6;
-const MOLOP_BATCH_MAX_FILES = 32;
-const MOLOP_BATCH_MAX_BYTES = 256 * 1024 * 1024;
+// Keep each HTTP request aligned with the validated local import window. The
+// API still enforces deployment-specific limits and returns a preflight 413
+// when an installation is configured more conservatively.
+const MOLOP_BATCH_MAX_FILES = 128;
+const MOLOP_BATCH_MAX_BYTES = 512 * 1024 * 1024;
 // Leave the completed batch summary on screen briefly before resetting the
 // queue so the user (and the acceptance suite) can observe the final counts.
 const BATCH_COMPLETION_RESET_DELAY_MS = 2_000;
@@ -592,6 +595,24 @@ async function runTaskBatch(selected: QueueTask[], runId: number): Promise<void>
           }
           return;
         }
+        // The API may be configured with a smaller request window than the
+        // validated development setting. A preflight 413 for a multi-file
+        // request is therefore recoverable by recursively splitting the same
+        // reserved tasks; a singleton remains a genuine per-file failure.
+        if (error instanceof ApiError && error.status === 413 && selected.length > 1) {
+          const midpoint = Math.ceil(selected.length / 2);
+          for (const task of selected) {
+            task.status = "queued";
+            task.loaded = 0;
+            task.error = "正在调整批次大小";
+            task.parsePhase = null;
+          }
+          await Promise.all([
+            runTaskBatch(selected.slice(0, midpoint), runId),
+            runTaskBatch(selected.slice(midpoint), runId),
+          ]);
+          return;
+        }
         const retryable = error instanceof ApiError
           && (error.status === 0 || error.status === 429 || error.status === 502 || error.status === 503 || error.status === 504);
         if (!retryable || selected.some((task) => task.attempt >= MAX_AUTOMATIC_ATTEMPTS)) {
@@ -790,6 +811,12 @@ watch(concurrency, (value) => {
   const normalized = Math.min(6, Math.max(1, Number(value) || 1));
   concurrency.value = normalized;
   window.localStorage.setItem("tricycle.uploadConcurrency", String(normalized));
+});
+watch(projectContext.currentProjectId, (value) => {
+  if (!batch.value && !selectedProjectId.value && value) selectedProjectId.value = value;
+});
+watch(() => route.query.project_id, (value) => {
+  if (!batch.value && typeof value === "string" && value) selectedProjectId.value = value;
 });
 watch(selectedProjectId, () => void refreshRecentBatches());
 watch([statusFilter, queuePage], () => {
