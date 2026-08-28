@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import {
+  CircleAlert,
   ChevronLeft,
   ChevronRight,
   FileStack,
@@ -102,6 +103,7 @@ const queueCancelled = ref(false);
 const loadingBatch = ref(false);
 const setupError = ref("");
 const queueError = ref("");
+const selectedErrorTask = ref<QueueTask | null>(null);
 const readingDrop = ref(false);
 let queueRunId = 0;
 let viewMounted = false;
@@ -525,6 +527,18 @@ function applyItem(task: QueueTask, item: UploadBatchItem): void {
   task.parseTotal = progress?.total ?? task.parseTotal;
 }
 
+function openTaskError(task: QueueTask): void {
+  if (task.error) selectedErrorTask.value = task;
+}
+
+function closeTaskError(): void {
+  selectedErrorTask.value = null;
+}
+
+function onKeydown(event: KeyboardEvent): void {
+  if (event.key === "Escape" && selectedErrorTask.value) closeTaskError();
+}
+
 function updateBatchProgress(selected: QueueTask[], loaded: number, total: number): void {
   const selectedBytes = selected.reduce((sum, task) => sum + task.size, 0);
   let remaining = total > 0
@@ -823,9 +837,13 @@ watch([statusFilter, queuePage], () => {
   if (remoteMode.value) void refreshRemoteItems();
 });
 watch(statusFilter, () => { queuePage.value = 0; });
+watch(selectedErrorTask, (task) => {
+  document.body.classList.toggle("drawer-open", task !== null);
+});
 
 onMounted(async () => {
   viewMounted = true;
+  window.addEventListener("keydown", onKeydown);
   progressPollTimer = window.setInterval(() => void pollUploadProgress(), 750);
   await refreshRecentBatches();
   const routeBatch = typeof route.query.batch === "string" ? route.query.batch : null;
@@ -836,6 +854,8 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   viewMounted = false;
+  window.removeEventListener("keydown", onKeydown);
+  closeTaskError();
   if (progressPollTimer !== null) {
     window.clearInterval(progressPollTimer);
     progressPollTimer = null;
@@ -1015,7 +1035,18 @@ onBeforeUnmount(() => {
             <progress :value="task.status === 'succeeded' ? task.size : task.loaded" :max="Math.max(1, task.size)"></progress>
             <span>{{ taskStatusLabel(task) }}<template v-if="task.attempt"> · {{ task.attempt }} 次</template></span>
           </div>
-          <span class="upload-task-error" :title="task.error">{{ task.error }}</span>
+          <button
+            v-if="task.error"
+            class="upload-task-error"
+            type="button"
+            title="查看完整错误"
+            :aria-label="`查看 ${task.filename} 的完整错误`"
+            @click="openTaskError(task)"
+          >
+            <CircleAlert :size="14" aria-hidden="true" />
+            <span>{{ task.error }}</span>
+          </button>
+          <span v-else class="upload-task-error-placeholder" aria-hidden="true"></span>
           <RouterLink
             v-if="task.artifactId"
             class="icon-button"
@@ -1044,5 +1075,50 @@ onBeforeUnmount(() => {
         <div v-if="!recentBatches.length" class="compact-empty">暂无上传批次</div>
       </div>
     </section>
+
+    <Teleport to="body">
+      <Transition name="drawer">
+        <button
+          v-if="selectedErrorTask"
+          class="drawer-backdrop"
+          type="button"
+          aria-label="关闭上传错误详情"
+          @click="closeTaskError"
+        ></button>
+      </Transition>
+      <Transition name="drawer-panel">
+        <aside
+          v-if="selectedErrorTask"
+          class="detail-drawer upload-error-drawer"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="upload-error-title"
+        >
+          <header class="drawer-header">
+            <div>
+              <span class="eyebrow">Upload diagnostics</span>
+              <h2 id="upload-error-title">上传错误</h2>
+            </div>
+            <button class="icon-button" type="button" title="关闭" aria-label="关闭上传错误详情" @click="closeTaskError">
+              <X :size="18" aria-hidden="true" />
+            </button>
+          </header>
+          <div class="upload-error-content">
+            <div class="upload-error-file">
+              <strong>{{ selectedErrorTask.filename }}</strong>
+              <span>{{ selectedErrorTask.relativePath }}</span>
+            </div>
+            <dl class="upload-error-meta">
+              <div><dt>状态</dt><dd>{{ taskStatusLabel(selectedErrorTask) }}</dd></div>
+              <div><dt>尝试次数</dt><dd>{{ selectedErrorTask.attempt }}</dd></div>
+            </dl>
+            <section class="upload-error-message" aria-labelledby="upload-error-message-title">
+              <h3 id="upload-error-message-title">错误信息</h3>
+              <pre>{{ selectedErrorTask.error }}</pre>
+            </section>
+          </div>
+        </aside>
+      </Transition>
+    </Teleport>
   </main>
 </template>

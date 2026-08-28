@@ -4811,8 +4811,7 @@ table.data-table {
 }
 
 .upload-task-name strong,
-.upload-task-name span,
-.upload-task-error {
+.upload-task-name span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -4837,12 +4836,141 @@ table.data-table {
   gap: 4px;
 }
 
+.upload-task-error,
+.upload-task-error-placeholder {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+}
+
+.upload-task-error {
+  color: var(--danger);
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.upload-task-error svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.upload-task-error span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upload-task-error:hover span {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .upload-task-row.is-failed .upload-task-error {
   color: var(--danger);
 }
 
+.upload-task-error-placeholder {
+  min-height: 14px;
+}
+
 .upload-task-action-placeholder {
   width: 34px;
+}
+
+.upload-error-drawer {
+  width: min(620px, 100vw);
+}
+
+.upload-error-content {
+  display: grid;
+  gap: 20px;
+  padding: 20px;
+}
+
+.upload-error-file {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.upload-error-file strong,
+.upload-error-file span {
+  overflow-wrap: anywhere;
+}
+
+.upload-error-file strong {
+  font-size: 14px;
+}
+
+.upload-error-file span {
+  color: var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.upload-error-meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.upload-error-meta div {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border-left: 1px solid var(--line);
+}
+
+.upload-error-meta div:first-child {
+  border-left: 0;
+}
+
+.upload-error-meta dt {
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.upload-error-meta dd {
+  margin: 0;
+  color: var(--danger);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.upload-error-message {
+  display: grid;
+  gap: 8px;
+}
+
+.upload-error-message h3 {
+  margin: 0;
+  font-size: 12px;
+}
+
+.upload-error-message pre {
+  max-height: min(56vh, 520px);
+  overflow: auto;
+  margin: 0;
+  padding: 14px;
+  color: var(--danger);
+  background: var(--red-soft);
+  border: 1px solid rgb(166 62 53 / 26%);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .upload-history {
@@ -4919,11 +5047,7 @@ table.data-table {
   }
 
   .upload-task-row {
-    grid-template-columns: 10px minmax(150px, 1fr) 74px minmax(110px, .7fr) 34px;
-  }
-
-  .upload-task-error {
-    display: none;
+    grid-template-columns: 10px minmax(150px, 1fr) 74px minmax(110px, .7fr) minmax(120px, .8fr) 34px;
   }
 }
 
@@ -5002,14 +5126,22 @@ table.data-table {
   }
 
   .upload-task-row {
-    grid-template-columns: 10px minmax(0, 1fr) 34px;
+    grid-template-columns: 10px minmax(0, 1fr) 34px 34px;
     gap: 8px;
     padding: 9px 5px;
   }
 
   .upload-task-size,
-  .upload-task-progress,
+  .upload-task-progress {
+    display: none;
+  }
+
   .upload-task-error {
+    align-items: center;
+    justify-content: center;
+  }
+
+  .upload-task-error span {
     display: none;
   }
 
