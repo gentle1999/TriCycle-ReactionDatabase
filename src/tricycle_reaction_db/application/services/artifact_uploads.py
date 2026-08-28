@@ -2034,11 +2034,30 @@ def _prepare_calculation_parser_path(
     maximum = get_settings().max_upload_bytes
     if source.stat().st_size > maximum:
         raise ArtifactUploadError(f"uploaded artifact exceeds the {maximum}-byte limit")
+    parser_suffix = _safe_parser_suffix(filename)
     with source.open("rb") as stream:
         is_gzip = filename.lower().endswith(".gz") or stream.peek(2)[:2] == b"\x1f\x8b"
         if not is_gzip:
-            return str(source), None
-        path = temporary_dir / f"{input_index:08d}{_safe_parser_suffix(filename)}"
+            # HTTP upload routes spool files with an opaque ``.upload`` suffix.
+            # MolOP's automatic parser selection uses the path suffix, so do
+            # not pass that opaque path through for an otherwise uncompressed
+            # calculation output. Local CLI imports keep their native suffix
+            # and can continue to avoid this copy.
+            source_suffix = source.suffix.lower()
+            if source_suffix in {".log", ".out", ".xyz"} and source_suffix == parser_suffix:
+                return str(source), None
+            path = temporary_dir / f"{input_index:08d}{parser_suffix}"
+            copied_size = 0
+            with path.open("wb") as output:
+                while chunk := stream.read(1024 * 1024):
+                    copied_size += len(chunk)
+                    if copied_size > maximum:
+                        raise ArtifactUploadError(
+                            f"uploaded artifact exceeds the {maximum}-byte limit"
+                        )
+                    output.write(chunk)
+            return str(path), None
+        path = temporary_dir / f"{input_index:08d}{parser_suffix}"
         try:
             with (
                 gzip.GzipFile(fileobj=stream, mode="rb") as decompressed,

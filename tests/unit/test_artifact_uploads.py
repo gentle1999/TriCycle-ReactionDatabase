@@ -27,6 +27,7 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
     _parse_calculation_outputs_batch,
     _parser_payload,
     _pipeline_task_lifecycle,
+    _prepare_calculation_parser_path,
     _require_batch_upload_budget,
     _run_molop_file_parser,
     _run_molop_file_pipeline,
@@ -672,6 +673,47 @@ def test_batch_parser_uses_uncompressed_spooled_source_directly(
     parsed = _parse_calculation_outputs_batch([(source, source.name)], n_jobs=2)
 
     assert parsed == {0: "parsed"}
+
+
+def test_parser_path_restores_filename_suffix_for_opaque_spool_file(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "00000000.upload"
+    source.write_bytes(b"spooled calculation output")
+    temporary_dir = tmp_path / "prepared"
+    temporary_dir.mkdir()
+
+    parser_path, compression = _prepare_calculation_parser_path(
+        source,
+        "gaussian.log",
+        temporary_dir=temporary_dir,
+        input_index=0,
+    )
+
+    assert Path(parser_path).suffix == ".log"
+    assert Path(parser_path) != source
+    assert Path(parser_path).read_bytes() == source.read_bytes()
+    assert compression is None
+
+
+def test_parser_path_decompresses_opaque_gzip_spool_file_with_filename_suffix(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "00000000.upload"
+    source.write_bytes(gzip.compress(b"compressed calculation output"))
+    temporary_dir = tmp_path / "prepared"
+    temporary_dir.mkdir()
+
+    parser_path, compression = _prepare_calculation_parser_path(
+        source,
+        "gaussian.log.gz",
+        temporary_dir=temporary_dir,
+        input_index=0,
+    )
+
+    assert Path(parser_path).suffix == ".log"
+    assert Path(parser_path).read_bytes() == b"compressed calculation output"
+    assert compression == "gzip"
 
 
 def test_batch_parser_decompresses_spooled_gzip_input(
