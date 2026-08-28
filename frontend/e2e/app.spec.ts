@@ -1168,10 +1168,19 @@ test("geometry cards preserve drawer preview and link to a standalone detail pag
   await expect(page.locator(".geometry-detail-page-content .geometry-canvas-3d")).toHaveAttribute("data-webgl-state", "ready", { timeout: 20_000 });
   const geometryRenderer = page.locator(".geometry-detail-page-content .geometry-canvas-3d");
   expect(await webGlCanvasHasDrawing(geometryRenderer)).toBe(true);
+  await expect(page.getByText("总电荷", { exact: true })).toBeVisible();
+  await expect(page.getByText("自旋多重度", { exact: true })).toBeVisible();
+  const coordinateTable = page.locator(".geometry-coordinate-table");
+  await expect(coordinateTable).toBeVisible();
+  await expect(coordinateTable.locator(".geometry-coordinate-row")).not.toHaveCount(1);
   const geometryCanvas = geometryRenderer.locator("canvas");
   expect(await dragChangesWebGlCanvas(page, geometryCanvas)).toBe(true);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await page.screenshot({ path: testInfo.outputPath("desktop-geometry-detail.png"), fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(coordinateTable).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath("mobile-geometry-detail.png"), fullPage: true });
 });
 
 test("geometry quick query submits only the basic SMILES filter", async ({ page }) => {

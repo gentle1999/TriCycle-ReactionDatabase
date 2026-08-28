@@ -95,7 +95,7 @@ async function refreshApplication(): Promise<void> {
       queryClient.invalidateQueries({ queryKey: ["catalog", "artifacts", { projectId }] }),
       queryClient.invalidateQueries({ queryKey: ["catalog", "frames", { projectId }] }),
       queryClient.invalidateQueries({ queryKey: ["catalog", "reactions", { projectId }] }),
-      queryClient.invalidateQueries({ queryKey: ["geometries", { projectId }] }),
+      queryClient.invalidateQueries({ queryKey: ["geometries"] }),
       queryClient.invalidateQueries({ queryKey: ["thermodynamic-statistics", { projectId }] }),
       ...(projectId ? [queryClient.invalidateQueries({ queryKey: ["project-overview", projectId] })] : []),
     ]);

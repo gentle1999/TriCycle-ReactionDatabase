@@ -4,7 +4,7 @@ import { computed, ref, watch } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 
 import { api, artifactDownloadUrl } from "@/api";
-import { emptyArtifactFilters, type ArtifactFilterValues } from "@/artifactQuery";
+import { emptyArtifactFilters, type ArtifactFilterValues, type ArtifactSort, type ArtifactSortBy } from "@/artifactQuery";
 import { artifactLabels, formatBytes, shortId, statusTone } from "@/format";
 import { withoutAccessState } from "@/routeAccessState";
 import type { ArtifactSummary, CalculationFrameSummary, CurrentUser, PageInfo } from "@/types";
@@ -27,6 +27,7 @@ const props = defineProps<{
   framesError: string;
   total: number;
   page: PageInfo;
+  sort: ArtifactSort;
 }>();
 
 const route = useRoute();
@@ -41,6 +42,7 @@ const emit = defineEmits<{
   nextPage: [];
   jumpPage: [offset: number];
   applyFilters: [filters: ArtifactFilterValues];
+  updateSort: [sort: ArtifactSort];
 }>();
 
 const filterText = ref(props.filterText);
@@ -101,6 +103,20 @@ function applyAdvancedFilters(filters: ArtifactFilterValues): void {
   advancedQueryOpen.value = false;
   filterText.value = filters.artifactId ?? filters.contentSha256 ?? filters.originalFilenameContains ?? "";
   emit("applyFilters", filters);
+}
+
+function updateSortBy(event: Event): void {
+  emit("updateSort", {
+    sortBy: (event.target as HTMLSelectElement).value as ArtifactSortBy,
+    sortDirection: props.sort.sortDirection,
+  });
+}
+
+function updateSortDirection(event: Event): void {
+  emit("updateSort", {
+    sortBy: props.sort.sortBy,
+    sortDirection: (event.target as HTMLSelectElement).value as ArtifactSort["sortDirection"],
+  });
 }
 
 function canDeleteArtifact(artifact: ArtifactSummary): boolean {
@@ -170,7 +186,13 @@ watch(
           <span class="eyebrow">Artifact catalog</span>
           <h2 id="artifact-results-title">文件目录</h2>
         </div>
-        <PaginationControls :page="page" label="原始文件分页（顶部）" @previous="emit('previousPage')" @next="emit('nextPage')" @jump="emit('jumpPage', $event)" />
+        <div class="catalog-header-actions">
+          <div class="catalog-sort-controls" aria-label="原始文件排序">
+            <label><span>排序</span><select :value="sort.sortBy" aria-label="原始文件排序字段" @change="updateSortBy"><option value="created_at">创建时间</option><option value="original_filename">文件名</option><option value="size_bytes">文件大小</option><option value="artifact_kind">文件类型</option><option value="storage_status">存储状态</option></select></label>
+            <label><span>顺序</span><select :value="sort.sortDirection" aria-label="原始文件排序方向" @change="updateSortDirection"><option value="asc">升序</option><option value="desc">降序</option></select></label>
+          </div>
+          <PaginationControls :page="page" label="原始文件分页（顶部）" @previous="emit('previousPage')" @next="emit('nextPage')" @jump="emit('jumpPage', $event)" />
+        </div>
       </header>
       <div class="artifact-upload-toolbar">
         <RouterLink v-if="canUpload" class="command-button" :to="{ name: 'uploads', query: { ...navigationQuery, project_id: selectedProjectId } }">

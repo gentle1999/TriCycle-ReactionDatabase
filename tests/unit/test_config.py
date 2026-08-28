@@ -40,16 +40,17 @@ def test_settings_accept_psycopg_database_url() -> None:
 
     assert settings.database_url.startswith("postgresql+psycopg://")
     assert settings.api_port == 8000
-    assert settings.molop_capture_source_evidence is False
+    assert settings.molop_capture_source_evidence is True
     assert settings.molop_parallel_frame_persistence is True
+    assert settings.molop_file_parse_timeout_seconds == 60.0
 
 
-def test_molop_source_evidence_can_be_enabled_for_audit_ingestion(
+def test_molop_source_evidence_can_be_disabled_for_legacy_fast_ingestion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE", "true")
+    monkeypatch.setenv("TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE", "false")
 
-    assert Settings(_env_file=None).molop_capture_source_evidence is True
+    assert Settings(_env_file=None).molop_capture_source_evidence is False
 
 
 def test_molop_parallel_frame_persistence_can_be_disabled(

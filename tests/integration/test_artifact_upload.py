@@ -230,7 +230,9 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
             mapping = inferred_geometry.mapping_bindings[0]
             expected_map_set = list(range(1, ts_frame.geometry.atom_count + 1))
             frame_source_to_geometry = list(ts_frame.observed_to_geometry_atom_indices)
-            assert frame_source_to_geometry != list(range(ts_frame.geometry.atom_count))
+            # MolGR topology order is the calculation-frame source order; no
+            # additional canonical atom permutation is introduced here.
+            assert frame_source_to_geometry == list(range(ts_frame.geometry.atom_count))
             assert mapping.geometry_atom_map_numbers == atom_maps_from_source_order(
                 ts_frame.geometry,
                 expected_map_set,

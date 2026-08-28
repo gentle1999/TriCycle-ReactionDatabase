@@ -36,6 +36,7 @@ from tricycle_reaction_db.application.services import (
     WorkflowManifestQueryService,
     get_geometry_dof_depiction,
     get_geometry_sdf,
+    get_geometry_xyz,
 )
 from tricycle_reaction_db.application.services.authentication import (
     AuthenticatedPrincipal,
@@ -922,6 +923,8 @@ async def test_artifact_frame_geometry_and_array_visibility(
         )
         assert await get_geometry_sdf(sample.shared_geometry_id) is not None
         assert await get_geometry_sdf(sample.private_geometry_id) is None
+        assert await get_geometry_xyz(sample.shared_geometry_id) is not None
+        assert await get_geometry_xyz(sample.private_geometry_id) is None
         assert await get_geometry_dof_depiction(sample.shared_geometry_id) is not None
         assert await get_geometry_dof_depiction(sample.private_geometry_id) is None
         with pytest.raises(ScientificArrayNotFoundError):
@@ -1199,6 +1202,10 @@ async def test_core_content_routes_do_not_reveal_private_ids(
             f"/api/depictions/geometry/{sample.private_geometry_id}.sdf"
         )
         missing_geometry = await client.get(f"/api/depictions/geometry/{missing}.sdf")
+        private_geometry_xyz = await client.get(
+            f"/api/depictions/geometry/{sample.private_geometry_id}.xyz"
+        )
+        missing_geometry_xyz = await client.get(f"/api/depictions/geometry/{missing}.xyz")
         private_geometry_svg = await client.get(
             f"/api/depictions/geometry/{sample.private_geometry_id}.svg"
         )
@@ -1220,6 +1227,8 @@ async def test_core_content_routes_do_not_reveal_private_ids(
     )
     assert private_geometry.status_code == missing_geometry.status_code == 404
     assert private_geometry.json() == missing_geometry.json()
+    assert private_geometry_xyz.status_code == missing_geometry_xyz.status_code == 404
+    assert private_geometry_xyz.json() == missing_geometry_xyz.json()
     assert private_geometry_svg.status_code == missing_geometry_svg.status_code == 404
     assert private_geometry_svg.json() == missing_geometry_svg.json()
     assert participant_topology.status_code == 200
@@ -1300,6 +1309,9 @@ async def test_same_depiction_url_is_not_reused_across_authorization_contexts(
 
     assert allowed.status_code == 200
     assert allowed.headers["cache-control"] == "private, no-store"
+    assert allowed.headers["content-disposition"] == (
+        f'attachment; filename="geometry-{sample.shared_geometry_id}.sdf"'
+    )
     assert denied.status_code == anonymous.status_code == 404
     assert denied.json() == anonymous.json() == {"detail": "molecular geometry not found"}
 
@@ -1383,6 +1395,7 @@ async def test_depiction_authorization_matrix_covers_all_roles_and_formats(
     visible_urls = [
         f"/api/depictions/geometry/{sample.shared_geometry_id}.svg",
         f"/api/depictions/geometry/{sample.shared_geometry_id}.sdf",
+        f"/api/depictions/geometry/{sample.shared_geometry_id}.xyz",
         f"/api/depictions/topology/{source_backed_participant_topology_id}.svg",
         f"/api/depictions/topology/{source_backed_participant_topology_id}.mol",
         f"/api/depictions/calculation-frame/{ts_frame_id}/transition-state/negative.sdf",
@@ -1392,6 +1405,7 @@ async def test_depiction_authorization_matrix_covers_all_roles_and_formats(
     denied_urls = [
         f"/api/depictions/geometry/{sample.private_geometry_id}.svg",
         f"/api/depictions/geometry/{sample.private_geometry_id}.sdf",
+        f"/api/depictions/geometry/{sample.private_geometry_id}.xyz",
         f"/api/depictions/topology/{private_participant_topology_id}.svg",
         f"/api/depictions/topology/{private_participant_topology_id}.mol",
     ]
@@ -1399,6 +1413,7 @@ async def test_depiction_authorization_matrix_covers_all_roles_and_formats(
     missing_urls = [
         f"/api/depictions/geometry/{missing}.svg",
         f"/api/depictions/geometry/{missing}.sdf",
+        f"/api/depictions/geometry/{missing}.xyz",
         f"/api/depictions/topology/{missing}.svg",
         f"/api/depictions/topology/{missing}.mol",
         f"/api/depictions/calculation-frame/{missing}/transition-state/center.sdf",

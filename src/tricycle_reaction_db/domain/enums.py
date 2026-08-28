@@ -276,6 +276,8 @@ class ArtifactResolutionStatus(StrEnum):
 
 
 class ReactionClass(StrEnum):
+    """Optional curator-supplied reaction classification."""
+
     CYCLOADDITION = "cycloaddition"
 
 

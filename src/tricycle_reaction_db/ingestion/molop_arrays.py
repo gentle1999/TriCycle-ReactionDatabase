@@ -20,6 +20,40 @@ from tricycle_reaction_db.domain.enums import (
 )
 
 _ARRAY_METADATA_SCHEMA_VERSION = "molop-array-source-v1"
+_ROTATIONAL_CONSTANT_TOLERANCE_GHZ = 5.5e-6
+
+
+def _rotational_constant_difference(
+    frame_constants: npt.NDArray[np.float64],
+    thermal_constants: npt.NDArray[np.float64],
+) -> float:
+    """Validate duplicate rotational constants and return their finite delta.
+
+    Linear molecules can have an infinite rotational constant.  Equal signed
+    infinities represent the same value, but subtracting them produces NaN;
+    only finite, pairwise values participate in the recorded difference.
+    """
+
+    if frame_constants.shape != thermal_constants.shape:
+        raise ValueError("MolOP rotational-constant sources disagree")
+    if np.isnan(frame_constants).any() or np.isnan(thermal_constants).any():
+        raise ValueError("MolOP rotational-constant sources contain NaN")
+
+    finite = np.isfinite(frame_constants) & np.isfinite(thermal_constants)
+    same_infinity = (
+        np.isinf(frame_constants)
+        & np.isinf(thermal_constants)
+        & (np.signbit(frame_constants) == np.signbit(thermal_constants))
+    )
+    if np.any(~(finite | same_infinity)):
+        raise ValueError("MolOP rotational-constant sources disagree")
+
+    if not np.any(finite):
+        return 0.0
+    differences = np.abs(frame_constants[finite] - thermal_constants[finite])
+    if np.any(differences > _ROTATIONAL_CONSTANT_TOLERANCE_GHZ):
+        raise ValueError("MolOP rotational-constant sources disagree")
+    return float(np.max(differences))
 
 
 def _quantity_array(quantity: Any, unit: str) -> npt.NDArray[np.float64]:
@@ -136,19 +170,10 @@ def _scientific_array_export_from_molop_frame(
     if thermal is not None and thermal.get("rotational_constants") is not None:
         frame_constants = _quantity_array(frame_payload["rotation_constants"], "gigahertz")
         thermal_constants = _quantity_array(thermal["rotational_constants"], "gigahertz")
-        if frame_constants.shape != thermal_constants.shape or not np.allclose(
-            frame_constants,
-            thermal_constants,
-            rtol=0.0,
-            # Gaussian prints the thermal duplicate at five decimal places;
-            # allow its half-unit rounding error, including binary float noise.
-            atol=5.5e-6,
-        ):
-            raise ValueError("MolOP rotational-constant sources disagree")
         rotation_metadata = {
             "authority_policy": "prefer-higher-precision-frame-value-v1",
-            "thermal_duplicate_max_abs_difference_ghz": float(
-                np.max(np.abs(frame_constants - thermal_constants))
+            "thermal_duplicate_max_abs_difference_ghz": _rotational_constant_difference(
+                frame_constants, thermal_constants
             ),
             "thermal_duplicate_source_field": "thermal_informations.rotational_constants",
         }

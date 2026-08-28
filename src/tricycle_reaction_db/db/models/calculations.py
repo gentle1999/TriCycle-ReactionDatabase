@@ -536,6 +536,11 @@ class CalculationFrame(SQLModel, table=True):
             "geometry_id",
             postgresql_where=text("optimization_status = 'converged'"),
         ),
+        Index(
+            "ix_calculation_frame_parse_revision_visibility",
+            "parse_revision_id",
+            postgresql_include=("id", "geometry_id"),
+        ),
     )
     __mapper_args__ = {
         "properties": {
@@ -764,6 +769,19 @@ class CalculationFrame(SQLModel, table=True):
     transition_state_endpoints: list["TransitionStateEndpoint"] = Relationship(
         back_populates="calculation_frame", cascade_delete=True, passive_deletes=True
     )
+
+
+class ProjectGeometryCatalog(SQLModel, table=True):
+    """Visible geometry membership and frame cardinality for one project."""
+
+    __tablename__ = "project_geometry_catalog"  # pyright: ignore[reportAssignmentType]
+    __table_args__ = (
+        CheckConstraint("frame_count > 0", name="ck_project_geometry_catalog_frame_count"),
+    )
+
+    project_id: UUID = Field(primary_key=True, nullable=False)
+    geometry_id: UUID = Field(primary_key=True, nullable=False)
+    frame_count: int = Field(sa_type=BigInteger, nullable=False)
 
 
 _scientific_array_data_column: Column[npt.NDArray[np.generic]] = Column(

@@ -3,7 +3,10 @@ import { useQuery } from "@tanstack/vue-query";
 
 import { api } from "@/api";
 import type { CalculationFrameSummary, CurrentUser, Page } from "@/types";
-import type { ReactionQueryFilters } from "@/reactionQuery";
+import type { ArtifactSort } from "@/artifactQuery";
+import type { ReactionQueryFilters, ReactionSort } from "@/reactionQuery";
+
+import { usePaginatedQuery } from "./usePaginatedQuery";
 
 export type CatalogView = "reactions" | "frames" | "artifacts";
 
@@ -13,7 +16,9 @@ interface CatalogQueryOptions {
   user: ComputedRef<CurrentUser | null>;
   reactionOffset: Ref<number>;
   reactionFilters: Ref<ReactionQueryFilters>;
+  reactionSort: Ref<ReactionSort>;
   artifactOffset: Ref<number>;
+  artifactSort: Ref<ArtifactSort>;
   artifactFilterId: ComputedRef<string | null>;
   artifactKindFilter: ComputedRef<string | null>;
   artifactContentShaFilter: ComputedRef<string | null>;
@@ -86,20 +91,32 @@ export function useCatalogQueries(options: CatalogQueryOptions) {
     staleTime: 30_000,
   });
 
-  const reactions = useQuery({
-    queryKey: computed(() => ["catalog", "reactions", {
+  function reactionPageQueryKey(offset: number) {
+    return ["catalog", "reactions", {
       projectId: options.projectId.value,
       reactionFilters: options.reactionFilters.value,
+      sort: options.reactionSort.value,
       limit: 12,
-      offset: options.reactionOffset.value,
-    }]),
-    queryFn: ({ signal }) => api.reactions({
+      offset,
+    }] as const;
+  }
+
+  function fetchReactionPage(offset: number, signal: AbortSignal) {
+    return api.reactions({
       projectId: options.projectId.value ?? undefined,
       ...options.reactionFilters.value,
+      ...options.reactionSort.value,
       limit: 12,
-      offset: options.reactionOffset.value,
-    }, signal),
+      offset,
+    }, signal);
+  }
+
+  const reactions = usePaginatedQuery({
+    queryKey: computed(() => reactionPageQueryKey(options.reactionOffset.value)),
     enabled: computed(() => options.activeView.value === "reactions" && options.projectId.value !== null),
+    offset: options.reactionOffset,
+    fetchPage: fetchReactionPage,
+    queryKeyForOffset: reactionPageQueryKey,
     staleTime: 30_000,
   });
 
@@ -138,31 +155,43 @@ export function useCatalogQueries(options: CatalogQueryOptions) {
     staleTime: 60_000,
   });
 
-  const artifacts = useQuery({
-    queryKey: computed(() => ["catalog", "artifacts", {
+  function artifactPageQueryKey(offset: number) {
+    return ["catalog", "artifacts", {
       artifactId: options.artifactFilterId.value,
       artifactKind: options.artifactKindFilter.value,
       contentSha256: options.artifactContentShaFilter.value,
       originalFilenameContains: options.artifactFilenameFilter.value,
       projectId: options.projectId.value,
       storageStatus: options.artifactStorageStatusFilter.value,
+      sort: options.artifactSort.value,
       limit: 50,
-      offset: options.artifactOffset.value,
-    }]),
-    queryFn: ({ signal }) => api.artifacts({
+      offset,
+    }] as const;
+  }
+
+  function fetchArtifactPage(offset: number, signal: AbortSignal) {
+    return api.artifacts({
       artifactId: options.artifactFilterId.value ?? undefined,
       artifactKind: options.artifactKindFilter.value ?? undefined,
       contentSha256: options.artifactContentShaFilter.value ?? undefined,
       originalFilenameContains: options.artifactFilenameFilter.value ?? undefined,
       projectId: options.projectId.value ?? undefined,
       storageStatus: options.artifactStorageStatusFilter.value ?? undefined,
+      ...options.artifactSort.value,
       limit: 50,
-      offset: options.artifactOffset.value,
-    }, signal),
+      offset,
+    }, signal);
+  }
+
+  const artifacts = usePaginatedQuery({
+    queryKey: computed(() => artifactPageQueryKey(options.artifactOffset.value)),
     enabled: computed(() =>
       options.activeView.value === "artifacts" &&
       (options.user.value === null || options.projectId.value !== null),
     ),
+    offset: options.artifactOffset,
+    fetchPage: fetchArtifactPage,
+    queryKeyForOffset: artifactPageQueryKey,
     staleTime: 30_000,
   });
 

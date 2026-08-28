@@ -3,11 +3,13 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pytest
 from molop import AutoParser, molopconfig
 
 from tricycle_reaction_db.db.types import summarize_numpy_array
 from tricycle_reaction_db.domain.enums import ScientificArrayKind
 from tricycle_reaction_db.ingestion import scientific_array_records_from_molop_frame
+from tricycle_reaction_db.ingestion.molop_arrays import _rotational_constant_difference
 
 
 class _FrameWithPartialThermochemistry:
@@ -38,6 +40,36 @@ def test_partial_thermal_information_without_moments_of_inertia_is_accepted() ->
     records = scientific_array_records_from_molop_frame(_FrameWithPartialThermochemistry())
 
     assert records == []
+
+
+def test_rotational_constant_difference_treats_matching_infinities_as_zero() -> None:
+    frame = np.array([np.inf, 11.0613252, 11.0613198])
+    thermal = np.array([np.inf, 11.06133, 11.06132])
+
+    assert _rotational_constant_difference(frame, thermal) == pytest.approx(4.8e-6)
+
+
+def test_rotational_constant_difference_returns_zero_for_only_matching_infinities() -> None:
+    frame = np.array([np.inf, -np.inf])
+    thermal = np.array([np.inf, -np.inf])
+
+    assert _rotational_constant_difference(frame, thermal) == 0.0
+
+
+def test_rotational_constant_difference_rejects_nan() -> None:
+    frame = np.array([np.nan, 11.0, 10.0])
+    thermal = np.array([np.nan, 11.0, 10.0])
+
+    with pytest.raises(ValueError, match="contain NaN"):
+        _rotational_constant_difference(frame, thermal)
+
+
+def test_rotational_constant_difference_rejects_infinite_mismatch() -> None:
+    frame = np.array([np.inf, 11.0, 10.0])
+    thermal = np.array([-np.inf, 11.0, 10.0])
+
+    with pytest.raises(ValueError, match="sources disagree"):
+        _rotational_constant_difference(frame, thermal)
 
 
 def test_da_bench_exports_every_supported_molop_array(

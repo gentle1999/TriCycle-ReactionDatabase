@@ -7,6 +7,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import and_, or_, select, true
+from sqlalchemy.orm import aliased
 from sqlmodel import col
 
 from tricycle_reaction_db.application.services.authentication import (
@@ -32,6 +33,7 @@ from tricycle_reaction_db.db.models import (
     MappedReactionNodeGeometry,
     MappedReactionParticipant,
     ParseRevision,
+    ProjectGeometryCatalog,
     TransitionStateEndpoint,
     TransitionStateInference,
     WorkflowManifest,
@@ -47,14 +49,33 @@ class QueryVisibilityScope:
     project_ids: frozenset[UUID]
     permission: ProjectPermission = ProjectPermission.ARTIFACT_READ
     unrestricted: bool = False
+    requested_project_id: UUID | None = None
+    requested_project_permitted: bool = False
 
     @property
     def is_authenticated(self) -> bool:
         return self.principal is not None
 
+    @property
+    def uses_project_geometry_catalog(self) -> bool:
+        """Whether the request can use the project-owned geometry directory."""
+
+        return self.requested_project_id is not None and self.requested_project_permitted
+
     def artifact_predicate(self) -> Any:
         if self.unrestricted:
             return true()
+        if self.requested_project_id is not None:
+            requested_project_artifacts = and_(
+                col(ArtifactFile.project_id) == self.requested_project_id,
+                col(ArtifactFile.storage_status) != StorageStatus.RETIRED,
+            )
+            if self.requested_project_permitted:
+                return requested_project_artifacts
+            return and_(
+                requested_project_artifacts,
+                col(ArtifactFile.visibility) == ArtifactVisibility.PUBLIC,
+            )
         return or_(
             and_(
                 col(ArtifactFile.storage_status) != StorageStatus.RETIRED,
@@ -85,13 +106,20 @@ async def query_visibility_scope(
     project_id: UUID | None = None,
 ) -> QueryVisibilityScope:
     principal = current_principal()
-    project_ids = (
-        frozenset({project_id}) if principal is not None and project_id is not None else frozenset()
-    )
+    requested_project_permitted = False
+    if principal is not None and project_id is not None:
+        accessible_project_ids = await AuthorizationService.accessible_project_ids(
+            principal.user_id,
+            permission,
+        )
+        requested_project_permitted = project_id in accessible_project_ids
+    project_ids = frozenset({project_id}) if requested_project_permitted else frozenset()
     return QueryVisibilityScope(
         principal=principal,
         project_ids=project_ids,
         permission=permission,
+        requested_project_id=project_id,
+        requested_project_permitted=requested_project_permitted,
     )
 
 
@@ -117,6 +145,28 @@ def visible_frame_ids(scope: QueryVisibilityScope) -> Any:
     )
 
 
+def calculation_frame_is_visible(scope: QueryVisibilityScope, parse_revision_id: Any) -> Any:
+    """Filter an already-selected calculation frame without rescanning its table."""
+
+    if scope.unrestricted:
+        return true()
+    return parse_revision_id.in_(visible_parse_revision_ids(scope))
+
+
+def visible_geometry_ids(scope: QueryVisibilityScope) -> Any:
+    """Return geometry IDs evidenced by calculation frames visible in the scope."""
+
+    if scope.unrestricted:
+        return select(col(Geometry.id))
+    if scope.uses_project_geometry_catalog:
+        return select(col(ProjectGeometryCatalog.geometry_id)).where(
+            col(ProjectGeometryCatalog.project_id) == scope.requested_project_id
+        )
+    return select(col(CalculationFrame.geometry_id)).where(
+        calculation_frame_is_visible(scope, col(CalculationFrame.parse_revision_id))
+    )
+
+
 def artifact_id_is_visible(scope: QueryVisibilityScope, artifact_id: Any) -> Any:
     if scope.unrestricted:
         return true()
@@ -138,11 +188,7 @@ def frame_id_is_visible(scope: QueryVisibilityScope, frame_id: Any) -> Any:
 def geometry_id_is_visible(scope: QueryVisibilityScope, geometry_id: Any) -> Any:
     if scope.unrestricted:
         return true()
-    return geometry_id.in_(
-        select(col(CalculationFrame.geometry_id)).where(
-            col(CalculationFrame.id).in_(visible_frame_ids(scope))
-        )
-    )
+    return geometry_id.in_(visible_geometry_ids(scope))
 
 
 def topology_derivation_id_is_visible(scope: QueryVisibilityScope, derivation_id: Any) -> Any:
@@ -183,7 +229,7 @@ def topology_id_is_visible(scope: QueryVisibilityScope, topology_id: Any) -> Any
     )
 
 
-def _mapped_reaction_ids_with_calculations(frame_ids: Any) -> Any:
+def _mapped_reaction_ids_with_calculations(geometry_ids: Any) -> Any:
     return (
         select(col(MappedReactionNode.mapped_reaction_id))
         .join(
@@ -191,11 +237,7 @@ def _mapped_reaction_ids_with_calculations(frame_ids: Any) -> Any:
             col(MappedReactionNodeGeometry.mapped_reaction_node_id) == col(MappedReactionNode.id),
         )
         .where(
-            col(MappedReactionNodeGeometry.geometry_id).in_(
-                select(col(CalculationFrame.geometry_id)).where(
-                    col(CalculationFrame.id).in_(frame_ids)
-                )
-            ),
+            col(MappedReactionNodeGeometry.geometry_id).in_(geometry_ids),
             geometry_has_thermodynamic_property_predicate(
                 col(MappedReactionNodeGeometry.geometry_id)
             ),
@@ -210,12 +252,35 @@ def _mapped_reaction_ids_with_inferences(revision_ids: Any) -> Any:
     )
 
 
+def _mapped_reaction_id_has_any_source(mapped_reaction_id: Any) -> Any:
+    """Check source existence for one reaction without building a global ID set."""
+
+    node = aliased(MappedReactionNode)
+    node_geometry = aliased(MappedReactionNodeGeometry)
+    inference = aliased(TransitionStateInference)
+    calculation_source = (
+        select(col(node.id))
+        .join(node_geometry, col(node_geometry.mapped_reaction_node_id) == col(node.id))
+        .where(
+            col(node.mapped_reaction_id) == mapped_reaction_id,
+            geometry_has_thermodynamic_property_predicate(col(node_geometry.geometry_id)),
+        )
+        .exists()
+    )
+    inference_source = (
+        select(col(inference.id))
+        .where(col(inference.mapped_reaction_id) == mapped_reaction_id)
+        .exists()
+    )
+    return or_(calculation_source, inference_source)
+
+
 def _mapped_reaction_id_has_visible_source(
     scope: QueryVisibilityScope,
     mapped_reaction_id: Any,
 ) -> Any:
     return or_(
-        mapped_reaction_id.in_(_mapped_reaction_ids_with_calculations(visible_frame_ids(scope))),
+        mapped_reaction_id.in_(_mapped_reaction_ids_with_calculations(visible_geometry_ids(scope))),
         mapped_reaction_id.in_(
             _mapped_reaction_ids_with_inferences(visible_parse_revision_ids(scope))
         ),
@@ -229,12 +294,7 @@ def mapped_reaction_id_is_visible(scope: QueryVisibilityScope, mapped_reaction_i
     if not scope.is_authenticated:
         return visible_source
 
-    any_source = or_(
-        mapped_reaction_id.in_(
-            _mapped_reaction_ids_with_calculations(select(col(CalculationFrame.id)))
-        ),
-        mapped_reaction_id.in_(_mapped_reaction_ids_with_inferences(select(col(ParseRevision.id)))),
-    )
+    any_source = _mapped_reaction_id_has_any_source(mapped_reaction_id)
     return or_(visible_source, and_(mapped_reaction_id.is_not(None), ~any_source))
 
 
@@ -295,6 +355,7 @@ def calculation_protocol_id_is_visible(scope: QueryVisibilityScope, protocol_id:
 __all__ = [
     "QueryVisibilityScope",
     "artifact_id_is_visible",
+    "calculation_frame_is_visible",
     "calculation_protocol_id_is_visible",
     "calculation_segment_id_is_visible",
     "frame_id_is_visible",
@@ -308,6 +369,7 @@ __all__ = [
     "topology_id_is_visible",
     "visible_artifact_ids",
     "visible_frame_ids",
+    "visible_geometry_ids",
     "visible_parse_revision_ids",
     "workflow_manifest_id_is_visible",
 ]

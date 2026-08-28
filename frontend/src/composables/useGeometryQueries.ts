@@ -2,12 +2,38 @@ import { computed, type Ref } from "vue";
 import { useQuery } from "@tanstack/vue-query";
 
 import { api } from "@/api";
-import type { GeometryQueryFilters } from "@/geometryQuery";
+import type { GeometryQueryFilters, GeometrySort } from "@/geometryQuery";
+
+import { usePaginatedQuery } from "./usePaginatedQuery";
+
+const GEOMETRY_PAGE_SIZE = 50;
+
+function geometryPageQueryKey(filters: GeometryQueryFilters, sort: GeometrySort, offset: number) {
+  return ["geometries", { filters, sort, offset, limit: GEOMETRY_PAGE_SIZE }] as const;
+}
+
+function fetchGeometryPage(
+  filters: GeometryQueryFilters,
+  sort: GeometrySort,
+  offset: number,
+  signal?: AbortSignal,
+) {
+  return api.geometries(
+    {
+      ...filters,
+      ...sort,
+      limit: GEOMETRY_PAGE_SIZE,
+      offset,
+    },
+    signal,
+  );
+}
 
 export function useGeometryQueries(
   projectId: Ref<string | null>,
   geometryId: Ref<string | null>,
   offset: Ref<number>,
+  sort: Ref<GeometrySort>,
   topologySmiles: Ref<string> = computed(() => ""),
   advancedFilters: Ref<GeometryQueryFilters | null> = computed(() => null),
   thermodynamicOnly: Ref<boolean> = computed(() => true),
@@ -23,20 +49,16 @@ export function useGeometryQueries(
       thermodynamicOnly: thermodynamicOnly.value,
     };
   });
-  const list = useQuery({
-    queryKey: computed(() => ["geometries", { filters: activeFilters.value, offset: offset.value, limit: 50 }]),
-    queryFn: ({ signal }) =>
-      api.geometries(
-        {
-          ...activeFilters.value,
-          limit: 50,
-          offset: offset.value,
-        },
-        signal,
-      ),
+  const list = usePaginatedQuery({
+    queryKey: computed(() => geometryPageQueryKey(activeFilters.value, sort.value, offset.value)),
     enabled: computed(() => projectId.value !== null),
+    offset,
+    fetchPage: (pageOffset, signal) =>
+      fetchGeometryPage(activeFilters.value, sort.value, pageOffset, signal),
+    queryKeyForOffset: (pageOffset) => geometryPageQueryKey(activeFilters.value, sort.value, pageOffset),
     staleTime: 30_000,
   });
+
   const detail = useQuery({
     queryKey: computed(() => ["geometry", { projectId: projectId.value, geometryId: geometryId.value }]),
     queryFn: ({ signal }) =>

@@ -120,17 +120,19 @@ class MolecularTopologySearchQuery(BaseModel):
     @field_validator("exact_smiles")
     @classmethod
     def normalize_exact_smiles(cls, value: str | None) -> str | None:
-        """Match the canonical display identity used by topology normalization."""
+        """Match the explicit-H display identity used by topology normalization."""
 
         if value is None:
             return None
         molecule = Chem.MolFromSmiles(value)
         if molecule is None:
             raise ValueError("exact_smiles must be a valid SMILES string")
+        explicit = Chem.AddHs(Chem.Mol(molecule))
         return Chem.MolToSmiles(
-            Chem.RemoveHs(Chem.Mol(molecule)),
+            explicit,
             canonical=True,
             isomericSmiles=True,
+            allHsExplicit=True,
         )
 
     @field_validator("mol_block")
@@ -152,10 +154,12 @@ class MolecularTopologySearchQuery(BaseModel):
         molecule = Chem.MolFromSmiles(value)
         if molecule is None:
             raise ValueError("similarity_smiles must be a valid SMILES string")
+        explicit = Chem.AddHs(Chem.Mol(molecule))
         return Chem.MolToSmiles(
-            Chem.RemoveHs(Chem.Mol(molecule)),
+            explicit,
             canonical=True,
             isomericSmiles=True,
+            allHsExplicit=True,
         )
 
     @field_validator("scaffold_smiles")
@@ -313,6 +317,8 @@ class GeometryRecord(BaseModel):
     internal_coordinate_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     geometry_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     canonicalization_version: str
+    charge: int = 0
+    multiplicity: int = Field(default=1, gt=0)
 
     @property
     def atom_count(self) -> int:
@@ -373,6 +379,10 @@ class NormalizedMoleculeRecord(BaseModel):
         atom_count = self.geometry.mol.GetNumAtoms()
         if not (self.formula.atom_count == self.topology.atom_count == atom_count):
             raise ValueError("Formula, Topology, and Geometry atom counts must match")
+        if self.geometry.charge != self.charge:
+            raise ValueError("Geometry charge does not match calculation charge")
+        if self.geometry.multiplicity != self.multiplicity:
+            raise ValueError("Geometry multiplicity does not match calculation multiplicity")
         observed = np.asarray(self.observed_coordinates)
         if observed.shape != (atom_count, 3):
             raise ValueError("observed_coordinates must have shape (atom_count, 3)")

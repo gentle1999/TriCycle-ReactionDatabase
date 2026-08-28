@@ -6,6 +6,7 @@ from tricycle_reaction_db.api.app import create_app
 from tricycle_reaction_db.application.services.depictions import (
     draw_geometry_dof_svg,
     draw_geometry_sdf,
+    draw_geometry_xyz,
     draw_molecule_molfile,
     draw_molecule_svg,
 )
@@ -69,6 +70,39 @@ def test_geometry_sdf_preserves_stored_three_dimensional_conformer() -> None:
     assert molecule.GetConformer().GetPositions() == pytest.approx(expected_positions)
 
 
+def test_geometry_xyz_preserves_stored_three_dimensional_conformer() -> None:
+    molecule = Chem.AddHs(Chem.MolFromSmiles("CO"))
+    conformer = Chem.Conformer(molecule.GetNumAtoms())
+    conformer.Set3D(True)
+    for atom_index in range(molecule.GetNumAtoms()):
+        conformer.SetAtomPosition(
+            atom_index,
+            (float(atom_index), float(atom_index % 2), float(atom_index) / 3.0),
+        )
+    molecule.AddConformer(conformer)
+    expected_positions = molecule.GetConformer().GetPositions().copy()
+
+    xyz = draw_geometry_xyz(molecule, charge=-1, multiplicity=2)
+    lines = xyz.splitlines()
+    rendered_coordinates = [
+        (fields[0], tuple(float(value) for value in fields[1:]))
+        for fields in (line.split() for line in lines[2:])
+    ]
+
+    assert lines[0] == str(molecule.GetNumAtoms())
+    assert lines[1] == (
+        "Geometry conformer; canonical topology atom order; coordinates in angstrom; "
+        "total_charge=-1; spin_multiplicity=2; total_spin_S=0.5"
+    )
+    assert [element for element, _ in rendered_coordinates] == [
+        atom.GetSymbol() for atom in molecule.GetAtoms()
+    ]
+    assert [coordinates for _, coordinates in rendered_coordinates] == pytest.approx(
+        expected_positions
+    )
+    assert molecule.GetConformer().GetPositions() == pytest.approx(expected_positions)
+
+
 def test_geometry_dof_svg_uses_stored_depth_without_mutating_molecule() -> None:
     molecule = Chem.AddHs(Chem.MolFromSmiles("CO"))
     conformer = Chem.Conformer(molecule.GetNumAtoms())
@@ -114,6 +148,7 @@ def test_combined_app_exposes_core_rest_routes() -> None:
     assert "/api/mapped-reactions/thermodynamics/export.csv" in paths
     assert "/api/calculation-frames" in paths
     assert "/api/depictions/geometry/{geometry_id}.sdf" in paths
+    assert "/api/depictions/geometry/{geometry_id}.xyz" in paths
     assert "/api/depictions/geometry/{geometry_id}.svg" in paths
     assert "/api/artifacts" in paths
     assert "/api/artifacts/batch" in paths

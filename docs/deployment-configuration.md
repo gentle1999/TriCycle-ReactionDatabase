@@ -352,7 +352,13 @@ TRICYCLE_RATE_LIMIT_BACKEND=redis
 TRICYCLE_RATE_LIMIT_REDIS_URL=rediss://:<redis-password>@redis-rw.internal.example:6380/0?ssl_ca_certs=/etc/reaction-database/ca/internal-ca.pem
 TRICYCLE_RATE_LIMIT_KEY_PREFIX=reaction-database
 
+# Limit native OpenMP/BLAS pools inside each file worker. Concurrent file
+# workers remain controlled separately by TRICYCLE_MOLOP_BATCH_N_JOBS.
+OMP_NUM_THREADS=1
+OPENBLAS_NUM_THREADS=1
+MKL_NUM_THREADS=1
 TRICYCLE_MOLOP_BATCH_N_JOBS=2
+TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS=60
 ~~~
 
 Voyager 使用 NexusX 6.1.2 的 `ComposedErManager` member cluster/color。当前所有数据库实体
@@ -659,7 +665,7 @@ VITE_API_PROXY_TARGET 控制，生产不应把开发端口暴露给浏览器。
 ~~~
 
 SPA 必须启用 history fallback 到 index.html。上传请求的代理 body 限制不能小于
-TRICYCLE_MAX_BATCH_BYTES，当前默认批次总大小为 256 MiB；单文件默认 64 MiB。
+TRICYCLE_MAX_BATCH_BYTES，当前默认批次总大小为 512 MiB；单文件默认 64 MiB。
 
 可以从 infra/caddy/Caddyfile 开始配置。当前示例已经显式代理 `/health/live`、
 `/health/ready`、`/docs`、`/docs/oauth2-redirect`、`/redoc`、`/openapi.json`、GraphQL
@@ -689,7 +695,9 @@ API 默认只监听 127.0.0.1:8000，由反向代理对外提供 HTTPS。`infra/
 的单进程 API service；生产通过多个 API 主机和 Caddy upstream 横向扩容。当前 Prometheus
 指标是进程内状态，不应在同一个监听端口启动 Uvicorn 多 worker，否则抓取请求只会随机命中
 其中一个 worker。若未来引入 Prometheus multiprocess 聚合，同机多 worker 仍必须按
-“Uvicorn worker 数 × TRICYCLE_MOLOP_BATCH_N_JOBS”评估 MolOP 解析进程的 CPU 和内存；
+先用 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS` 和 `MKL_NUM_THREADS` 限制每个 MolOP
+进程内部的原生线程池，再用“Uvicorn worker 数 × `TRICYCLE_MOLOP_BATCH_N_JOBS`”评估
+MolOP 解析进程的 CPU 和内存；
 MolOP 解析并发由解析进程池 worker 数控制；请求不会再经过额外的 slot 闸门。
 生产不得设置 `TRICYCLE_MOLOP_BATCH_N_JOBS=-1`。
 

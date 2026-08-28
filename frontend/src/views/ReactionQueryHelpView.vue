@@ -62,6 +62,7 @@ import { RouterLink } from "vue-router";
             <tr><th><code>rxn_smarts</code> / <code>reaction_smarts</code></th><td>完整 RXN SMARTS</td><td>同时约束反应物、试剂（若有）和产物。</td></tr>
             <tr><th><code>reactant_mol_block</code> / <code>product_mol_block</code></th><td>绘图编辑器或 MOL Block</td><td>先解析为分子，再转换为结构查询；它不是 SMARTS 通配查询。</td></tr>
             <tr><th><code>smarts</code></th><td>分子 SMARTS</td><td>在前体侧或后体侧任一侧命中。</td></tr>
+            <tr><th><code>reactant_product_changed</code></th><td>布尔值 <code>true</code> / <code>false</code></td><td>按前体和后体的标准分子拓扑（含顺序标准化）比较多重集合；化学计量系数也参与比较。</td></tr>
             <tr><th>元数据和能量</th><td>ID、名称、反应类型、自由能、创建时间</td><td>精确、范围或时间边界条件，按字段名称的“最低/最高”含义比较。</td></tr>
           </tbody>
         </table>

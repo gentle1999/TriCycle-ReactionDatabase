@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
+from contextlib import nullcontext, suppress
+from copy import copy
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
@@ -78,6 +81,8 @@ from tricycle_reaction_db.ingestion import (
     segment_record_from_molop,
 )
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True, slots=True)
 class PersistedMolOPArtifact:
@@ -85,6 +90,56 @@ class PersistedMolOPArtifact:
     frames_by_file_index: dict[int, CalculationFrame]
     frame_count: int
     array_counts: dict[str, int]
+    failed_frame_count: int = 0
+    parse_diagnostics: tuple[dict[str, Any], ...] = ()
+    parse_completeness: ParseCompleteness = ParseCompleteness.COMPLETE
+
+
+_GEOMETRY_CONTEXT_FIELDS = (
+    "topologies",
+    "formulas_by_hash",
+    "topologies_by_identity",
+    "topology_derivations_by_key",
+    "geometries_by_hash",
+    "exact_geometry_keys_loaded",
+    "equivalent_geometry_by_key",
+    "equivalent_geometry_candidates",
+    "equivalent_geometry_keys_loaded",
+    "geometries_to_reconcile",
+    "reaction_participants_by_topology",
+    "mapped_reactions_by_id",
+)
+
+
+def _snapshot_geometry_context(context: GeometryPersistenceContext) -> dict[str, Any]:
+    return {field: copy(getattr(context, field)) for field in _GEOMETRY_CONTEXT_FIELDS}
+
+
+def _restore_geometry_context(
+    context: GeometryPersistenceContext,
+    snapshot: dict[str, Any],
+) -> None:
+    for field, value in snapshot.items():
+        current = getattr(context, field)
+        current.clear()
+        current.update(value)
+
+
+def _frame_failure_diagnostic(
+    *,
+    file_frame_index: int | None,
+    segment_index: int,
+    error: Exception,
+    stage: str,
+) -> dict[str, Any]:
+    return {
+        "code": "frame_persistence_failed" if stage == "persistence" else "frame_parse_failed",
+        "stage": stage,
+        "segment_index": segment_index,
+        "file_frame_index": file_frame_index,
+        "error_type": type(error).__name__,
+        "message": str(error) or type(error).__name__,
+    }
 
 
 def _json_sha256(value: object) -> str:
@@ -298,6 +353,7 @@ def persist_molop_calculation_artifact(
     geometry_context: GeometryPersistenceContext | None = None,
     preload_geometry_context: bool = True,
     defer_reconciliation: bool = False,
+    parse_diagnostics: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
 ) -> PersistedMolOPArtifact:
     """Persist every parsed segment, frame, graph, coordinate, scalar, and array."""
 
@@ -312,10 +368,37 @@ def persist_molop_calculation_artifact(
             and chem_file.artifact_size_bytes != artifact.size_bytes
         ):
             raise ValueError("MolOP source byte size does not match the stored ArtifactFile")
-    frame_records = records or [
-        frame_records_from_molop(frame, export_schema_version=chem_file.schema_version)
-        for frame in chem_file
-    ]
+    diagnostics: list[dict[str, Any]] = list(parse_diagnostics or ())
+    if records is None:
+        frame_records: list[MolOPFrameRecords] = []
+        for fallback_index, frame in enumerate(chem_file):
+            try:
+                frame_records.append(
+                    frame_records_from_molop(
+                        frame,
+                        export_schema_version=chem_file.schema_version,
+                        fallback_index=fallback_index,
+                    )
+                )
+            except Exception as error:
+                diagnostics.append(
+                    _frame_failure_diagnostic(
+                        file_frame_index=int(
+                            getattr(frame, "file_frame_index", fallback_index)
+                            or fallback_index
+                        ),
+                        segment_index=int(getattr(frame, "segment_index", 0) or 0),
+                        error=error,
+                        stage="conversion",
+                    )
+                )
+    else:
+        frame_records = list(records)
+    failed_frame_count = sum(
+        item.get("code")
+        in {"frame_parse_failed", "frame_persistence_failed", "ts_inference_failed"}
+        for item in diagnostics
+    )
     # Parallel frame persistence here means batched, revision-local writes in
     # one transaction. A shared SQLAlchemy Session cannot be forked safely;
     # client-side IDs and deferred flushes provide multi-row batching without
@@ -336,8 +419,13 @@ def persist_molop_calculation_artifact(
                 chem_file,
                 started_at=started_at,
                 source_compression=source_compression,
-                artifact_sha256=artifact.content_sha256,
-                artifact_size_bytes=artifact.size_bytes,
+                # MolOP's source spans and identity describe the decoded
+                # stream for compressed uploads.  Only uncompressed inputs
+                # can use ArtifactFile's byte identity directly.
+                artifact_sha256=(
+                    artifact.content_sha256 if source_compression is None else None
+                ),
+                artifact_size_bytes=(artifact.size_bytes if source_compression is None else None),
             ),
             force_new_revision=force_new_revision,
         )
@@ -345,14 +433,41 @@ def persist_molop_calculation_artifact(
         array_counts: dict[str, int] = {}
         active_geometry_context = geometry_context or GeometryPersistenceContext()
         if preload_geometry_context:
-            preload_molecular_geometry_context(
-                session,
-                [
-                    (record.molecule, record.frame.coordinate_decimal_places)
-                    for record in frame_records
-                ],
-                context=active_geometry_context,
-            )
+            preload_snapshot = _snapshot_geometry_context(active_geometry_context)
+            pending_snapshot = list(session.info.get("_fast_pending_entities", ()))
+            try:
+                preload_scope = (
+                    nullcontext() if effective_fast_insert else session.begin_nested()
+                )
+                with preload_scope:
+                    preload_molecular_geometry_context(
+                        session,
+                        [
+                            (record.molecule, record.frame.coordinate_decimal_places)
+                            for record in frame_records
+                        ],
+                        context=active_geometry_context,
+                    )
+            except Exception as error:
+                # A malformed frame must not prevent the remaining frames from
+                # using the regular per-frame persistence path.  Roll back
+                # only the preload savepoint and discard its cache additions.
+                _restore_geometry_context(active_geometry_context, preload_snapshot)
+                if effective_fast_insert:
+                    session.info["_fast_pending_entities"] = pending_snapshot
+                diagnostics.append(
+                    {
+                        "code": "geometry_preload_failed",
+                        "stage": "preload",
+                        "error_type": type(error).__name__,
+                        "message": str(error) or type(error).__name__,
+                    }
+                )
+                logger.warning(
+                    "geometry preload failed; falling back to per-frame writes",
+                    exc_info=True,
+                )
+                preload_geometry_context = False
         records_by_segment: dict[int, list[MolOPFrameRecords]] = {}
         for record in frame_records:
             records_by_segment.setdefault(record.segment_index, []).append(record)
@@ -362,6 +477,7 @@ def persist_molop_calculation_artifact(
             # Keep the relational segment required by the schema, but leave all
             # source-location fields NULL rather than manufacturing offsets.
             source_segments = (None,)
+        persisted_segments = []
         for source_segment in source_segments:
             protocol_record = (
                 protocol_record_from_molop_segment(source_segment)
@@ -373,88 +489,186 @@ def persist_molop_calculation_artifact(
                 if protocol_record is not None
                 else None
             )
+            segment_record = (
+                segment_record_from_molop(source_segment)
+                if source_segment is not None
+                else CalculationSegmentRecord(
+                    segment_index=0,
+                    source_frame_count=len(chem_file),
+                    parse_completeness=(
+                        ParseCompleteness.PARTIAL
+                        if diagnostics or len(frame_records) != len(chem_file)
+                        else ParseCompleteness.NOT_ASSESSED
+                    ),
+                    parse_diagnostics=list(diagnostics),
+                    program_metadata={"source_evidence_captured": False},
+                )
+            )
             segment = persist_calculation_segment(
                 session,
                 revision,
                 protocol,
-                (
-                    segment_record_from_molop(source_segment)
-                    if source_segment is not None
-                    else CalculationSegmentRecord(
-                        segment_index=0,
-                        source_frame_count=len(frame_records),
-                        parse_completeness=ParseCompleteness.NOT_ASSESSED,
-                        program_metadata={"source_evidence_captured": False},
-                    )
-                ),
+                segment_record,
             )
+            persisted_segments.append(segment)
             segment_frames = records_by_segment.get(
                 source_segment.segment_index if source_segment is not None else 0,
                 [],
             )
+            segment_diagnostics = list(segment_record.parse_diagnostics)
+            captured_indices = set(
+                segment_record.program_metadata.get("molop_captured_frame_indices", ())
+            )
+            segment_diagnostics.extend(
+                diagnostic
+                for diagnostic in diagnostics
+                if diagnostic.get("file_frame_index") in captured_indices
+                and diagnostic not in segment_diagnostics
+            )
+            segment_failed = any(
+                record.frame.parse_completeness is ParseCompleteness.PARTIAL
+                for record in segment_frames
+            )
+            if segment_failed:
+                frame_diagnostics = [
+                    diagnostic
+                    for record in segment_frames
+                    for diagnostic in record.frame.parse_diagnostics
+                ]
+                segment_diagnostics.extend(frame_diagnostics)
+                diagnostics.extend(frame_diagnostics)
             for record in segment_frames:
                 file_frame_index = record.frame.file_frame_index
-                if file_frame_index is None or record.frame.frame_index is None:
-                    raise ValueError("MolOP frame is missing stable source indices")
-                molecule = persist_molecular_geometry(
-                    session,
-                    record.molecule,
-                    coordinate_decimal_places=record.frame.coordinate_decimal_places,
-                    context=active_geometry_context,
-                )
-                frame_record = record.frame
-                if (
-                    molecule.geometry_assignment_kind
-                    is GeometryAssignmentKind.MATCHED_EXISTING_GEOMETRY
-                ):
-                    frame_record = frame_record.model_copy(
-                        update={
-                            "geometry_assignment_kind": (
-                                GeometryAssignmentKind.MATCHED_EXISTING_GEOMETRY
-                            ),
-                            "observed_coordinate_hash": record.molecule.observed_coordinate_hash,
-                            "observed_to_geometry_atom_indices": (
-                                molecule.observed_to_geometry_atom_indices
-                            ),
-                            "observed_to_geometry_transform": list(
-                                molecule.observed_to_geometry_transform
-                            ),
-                            "geometry_assignment_rmsd_angstrom": molecule.coordinate_rmsd_angstrom,
-                            "geometry_assignment_max_abs_angstrom": (
-                                molecule.coordinate_max_abs_angstrom
-                            ),
-                            "geometry_assignment_policy_version": (
-                                "geometry-internal-coordinate-match-v3"
-                            ),
-                        }
+                frame_snapshot = _snapshot_geometry_context(active_geometry_context)
+                pending_snapshot = list(session.info.get("_fast_pending_entities", ()))
+                array_counts_snapshot = dict(array_counts)
+                persisted_frame: CalculationFrame | None = None
+                try:
+                    # Fast ingestion defers all INSERTs to the batch flush;
+                    # opening a savepoint would force SQLAlchemy to flush
+                    # revision-local rows before their deferred Geometry
+                    # parents.  Its pending queue is therefore the frame
+                    # isolation boundary.  The regular path uses a real
+                    # savepoint because each child is flushed immediately.
+                    frame_scope = (
+                        nullcontext() if effective_fast_insert else session.begin_nested()
                     )
-                frame = persist_calculation_frame(
-                    session,
-                    segment,
-                    molecule.geometry,
-                    molecule.topology_derivation,
-                    frame_record,
-                    reconcile=False,
-                )
-                frames_by_file_index[file_frame_index] = frame
-                if record.energy is not None:
-                    energy = persist_frame_energy_result(session, frame, record.energy)
-                    for observation in record.energy_observations:
-                        persist_energy_observation(session, energy, observation)
-                if record.optimization is not None:
-                    persist_geometry_optimization_result(session, frame, record.optimization)
-                if record.vibration is not None:
-                    persist_vibration_result(session, frame, record.vibration)
-                if record.status is not None:
-                    persist_calculation_status_result(session, frame, record.status)
-                _persist_extended_results(session, frame, record, array_counts)
-                if record.thermochemistry is not None:
-                    persist_thermochemistry_result(
-                        session,
-                        frame,
-                        record.thermochemistry,
-                        reconcile=False,
+                    with frame_scope:
+                        if file_frame_index is None or record.frame.frame_index is None:
+                            raise ValueError("MolOP frame is missing stable source indices")
+                        molecule = persist_molecular_geometry(
+                            session,
+                            record.molecule,
+                            coordinate_decimal_places=record.frame.coordinate_decimal_places,
+                            context=active_geometry_context,
+                        )
+                        frame_record = record.frame
+                        if (
+                            molecule.geometry_assignment_kind
+                            is GeometryAssignmentKind.MATCHED_EXISTING_GEOMETRY
+                        ):
+                            frame_record = frame_record.model_copy(
+                                update={
+                                    "geometry_assignment_kind": (
+                                        GeometryAssignmentKind.MATCHED_EXISTING_GEOMETRY
+                                    ),
+                                    "observed_coordinate_hash": (
+                                        record.molecule.observed_coordinate_hash
+                                    ),
+                                    "observed_to_geometry_atom_indices": (
+                                        molecule.observed_to_geometry_atom_indices
+                                    ),
+                                    "observed_to_geometry_transform": list(
+                                        molecule.observed_to_geometry_transform
+                                    ),
+                                    "geometry_assignment_rmsd_angstrom": (
+                                        molecule.coordinate_rmsd_angstrom
+                                    ),
+                                    "geometry_assignment_max_abs_angstrom": (
+                                        molecule.coordinate_max_abs_angstrom
+                                    ),
+                                    "geometry_assignment_policy_version": (
+                                        "geometry-internal-coordinate-match-v3"
+                                    ),
+                                }
+                            )
+                        persisted_frame = persist_calculation_frame(
+                            session,
+                            segment,
+                            molecule.geometry,
+                            molecule.topology_derivation,
+                            frame_record,
+                            reconcile=False,
+                        )
+                        frames_by_file_index[file_frame_index] = persisted_frame
+                        if record.energy is not None:
+                            energy = persist_frame_energy_result(
+                                session, persisted_frame, record.energy
+                            )
+                            for observation in record.energy_observations:
+                                persist_energy_observation(session, energy, observation)
+                        if record.optimization is not None:
+                            persist_geometry_optimization_result(
+                                session, persisted_frame, record.optimization
+                            )
+                        if record.vibration is not None:
+                            persist_vibration_result(session, persisted_frame, record.vibration)
+                        if record.status is not None:
+                            persist_calculation_status_result(
+                                session, persisted_frame, record.status
+                            )
+                        _persist_extended_results(session, persisted_frame, record, array_counts)
+                        if record.thermochemistry is not None:
+                            persist_thermochemistry_result(
+                                session,
+                                persisted_frame,
+                                record.thermochemistry,
+                                reconcile=False,
+                            )
+                except Exception as error:
+                    segment_failed = True
+                    failed_frame_count += 1
+                    frames_by_file_index.pop(file_frame_index, None)
+                    if persisted_frame is not None:
+                        segment_frames_collection = segment.__dict__.get("frames")
+                        if isinstance(segment_frames_collection, list):
+                            with suppress(ValueError):
+                                segment_frames_collection.remove(persisted_frame)
+                    _restore_geometry_context(active_geometry_context, frame_snapshot)
+                    if effective_fast_insert:
+                        session.info["_fast_pending_entities"] = pending_snapshot
+                    array_counts.clear()
+                    array_counts.update(array_counts_snapshot)
+                    diagnostic = _frame_failure_diagnostic(
+                        file_frame_index=file_frame_index,
+                        segment_index=segment.segment_index,
+                        error=error,
+                        stage="persistence",
                     )
+                    diagnostics.append(diagnostic)
+                    segment_diagnostics.append(diagnostic)
+                    logger.warning(
+                        "skipping failed calculation frame %s in segment %s",
+                        file_frame_index,
+                        segment.segment_index,
+                        exc_info=True,
+                    )
+            if (
+                segment_failed
+                or (
+                    segment_record.source_frame_count is not None
+                    and len(segment_frames) != segment_record.source_frame_count
+                )
+            ):
+                segment.parse_completeness = ParseCompleteness.PARTIAL
+                segment.parse_diagnostics = segment_diagnostics
+                session.add(segment)
+            elif segment.parse_completeness is ParseCompleteness.PARTIAL:
+                segment.parse_diagnostics = segment_diagnostics
+                session.add(segment)
+
+        if not frames_by_file_index:
+            raise ValueError("no calculation frames could be persisted from the source")
 
         # Batch ingestion can keep revision-local rows pending across files.
         # The shared context owns their identities, and the final reconciliation
@@ -465,6 +679,18 @@ def persist_molop_calculation_artifact(
             session.flush()
         if not defer_reconciliation:
             reconcile_molop_geometry_context(session, active_geometry_context)
+
+        partial_parse = bool(diagnostics) or any(
+            segment.parse_completeness is ParseCompleteness.PARTIAL
+            for segment in persisted_segments
+        ) or any(
+            record.frame.parse_completeness is ParseCompleteness.PARTIAL
+            for record in frame_records
+        )
+        if partial_parse:
+            revision.parse_completeness = ParseCompleteness.PARTIAL
+            revision.parse_diagnostics = [*revision.parse_diagnostics, *diagnostics]
+            session.add(revision)
 
         finalize_parse_revision(
             session,
@@ -482,8 +708,13 @@ def persist_molop_calculation_artifact(
         return PersistedMolOPArtifact(
             parse_revision=revision,
             frames_by_file_index=frames_by_file_index,
-            frame_count=len(frame_records),
+            frame_count=len(frames_by_file_index),
             array_counts=array_counts,
+            failed_frame_count=failed_frame_count,
+            parse_diagnostics=tuple(diagnostics),
+            parse_completeness=(
+                ParseCompleteness.PARTIAL if partial_parse else ParseCompleteness.COMPLETE
+            ),
         )
     finally:
         session.autoflush = previous_autoflush

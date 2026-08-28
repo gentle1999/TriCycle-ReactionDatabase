@@ -8,8 +8,10 @@ import json
 import mimetypes
 import os
 import sys
+from collections import deque
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 from pathlib import Path
@@ -22,6 +24,7 @@ from sqlalchemy import event
 from tricycle_reaction_db.application.services.artifact_uploads import (
     ArtifactUploadPayload,
     ArtifactUploadService,
+    close_molop_process_pool,
 )
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.session import engine
@@ -29,6 +32,12 @@ from tricycle_reaction_db.domain.enums import ArtifactKind
 
 HASH_CHUNK_BYTES = 1024 * 1024
 MAX_FINGERPRINT_WORKERS = 32
+# The service still enforces its configured upload limits, but local imports
+# should commit frequently enough that a slow or interrupted run has a small
+# recovery window. The queue is deliberately larger than one commit window so
+# parsing can stay ahead of persistence without retaining the whole import.
+IMPORT_COMMIT_BATCH_FILES = 16
+IMPORT_STREAM_QUEUE_SIZE = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,40 +327,46 @@ async def import_files(
     state: ImportState,
     dry_run: bool,
     fingerprint_workers: int | None = None,
+    commit_batch_files: int = IMPORT_COMMIT_BATCH_FILES,
+    stream_queue_size: int = IMPORT_STREAM_QUEUE_SIZE,
     metrics: ImportMetrics | None = None,
 ) -> ImportSummary:
     metrics = metrics or ImportMetrics()
     settings = get_settings()
+    if commit_batch_files < 1:
+        raise ValueError("commit_batch_files must be positive")
+    if stream_queue_size < 1:
+        raise ValueError("stream_queue_size must be positive")
     summary = ImportSummary(scanned=len(candidates))
     workers = fingerprint_workers or min(MAX_FINGERPRINT_WORKERS, max(4, os.cpu_count() or 4))
     if workers < 1:
         raise ValueError("fingerprint_workers must be positive")
-    step_started = perf_counter()
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        fingerprints = dict(
-            zip(
-                candidates,
-                executor.map(file_fingerprint, (candidate.path for candidate in candidates)),
-                strict=True,
-            )
-        )
-    metrics.add_step_timing("fingerprint", (perf_counter() - step_started) * 1000)
-    step_started = perf_counter()
-    pending: list[tuple[ImportCandidate, ImportFingerprint]] = []
-    for candidate in candidates:
-        fingerprint = fingerprints[candidate]
-        if state.path is not None and state.terminal(
-            candidate.path,
-            project_id=project_id,
-            artifact_kind=artifact_kind,
-            fingerprint=fingerprint,
-        ):
-            summary = summary.add(ImportSummary(skipped=1))
-            continue
-        pending.append((candidate, fingerprint))
-    metrics.add_step_timing("state_filter", (perf_counter() - step_started) * 1000)
-
+    fingerprints: dict[ImportCandidate, ImportFingerprint] = {}
     if dry_run:
+        step_started = perf_counter()
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            fingerprints.update(
+                zip(
+                    candidates,
+                    executor.map(file_fingerprint, (candidate.path for candidate in candidates)),
+                    strict=True,
+                )
+            )
+        metrics.add_step_timing("fingerprint", (perf_counter() - step_started) * 1000)
+        step_started = perf_counter()
+        pending: list[tuple[ImportCandidate, ImportFingerprint]] = []
+        for candidate in candidates:
+            fingerprint = fingerprints[candidate]
+            if state.path is not None and state.terminal(
+                candidate.path,
+                project_id=project_id,
+                artifact_kind=artifact_kind,
+                fingerprint=fingerprint,
+            ):
+                summary = summary.add(ImportSummary(skipped=1))
+                continue
+            pending.append((candidate, fingerprint))
+        metrics.add_step_timing("state_filter", (perf_counter() - step_started) * 1000)
         metrics.add_step_timing("dry_run", 0.0)
         return summary.add(
             ImportSummary(
@@ -360,7 +375,7 @@ async def import_files(
             )
         )
 
-    fingerprints = dict(pending)
+    skipped_count = 0
 
     sql_stats = _SQLStats()
     event.listen(engine.sync_engine, "before_cursor_execute", sql_stats.before_cursor_execute)
@@ -381,6 +396,35 @@ async def import_files(
             f"importing {len(batch)} files ({sum(item.size_bytes for item in batch)} bytes)",
             file=sys.stderr,
         )
+        checkpointed_indices: set[int] = set()
+
+        async def checkpoint(index: int, item: Any) -> None:
+            """Append a source checkpoint immediately after its DB commit."""
+
+            candidate = batch[index]
+            fingerprint = fingerprints[candidate]
+            filtered = item.error_code == "no_calculation_frames" or (
+                item.result is not None and item.result.source_frame_count == 0
+            )
+            status = "filtered" if filtered else "succeeded" if item.succeeded else "failed"
+            state.append(
+                _record(
+                    candidate,
+                    fingerprint,
+                    project_id=project_id,
+                    artifact_kind=artifact_kind,
+                    status=status,
+                    artifact_id=item.result.artifact_id if item.result is not None else None,
+                    ingestion_status=(
+                        item.result.ingestion_status.value
+                        if item.result is not None and item.result.ingestion_status is not None
+                        else None
+                    ),
+                    error=item.error_message,
+                )
+            )
+            checkpointed_indices.add(index)
+
         try:
             service_started = perf_counter()
             result = await ArtifactUploadService.upload_batch(
@@ -388,6 +432,8 @@ async def import_files(
                 artifact_kind=artifact_kind,
                 project_id=project_id,
                 user_id=user_id,
+                on_file_committed=checkpoint,
+                streaming=True,
             )
             service_elapsed_ms = (perf_counter() - service_started) * 1000
             metrics.add_phase_timing("upload_batch_service_ms", service_elapsed_ms)
@@ -445,7 +491,7 @@ async def import_files(
             raise
 
         batch_summary = ImportSummary(attempted=len(batch))
-        for candidate, item in zip(batch, result.items, strict=True):
+        for index, (candidate, item) in enumerate(zip(batch, result.items, strict=True)):
             fingerprint = fingerprints[candidate]
             artifact_id = item.result.artifact_id if item.result is not None else None
             filtered = item.error_code == "no_calculation_frames" or (
@@ -462,39 +508,134 @@ async def import_files(
             else:
                 batch_summary = batch_summary.add(ImportSummary(failed=1))
                 status = "failed"
-            state.append(
-                _record(
-                    candidate,
-                    fingerprint,
-                    project_id=project_id,
-                    artifact_kind=artifact_kind,
-                    status=status,
-                    artifact_id=artifact_id,
-                    ingestion_status=(
-                        item.result.ingestion_status.value
-                        if item.result is not None and item.result.ingestion_status is not None
-                        else None
-                    ),
-                    error=item.error_message,
+            if index not in checkpointed_indices:
+                state.append(
+                    _record(
+                        candidate,
+                        fingerprint,
+                        project_id=project_id,
+                        artifact_kind=artifact_kind,
+                        status=status,
+                        artifact_id=artifact_id,
+                        ingestion_status=(
+                            item.result.ingestion_status.value
+                            if item.result is not None and item.result.ingestion_status is not None
+                            else None
+                        ),
+                        error=item.error_message,
+                    )
                 )
-            )
         return batch_summary
 
+    # Feed candidates through a bounded queue instead of constructing all
+    # upload tasks at once. A microbatch is intentionally governed by the
+    # commit target. On-disk streaming uploads do not use the HTTP aggregate
+    # byte limit as a processing boundary; each source is still checked against
+    # the per-file upload limit by the shared upload service.
+    candidate_queue: asyncio.Queue[tuple[ImportCandidate, ImportFingerprint] | None] = (
+        asyncio.Queue(maxsize=stream_queue_size)
+    )
+
+    fingerprints_executor = ThreadPoolExecutor(max_workers=workers)
+    producer_error: BaseException | None = None
+
+    async def produce_candidates() -> None:
+        """Fingerprint only a bounded in-flight window and feed the parser queue."""
+
+        nonlocal producer_error, skipped_count
+        loop = asyncio.get_running_loop()
+        candidate_iterator = iter(candidates)
+        futures: deque[tuple[ImportCandidate, asyncio.Future[ImportFingerprint]]] = deque()
+        fingerprint_started = perf_counter()
+
+        def submit_next() -> None:
+            try:
+                candidate = next(candidate_iterator)
+            except StopIteration:
+                return
+            future = asyncio.ensure_future(
+                loop.run_in_executor(fingerprints_executor, file_fingerprint, candidate.path)
+            )
+            futures.append((candidate, future))
+
+        try:
+            for _ in range(min(workers, len(candidates))):
+                submit_next()
+            while futures:
+                candidate, future = futures.popleft()
+                fingerprint = await future
+                fingerprints[candidate] = fingerprint
+                if state.path is not None and state.terminal(
+                    candidate.path,
+                    project_id=project_id,
+                    artifact_kind=artifact_kind,
+                    fingerprint=fingerprint,
+                ):
+                    skipped_count += 1
+                else:
+                    await candidate_queue.put((candidate, fingerprint))
+                submit_next()
+        except asyncio.CancelledError:
+            # The upload consumer may fail while fingerprint workers are still
+            # running. Do not block cancellation on a full queue.
+            with suppress(asyncio.QueueFull):
+                candidate_queue.put_nowait(None)
+            raise
+        except BaseException as error:
+            # Let the consumer drain already-fingerprinted files before
+            # surfacing the producer failure to the caller.
+            producer_error = error
+            await candidate_queue.put(None)
+        else:
+            await candidate_queue.put(None)
+        finally:
+            metrics.add_step_timing("fingerprint", (perf_counter() - fingerprint_started) * 1000)
+            metrics.add_step_timing("state_filter", (perf_counter() - fingerprint_started) * 1000)
+            await asyncio.to_thread(
+                fingerprints_executor.shutdown,
+                wait=True,
+                cancel_futures=True,
+            )
+
     batches_started_at = perf_counter()
+    producer_task = asyncio.create_task(produce_candidates())
+    commit_limit = min(commit_batch_files, settings.max_batch_files)
+    producer_finished = False
     try:
-        for batch in iter_batches(
-            [candidate for candidate, _ in pending],
-            max_files=settings.max_batch_files,
-            max_bytes=settings.max_batch_bytes,
-        ):
+        while not producer_finished:
+            first = await candidate_queue.get()
+            if first is None:
+                producer_finished = True
+                break
+
+            batch_with_fingerprints = [first]
+            while len(batch_with_fingerprints) < commit_limit:
+                next_item = await candidate_queue.get()
+                if next_item is None:
+                    producer_finished = True
+                    break
+                batch_with_fingerprints.append(next_item)
+
+            batch = [candidate for candidate, _ in batch_with_fingerprints]
             summary = summary.add(await import_batch(batch))
+            print(
+                f"committed {len(batch)} files ({sum(item.size_bytes for item in batch)} bytes)",
+                file=sys.stderr,
+            )
     finally:
+        if not producer_task.done():
+            producer_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await producer_task
         event.remove(engine.sync_engine, "before_cursor_execute", sql_stats.before_cursor_execute)
         event.remove(engine.sync_engine, "after_cursor_execute", sql_stats.after_cursor_execute)
     metrics.sql_statement_count = sql_stats.count
     metrics.sql_executemany_count = sql_stats.executemany_count
     metrics.sql_elapsed_ms_by_operation = sql_stats.elapsed_ms_by_operation
     metrics.add_step_timing("upload_batches", (perf_counter() - batches_started_at) * 1000)
+    summary = summary.add(ImportSummary(skipped=skipped_count))
+    if producer_error is not None:
+        raise producer_error
     return summary
 
 
@@ -529,6 +670,24 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="scan and report without writing PostgreSQL/RustFS",
     )
+    parser.add_argument(
+        "--commit-batch-files",
+        type=int,
+        default=IMPORT_COMMIT_BATCH_FILES,
+        help=(
+            "number of completed files per local persistence commit "
+            f"(default: {IMPORT_COMMIT_BATCH_FILES})"
+        ),
+    )
+    parser.add_argument(
+        "--stream-queue-size",
+        type=int,
+        default=IMPORT_STREAM_QUEUE_SIZE,
+        help=(
+            "maximum number of pending files held between discovery and upload "
+            f"(default: {IMPORT_STREAM_QUEUE_SIZE})"
+        ),
+    )
     return parser
 
 
@@ -544,19 +703,24 @@ async def _run(args: argparse.Namespace) -> int:
     candidates = discover_files(args.roots)
     metrics.add_step_timing("discover", (perf_counter() - discover_started) * 1000)
     state = ImportState(args.state_file)
-    summary = await import_files(
-        candidates,
-        project_id=args.project_id,
-        user_id=user_id,
-        artifact_kind=artifact_kind,
-        state=state,
-        dry_run=args.dry_run,
-        metrics=metrics,
-    )
-    payload = asdict(summary)
-    payload["timings"] = metrics.as_dict(total_ms=(perf_counter() - started_at) * 1000)
-    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-    return 1 if summary.failed else 0
+    try:
+        summary = await import_files(
+            candidates,
+            project_id=args.project_id,
+            user_id=user_id,
+            artifact_kind=artifact_kind,
+            state=state,
+            dry_run=args.dry_run,
+            commit_batch_files=args.commit_batch_files,
+            stream_queue_size=args.stream_queue_size,
+            metrics=metrics,
+        )
+        payload = asdict(summary)
+        payload["timings"] = metrics.as_dict(total_ms=(perf_counter() - started_at) * 1000)
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 1 if summary.failed else 0
+    finally:
+        await close_molop_process_pool()
 
 
 def main() -> None:

@@ -292,8 +292,8 @@ onBeforeUnmount(() => previewController?.abort());
     <section class="drawer-section">
       <h3>来源与拓扑重建</h3>
       <dl class="detail-list">
-        <div><dt>source lines</dt><dd>{{ frame.source_span.start_line }}-{{ frame.source_span.end_line }}</dd></div>
-        <div><dt>source hash</dt><dd :title="frame.source_span.block_sha256">{{ shortId(frame.source_span.block_sha256) }}</dd></div>
+        <div><dt>source lines</dt><dd>{{ frame.source_span ? `${frame.source_span.start_line ?? "?"}-${frame.source_span.end_line ?? "?"}` : "未记录" }}</dd></div>
+        <div><dt>source hash</dt><dd :title="frame.source_span?.block_sha256 ?? undefined">{{ frame.source_span?.block_sha256 ? shortId(frame.source_span.block_sha256) : "未记录" }}</dd></div>
         <div><dt>method</dt><dd>{{ frame.topology_derivation.reconstruction_method }}</dd></div>
         <div><dt>version</dt><dd>{{ frame.topology_derivation.reconstruction_version }}</dd></div>
         <div><dt>provenance</dt><dd :title="frame.topology_derivation.provenance_hash">{{ shortId(frame.topology_derivation.provenance_hash) }}</dd></div>

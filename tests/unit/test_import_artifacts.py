@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import cast
 from uuid import UUID
@@ -16,6 +17,7 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
 from tricycle_reaction_db.core.config import Settings
 from tricycle_reaction_db.dev.import_artifacts import (
     ImportCandidate,
+    ImportFingerprint,
     ImportMetrics,
     ImportState,
     discover_files,
@@ -280,3 +282,206 @@ def test_import_files_isolates_deterministic_batch_failures(monkeypatch, tmp_pat
         "good-a.log": "succeeded",
         "good-b.log": "succeeded",
     }
+
+
+def test_import_files_streams_small_commit_batches_and_checkpoints_each_batch(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    sources = []
+    for index in range(17):
+        source = tmp_path / f"file-{index:02d}.log"
+        source.write_bytes(source.name.encode())
+        sources.append(source)
+    state_path = tmp_path / "state.jsonl"
+    calls: list[list[str]] = []
+    state_lines_seen_before_call: list[int] = []
+
+    async def fake_upload_batch(**kwargs: object) -> ArtifactBatchUploadResult:
+        payloads = cast(list[ArtifactUploadPayload], kwargs["files"])
+        assert kwargs["streaming"] is True
+        calls.append([payload.filename for payload in payloads])
+        state_lines_seen_before_call.append(
+            len(state_path.read_text(encoding="utf-8").splitlines()) if state_path.exists() else 0
+        )
+        return ArtifactBatchUploadResult(
+            total_count=len(payloads),
+            succeeded_count=len(payloads),
+            failed_count=0,
+            source_frame_count=0,
+            transition_state_frame_count=0,
+            inferred_reaction_count=0,
+            items=[
+                ArtifactBatchUploadItem(
+                    filename=payload.filename,
+                    succeeded=True,
+                    result=ArtifactUploadResult(
+                        artifact_id=UUID("00000000-0000-7000-0000-000000000301"),
+                        artifact_kind=ArtifactKind.INPUT,
+                        storage_status=StorageStatus.AVAILABLE,
+                        ingestion_status=ArtifactIngestionStatus.SUCCEEDED,
+                        inferred_reaction_count=0,
+                        inferences=[],
+                    ),
+                )
+                for payload in payloads
+            ],
+        )
+
+    monkeypatch.setattr(ArtifactUploadService, "upload_batch", fake_upload_batch)
+    monkeypatch.setattr(
+        "tricycle_reaction_db.dev.import_artifacts.get_settings",
+        lambda: Settings(_env_file=None, max_batch_files=128, max_batch_bytes=1024),
+    )
+
+    summary = asyncio.run(
+        import_files(
+            discover_files(sources),
+            project_id=UUID("00000000-0000-7000-8000-000000000201"),
+            user_id=UUID("00000000-0000-7000-8000-000000000002"),
+            artifact_kind=ArtifactKind.INPUT,
+            state=ImportState(state_path),
+            dry_run=False,
+            commit_batch_files=8,
+            stream_queue_size=2,
+        )
+    )
+
+    assert summary.succeeded == 17
+    assert [len(call) for call in calls] == [8, 8, 1]
+    # The second service call observes the first microbatch's durable state.
+    assert state_lines_seen_before_call == [0, 8, 16]
+
+
+def test_import_files_does_not_split_streaming_microbatches_by_aggregate_bytes(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    sources = []
+    for index in range(3):
+        source = tmp_path / f"file-{index}.log"
+        source.write_bytes(b"1" * 400)
+        sources.append(source)
+    calls: list[list[str]] = []
+
+    async def fake_upload_batch(**kwargs: object) -> ArtifactBatchUploadResult:
+        payloads = cast(list[ArtifactUploadPayload], kwargs["files"])
+        assert kwargs["streaming"] is True
+        calls.append([payload.filename for payload in payloads])
+        return ArtifactBatchUploadResult(
+            total_count=len(payloads),
+            succeeded_count=len(payloads),
+            failed_count=0,
+            source_frame_count=0,
+            transition_state_frame_count=0,
+            inferred_reaction_count=0,
+            items=[
+                ArtifactBatchUploadItem(
+                    filename=payload.filename,
+                    succeeded=True,
+                    result=ArtifactUploadResult(
+                        artifact_id=UUID("00000000-0000-7000-0000-000000000301"),
+                        artifact_kind=ArtifactKind.INPUT,
+                        storage_status=StorageStatus.AVAILABLE,
+                        ingestion_status=ArtifactIngestionStatus.SUCCEEDED,
+                        inferred_reaction_count=0,
+                        inferences=[],
+                    ),
+                )
+                for payload in payloads
+            ],
+        )
+
+    monkeypatch.setattr(ArtifactUploadService, "upload_batch", fake_upload_batch)
+    monkeypatch.setattr(
+        "tricycle_reaction_db.dev.import_artifacts.get_settings",
+        lambda: Settings(_env_file=None, max_batch_files=128, max_batch_bytes=1024),
+    )
+
+    summary = asyncio.run(
+        import_files(
+            discover_files(sources),
+            project_id=UUID("00000000-0000-7000-0000-000000000201"),
+            user_id=UUID("00000000-0000-7000-8000-000000000002"),
+            artifact_kind=ArtifactKind.INPUT,
+            state=ImportState(None),
+            dry_run=False,
+            commit_batch_files=16,
+        )
+    )
+
+    assert summary.succeeded == 3
+    assert [len(call) for call in calls] == [3]
+
+
+def test_import_files_starts_upload_before_fingerprinting_all_candidates(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    sources = []
+    for index in range(40):
+        source = tmp_path / f"file-{index:02d}.log"
+        source.write_bytes(source.name.encode())
+        sources.append(source)
+    fingerprint_calls: list[str] = []
+    first_upload_fingerprint_count: list[int] = []
+
+    def fake_fingerprint(path: Path) -> ImportFingerprint:
+        fingerprint_calls.append(path.name)
+        time.sleep(0.01)
+        return file_fingerprint(path)
+
+    async def fake_upload_batch(**kwargs: object) -> ArtifactBatchUploadResult:
+        payloads = cast(list[ArtifactUploadPayload], kwargs["files"])
+        first_upload_fingerprint_count.append(len(fingerprint_calls))
+        return ArtifactBatchUploadResult(
+            total_count=len(payloads),
+            succeeded_count=len(payloads),
+            failed_count=0,
+            source_frame_count=0,
+            transition_state_frame_count=0,
+            inferred_reaction_count=0,
+            items=[
+                ArtifactBatchUploadItem(
+                    filename=payload.filename,
+                    succeeded=True,
+                    result=ArtifactUploadResult(
+                        artifact_id=UUID("00000000-0000-7000-0000-000000000301"),
+                        artifact_kind=ArtifactKind.INPUT,
+                        storage_status=StorageStatus.AVAILABLE,
+                        ingestion_status=ArtifactIngestionStatus.SUCCEEDED,
+                        inferred_reaction_count=0,
+                        inferences=[],
+                    ),
+                )
+                for payload in payloads
+            ],
+        )
+
+    monkeypatch.setattr(
+        "tricycle_reaction_db.dev.import_artifacts.file_fingerprint",
+        fake_fingerprint,
+    )
+    monkeypatch.setattr(ArtifactUploadService, "upload_batch", fake_upload_batch)
+    monkeypatch.setattr(
+        "tricycle_reaction_db.dev.import_artifacts.get_settings",
+        lambda: Settings(_env_file=None, max_batch_files=128, max_batch_bytes=1024),
+    )
+
+    summary = asyncio.run(
+        import_files(
+            discover_files(sources),
+            project_id=UUID("00000000-0000-7000-8000-000000000201"),
+            user_id=UUID("00000000-0000-7000-8000-000000000002"),
+            artifact_kind=ArtifactKind.INPUT,
+            state=ImportState(None),
+            dry_run=False,
+            fingerprint_workers=2,
+            commit_batch_files=16,
+            stream_queue_size=2,
+        )
+    )
+
+    assert summary.succeeded == 40
+    assert first_upload_fingerprint_count
+    assert first_upload_fingerprint_count[0] < len(sources)

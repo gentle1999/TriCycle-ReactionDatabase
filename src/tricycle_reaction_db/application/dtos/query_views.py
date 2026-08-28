@@ -116,6 +116,8 @@ class GeometrySummary(QueryView):
     geometry_hash: str
     internal_coordinate_hash: str
     canonicalization_version: str
+    charge: int
+    multiplicity: int
     calculation_count: int
     reaction_binding_count: int
     imaginary_frequency_status: str
@@ -124,6 +126,16 @@ class GeometrySummary(QueryView):
 class GeometryPage(QueryView):
     items: list[GeometrySummary]
     page: PageInfo
+
+
+class GeometryAtomCoordinate(QueryView):
+    """One Geometry conformer atom in canonical topology atom order."""
+
+    atom_index: int
+    element: str
+    x_angstrom: float
+    y_angstrom: float
+    z_angstrom: float
 
 
 class GeometryEnergyView(QueryView):
@@ -160,15 +172,18 @@ class GeometryDetail(GeometrySummary):
     # frame summaries remain the canonical calculation view below.
     frames: list["CalculationFrameSummary"]
     energy_view: GeometryEnergyView
+    coordinates: list[GeometryAtomCoordinate]
 
 
 class LogicalReactionSummary(QueryView):
     id: UUID
     reaction_key: str
     label: str | None = None
-    reaction_class: str
+    reaction_class: str | None = None
     cycloaddition_pattern: str | None = None
     reaction_hash: str
+    # True when canonical reactant/product topology multisets differ.
+    reactant_product_changed: bool | None = None
     created_at: datetime | None = None
     # Lightweight path-preview identities used by catalog cards. Detail
     # endpoints remain the source of the complete participant/mapping DTOs.
@@ -205,6 +220,8 @@ class MappedReactionSummary(QueryView):
     mapped_reaction_smiles: str
     mapping_hash: str
     reaction_structural_bfp_schema_version: str
+    # This mirrors the parent logical reaction's canonical topology comparison.
+    reactant_product_changed: bool | None = None
     created_at: datetime | None = None
     reaction_smarts_match: bool | None = None
     similarity_score: float | None = None
@@ -289,6 +306,8 @@ class CalculationFramePage(QueryView):
 class TransitionStateEndpointView(QueryView):
     direction: str
     topology_id: UUID
+    charge: int
+    multiplicity: int
     atom_count: int
     displacement_ratio: float
     source_coordinate_hash: str
@@ -324,6 +343,7 @@ class TransitionStateInferenceSummary(QueryView):
     logical_reaction_id: UUID | None = None
     mapped_reaction_id: UUID | None = None
     calculation_frame_id: UUID | None = None
+    reactant_product_changed: bool | None = None
     error_code: str | None = None
     error_message: str | None = None
 

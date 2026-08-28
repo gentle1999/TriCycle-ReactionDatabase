@@ -1,7 +1,9 @@
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
+from rdkit import Chem
 
 from tricycle_reaction_db.application.dtos import (
     CreateReactionCommand,
@@ -13,6 +15,7 @@ from tricycle_reaction_db.application.dtos import (
 from tricycle_reaction_db.application.services.reactions import (
     _canonical_mapped_reaction_smiles,
     _mapped_reaction_from_smiles,
+    _mapping_assignment_for_topology,
 )
 from tricycle_reaction_db.domain.enums import (
     ArtifactResolutionStatus,
@@ -21,6 +24,7 @@ from tricycle_reaction_db.domain.enums import (
     ManifestArtifactRole,
     WorkflowManifestStatus,
 )
+from tricycle_reaction_db.ingestion.normalization import normalize_topology_with_mapping
 
 
 def test_manifest_record_requires_a_timezone_aware_publication_timestamp() -> None:
@@ -52,6 +56,7 @@ def test_create_reaction_command_requires_only_a_reaction_representation() -> No
     command = CreateReactionCommand(reaction="C1CC1>>C=CC")
 
     assert command.reaction == "C1CC1>>C=CC"
+    assert command.reaction_class is None
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         CreateReactionCommand(
             reaction="C1CC1>>C=CC",
@@ -150,6 +155,127 @@ def test_mapped_reaction_canonicalization_is_stable_for_metal_stereo() -> None:
 
     assert canonical == reparsed
     assert "[Ru@" not in canonical
+
+
+def test_mapping_assignment_uses_source_order_without_topology_normalization() -> None:
+    """Mapped endpoint atom positions stay in their calculation-frame order."""
+
+    benzene = Chem.AddHs(Chem.MolFromSmiles("c1ccccc1"))
+    template = Chem.RenumberAtoms(benzene, [7, 4, 10, 1, 8, 2, 11, 0, 9, 3, 6, 5])
+    for atom_index, atom in enumerate(template.GetAtoms(), start=1):
+        atom.SetAtomMapNum(atom_index)
+    normalized, _ = normalize_topology_with_mapping(
+        template,
+        add_hydrogens=False,
+        reconstruction_method="molgr/test",
+        reconstruction_version="test",
+        reconstruction_metadata={"topology_source_trusted": True},
+    )
+    topology = SimpleNamespace(
+        atom_count=normalized.topology.atom_count,
+        identity_schema_version=normalized.topology.identity_schema_version,
+        graph_hash=normalized.topology.graph_hash,
+        mol=normalized.topology.mol,
+    )
+
+    atom_maps, mapped_smiles = _mapping_assignment_for_topology(
+        template,
+        topology,
+        source_atom_map_numbers=list(range(1, topology.atom_count + 1)),
+    )
+
+    assert atom_maps == list(range(1, topology.atom_count + 1))
+    expected = Chem.Mol(topology.mol)
+    for atom_index, atom in enumerate(expected.GetAtoms(), start=1):
+        atom.SetAtomMapNum(atom_index)
+    assert mapped_smiles == Chem.MolToSmiles(
+        expected,
+        canonical=True,
+        isomericSmiles=True,
+        allHsExplicit=True,
+    )
+
+
+def test_mapping_assignment_allows_endpoint_graph_change() -> None:
+    """Template and persisted endpoint need not have the same bond topology."""
+
+    template = Chem.MolFromSmiles("[CH3:1][CH3:2]")
+    endpoint = Chem.MolFromSmiles("[CH2:1]=[CH2:2]")
+    topology = SimpleNamespace(atom_count=2, mol=endpoint)
+
+    atom_maps, mapped_smiles = _mapping_assignment_for_topology(template, topology)
+
+    assert atom_maps == [1, 2]
+    assert mapped_smiles == "[CH2:1]=[CH2:2]"
+
+
+def test_mapping_assignment_preserves_global_maps_for_endpoint_fragments() -> None:
+    """A fragment keeps the calculation frame's global atom-map numbers."""
+
+    template = Chem.MolFromSmiles("[CH3:7][CH3:8]")
+    endpoint = Chem.MolFromSmiles("[CH2]=[CH2]")
+    topology = SimpleNamespace(atom_count=2, mol=endpoint)
+
+    atom_maps, mapped_smiles = _mapping_assignment_for_topology(
+        template,
+        topology,
+        source_atom_map_numbers=[7, 8],
+    )
+
+    assert atom_maps == [7, 8]
+    assert mapped_smiles == "[CH2:7]=[CH2:8]"
+
+
+def test_mapping_assignment_preserves_molop_source_atom_order() -> None:
+    """TS endpoint maps remain tied to the calculation-frame atom sequence."""
+
+    source = Chem.RenumberAtoms(
+        Chem.AddHs(Chem.MolFromSmiles("c1ccccc1")),
+        [7, 4, 10, 1, 8, 2, 11, 0, 9, 3, 6, 5],
+    )
+    mapped_source = Chem.Mol(source)
+    for atom_index, atom in enumerate(mapped_source.GetAtoms(), start=1):
+        atom.SetAtomMapNum(atom_index)
+    source_smiles = Chem.MolToSmiles(
+        mapped_source,
+        canonical=True,
+        isomericSmiles=True,
+        allHsExplicit=True,
+    )
+    reaction_smiles = _canonical_mapped_reaction_smiles(
+        _mapped_reaction_from_smiles(f"{source_smiles}>>{source_smiles}")
+    )
+    template = _mapped_reaction_from_smiles(reaction_smiles).GetReactants()[0]
+    normalized, _ = normalize_topology_with_mapping(
+        source,
+        add_hydrogens=False,
+        reconstruction_method="molgr/test",
+        reconstruction_version="test",
+        reconstruction_metadata={"topology_source_trusted": True},
+    )
+    topology = SimpleNamespace(
+        atom_count=normalized.topology.atom_count,
+        identity_schema_version=normalized.topology.identity_schema_version,
+        graph_hash=normalized.topology.graph_hash,
+        mol=normalized.topology.mol,
+    )
+
+    atom_maps, mapped_smiles = _mapping_assignment_for_topology(
+        template,
+        topology,
+        source_atom_map_numbers=list(range(1, topology.atom_count + 1)),
+    )
+
+    assert atom_maps == list(range(1, topology.atom_count + 1))
+    expected = Chem.Mol(topology.mol)
+    for atom_index, atom in enumerate(expected.GetAtoms(), start=1):
+        atom.SetAtomMapNum(atom_index)
+    assert mapped_smiles == Chem.MolToSmiles(
+        expected,
+        canonical=True,
+        isomericSmiles=True,
+        allHsExplicit=True,
+    )
 
 
 @pytest.mark.parametrize("element", ["As", "Se", "Te"])

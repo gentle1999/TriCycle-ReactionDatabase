@@ -753,11 +753,10 @@ CREATE TABLE public.logical_reaction (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     reaction_key text NOT NULL,
     label text,
-    reaction_class character varying(13) DEFAULT 'cycloaddition'::character varying NOT NULL,
+    reaction_class character varying(13),
     cycloaddition_pattern character varying(32),
     reaction_hash character varying(64) NOT NULL,
-    CONSTRAINT ck_reaction_hash_hex CHECK (((reaction_hash)::text ~ '^[0-9a-f]{64}$'::text)),
-    CONSTRAINT reaction_class CHECK (((reaction_class)::text = 'cycloaddition'::text))
+    CONSTRAINT ck_reaction_hash_hex CHECK (((reaction_hash)::text ~ '^[0-9a-f]{64}$'::text))
 );
 
 

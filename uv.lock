@@ -857,7 +857,7 @@ wheels = [
 
 [[package]]
 name = "molgr"
-version = "0.1.6"
+version = "0.1.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
@@ -865,18 +865,18 @@ dependencies = [
     { name = "rdkit" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/70/ea/26e6ea16084caf6687b54c51020fb0787d4bbef2e0fabaf0ec964924b11c/molgr-0.1.6.tar.gz", hash = "sha256:78d876d25aa70f1677992d322fbdc6fb619e4848b8629bd7de7cd4b252b9d676", size = 850840, upload-time = "2026-08-19T13:11:55.381Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c1/e2/c858357552a613dcf18b24dde87a06b13cfe5741aec6679f91e30486e9b1/molgr-0.1.8.tar.gz", hash = "sha256:bde528d2219f8d50c0fab2202c575e034689c62635650c55192ccf38d9732ba3", size = 854460, upload-time = "2026-08-27T13:23:56.921Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/15/97/83291bfdc8e1cec01f0c95fe6e1d75982e6b59d3dc77783ada76d6af63c1/molgr-0.1.6-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:5bf0aa2214c6fbb2a8238c07e4d4e13f60012168bfbb86321000b74bfba193e2", size = 757455, upload-time = "2026-08-19T13:11:20.482Z" },
-    { url = "https://files.pythonhosted.org/packages/82/b3/186049722404215f457a674e8348dceb98807eb658b016e03c50370c3f96/molgr-0.1.6-cp312-cp312-macosx_14_0_x86_64.whl", hash = "sha256:1a672a9e8be8429e9f531b206d81251d2d6e104345fffcdd05b435ee8e5da133", size = 783102, upload-time = "2026-08-19T13:11:21.723Z" },
-    { url = "https://files.pythonhosted.org/packages/d9/c1/1bc0ed7c30be8fb3dca7abb8bed50a667046d9fd5bf37be44fa3b31105a6/molgr-0.1.6-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:82283343878e39c1a54381c1da00b9913f40f457347f88b3290ae942370131c4", size = 898663, upload-time = "2026-08-19T13:11:23.189Z" },
-    { url = "https://files.pythonhosted.org/packages/e3/d5/c194aca6cd03d8a30499f153dde1257ebfbbca3b7b8a9b589fa2d422a2b3/molgr-0.1.6-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:c345346f90a4a71faaee09d6ecd646e7c0fd5be86c5098452283435d9dbefe0b", size = 946538, upload-time = "2026-08-19T13:11:24.605Z" },
-    { url = "https://files.pythonhosted.org/packages/20/2a/fb4e97165f9b2b538e53ad418ebb6986ac937e8de01c9bcc165faa9989e0/molgr-0.1.6-cp312-cp312-win_amd64.whl", hash = "sha256:fd2558a15d5b5bfb704fb1a1288b8b4c7c0b80b955ad4044262215a6b151b2d7", size = 926809, upload-time = "2026-08-19T13:11:26.142Z" },
+    { url = "https://files.pythonhosted.org/packages/c6/49/db98819b8a972b9e7bc0c0ddfafab54c631969c349c6d61aabd06d323255/molgr-0.1.8-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:3c4bd0f4a0c4c5603ad4c465778502d913cb3740b20f3ca395cbe184416d8d4f", size = 759451, upload-time = "2026-08-27T13:23:22.484Z" },
+    { url = "https://files.pythonhosted.org/packages/16/14/2acbdfd993287c7b12a30eae8f02b9d2673823ad04c644888bb5083d9a81/molgr-0.1.8-cp312-cp312-macosx_14_0_x86_64.whl", hash = "sha256:e1c577e0510af51cf0042aa30a1fec8816fd830453132744a9f790151690bfd8", size = 785081, upload-time = "2026-08-27T13:23:23.674Z" },
+    { url = "https://files.pythonhosted.org/packages/1d/0e/932a1e302dc0200425d0e81cbeb9127eef047bef2b735630a07dcca1cb77/molgr-0.1.8-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:c7b6cc02839390b0cf3862f194f55930e147e06b617274ab5f7f5b9d7b6ed98e", size = 900738, upload-time = "2026-08-27T13:23:24.848Z" },
+    { url = "https://files.pythonhosted.org/packages/4f/1b/8b31124532be498db07f69f7b70a3021f18264adc6e11f2a27c45c8e7662/molgr-0.1.8-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:0d6ce8ac527dc7a75dc2cfa7c04eb195bae999958b545eedb7a1a103d9c7e7c5", size = 949260, upload-time = "2026-08-27T13:23:27.031Z" },
+    { url = "https://files.pythonhosted.org/packages/16/49/6e34c8e1cd2599fe5db68519bffac57d965518a9be7da4c025bf1770dfc4/molgr-0.1.8-cp312-cp312-win_amd64.whl", hash = "sha256:ef209ec9ecc7993b8ad061541aedd1f1719f726430ec74ad9157716bd741f04e", size = 928208, upload-time = "2026-08-27T13:23:28.295Z" },
 ]
 
 [[package]]
 name = "molop"
-version = "0.2.10"
+version = "0.2.11"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -893,9 +893,9 @@ dependencies = [
     { name = "tabulate" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/87/38/57a7f5f9d30a59124ce2bcff83f7f1b920e7c4efa8256dcca19bcd655994/molop-0.2.10.tar.gz", hash = "sha256:8f2e559c388e1e2a88bdf9c296b44bd4e204d66c9422e04c0eeb497bb1f014d4", size = 294171, upload-time = "2026-08-22T07:19:30.051Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/79/fc/f23baa08aeaef583588c80729dc41201c0bce5b959b49caeb82ecf411020/molop-0.2.11.tar.gz", hash = "sha256:c6a9df46fe5bd8b88638c1c5f50677c8f068698e753a0b22ea6b7e4835212e3d", size = 297404, upload-time = "2026-08-25T09:04:14.158Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/cf/2f/741c1c58776737ad6edd3936ab9dd073c00f5ae6365cad592ae4a036c740/molop-0.2.10-py3-none-any.whl", hash = "sha256:d2ea8d4b63b23f6e2da45dfb402485bcbe78b25e5c76b46b4700e9a024c177e3", size = 363671, upload-time = "2026-08-22T07:19:28.756Z" },
+    { url = "https://files.pythonhosted.org/packages/27/08/0feee7bb0d8a598c2e6f99d344147252120008fff0634b1aa415f4a747ea/molop-0.2.11-py3-none-any.whl", hash = "sha256:e0dead278600b8b3eec411050635520ca36ae9053117583771ab4a83aca2d851", size = 367393, upload-time = "2026-08-25T09:04:12.894Z" },
 ]
 
 [[package]]
@@ -1794,8 +1794,8 @@ requires-dist = [
     { name = "fastmcp", specifier = ">=3.2,<4" },
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "molalchemy", specifier = "==0.0.7" },
-    { name = "molgr", specifier = ">=0.1.6" },
-    { name = "molop", specifier = ">=0.2.10" },
+    { name = "molgr", specifier = ">=0.1.8" },
+    { name = "molop", specifier = ">=0.2.11" },
     { name = "nexusx", specifier = "==6.1.2" },
     { name = "numpy", specifier = ">=2.2,<3" },
     { name = "prometheus-client", specifier = ">=0.24,<1" },

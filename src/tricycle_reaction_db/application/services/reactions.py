@@ -2,7 +2,7 @@
 
 import json
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from functools import lru_cache
 from hashlib import sha256
 
@@ -293,8 +293,19 @@ def _ensure_reaction_mutable(reaction: LogicalReaction) -> None:
 def _mapping_assignment_for_topology(
     template: Chem.Mol,
     topology: MolecularTopology,
+    *,
+    source_atom_map_numbers: Iterable[int] | None = None,
 ) -> tuple[list[int], str]:
-    """Resolve template atom maps into canonical topology atom order."""
+    """Transfer reaction maps to a source-order topology.
+
+    MolOP TS endpoints and their MolGR-derived participant topologies retain
+    the calculation-frame atom order.  The map labels in the reaction
+    template therefore already describe that same source sequence.  A
+    reaction may change bonds, charges, or radical annotations between sides;
+    none of those changes is a reason to compare the endpoint graph with the
+    template graph here.  This function only validates the map/count contract
+    and renders the topology with its source-order map labels.
+    """
 
     template_maps = [
         atom.GetAtomMapNum()
@@ -302,65 +313,26 @@ def _mapping_assignment_for_topology(
     ]
     if not template_maps or any(number <= 0 for number in template_maps):
         raise ValueError("every mapped reaction template atom must have an atom map")
+    if len(set(template_maps)) != len(template_maps):
+        raise ValueError("mapped reaction template atom maps must be unique")
     if len(template_maps) != topology.atom_count:
         raise ValueError("mapped reaction template atom count does not match its Topology")
 
-    expected_smiles = Chem.MolToSmiles(
-        template,
-        canonical=True,
-        isomericSmiles=True,
-        allHsExplicit=True,
+    # MolOP endpoint fragments carry the original calculation-frame map number
+    # for each atom.  Their map sequence is supplied by the caller because an
+    # RDKit reaction template may reorder atoms while serializing a component.
+    # A caller without that source evidence retains the template's direct atom
+    # sequence, which is the correct contract for explicitly supplied paths.
+    atom_maps = (
+        list(source_atom_map_numbers) if source_atom_map_numbers is not None else template_maps
     )
-    expected_graph_smiles = Chem.MolToSmiles(
-        template,
-        canonical=True,
-        isomericSmiles=False,
-        allHsExplicit=True,
-    )
-    query = Chem.Mol(template)
-    for atom in query.GetAtoms():  # type: ignore[no-untyped-call]
-        atom.SetAtomMapNum(0)
-    matches = topology.mol.GetSubstructMatches(
-        query,
-        uniquify=False,
-        useChirality=True,
-        maxMatches=10_000,
-    )
-    for match in matches:
-        if len(match) != topology.atom_count:
-            continue
-        topology_maps = [0] * topology.atom_count
-        for template_index, topology_index in enumerate(match):
-            topology_maps[topology_index] = template_maps[template_index]
-        mapped_topology = Chem.Mol(topology.mol)
-        mapped_atoms = list(mapped_topology.GetAtoms())  # type: ignore[no-untyped-call]
-        for atom, map_number in zip(
-            mapped_atoms,
-            topology_maps,
-            strict=True,
-        ):
-            atom.SetAtomMapNum(map_number)
-        mapped_smiles = Chem.MolToSmiles(
-            mapped_topology,
-            canonical=True,
-            isomericSmiles=True,
-            allHsExplicit=True,
-        )
-        if mapped_smiles == expected_smiles:
-            return topology_maps, mapped_smiles
-        # Some metal stereochemistry is graph-equivalent but serialized with
-        # different unsupported tetrahedral/octahedral annotations after
-        # topology canonicalization. The substructure match above still keeps
-        # chirality constraints; compare only the graph as a final fallback.
-        mapped_graph_smiles = Chem.MolToSmiles(
-            mapped_topology,
-            canonical=True,
-            isomericSmiles=False,
-            allHsExplicit=True,
-        )
-        if mapped_graph_smiles == expected_graph_smiles:
-            return topology_maps, mapped_smiles
-    raise ValueError("mapped reaction template is not isomorphic to its referenced Topology")
+    if len(atom_maps) != topology.atom_count:
+        raise ValueError("source atom-map count must match MolecularTopology.atom_count")
+    if any(number <= 0 for number in atom_maps) or len(set(atom_maps)) != len(atom_maps):
+        raise ValueError("source atom-map numbers must be unique positive integers")
+    if set(atom_maps) != set(template_maps):
+        raise ValueError("source atom-map numbers do not match the reaction template")
+    return atom_maps, mapped_smiles_for_topology(topology, atom_maps)
 
 
 def persist_workflow_manifest(
@@ -512,6 +484,11 @@ def persist_logical_reaction(
         select(LogicalReaction).where(LogicalReaction.reaction_hash == record.reaction_hash)
     ).first()
     if reaction is not None:
+        # Automatic endpoint inference leaves the class unset. A later curator
+        # command may explicitly classify that same topology identity.
+        if reaction.reaction_class is None and record.reaction_class is not None:
+            reaction.reaction_class = record.reaction_class
+            session.flush()
         return reaction
     reaction = _new_entity(session, LogicalReaction, **record.model_dump())
     _flush_new_entity(session, reaction, label="LogicalReaction")
@@ -621,6 +598,11 @@ def persist_mapped_reaction(
     session: Session,
     reaction: LogicalReaction,
     record: MappedReactionRecord,
+    *,
+    source_atom_maps_by_template: Mapping[tuple[LogicalReactionParticipantSide, int], Iterable[int]]
+    | None = None,
+    topology_ids_by_template: Mapping[tuple[LogicalReactionParticipantSide, int], object]
+    | None = None,
 ) -> MappedReaction:
     """Insert or reuse one explicit mapped reaction under a logical reaction."""
 
@@ -664,10 +646,28 @@ def persist_mapped_reaction(
             raise ValueError("mapped reaction template count must match logical participants")
         for template_index, template in enumerate(templates):
             match = None
+            template_key = (side, template_index)
+            source_atom_maps = (
+                source_atom_maps_by_template.get(template_key)
+                if source_atom_maps_by_template is not None
+                else None
+            )
+            expected_topology_id = (
+                topology_ids_by_template.get(template_key)
+                if topology_ids_by_template is not None
+                else None
+            )
             for participant in unused:
+                if (
+                    expected_topology_id is not None
+                    and participant.topology_id != expected_topology_id
+                ):
+                    continue
                 try:
                     atom_maps, mapped_smiles = _mapping_assignment_for_topology(
-                        template, participant.topology
+                        template,
+                        participant.topology,
+                        source_atom_map_numbers=source_atom_maps,
                     )
                 except ValueError:
                     continue

@@ -41,6 +41,22 @@ def geometry_has_thermodynamic_property_predicate(geometry_id: Any) -> Any:
     )
 
 
+def geometry_ids_with_thermodynamic_property(frame_visibility: Any) -> Any:
+    """Select geometry IDs whose visible frame exposes a thermodynamic scalar."""
+
+    return (
+        select(col(CalculationFrame.geometry_id))
+        .join(
+            ThermochemistryResult,
+            col(ThermochemistryResult.frame_id) == col(CalculationFrame.id),
+        )
+        .where(
+            frame_visibility,
+            or_(*(col(column).is_not(None) for column in _THERMODYNAMIC_PROPERTY_COLUMNS)),
+        )
+    )
+
+
 def geometry_has_thermodynamic_property(session: Session, geometry: Geometry) -> bool:
     geometry_id = _require_id(geometry, label="Geometry")
     return bool(
@@ -87,6 +103,7 @@ def require_geometry_thermodynamic_property(session: Session, geometry: Geometry
 
 
 __all__ = [
+    "geometry_ids_with_thermodynamic_property",
     "geometry_has_thermodynamic_property",
     "geometry_has_thermodynamic_property_predicate",
     "geometry_has_no_imaginary_frequency",

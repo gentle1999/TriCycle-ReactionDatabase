@@ -14,7 +14,7 @@ import { api } from "@/api";
 import { useGeometryQueries } from "@/composables/useGeometryQueries";
 import { useProjectContext } from "@/composables/useProjectContext";
 import { withoutAccessState } from "@/routeAccessState";
-import type { GeometryQueryFilters } from "@/geometryQuery";
+import type { GeometryQueryFilters, GeometrySort } from "@/geometryQuery";
 import type { CalculationFrameDetail, GeometryDetail } from "@/types";
 
 const route = useRoute();
@@ -22,6 +22,7 @@ const router = useRouter();
 const projectContext = useProjectContext();
 const currentProjectId = projectContext.currentProjectId;
 const offset = ref(0);
+const geometrySort = ref<GeometrySort>({ sortBy: "default", sortDirection: "asc" });
 const initialTopologySmiles = typeof route.query.topology === "string" ? route.query.topology : "";
 const quickSmilesInput = ref(initialTopologySmiles);
 const topologySmiles = ref(initialTopologySmiles);
@@ -39,7 +40,7 @@ let quickValidationController: AbortController | null = null;
 let quickValidationGeneration = 0;
 
 const selectedGeometryId = computed(() => typeof route.query.preview_geometry === "string" ? route.query.preview_geometry : null);
-const queries = useGeometryQueries(currentProjectId, selectedGeometryId, offset, topologySmiles, advancedFilters, thermodynamicOnly);
+const queries = useGeometryQueries(currentProjectId, selectedGeometryId, offset, geometrySort, topologySmiles, advancedFilters, thermodynamicOnly);
 const databaseTotals = useQuery({
   queryKey: computed(() => ["catalog", "geometry-totals", { projectId: currentProjectId.value }]),
   queryFn: async ({ signal }) => {
@@ -69,12 +70,13 @@ const listError = computed(() => {
   const error = queries.list.error.value;
   return error instanceof Error ? error.message : "";
 });
-const catalogLoading = computed(() => queries.list.isFetching.value);
+const catalogLoading = computed(() => queries.list.isLoading.value);
 const detailError = computed(() => queries.detail.error.value instanceof Error ? queries.detail.error.value.message : "");
 const advancedConditionCount = computed(() => advancedFilters.value?.filterExpression?.conditions.length ?? 0);
 
 watch(currentProjectId, () => { offset.value = 0; });
 watch(thermodynamicOnly, () => { offset.value = 0; });
+watch(geometrySort, () => { offset.value = 0; }, { deep: true });
 watch(() => route.query.topology, (value) => {
   const nextValue = typeof value === "string" ? value : "";
   if (nextValue === topologySmiles.value) return;
@@ -223,7 +225,16 @@ onBeforeUnmount(() => {
     </aside>
 
     <section class="geometry-results">
-      <header class="geometry-results-header"><div><span class="eyebrow">Conformer catalog</span><h2>{{ advancedConditionCount ? "高级查询结果" : topologySmiles ? "SMILES 查询结果" : thermodynamicOnly ? "含热力学属性的几何构象" : "全部几何构象" }}</h2></div><PaginationControls :page="page" label="几何构象分页" @previous="previousPage" @next="nextPage" @jump="jumpPage" /></header>
+      <header class="geometry-results-header">
+        <div><span class="eyebrow">Conformer catalog</span><h2>{{ advancedConditionCount ? "高级查询结果" : topologySmiles ? "SMILES 查询结果" : thermodynamicOnly ? "含热力学属性的几何构象" : "全部几何构象" }}</h2></div>
+        <div class="catalog-header-actions">
+          <div class="catalog-sort-controls" aria-label="几何构象排序">
+            <label><span>排序</span><select v-model="geometrySort.sortBy" aria-label="几何构象排序字段"><option value="default">默认顺序</option><option value="created_at">创建时间</option><option value="atom_count">原子数</option><option value="calculation_count">计算帧数</option></select></label>
+            <label><span>顺序</span><select v-model="geometrySort.sortDirection" aria-label="几何构象排序方向" :disabled="geometrySort.sortBy === 'default'"><option value="asc">升序</option><option value="desc">降序</option></select></label>
+          </div>
+          <PaginationControls :page="page" label="几何构象分页" @previous="previousPage" @next="nextPage" @jump="jumpPage" />
+        </div>
+      </header>
       <div v-if="listError" class="notice" role="alert">{{ listError }}</div>
       <div v-if="catalogLoading" class="geometry-card-grid"><div v-for="i in 6" :key="i" class="geometry-card geometry-card-skeleton"><div></div><span></span><span></span></div></div>
       <div v-else-if="!geometries.length" class="workspace-empty"><strong>没有匹配的 Geometry</strong><p>请调整 SMILES，或使用高级查询组合其他条件。</p></div>

@@ -201,6 +201,48 @@ def test_printing_precision_observation_reuses_one_geometry() -> None:
         engine.dispose()
 
 
+def test_same_coordinates_with_different_electronic_state_are_distinct_geometries() -> None:
+    molecule = Chem.AddHs(Chem.MolFromSmiles("CO"))
+    assert molecule is not None
+    coordinates = np.column_stack(
+        (
+            np.arange(molecule.GetNumAtoms(), dtype=np.float64),
+            np.zeros(molecule.GetNumAtoms()),
+            np.zeros(molecule.GetNumAtoms()),
+        )
+    )
+    singlet = normalize_molecule(
+        molecule,
+        coordinates,
+        charge=0,
+        multiplicity=1,
+        reconstruction_method="geometry-state-test",
+        reconstruction_version="v1",
+    )
+    triplet = normalize_molecule(
+        molecule,
+        coordinates,
+        charge=0,
+        multiplicity=3,
+        reconstruction_method="geometry-state-test",
+        reconstruction_version="v1",
+    )
+    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    connection = engine.connect()
+    transaction = connection.begin()
+    try:
+        with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
+            first = persist_molecular_geometry(session, singlet)
+            second = persist_molecular_geometry(session, triplet)
+            assert first.geometry.id != second.geometry.id
+            assert (first.geometry.charge, first.geometry.multiplicity) == (0, 1)
+            assert (second.geometry.charge, second.geometry.multiplicity) == (0, 3)
+    finally:
+        transaction.rollback()
+        connection.close()
+        engine.dispose()
+
+
 def test_ambiguous_geometry_match_is_rejected_with_persisted_versioned_qc_evidence() -> None:
     molecule = Chem.AddHs(Chem.MolFromSmiles("CO"))
     atom_indices = np.arange(molecule.GetNumAtoms(), dtype=np.float64)

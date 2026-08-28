@@ -86,6 +86,7 @@ def test_nexusx_exposes_only_the_explicit_reaction_mutation() -> None:
         "logical_reaction_id: UUID = null",
         "calculation_frame_id: UUID = null",
         "minimum_imaginary_frequency_cm1: Float = null",
+        "reactant_product_changed: Boolean = null",
     } <= set(_graphql_field(sdl, "list_transition_state_inferences").split(", "))
     calculation_field = _graphql_field(sdl, "list_calculation_frames")
     assert "segment_index: Int = null" in calculation_field
@@ -96,6 +97,14 @@ def test_nexusx_exposes_only_the_explicit_reaction_mutation() -> None:
     assert "topology_derivation_id: UUID = null" in geometry_field
     assert "reaction_node_role: String = null" in geometry_field
     assert "imaginary_frequency_status: String = null" in geometry_field
+    assert 'sort_by: String! = "default"' in geometry_field
+    assert 'sort_direction: String! = "asc"' in geometry_field
+    logical_reaction_field = _graphql_field(sdl, "list_logical_reactions")
+    assert 'sort_by: String! = "default"' in logical_reaction_field
+    assert 'sort_direction: String! = "asc"' in logical_reaction_field
+    artifact_field = _graphql_field(sdl, "list_artifacts")
+    assert 'sort_by: String! = "created_at"' in artifact_field
+    assert 'sort_direction: String! = "desc"' in artifact_field
     mapped_reaction_field = _graphql_field(sdl, "list_mapped_reactions")
     assert "project_id: UUID = null" in mapped_reaction_field
     assert "minimum_transition_state_geometry_count: Int = null" in mapped_reaction_field
@@ -158,6 +167,8 @@ def test_fastapi_mounts_all_allowlisted_nexusx_transports() -> None:
         "topology_smiles",
         "topology_mol_block",
         "topology_smarts",
+        "sort_by",
+        "sort_direction",
     } <= _request_properties(
         openapi,
         "/api/geometry_query_service/list_geometries",
@@ -167,6 +178,8 @@ def test_fastapi_mounts_all_allowlisted_nexusx_transports() -> None:
         "reactant_mol_block",
         "product_mol_block",
         "filter_expression",
+        "sort_by",
+        "sort_direction",
     } <= _request_properties(
         openapi,
         "/api/logical_reaction_query_service/list_logical_reactions",

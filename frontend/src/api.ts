@@ -27,6 +27,7 @@ import type {
   ProjectMemberView,
   ProjectView,
   ScientificArrayPreview,
+  TransitionStateInferenceSummary,
   SessionView,
   UserPage,
   UploadBatch,
@@ -36,8 +37,9 @@ import type {
   UploadBatchPage,
   UploadBatchStatus,
 } from "./types";
-import type { GeometryQueryFilters } from "./geometryQuery";
-import type { ReactionQueryFilters } from "./reactionQuery";
+import type { GeometryQueryFilters, GeometrySort } from "./geometryQuery";
+import type { ReactionQueryFilters, ReactionSort } from "./reactionQuery";
+import type { ArtifactSort } from "./artifactQuery";
 
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
 const csrfCookieName = import.meta.env.VITE_CSRF_COOKIE_NAME?.trim() || "example_csrf";
@@ -481,7 +483,7 @@ export const api = {
     requestMutation<ProjectInvitationView>(`/api/auth/invitations/${encodeURIComponent(token)}/accept`, "POST", {}, signal),
   projectAudit: (id: string, options: { limit?: number; offset?: number } = {}, signal?: AbortSignal) =>
     request<AuditEventView[]>(`/api/projects/${encodeURIComponent(id)}/audit?limit=${options.limit ?? 50}&offset=${options.offset ?? 0}`, signal),
-  reactions: (options: ReactionQueryFilters & { limit?: number; offset?: number } = {}, signal?: AbortSignal) => {
+  reactions: (options: ReactionQueryFilters & Partial<ReactionSort> & { limit?: number; offset?: number } = {}, signal?: AbortSignal) => {
     const limit = options.limit ?? 50;
     const offset = options.offset ?? 0;
     if (options.filterExpression) {
@@ -503,9 +505,12 @@ export const api = {
           maximum_reaction_gibbs_free_energy_kcal_mol: null,
           has_activation_gibbs_free_energy: options.hasActivationGibbsFreeEnergy ?? null,
           has_reaction_gibbs_free_energy: options.hasReactionGibbsFreeEnergy ?? null,
+          reactant_product_changed: options.reactantProductChanged ?? null,
           created_after: null,
           created_before: null,
           filter_expression: JSON.stringify(options.filterExpression),
+          sort_by: options.sortBy ?? "default",
+          sort_direction: options.sortDirection ?? "asc",
           limit,
           offset,
         },
@@ -528,6 +533,9 @@ export const api = {
         ...(options.maximumReactionGibbsFreeEnergyKcalMol !== undefined ? { maximum_reaction_gibbs_free_energy_kcal_mol: String(options.maximumReactionGibbsFreeEnergyKcalMol) } : {}),
         ...(options.hasActivationGibbsFreeEnergy ? { has_activation_gibbs_free_energy: "true" } : {}),
         ...(options.hasReactionGibbsFreeEnergy ? { has_reaction_gibbs_free_energy: "true" } : {}),
+        ...(options.reactantProductChanged !== undefined ? { reactant_product_changed: String(options.reactantProductChanged) } : {}),
+        ...(options.sortBy ? { sort_by: options.sortBy } : {}),
+        ...(options.sortDirection ? { sort_direction: options.sortDirection } : {}),
       })}`,
       signal,
     );
@@ -564,6 +572,7 @@ export const api = {
     maximumActivationGibbsFreeEnergyKcalMol?: number;
     minimumReactionGibbsFreeEnergyKcalMol?: number;
     maximumReactionGibbsFreeEnergyKcalMol?: number;
+    reactantProductChanged?: boolean;
     limit?: number;
     offset?: number;
   } = {}, signal?: AbortSignal) =>
@@ -577,7 +586,38 @@ export const api = {
         ...(options.maximumActivationGibbsFreeEnergyKcalMol !== undefined ? { maximum_activation_gibbs_free_energy_kcal_mol: String(options.maximumActivationGibbsFreeEnergyKcalMol) } : {}),
         ...(options.minimumReactionGibbsFreeEnergyKcalMol !== undefined ? { minimum_reaction_gibbs_free_energy_kcal_mol: String(options.minimumReactionGibbsFreeEnergyKcalMol) } : {}),
         ...(options.maximumReactionGibbsFreeEnergyKcalMol !== undefined ? { maximum_reaction_gibbs_free_energy_kcal_mol: String(options.maximumReactionGibbsFreeEnergyKcalMol) } : {}),
+        ...(options.reactantProductChanged !== undefined ? { reactant_product_changed: String(options.reactantProductChanged) } : {}),
       })}`,
+      signal,
+    ),
+  transitionStateInferences: (options: {
+    artifactIngestionId?: string;
+    parseRevisionId?: string;
+    status?: string;
+    logicalReactionId?: string;
+    mappedReactionId?: string;
+    calculationFrameId?: string;
+    minimumImaginaryFrequencyCm1?: number;
+    maximumImaginaryFrequencyCm1?: number;
+    reactantProductChanged?: boolean;
+    limit?: number;
+    offset?: number;
+  } = {}, signal?: AbortSignal) =>
+    requestJson<Page<TransitionStateInferenceSummary>>(
+      "/api/transition_state_inference_query_service/list_transition_state_inferences",
+      {
+        artifact_ingestion_id: options.artifactIngestionId ?? null,
+        parse_revision_id: options.parseRevisionId ?? null,
+        status: options.status ?? null,
+        logical_reaction_id: options.logicalReactionId ?? null,
+        mapped_reaction_id: options.mappedReactionId ?? null,
+        calculation_frame_id: options.calculationFrameId ?? null,
+        minimum_imaginary_frequency_cm1: options.minimumImaginaryFrequencyCm1 ?? null,
+        maximum_imaginary_frequency_cm1: options.maximumImaginaryFrequencyCm1 ?? null,
+        reactant_product_changed: options.reactantProductChanged ?? null,
+        limit: options.limit ?? 50,
+        offset: options.offset ?? 0,
+      },
       signal,
     ),
   reactionEnergyProfile: (
@@ -608,7 +648,7 @@ export const api = {
       `/api/scientific-arrays/${encodeURIComponent(id)}/preview?max_elements=${options.maxElements ?? 512}`,
       signal,
     ),
-  artifacts: (options: { artifactId?: string; artifactKind?: string; contentSha256?: string; originalFilenameContains?: string; projectId?: string; storageStatus?: string; limit?: number; offset?: number; cursor?: string } = {}, signal?: AbortSignal) =>
+  artifacts: (options: Partial<ArtifactSort> & { artifactId?: string; artifactKind?: string; contentSha256?: string; originalFilenameContains?: string; projectId?: string; storageStatus?: string; limit?: number; offset?: number; cursor?: string } = {}, signal?: AbortSignal) =>
     request<Page<ArtifactSummary>>(
       `/api/artifacts?${new URLSearchParams({
         limit: String(options.limit ?? 50),
@@ -620,6 +660,8 @@ export const api = {
         ...(options.projectId ? { project_id: options.projectId } : {}),
         ...(options.storageStatus ? { storage_status: options.storageStatus } : {}),
         ...(options.cursor !== undefined ? { cursor: options.cursor } : {}),
+        ...(options.sortBy ? { sort_by: options.sortBy } : {}),
+        ...(options.sortDirection ? { sort_direction: options.sortDirection } : {}),
       })}`,
       signal,
     ),
@@ -629,7 +671,7 @@ export const api = {
       signal,
     ),
   geometries: (
-    options: GeometryQueryFilters & { limit?: number; offset?: number } = {},
+    options: GeometryQueryFilters & Partial<GeometrySort> & { limit?: number; offset?: number } = {},
     signal?: AbortSignal,
   ) =>
     requestJson<Page<GeometrySummary>>(
@@ -650,6 +692,8 @@ export const api = {
         minimum_atom_count: options.minimumAtomCount ?? null,
         maximum_atom_count: options.maximumAtomCount ?? null,
         filter_expression: options.filterExpression ? JSON.stringify(options.filterExpression) : null,
+        sort_by: options.sortBy ?? "default",
+        sort_direction: options.sortDirection ?? "asc",
         limit: options.limit ?? 50,
         offset: options.offset ?? 0,
       },

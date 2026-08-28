@@ -33,6 +33,7 @@ def test_nexusx_registers_complete_read_query_surface() -> None:
         "/api/molecular_topology_derivation_query_service/list_topology_derivations",
         "/api/molecular_topology_derivation_query_service/get_topology_derivation",
         "/api/depictions/geometry/{geometry_id}.sdf",
+        "/api/depictions/geometry/{geometry_id}.xyz",
         "/api/depictions/geometry/{geometry_id}.svg",
         "/api/depictions/topology/{topology_id}.svg",
         "/api/depictions/topology/{topology_id}.mol",

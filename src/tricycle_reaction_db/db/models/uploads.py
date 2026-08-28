@@ -20,7 +20,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, SMALLINT
 from sqlalchemy.orm import deferred
 from sqlmodel import Field, Relationship, SQLModel
 
@@ -383,6 +383,10 @@ class TransitionStateEndpoint(SQLModel, table=True):
             name="ck_transition_state_endpoint_displacement_ratio_positive",
         ),
         CheckConstraint(
+            "multiplicity > 0",
+            name="ck_transition_state_endpoint_multiplicity_positive",
+        ),
+        CheckConstraint(
             "cardinality(source_to_topology_atom_indices) = atom_count",
             name="ck_transition_state_endpoint_mapping_length",
         ),
@@ -414,6 +418,10 @@ class TransitionStateEndpoint(SQLModel, table=True):
         index=True,
         nullable=False,
     )
+    # Defaults keep lightweight fixture construction backwards-compatible;
+    # ingestion always supplies the exact CalculationFrame state.
+    charge: int = Field(default=0, sa_type=SMALLINT, nullable=False)
+    multiplicity: int = Field(default=1, sa_type=SMALLINT, nullable=False)
     direction: TransitionStateEndpointDirection = Field(
         sa_column=Column(
             string_enum(

@@ -86,6 +86,7 @@ from tricycle_reaction_db.db.types import (
     summarize_numpy_array,
 )
 from tricycle_reaction_db.domain.enums import (
+    ParseCompleteness,
     ParseStatus,
     QMSoftware,
     ScientificArrayKind,
@@ -1189,7 +1190,11 @@ def finalize_parse_revision(
         frame_count = len(segment.frames)
         if segment.source_frame_count is None and frame_count == 0:
             raise ValueError("a segment without source frame evidence requires a frame")
-        if revision.source_complete is True and segment.source_frame_count != frame_count:
+        if (
+            revision.source_complete is True
+            and revision.parse_completeness is not ParseCompleteness.PARTIAL
+            and segment.source_frame_count != frame_count
+        ):
             raise ValueError("complete source capture must persist every located segment frame")
         if segment.source_frame_count is not None and frame_count > segment.source_frame_count:
             raise ValueError("persisted frame count cannot exceed the located source frame count")

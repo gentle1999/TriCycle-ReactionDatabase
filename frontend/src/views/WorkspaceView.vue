@@ -6,13 +6,13 @@ import ArtifactPreviewDrawer from "@/components/ArtifactPreviewDrawer.vue";
 import ArtifactsView from "@/components/ArtifactsView.vue";
 import FrameDrawer from "@/components/FrameDrawer.vue";
 import ReactionView from "@/components/ReactionView.vue";
-import type { ArtifactFilterValues } from "@/artifactQuery";
+import type { ArtifactFilterValues, ArtifactSort } from "@/artifactQuery";
 import { useCatalogQueries, type CatalogView } from "@/composables/useCatalogQueries";
 import { useProjectContext } from "@/composables/useProjectContext";
 import { useSession } from "@/composables/useSession";
 import { queryClient } from "@/queryClient";
 import { withoutAccessState } from "@/routeAccessState";
-import type { ReactionQueryFilters } from "@/reactionQuery";
+import type { ReactionQueryFilters, ReactionSort } from "@/reactionQuery";
 import type { PageInfo } from "@/types";
 
 const route = useRoute();
@@ -65,7 +65,9 @@ const selectedArtifactId = ref<string | null>(null);
 const expandedArtifactId = ref<string | null>(null);
 const reactionOffset = ref(0);
 const reactionFilters = ref<ReactionQueryFilters>({});
+const reactionSort = ref<ReactionSort>({ sortBy: "default", sortDirection: "asc" });
 const artifactOffset = ref(0);
+const artifactSort = ref<ArtifactSort>({ sortBy: "created_at", sortDirection: "desc" });
 
 const mappedReactionId = computed(() => routeMappedReactionId.value ?? selectedMappedId.value);
 const queries = useCatalogQueries({
@@ -74,7 +76,9 @@ const queries = useCatalogQueries({
   user: currentUser,
   reactionOffset,
   reactionFilters,
+  reactionSort,
   artifactOffset,
+  artifactSort,
   artifactFilterId,
   artifactKindFilter,
   artifactContentShaFilter,
@@ -170,6 +174,11 @@ function applyReactionFilters(filters: ReactionQueryFilters): void {
   reactionOffset.value = 0;
 }
 
+function updateReactionSort(sort: ReactionSort): void {
+  reactionSort.value = sort;
+  reactionOffset.value = 0;
+}
+
 function closeFrame(): void {
   selectedFrameId.value = null;
 }
@@ -205,6 +214,11 @@ function applyArtifactFilters(filters: ArtifactFilterValues): void {
   resetArtifactPagination();
   expandedArtifactId.value = null;
   void router.push({ name: "artifacts", query: artifactFilterQuery(filters) });
+}
+
+function updateArtifactSort(sort: ArtifactSort): void {
+  artifactSort.value = sort;
+  resetArtifactPagination();
 }
 
 function closeArtifactPreview(): void {
@@ -274,6 +288,7 @@ function jumpArtifactPage(offset: number): void {
       :total="reactionPage.total"
       :page="reactionPage"
       :query-filters="reactionFilters"
+      :sort="reactionSort"
       @select-reaction="selectReaction"
       @select-mapped="selectMapped"
       @open-frame="openFrame"
@@ -281,6 +296,7 @@ function jumpArtifactPage(offset: number): void {
       @next-page="nextReactionPage"
       @jump-page="jumpReactionPage"
       @apply-filters="applyReactionFilters"
+      @update-sort="updateReactionSort"
     />
     <ArtifactsView
       v-if="activeView === 'artifacts'"
@@ -296,7 +312,9 @@ function jumpArtifactPage(offset: number): void {
       :frames-error="queries.artifactFrames.error.value instanceof Error ? queries.artifactFrames.error.value.message : ''"
       :total="artifactPage.total"
       :page="artifactPage"
+      :sort="artifactSort"
       @apply-filters="applyArtifactFilters"
+      @update-sort="updateArtifactSort"
       @preview="openArtifactPreview"
       @deleted="refreshAfterDelete"
       @toggle-frames="toggleArtifactFrames"

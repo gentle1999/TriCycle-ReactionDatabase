@@ -85,12 +85,17 @@ async function renderMolecule(): Promise<void> {
       viewer.styles.atoms_font_size_2D = props.atomMapNumbers?.length ? 10 : 13;
       viewer.styles.bonds_width_2D = 1.35;
       viewer.styles.bonds_clearOverlaps_2D = true;
+      viewer.styles.atoms_implicitHydrogens_2D = false;
     }
 
     const molfile = await getTopologyMolfile(props.topologyId, requestController.signal);
     const molecule = ChemDoodle.readMOL(molfile);
     if (!molecule) throw new Error("molfile 无法解析");
     const molCharges = readMolCharges(molfile);
+    // Only coordinate-bearing atoms from the stored MOL are rendered.
+    molecule.atoms.forEach((atom) => {
+      atom.implicitH = 0;
+    });
     for (const [atomIndex, charge] of molCharges) {
       const atom = molecule.atoms[atomIndex];
       if (!atom) continue;

@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     # trade one unbounded dimension for another.
     max_upload_bytes: int = Field(default=64 * 1024 * 1024, ge=1024)
     max_batch_files: int = Field(default=64, ge=1, le=10_000)
-    max_batch_bytes: int = Field(default=256 * 1024 * 1024, ge=1024, le=4 * 1024 * 1024 * 1024)
+    max_batch_bytes: int = Field(default=512 * 1024 * 1024, ge=1024, le=4 * 1024 * 1024 * 1024)
     max_upload_queue_files: int = Field(default=20_000, ge=1, le=100_000)
     max_upload_queue_bytes: int = Field(
         default=1024 * 1024 * 1024 * 1024,
@@ -77,13 +77,17 @@ class Settings(BaseSettings):
     read_rate_limit_requests: int = Field(default=10_000, ge=1, le=1_000_000)
     upload_rate_limit_requests: int = Field(default=1_000, ge=1, le=1_000_000)
     upload_max_concurrency: int = Field(default=8, ge=1, le=128)
-    # Source spans and block hashes are expensive to collect for large logs.
-    # Keep them opt-in for normal ingestion; audit/reproducibility workflows
-    # can enable this setting explicitly.
-    molop_capture_source_evidence: bool = False
+    # MolOP 0.2.11 collects frame roles and source locators without implicitly
+    # reconstructing molecular graphs. Keep evidence enabled so optimization
+    # frames retain their initial/intermediate/terminal role during ingestion.
+    # Deployments may still disable it explicitly for legacy fast-ingestion
+    # behavior, but those frames cannot provide MolOP's evidence-derived role.
+    molop_capture_source_evidence: bool = True
     # Fast ingestion batches revision-local frame rows in one transaction.
-    # This is enabled automatically only when source evidence is disabled.
+    # Evidence capture no longer disables deferred topology reconstruction.
     molop_parallel_frame_persistence: bool = True
+    # Bound the end-to-end time spent parsing and reconstructing one source file.
+    molop_file_parse_timeout_seconds: float = Field(default=60.0, gt=0.0, le=86400.0)
     molecule_query_rate_limit_requests: int = Field(default=10_000, ge=1, le=1_000_000)
     depiction_rate_limit_requests: int = Field(default=10_000, ge=1, le=1_000_000)
     query_rate_limit_window_seconds: int = Field(default=60, ge=1, le=86_400)

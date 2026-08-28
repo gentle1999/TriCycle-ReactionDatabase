@@ -9,6 +9,7 @@ import ChemDoodleMolecule from "@/components/ChemDoodleMolecule.vue";
 import GeometryCatalogCard from "@/components/GeometryCatalogCard.vue";
 import PaginationControls from "@/components/PaginationControls.vue";
 import { useProjectContext } from "@/composables/useProjectContext";
+import { usePaginatedQuery } from "@/composables/usePaginatedQuery";
 import { formatNumber, labelFor, shortId } from "@/format";
 import { withoutAccessState } from "@/routeAccessState";
 
@@ -29,38 +30,58 @@ const topologyQuery = useQuery({
   staleTime: 60_000,
 });
 
-const geometriesQuery = useQuery({
-  queryKey: computed(() => ["topology-geometries", {
+function geometryPageQueryKey(offset: number) {
+  return ["topology-geometries", {
     topologyId: topologyId.value,
     projectId: currentProjectId.value,
     limit: relatedPageLimit,
-    offset: geometryOffset.value,
-  }]),
-  queryFn: ({ signal }) => api.geometries({
+    offset,
+  }] as const;
+}
+
+function fetchGeometryPage(offset: number, signal: AbortSignal) {
+  return api.geometries({
     projectId: currentProjectId.value ?? undefined,
     topologyId: topologyId.value ?? undefined,
     thermodynamicOnly: false,
     limit: relatedPageLimit,
-    offset: geometryOffset.value,
-  }, signal),
+    offset,
+  }, signal);
+}
+
+const geometriesQuery = usePaginatedQuery({
+  queryKey: computed(() => geometryPageQueryKey(geometryOffset.value)),
   enabled: computed(() => topologyId.value !== null && currentProjectId.value !== null),
+  offset: geometryOffset,
+  fetchPage: fetchGeometryPage,
+  queryKeyForOffset: geometryPageQueryKey,
   staleTime: 60_000,
 });
 
-const reactionsQuery = useQuery({
-  queryKey: computed(() => ["topology-reactions", {
+function reactionPageQueryKey(offset: number) {
+  return ["topology-reactions", {
     topologyId: topologyId.value,
     projectId: currentProjectId.value,
     limit: relatedPageLimit,
-    offset: reactionOffset.value,
-  }]),
-  queryFn: ({ signal }) => api.reactions({
+    offset,
+  }] as const;
+}
+
+function fetchReactionPage(offset: number, signal: AbortSignal) {
+  return api.reactions({
     projectId: currentProjectId.value ?? undefined,
     topologyId: topologyId.value ?? undefined,
     limit: relatedPageLimit,
-    offset: reactionOffset.value,
-  }, signal),
+    offset,
+  }, signal);
+}
+
+const reactionsQuery = usePaginatedQuery({
+  queryKey: computed(() => reactionPageQueryKey(reactionOffset.value)),
   enabled: computed(() => topologyId.value !== null && currentProjectId.value !== null),
+  offset: reactionOffset,
+  fetchPage: fetchReactionPage,
+  queryKeyForOffset: reactionPageQueryKey,
   staleTime: 60_000,
 });
 

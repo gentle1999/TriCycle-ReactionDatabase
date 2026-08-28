@@ -5,6 +5,18 @@ export type ArtifactQueryField =
   | "artifact_kind"
   | "storage_status";
 
+export type ArtifactSortBy =
+  | "created_at"
+  | "original_filename"
+  | "size_bytes"
+  | "artifact_kind"
+  | "storage_status";
+
+export interface ArtifactSort {
+  sortBy: ArtifactSortBy;
+  sortDirection: "asc" | "desc";
+}
+
 export interface ArtifactFilterValues {
   artifactId: string | null;
   contentSha256: string | null;

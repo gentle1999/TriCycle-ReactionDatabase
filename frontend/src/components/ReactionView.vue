@@ -6,7 +6,7 @@ import { RouterLink } from "vue-router";
 import { api } from "@/api";
 import QueryValidationIndicator from "@/components/QueryValidationIndicator.vue";
 import type { LogicalReactionDetail, LogicalReactionSummary, MappedReactionDetail, PageInfo } from "@/types";
-import type { ReactionQueryFilters } from "@/reactionQuery";
+import type { ReactionQueryFilters, ReactionSort, ReactionSortBy } from "@/reactionQuery";
 
 import MappedReactionExpansion from "./MappedReactionExpansion.vue";
 import ReactionAdvancedQueryModal from "./ReactionAdvancedQueryModal.vue";
@@ -25,6 +25,7 @@ const props = defineProps<{
   total: number;
   page: PageInfo;
   queryFilters: ReactionQueryFilters;
+  sort: ReactionSort;
 }>();
 
 const emit = defineEmits<{
@@ -35,11 +36,13 @@ const emit = defineEmits<{
   nextPage: [];
   jumpPage: [offset: number];
   applyFilters: [filters: ReactionQueryFilters];
+  updateSort: [sort: ReactionSort];
 }>();
 
 const quickReactionInput = ref(props.queryFilters.reactionSmarts ?? "");
 const hasActivationGibbsFreeEnergy = ref(props.queryFilters.hasActivationGibbsFreeEnergy ?? false);
 const hasReactionGibbsFreeEnergy = ref(props.queryFilters.hasReactionGibbsFreeEnergy ?? false);
+const reactantProductChanged = ref<boolean | null>(props.queryFilters.reactantProductChanged ?? null);
 const validationError = ref("");
 type QueryValidationStatus = "idle" | "pending" | "valid" | "invalid";
 const quickValidation = ref<{ status: QueryValidationStatus; message: string }>({ status: "idle", message: "" });
@@ -63,11 +66,15 @@ watch(() => props.queryFilters.hasActivationGibbsFreeEnergy, (value) => {
 watch(() => props.queryFilters.hasReactionGibbsFreeEnergy, (value) => {
   hasReactionGibbsFreeEnergy.value = value ?? false;
 });
+watch(() => props.queryFilters.reactantProductChanged, (value) => {
+  reactantProductChanged.value = value ?? null;
+});
 
 function selectedEnergyFilters(): ReactionQueryFilters {
   return {
     ...(hasActivationGibbsFreeEnergy.value ? { hasActivationGibbsFreeEnergy: true } : { hasActivationGibbsFreeEnergy: undefined }),
     ...(hasReactionGibbsFreeEnergy.value ? { hasReactionGibbsFreeEnergy: true } : { hasReactionGibbsFreeEnergy: undefined }),
+    ...(reactantProductChanged.value === null ? { reactantProductChanged: undefined } : { reactantProductChanged: reactantProductChanged.value }),
   };
 }
 
@@ -156,6 +163,7 @@ function clearFilters(): void {
   quickReactionInput.value = "";
   hasActivationGibbsFreeEnergy.value = false;
   hasReactionGibbsFreeEnergy.value = false;
+  reactantProductChanged.value = null;
   validationError.value = "";
   advancedQueryOpen.value = false;
   emit("applyFilters", {});
@@ -169,11 +177,26 @@ function applyAdvancedQuery(filters: ReactionQueryFilters): void {
     ...filters,
     ...(hasActivationGibbsFreeEnergy.value ? { hasActivationGibbsFreeEnergy: true } : {}),
     ...(hasReactionGibbsFreeEnergy.value ? { hasReactionGibbsFreeEnergy: true } : {}),
+    ...(reactantProductChanged.value === null ? {} : { reactantProductChanged: reactantProductChanged.value }),
   });
 }
 
 function applyOuterEnergyFilters(): void {
   emit("applyFilters", outerReactionFilters());
+}
+
+function updateSortBy(event: Event): void {
+  emit("updateSort", {
+    sortBy: (event.target as HTMLSelectElement).value as ReactionSortBy,
+    sortDirection: props.sort.sortDirection,
+  });
+}
+
+function updateSortDirection(event: Event): void {
+  emit("updateSort", {
+    sortBy: props.sort.sortBy,
+    sortDirection: (event.target as HTMLSelectElement).value as ReactionSort["sortDirection"],
+  });
 }
 
 watch(quickReactionInput, (value) => scheduleQuickValidation(value));
@@ -218,6 +241,14 @@ onBeforeUnmount(() => {
           <span><strong>含有反应自由能</strong><small>仅保留有 ΔG 数据的反应路径。</small></span>
         </label>
       </div>
+      <label class="filter-select-field reaction-change-filter">
+        <span>前后体拓扑</span>
+        <select v-model="reactantProductChanged" aria-label="前后体拓扑是否发生变化" @change="applyOuterEnergyFilters">
+          <option :value="null">全部反应</option>
+          <option :value="true">发生变化</option>
+          <option :value="false">未发生变化</option>
+        </select>
+      </label>
       <div v-if="advancedConditionCount" class="advanced-query-active">
         <span>高级查询</span><strong>{{ advancedConditionCount }} 个条件</strong>
         <button class="icon-button" type="button" title="清除高级查询" aria-label="清除高级查询" @click="clearFilters"><X :size="14" aria-hidden="true" /></button>
@@ -231,7 +262,13 @@ onBeforeUnmount(() => {
           <span class="eyebrow">Reaction catalog</span>
           <h2 id="reaction-results-title">{{ resultTitle }}</h2>
         </div>
-        <PaginationControls :page="page" label="反应分页（顶部）" @previous="emit('previousPage')" @next="emit('nextPage')" @jump="emit('jumpPage', $event)" />
+        <div class="catalog-header-actions">
+          <div class="catalog-sort-controls" aria-label="反应排序">
+            <label><span>排序</span><select :value="sort.sortBy" aria-label="反应排序字段" @change="updateSortBy"><option value="default">默认顺序</option><option value="created_at">创建时间</option><option value="reaction_key">反应键</option><option value="reaction_class">反应类型</option><option value="minimum_activation_gibbs_free_energy">最低 ΔG‡</option><option value="minimum_reaction_gibbs_free_energy">最低 ΔG</option></select></label>
+            <label><span>顺序</span><select :value="sort.sortDirection" aria-label="反应排序方向" :disabled="sort.sortBy === 'default'" @change="updateSortDirection"><option value="asc">升序</option><option value="desc">降序</option></select></label>
+          </div>
+          <PaginationControls :page="page" label="反应分页（顶部）" @previous="emit('previousPage')" @next="emit('nextPage')" @jump="emit('jumpPage', $event)" />
+        </div>
       </header>
       <div v-if="loading && !reactions.length" class="workspace-loading"><div class="loading-block is-wide"></div><div class="loading-block is-wide"></div></div>
       <div v-else-if="!reactions.length" class="workspace-empty"><FlaskConical :size="32" /><strong>没有匹配的逻辑反应</strong><p>请调整反应 SMILES，或使用高级查询组合其他条件。</p></div>

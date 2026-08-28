@@ -111,7 +111,7 @@ function newCondition(field: ReactionQueryField = "rxn_smarts"): ReactionQueryCo
   return {
     id: nextConditionId.value++,
     field,
-    value: field === "reaction_class" ? "cycloaddition" : "",
+    value: field === "reactant_product_changed" ? "true" : "",
     reactantSmiles: "",
     productSmiles: "",
     molfile: "",
@@ -139,7 +139,7 @@ function removeCondition(id: number): void {
 
 function changeField(condition: ReactionQueryCondition): void {
   clearConditionValidation(condition.id);
-  condition.value = condition.field === "reaction_class" ? "cycloaddition" : "";
+  condition.value = condition.field === "reactant_product_changed" ? "true" : "";
   condition.reactantSmiles = "";
   condition.productSmiles = "";
   condition.molfile = "";
@@ -166,7 +166,7 @@ function parseDatetime(value: string): string | null {
 function buildFilters(): ReactionQueryFilters | null {
   const expressionConditions: ReactionQueryExpressionCondition[] = [];
   for (const condition of conditions.value) {
-    let expressionValue: string | number;
+    let expressionValue: string | number | boolean;
     const structureInput = validationInput(condition);
     const structureValidation = validationStates.value[condition.id];
     if (fieldKind(condition) === "reaction") {
@@ -195,6 +195,12 @@ function buildFilters(): ReactionQueryFilters | null {
         return null;
       }
       expressionValue = parsed;
+    } else if (fieldKind(condition) === "boolean") {
+      if (condition.value !== "true" && condition.value !== "false") {
+        validationError.value = `请选择“${reactionQueryFieldOption(condition.field).label}”的布尔值`;
+        return null;
+      }
+      expressionValue = condition.value === "true";
     } else {
       expressionValue = condition.value.trim();
       if (!expressionValue) {
@@ -378,7 +384,12 @@ watch(
                   </template>
                 </ChemDoodleTopologyEditor>
                 <select v-else-if="fieldKind(condition) === 'class'" v-model="condition.value" aria-label="反应类型条件">
+                  <option value="" disabled>请选择反应类型</option>
                   <option value="cycloaddition">环加成</option>
+                </select>
+                <select v-else-if="fieldKind(condition) === 'boolean'" v-model="condition.value" :aria-label="`${reactionQueryFieldOption(condition.field).label}条件值`">
+                  <option value="true">是</option>
+                  <option value="false">否</option>
                 </select>
                 <div v-else class="query-input-with-validation">
                   <input

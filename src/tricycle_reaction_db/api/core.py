@@ -199,21 +199,28 @@ async def list_artifacts(
     limit: CoreLimit = 50,
     offset: CoreOffset = 0,
     cursor: str | None = None,
+    sort_by: str = "created_at",
+    sort_direction: str = "desc",
 ) -> ArtifactPage:
-    return cast(
-        ArtifactPage,
-        await ArtifactQueryService.list_artifacts(
-            artifact_id=artifact_id,
-            artifact_kind=artifact_kind,
-            project_id=project_id,
-            content_sha256=content_sha256,
-            storage_status=storage_status,
-            original_filename_contains=original_filename_contains,
-            limit=limit,
-            offset=offset,
-            cursor=cursor,
-        ),
-    )
+    try:
+        return cast(
+            ArtifactPage,
+            await ArtifactQueryService.list_artifacts(
+                artifact_id=artifact_id,
+                artifact_kind=artifact_kind,
+                project_id=project_id,
+                content_sha256=content_sha256,
+                storage_status=storage_status,
+                original_filename_contains=original_filename_contains,
+                limit=limit,
+                offset=offset,
+                cursor=cursor,
+                sort_by=sort_by,
+                sort_direction=sort_direction,
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/artifacts/{artifact_id}", response_model=ArtifactSummary)
@@ -301,8 +308,11 @@ async def list_logical_reactions(
     maximum_reaction_gibbs_free_energy_kcal_mol: float | None = None,
     has_activation_gibbs_free_energy: bool | None = None,
     has_reaction_gibbs_free_energy: bool | None = None,
+    reactant_product_changed: bool | None = None,
     limit: CoreLimit = 50,
     offset: CoreOffset = 0,
+    sort_by: str = "default",
+    sort_direction: str = "asc",
 ) -> LogicalReactionPage:
     try:
         return cast(
@@ -330,8 +340,11 @@ async def list_logical_reactions(
                 ),
                 has_activation_gibbs_free_energy=has_activation_gibbs_free_energy,
                 has_reaction_gibbs_free_energy=has_reaction_gibbs_free_energy,
+                reactant_product_changed=reactant_product_changed,
                 limit=limit,
                 offset=offset,
+                sort_by=sort_by,
+                sort_direction=sort_direction,
             ),
         )
     except ValueError as exc:
@@ -431,6 +444,7 @@ async def list_mapped_reactions(
     maximum_activation_gibbs_free_energy_kcal_mol: float | None = None,
     minimum_reaction_gibbs_free_energy_kcal_mol: float | None = None,
     maximum_reaction_gibbs_free_energy_kcal_mol: float | None = None,
+    reactant_product_changed: bool | None = None,
     limit: CoreLimit = 50,
     offset: CoreOffset = 0,
 ) -> MappedReactionPage:
@@ -459,6 +473,7 @@ async def list_mapped_reactions(
             maximum_reaction_gibbs_free_energy_kcal_mol=(
                 maximum_reaction_gibbs_free_energy_kcal_mol
             ),
+            reactant_product_changed=reactant_product_changed,
             limit=limit,
             offset=offset,
         ),

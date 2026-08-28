@@ -24,18 +24,18 @@ uv sync --python 3.12
 需要覆盖开发默认值时，基于 `.env.example` 创建 `.env`。默认配置只监听
 `127.0.0.1`，数据库账号和密码仅用于本地开发。
 
-完成初始化后，使用以下一个命令启动支持热更新的完整宿主机开发服务：
+完成初始化后，使用以下一个命令启动支持热更新的宿主机开发服务：
 
 ```bash
 make dev
 ```
 
-该命令让 Compose 使用仓库的 `.env.example` 单机开发配置，并显式覆盖 API 的本地数据库、
-RustFS、认证模式与监听地址；因此不会继承两主机 `.env` 中的远端数据服务端点。它会启动
-PostgreSQL/RDKit、RustFS 和本地 Keycloak，执行 migration 与 development bootstrap，并同时启动
-组合 API 和 Vite 前端。Python 源码修改会触发 API reload，前端源码修改
-由 Vite HMR 更新；浏览器访问 <http://127.0.0.1:5173/>。按 `Ctrl-C` 只停止 API 和前端进程，
-基础设施容器与其中的开发数据继续运行。
+该命令会在宿主机上同时启动组合 API 和 Vite 前端，并显式覆盖本地数据库、RustFS、认证模式与
+监听地址；因此不会继承两主机 `.env` 中的远端数据服务端点。Python 源码修改会触发 API reload，
+前端源码修改由 Vite HMR 更新；浏览器访问 <http://127.0.0.1:5173/>。按 `Ctrl-C` 只停止 API
+和前端进程。
+
+如果需要把 PostgreSQL/RDKit、RustFS 和本地 Keycloak 也一起拉起，使用 `make dev-stack`。
 
 ### 远程 Compute 容器联合压力测试
 
@@ -465,7 +465,8 @@ writer endpoint 对应用呈现为同一个逻辑 engine，节点数量不会变
 | `TRICYCLE_QUERY_RATE_LIMIT_WINDOW_SECONDS` | `60` | 限流窗口秒数 |
 | `TRICYCLE_STRUCTURE_QUERY_MAX_CHARACTERS` | `16384` | SMILES/SMARTS/reaction 输入长度上限 |
 | `TRICYCLE_STRUCTURE_CANDIDATE_LIMIT` | `50000` | 需要逐候选后处理的最大关系行数 |
-| `TRICYCLE_MOLOP_BATCH_N_JOBS` | `2` | 每个 API worker 维护的可复用 MolOP 解析进程池大小，单文件与批量解析共用；`-1` 在开发环境使用全部可用 CPU，生产环境必须显式限界 |
+| `TRICYCLE_MOLOP_BATCH_N_JOBS` | `2` | 同时处理的文件级 MolOP worker 数；每个文件使用可终止的独立 worker，`-1` 在开发环境使用全部可用 CPU，生产环境必须显式限界 |
+| `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS` | `60` | 单个文件的 MolOP 解析与 MolGR 帧重建最长允许时间；超时文件单独失败，批次继续处理 |
 
 描述符、Murcko scaffold、手性和匹配次数等逐候选计算必须先通过 Formula、
 Topology 或
@@ -533,7 +534,7 @@ make seed-da-bench
 
 ### 直接批量导入存量文件
 
-大量存量文件不需要经过浏览器或 HTTP API。`tricycle-import-artifacts` 在服务端进程内递归读取文件，直接调用 Artifact 入库服务，写入 PostgreSQL/RustFS，并按现有 MolOP 解析流程处理计算输出。它按服务端 `max_batch_files` 和 `max_batch_bytes` 自动分批，内容 SHA-256 由 Artifact 唯一约束负责幂等去重。
+大量存量文件不需要经过浏览器或 HTTP API。`tricycle-import-artifacts` 在服务端进程内递归读取文件，直接调用 Artifact 入库服务，写入 PostgreSQL/RustFS，并按现有 MolOP 解析流程处理计算输出。指纹计算也采用有界的顺序释放流水线，不会先扫描并哈希完整目录后才开始解析。导入使用有界流式队列，默认每 16 个完成文件进入一次持久化微批；文件解析、RustFS 写入和数据库持久化可以流水线重叠。磁盘流模式按文件数和单文件大小限制资源，不把 `max_batch_bytes` 当作处理屏障；该配置仍保护 HTTP 批量上传请求。每个微批提交后立即追加逐文件检查点，内容 SHA-256 由 Artifact 唯一约束负责幂等去重。
 
 先启动 PostgreSQL、RustFS、完成 migration 和 development bootstrap，然后执行：
 
@@ -547,6 +548,8 @@ uv run tricycle-import-artifacts \
 参数说明：
 
 - 可以传入多个文件或目录；目录会递归扫描，符号链接不会展开。
+- `--commit-batch-files` 控制本地解析及持久化微批的目标文件数，默认 `16`；也可通过 `IMPORT_COMMIT_BATCH_FILES` 传给 `make import-artifacts`。该值只控制提交频率，不改变单文件解析队列。
+- `--stream-queue-size` 控制待读取文件的有界队列大小，默认 `32`；也可通过 `IMPORT_STREAM_QUEUE_SIZE` 传给 `make import-artifacts`。
 - 默认导入 `calculation_output`，可用 `--artifact-kind input|workflow_manifest|auxiliary` 覆盖。
 - `--state-file` 是追加写入的 JSONL 检查点。重复执行会按路径、大小、mtime 和 SHA-256 跳过已成功文件；文件发生变化后会重新导入。
 - 使用 `--dry-run` 只扫描并输出统计，不写数据库或对象存储。

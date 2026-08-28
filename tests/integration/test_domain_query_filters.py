@@ -269,7 +269,23 @@ def _create_domain_sample(session: Session) -> tuple[Any, ...]:
         minimum_reaction_gibbs_free_energy_kcal_mol=1.0,
         maximum_reaction_gibbs_free_energy_kcal_mol=1.0,
     )
-    session.add_all([array, thermochemistry, mapped_reaction])
+    participants = [
+        LogicalReactionParticipant(
+            logical_reaction_id=logical_reaction.id,
+            topology_id=topology.id,
+            side=LogicalReactionParticipantSide.REACTANT,
+            participant_index=0,
+            stoichiometric_coefficient=1,
+        ),
+        LogicalReactionParticipant(
+            logical_reaction_id=logical_reaction.id,
+            topology_id=topology.id,
+            side=LogicalReactionParticipantSide.PRODUCT,
+            participant_index=0,
+            stoichiometric_coefficient=1,
+        ),
+    ]
+    session.add_all([array, thermochemistry, mapped_reaction, *participants])
     session.flush()
     assert mapped_reaction.id is not None
     node = MappedReactionNode(
@@ -447,6 +463,26 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         )
         assert inference_page.page.total == 1
         assert [item.id for item in inference_page.items] == [inference.id]
+        assert inference_page.items[0].reactant_product_changed is False
+
+        inference_unchanged_page = asyncio.run(
+            TransitionStateInferenceQueryService.list_transition_state_inferences(
+                logical_reaction_id=logical_reaction.id,
+                reactant_product_changed=False,
+                limit=1,
+                offset=0,
+            )
+        )
+        assert inference_unchanged_page.page.total == 1
+        inference_changed_page = asyncio.run(
+            TransitionStateInferenceQueryService.list_transition_state_inferences(
+                logical_reaction_id=logical_reaction.id,
+                reactant_product_changed=True,
+                limit=1,
+                offset=0,
+            )
+        )
+        assert inference_changed_page.page.total == 0
 
         frame_page = asyncio.run(
             CalculationQueryService.list_calculation_frames(
@@ -584,6 +620,16 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         )
         assert mapped_page.page.total == 1
         assert [item.id for item in mapped_page.items] == [mapped_reaction.id]
+        assert mapped_page.items[0].reactant_product_changed is False
+        mapped_changed_page = asyncio.run(
+            MappedReactionQueryService.list_mapped_reactions(
+                logical_reaction_id=logical_reaction.id,
+                reactant_product_changed=True,
+                limit=1,
+                offset=0,
+            )
+        )
+        assert mapped_changed_page.page.total == 0
         assert mapped_reaction.minimum_reaction_gibbs_free_energy_kcal_mol is not None
         reaction_gibbs = mapped_reaction.minimum_reaction_gibbs_free_energy_kcal_mol
         mapped_reaction_gibbs_page = asyncio.run(
@@ -620,6 +666,56 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         )
         assert logical_page.page.total == 1
         assert [item.id for item in logical_page.items] == [logical_reaction.id]
+        assert logical_page.items[0].reactant_product_changed is False
+        logical_changed_page = asyncio.run(
+            LogicalReactionQueryService.list_logical_reactions(
+                reaction_hash=logical_reaction.reaction_hash,
+                reactant_product_changed=True,
+                limit=1,
+                offset=0,
+            )
+        )
+        assert logical_changed_page.page.total == 0
+        with Session(engine) as session:
+            product_participant = (
+                session.execute(
+                    select(LogicalReactionParticipant).where(
+                        col(LogicalReactionParticipant.logical_reaction_id) == logical_reaction.id,
+                        col(LogicalReactionParticipant.side)
+                        == LogicalReactionParticipantSide.PRODUCT,
+                    )
+                )
+                .scalars()
+                .one()
+            )
+            product_participant.stoichiometric_coefficient = 2
+            session.add(product_participant)
+            session.commit()
+        logical_stoichiometry_page = asyncio.run(
+            LogicalReactionQueryService.list_logical_reactions(
+                reaction_hash=logical_reaction.reaction_hash,
+                reactant_product_changed=True,
+                limit=1,
+                offset=0,
+            )
+        )
+        assert logical_stoichiometry_page.page.total == 1
+        logical_expression_page = asyncio.run(
+            LogicalReactionQueryService.list_logical_reactions(
+                filter_expression=json.dumps(
+                    {
+                        "operator": "and",
+                        "conditions": [
+                            {"field": "reaction_hash", "value": logical_reaction.reaction_hash},
+                            {"field": "reactant_product_changed", "value": True},
+                        ],
+                    }
+                ),
+                limit=1,
+                offset=0,
+            )
+        )
+        assert logical_expression_page.page.total == 1
         logical_reaction_gibbs_page = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
                 minimum_reaction_gibbs_free_energy_kcal_mol=reaction_gibbs - 0.01,

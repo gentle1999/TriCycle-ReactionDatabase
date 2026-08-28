@@ -6,9 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from molgr import interface as molgr_interface
 from molgr.config import CONFIG as molgr_config
 from molop import molopconfig
+from molop.io.base_models import Molecule as molop_molecule_module
 from rdkit.Chem import rdChemReactions
 
 from tricycle_reaction_db.application.dtos import ArtifactUploadResult
@@ -18,13 +18,18 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
     ArtifactUploadLimitError,
     ArtifactUploadPayload,
     ArtifactUploadService,
+    MolOPFileParseTimeoutError,
+    _await_cancellation_safe,
     _FailedInference,
+    _fast_molop_ingestion_enabled,
     _materialize_parsed_artifacts,
     _parse_calculation_output,
     _parse_calculation_outputs_batch,
     _parser_payload,
+    _pipeline_task_lifecycle,
     _require_batch_upload_budget,
     _run_molop_file_parser,
+    _run_molop_file_pipeline,
     _run_molop_parser_with_progress,
     _SuccessfulInference,
 )
@@ -33,6 +38,7 @@ from tricycle_reaction_db.core.config import Settings
 from tricycle_reaction_db.domain.enums import (
     ArtifactIngestionStatus,
     ArtifactKind,
+    FrameRole,
     StorageStatus,
 )
 from tricycle_reaction_db.domain.identity import DEVELOPMENT_USER_ID, SYSTEM_PROJECT_ID
@@ -104,6 +110,278 @@ def test_non_ts_calculation_frames_do_not_infer_reactions() -> None:
     assert parsed.inferences == ()
 
 
+def test_frame_conversion_failure_keeps_other_frames(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A malformed frame is diagnosed without discarding valid frames."""
+
+    class FakeFrame:
+        def __init__(self, index: int) -> None:
+            self.file_frame_index = index
+
+    class FakeChemFile:
+        schema_version = "test-schema"
+        source_format = "other"
+        source_segments: tuple[object, ...] = ()
+
+        def __init__(self) -> None:
+            self.frames = [FakeFrame(index) for index in range(3)]
+
+        def __iter__(self):
+            return iter(self.frames)
+
+        def __len__(self) -> int:
+            return len(self.frames)
+
+    def convert(frame: FakeFrame, **_: object) -> object:
+        if frame.file_frame_index == 1:
+            raise ValueError("malformed frame")
+        return SimpleNamespace(
+            segment_index=0,
+            frame=SimpleNamespace(file_frame_index=frame.file_frame_index),
+        )
+
+    monkeypatch.setattr(upload_module, "frame_records_from_molop", convert)
+    parsed = upload_module._parsed_artifact_from_chem_file(
+        FakeChemFile(),
+        source_compression=None,
+    )
+
+    assert len(parsed.frame_records) == 2
+    assert parsed.source_frame_count == 3
+    assert parsed.parse_diagnostics == (
+        {
+            "code": "frame_parse_failed",
+            "stage": "conversion",
+            "segment_index": 0,
+            "file_frame_index": 1,
+            "error_type": "ValueError",
+            "message": "malformed frame",
+        },
+    )
+
+
+def test_source_evidence_does_not_disable_fast_ingestion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(_env_file=None, molop_capture_source_evidence=True)
+    monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
+    assert settings.molop_capture_source_evidence
+    assert _fast_molop_ingestion_enabled()
+
+
+def test_storage_pool_does_not_recycle_workers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Avoid Python 3.12's max_tasks_per_child rollover deadlock for uploads."""
+
+    created: list[dict[str, object]] = []
+
+    class FakePool:
+        def __init__(self, **kwargs: object) -> None:
+            created.append(kwargs)
+
+        def shutdown(self, **_: object) -> None:
+            return None
+
+    monkeypatch.setattr(upload_module, "ProcessPoolExecutor", FakePool)
+    monkeypatch.setattr(upload_module, "_storage_process_pool", None)
+    monkeypatch.setattr(upload_module, "_storage_process_pool_workers", None)
+    monkeypatch.setattr(upload_module, "_storage_process_pool_pid", None)
+
+    upload_module._get_storage_process_pool(2)
+
+    assert len(created) == 1
+    assert "max_tasks_per_child" not in created[0]
+
+
+@pytest.mark.asyncio
+async def test_file_pipeline_timeout_isolated_to_one_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = Settings(_env_file=None, molop_file_parse_timeout_seconds=0.01)
+    monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
+
+    async def slow_file(*_: object, **__: object) -> object:
+        await asyncio.sleep(1)
+        return None
+
+    monkeypatch.setattr(upload_module, "_run_isolated_molop_file", slow_file)
+    with pytest.raises(MolOPFileParseTimeoutError, match="exceeded 0.01s"):
+        await _run_molop_file_pipeline(b"source", "slow.log")
+
+
+@pytest.mark.asyncio
+async def test_file_pipeline_timeout_releases_slot_for_next_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(_env_file=None, molop_file_parse_timeout_seconds=0.01)
+    monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
+    calls: list[str] = []
+
+    async def fake_file(_: object, filename: str, **__: object) -> object:
+        calls.append(filename)
+        if filename == "slow.log":
+            await asyncio.sleep(1)
+        return f"parsed:{filename}"
+
+    monkeypatch.setattr(upload_module, "_run_isolated_molop_file", fake_file)
+    file_slots = asyncio.Semaphore(1)
+    slow_task = asyncio.create_task(
+        _run_molop_file_pipeline(b"slow", "slow.log", file_slots=file_slots)
+    )
+    await asyncio.sleep(0)
+    fast_task = asyncio.create_task(
+        _run_molop_file_pipeline(b"fast", "next.log", file_slots=file_slots)
+    )
+    slow_result, fast_result = await asyncio.gather(slow_task, fast_task, return_exceptions=True)
+
+    assert isinstance(slow_result, MolOPFileParseTimeoutError)
+    assert fast_result == "parsed:next.log"
+    assert calls == ["slow.log", "next.log"]
+
+
+@pytest.mark.asyncio
+async def test_file_timeout_does_not_shutdown_shared_molop_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(_env_file=None, molop_file_parse_timeout_seconds=0.01)
+    monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
+    shared_pool = object()
+    shutdown_calls: list[object] = []
+
+    async def slow_file(*_: object, **__: object) -> object:
+        await asyncio.sleep(1)
+        return None
+
+    monkeypatch.setattr(upload_module, "_run_isolated_molop_file", slow_file)
+    monkeypatch.setattr(
+        upload_module,
+        "_shutdown_molop_process_pool_sync",
+        lambda: shutdown_calls.append(shared_pool),
+    )
+
+    with pytest.raises(MolOPFileParseTimeoutError):
+        await _run_molop_file_pipeline(b"source", "slow.log")
+
+    assert shutdown_calls == []
+
+
+@pytest.mark.asyncio
+async def test_batch_startup_failure_recovers_committed_reservations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(_env_file=None, max_batch_files=1, max_batch_bytes=1024)
+    monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
+
+    async def allow_upload(*_: object) -> None:
+        return None
+
+    monkeypatch.setattr(AuthorizationService, "require_project_permission", allow_upload)
+
+    async def fake_prepare_batch(
+        cls: object,
+        **_: object,
+    ) -> tuple[dict[int, object], dict[int, object]]:
+        return {0: object()}, {}
+
+    monkeypatch.setattr(
+        ArtifactUploadService,
+        "_prepare_upload_batch",
+        classmethod(fake_prepare_batch),
+    )
+
+    async def recover(**values: object) -> None:
+        recovered.append(values["error"])
+
+    recovered: list[BaseException] = []
+    monkeypatch.setattr(upload_module, "_recover_aborted_batch", recover)
+
+    def fail_storage_pool(*_: object, **__: object) -> object:
+        raise RuntimeError("storage pool startup failed")
+
+    monkeypatch.setattr(upload_module, "_get_storage_process_pool", fail_storage_pool)
+    with pytest.raises(RuntimeError, match="storage pool startup failed"):
+        await ArtifactUploadService.upload_batch(
+            files=[ArtifactUploadPayload("one.log", "text/plain", b"one")],
+            artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+            project_id=SYSTEM_PROJECT_ID,
+            user_id=DEVELOPMENT_USER_ID,
+        )
+
+    assert len(recovered) == 1
+    assert str(recovered[0]) == "storage pool startup failed"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_task_lifecycle_cancels_files_when_batch_fails() -> None:
+    started = asyncio.Event()
+
+    async def pending_file() -> None:
+        started.set()
+        await asyncio.Future()
+
+    task = asyncio.create_task(pending_file())
+    await started.wait()
+    with pytest.raises(RuntimeError, match="persistence failed"):
+        async with _pipeline_task_lifecycle([task]):
+            raise RuntimeError("persistence failed")
+    assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_task_lifecycle_runs_abort_recovery_before_reraising() -> None:
+    recovered: list[BaseException] = []
+
+    async def recover(error: BaseException) -> None:
+        recovered.append(error)
+
+    with pytest.raises(RuntimeError, match="persistence failed"):
+        async with _pipeline_task_lifecycle([], on_abort=recover):
+            raise RuntimeError("persistence failed")
+
+    assert len(recovered) == 1
+    assert isinstance(recovered[0], RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_pipeline_task_lifecycle_recovers_before_propagating_cancellation() -> None:
+    recovered: list[BaseException] = []
+
+    async def recover(error: BaseException) -> None:
+        await asyncio.sleep(0)
+        recovered.append(error)
+
+    with pytest.raises(asyncio.CancelledError):
+        async with _pipeline_task_lifecycle([], on_abort=recover):
+            raise asyncio.CancelledError
+
+    assert len(recovered) == 1
+    assert isinstance(recovered[0], asyncio.CancelledError)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_safe_wait_drains_external_operation() -> None:
+    finished = asyncio.Event()
+
+    async def external_operation() -> str:
+        await asyncio.sleep(0.01)
+        finished.set()
+        return "done"
+
+    task = asyncio.create_task(_await_cancellation_safe(external_operation()))
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_file_pipeline_runs_parse_and_conversion_in_file_worker() -> None:
+    parsed = await upload_module._run_isolated_molop_file(
+        TS_FIXTURE.read_bytes(),
+        TS_FIXTURE.name,
+    )
+    assert parsed.source_frame_count == 23
+    assert len(parsed.frame_records) == 23
+    assert len(parsed.inferences) == 1
+
+
 def test_fast_molop_parse_defers_topology_reconstruction_until_materialization() -> None:
     molopconfig.show_progress_bar = False
     parsed = asyncio.run(_run_molop_file_parser(TS_FIXTURE.read_bytes(), TS_FIXTURE.name))
@@ -111,11 +389,17 @@ def test_fast_molop_parse_defers_topology_reconstruction_until_materialization()
     assert parsed.source_frame_count == 23
     assert parsed.frame_records == ()
     assert parsed.inferences == ()
+    assert parsed.chem_file.source_segments
+    assert parsed.chem_file[0].frame_role == FrameRole.INITIAL.value
+    assert parsed.chem_file[9].frame_role == FrameRole.TERMINAL.value
     assert all(frame.topology_reconstruction_status is None for frame in parsed.chem_file)
 
     materialized = _materialize_parsed_artifacts([parsed])[0]
     assert len(materialized.frame_records) == 23
     assert len(materialized.inferences) == 1
+    assert materialized.frame_records[0].frame.frame_role is FrameRole.INITIAL
+    assert materialized.frame_records[9].frame.frame_role is FrameRole.TERMINAL
+    assert materialized.frame_records[22].frame.frame_role is FrameRole.TERMINAL
     assert all(
         frame.topology_reconstruction_status in {"succeeded", "suspicious_fallback"}
         for frame in materialized.chem_file
@@ -124,23 +408,28 @@ def test_fast_molop_parse_defers_topology_reconstruction_until_materialization()
 
 def test_reconstruction_failure_persists_suspicious_topology(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     molopconfig.show_progress_bar = False
+    reconstruct = molop_molecule_module.xyz_to_rdmol
 
-    def fail_reconstruction(*_: object, **__: object) -> object:
-        raise RuntimeError("forced reconstruction failure")
+    def suspicious_reconstruction(*args: object, **kwargs: object) -> object:
+        molecule = reconstruct(*args, **kwargs)
+        assert molecule is not None
+        molecule.SetProp("_MolGRReconstructionStatus", "suspicious_fallback")
+        molecule.SetProp(
+            "_MolGRReconstructionDiagnostics",
+            '{"message":"forced suspicious fallback"}',
+        )
+        return molecule
 
     monkeypatch.setattr(
-        molgr_interface.core.pipeline.reconstruct_with_metals,
-        "xyz2omol",
-        fail_reconstruction,
+        molop_molecule_module,
+        "xyz_to_rdmol",
+        suspicious_reconstruction,
     )
     parsed = _parse_calculation_output(NON_TS_FIXTURE.read_bytes(), NON_TS_FIXTURE.name)
 
     assert parsed.source_frame_count == len(parsed.frame_records) > 0
     assert all(
         frame.topology_reconstruction_status == "suspicious_fallback" for frame in parsed.chem_file
-    )
-    assert all(
-        record.frame.parse_presence["topology"] == "parse_failed" for record in parsed.frame_records
     )
     assert all(
         record.molecule.topology_derivation.reconstruction_metadata["molgr_status"]
@@ -155,30 +444,46 @@ def test_reconstruction_failure_persists_suspicious_topology(monkeypatch) -> Non
     )
 
 
-def test_suspicious_ts_topology_is_not_used_for_reaction_inference(
+def test_suspicious_ts_frame_still_attempts_reaction_inference(
     monkeypatch,
 ) -> None:  # type: ignore[no-untyped-def]
     molopconfig.show_progress_bar = False
-
-    def fail_reconstruction(*_: object, **__: object) -> object:
-        raise RuntimeError("forced reconstruction failure")
-
-    monkeypatch.setattr(
-        molgr_interface.core.pipeline.reconstruct_with_metals,
-        "xyz2omol",
-        fail_reconstruction,
-    )
     parsed = _parse_calculation_output(TS_FIXTURE.read_bytes(), TS_FIXTURE.name)
+    frame = parsed.chem_file[-1]
+    frame.topology_reconstruction_status = "suspicious_fallback"
+    signed_endpoints = upload_module._signed_ts_endpoints
 
-    assert len(parsed.inferences) == 1
-    inference = parsed.inferences[0]
+    def trusted_endpoints(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        negative, positive, negative_ratio, positive_ratio = signed_endpoints(*args, **kwargs)
+        for endpoint in (negative, positive):
+            if endpoint.HasProp("_MolGRReconstructionStatus"):
+                endpoint.ClearProp("_MolGRReconstructionStatus")
+        return negative, positive, negative_ratio, positive_ratio
+
+    monkeypatch.setattr(upload_module, "_signed_ts_endpoints", trusted_endpoints)
+    inference = upload_module._infer_ts_frame(frame, fallback_index=22)
+
+    assert isinstance(inference, _SuccessfulInference)
+
+
+def test_suspicious_ts_endpoint_is_not_used_for_reaction_inference(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    molopconfig.show_progress_bar = False
+    parsed = _parse_calculation_output(TS_FIXTURE.read_bytes(), TS_FIXTURE.name)
+    frame = parsed.chem_file[-1]
+    signed_endpoints = upload_module._signed_ts_endpoints
+
+    def suspicious_endpoints(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        negative, positive, negative_ratio, positive_ratio = signed_endpoints(*args, **kwargs)
+        negative.SetProp("_MolGRReconstructionStatus", "suspicious_fallback")
+        return negative, positive, negative_ratio, positive_ratio
+
+    monkeypatch.setattr(upload_module, "_signed_ts_endpoints", suspicious_endpoints)
+    inference = upload_module._infer_ts_frame(frame, fallback_index=22)
+
     assert isinstance(inference, _FailedInference)
     assert inference.error_code == "ts_topology_untrusted"
-    assert all(
-        record.molecule.topology_derivation.reconstruction_metadata["molgr_status"]
-        == "suspicious_fallback"
-        for record in parsed.frame_records
-    )
 
 
 def test_gzip_parser_payload_keeps_logical_source_identity_separate() -> None:
@@ -310,6 +615,38 @@ def test_spooled_batch_budget_rejects_gzip_bomb(
     with pytest.raises(ArtifactUploadLimitError, match="decompressed artifact"):
         _require_batch_upload_budget(
             [ArtifactUploadPayload(source.name, "application/gzip", None, spool_path=source)]
+        )
+
+
+def test_streaming_spooled_budget_uses_per_file_limit_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first.log"
+    second = tmp_path / "second.log"
+    first.write_bytes(b"a" * 700)
+    second.write_bytes(b"b" * 700)
+    monkeypatch.setattr(
+        upload_module,
+        "get_settings",
+        lambda: Settings(_env_file=None, max_upload_bytes=1024, max_batch_bytes=1024),
+    )
+
+    inspected = _require_batch_upload_budget(
+        [
+            ArtifactUploadPayload(first.name, "text/plain", None, spool_path=first),
+            ArtifactUploadPayload(second.name, "text/plain", None, spool_path=second),
+        ],
+        enforce_batch_bytes=False,
+    )
+
+    assert sorted(inspected) == [0, 1]
+    with pytest.raises(ArtifactUploadLimitError, match="upload batch exceeds"):
+        _require_batch_upload_budget(
+            [
+                ArtifactUploadPayload(first.name, "text/plain", None, spool_path=first),
+                ArtifactUploadPayload(second.name, "text/plain", None, spool_path=second),
+            ]
         )
 
 

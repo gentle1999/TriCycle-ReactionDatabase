@@ -45,9 +45,10 @@ export interface LogicalReactionSummary {
   id: string;
   reaction_key: string;
   label: string | null;
-  reaction_class: string;
+  reaction_class: string | null;
   cycloaddition_pattern: string | null;
   reaction_hash: string;
+  reactant_product_changed: boolean | null;
   created_at: string | null;
   reactant_topology_ids: string[];
   product_topology_ids: string[];
@@ -76,6 +77,7 @@ export interface MappedReactionSummary {
   mapped_reaction_kind: string;
   mapped_reaction_smiles: string;
   mapping_hash: string;
+  reactant_product_changed: boolean | null;
   created_at: string | null;
   minimum_activation_gibbs_free_energy_kcal_mol: number | null;
   maximum_activation_gibbs_free_energy_kcal_mol: number | null;
@@ -123,6 +125,8 @@ export interface GeometrySummary {
   geometry_hash: string;
   internal_coordinate_hash: string;
   canonicalization_version: string;
+  charge: number;
+  multiplicity: number;
   calculation_count: number;
   reaction_binding_count: number;
   imaginary_frequency_status: "present" | "absent" | "unavailable";
@@ -131,6 +135,15 @@ export interface GeometrySummary {
 export interface GeometryDetail extends GeometrySummary {
   frames: CalculationFrameSummary[];
   energy_view: GeometryEnergyView;
+  coordinates: GeometryAtomCoordinate[];
+}
+
+export interface GeometryAtomCoordinate {
+  atom_index: number;
+  element: string;
+  x_angstrom: number;
+  y_angstrom: number;
+  z_angstrom: number;
 }
 
 export interface GeometryEnergyView {
@@ -317,17 +330,17 @@ export interface ReactionEnergyProfile {
 }
 
 export interface SourceSpan {
-  start_byte: number;
-  end_byte: number;
+  start_byte: number | null;
+  end_byte: number | null;
   start_char: number | null;
   end_char: number | null;
-  start_line: number;
-  end_line: number;
-  block_sha256: string;
+  start_line: number | null;
+  end_line: number | null;
+  block_sha256: string | null;
 }
 
 export interface CalculationFrameDetail extends CalculationFrameSummary {
-  source_span: SourceSpan;
+  source_span: SourceSpan | null;
   parse_completeness: string;
   geometry_assignment_kind: string;
   observed_coordinate_hash: string;
@@ -359,6 +372,8 @@ export interface CalculationFrameDetail extends CalculationFrameSummary {
   transition_state_endpoints: Array<{
     direction: "negative" | "positive";
     topology_id: string;
+    charge: number;
+    multiplicity: number;
     atom_count: number;
     displacement_ratio: number;
     source_coordinate_hash: string;
@@ -572,6 +587,11 @@ export interface TransitionStateInferenceResult {
   calculation_frame_id: string | null;
   error_code: string | null;
   error_message: string | null;
+}
+
+export interface TransitionStateInferenceSummary extends TransitionStateInferenceResult {
+  artifact_ingestion_id: string;
+  parse_revision_id: string;
 }
 
 export interface ArtifactUploadResult {

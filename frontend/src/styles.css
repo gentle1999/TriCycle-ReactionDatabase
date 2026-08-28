@@ -4473,6 +4473,41 @@ table.data-table {
 .geometry-results-header h2,
 .artifact-results-header h2 { margin: 5px 0 0; font-size: 22px; }
 
+.catalog-header-actions {
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.catalog-sort-controls {
+  display: grid;
+  grid-template-columns: minmax(116px, 1fr) 72px;
+  gap: 7px;
+}
+
+.catalog-sort-controls label {
+  display: grid;
+  gap: 4px;
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.catalog-sort-controls select {
+  min-width: 0;
+  height: 30px;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.catalog-sort-controls select:disabled {
+  color: var(--ink-muted);
+  background: var(--surface-muted);
+}
+
 .artifact-upload-toolbar {
   display: flex;
   justify-content: flex-end;
@@ -5088,6 +5123,20 @@ table.data-table {
 .geometry-detail-smiles { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
 .geometry-detail-identity code { color: var(--ink-soft); font-size: 9px; overflow-wrap: anywhere; }
 .geometry-detail-content .energy-facts { border: 1px solid var(--line); border-radius: 5px; }
+.geometry-coordinates-section { margin-top: 24px; border-top: 1px solid var(--line-strong); }
+.geometry-coordinates-section > header { display: flex; align-items: baseline; justify-content: space-between; padding: 14px 0 8px; }
+.geometry-coordinates-section h3 { margin: 4px 0 0; font-size: 16px; }
+.geometry-coordinates-section > header > span { color: var(--ink-soft); font-family: var(--mono); font-size: 10px; }
+.geometry-coordinate-table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 5px; }
+.geometry-coordinate-table { min-width: 430px; }
+.geometry-coordinate-row { display: grid; grid-template-columns: 38px 52px repeat(3, minmax(104px, 1fr)); min-width: 0; border-bottom: 1px solid var(--line); }
+.geometry-coordinate-row:last-child { border-bottom: 0; }
+.geometry-coordinate-row > * { min-width: 0; padding: 8px 10px; border-right: 1px solid var(--line); font-size: 10px; }
+.geometry-coordinate-row > *:last-child { border-right: 0; }
+.geometry-coordinate-row > code { font-family: var(--mono); text-align: right; white-space: nowrap; }
+.geometry-coordinate-row > strong { font-family: var(--mono); font-weight: 600; }
+.geometry-coordinate-row.is-header { color: var(--ink-soft); background: var(--surface-muted); }
+.geometry-coordinate-row.is-header > * { font-size: 9px; font-weight: 600; }
 .geometry-frame-section { margin-top: 24px; border-top: 1px solid var(--line-strong); }
 .geometry-frame-section > header { display: flex; align-items: baseline; justify-content: space-between; padding: 14px 0 8px; }
 .geometry-frame-section h3 { margin: 4px 0 0; font-size: 16px; }
@@ -5143,6 +5192,11 @@ table.data-table {
   .reaction-browser,
   .geometry-browser,
   .artifact-browser { grid-template-columns: 1fr; }
+  .reaction-results-header,
+  .geometry-results-header,
+  .artifact-results-header { align-items: flex-start; flex-direction: column; }
+  .catalog-header-actions { width: 100%; flex-wrap: wrap; justify-content: space-between; }
+  .catalog-sort-controls { flex: 1 1 260px; }
   .reaction-filter-sidebar,
   .geometry-filter-sidebar,
   .artifact-filter-sidebar { padding: 20px 0; border-right: 0; border-bottom: 1px solid var(--line-strong); }

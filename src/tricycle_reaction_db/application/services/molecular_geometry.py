@@ -83,18 +83,24 @@ class GeometryPersistenceContext:
     topologies: dict[tuple[str, ...], PersistedMolecularTopology] = field(default_factory=dict)
     formulas_by_hash: dict[str, MolecularFormula] = field(default_factory=dict)
     topologies_by_identity: dict[tuple[str, str], MolecularTopology] = field(default_factory=dict)
-    topology_derivations_by_key: dict[
-        tuple[UUID, str, str], MolecularTopologyDerivation
-    ] = field(default_factory=dict)
-    geometries_by_hash: dict[tuple[UUID, str, str], Geometry] = field(default_factory=dict)
-    # Keys populated by one PostgreSQL bulk lookup. A missing key is useful
-    # information too: it lets the frame loop skip a per-Geometry SELECT.
-    exact_geometry_keys_loaded: set[tuple[UUID, str, str]] = field(default_factory=set)
-    equivalent_geometry_by_key: dict[tuple[UUID, str, str], Geometry] = field(default_factory=dict)
-    equivalent_geometry_candidates: dict[tuple[UUID, str, str], tuple[UUID, ...]] = field(
+    topology_derivations_by_key: dict[tuple[UUID, str, str], MolecularTopologyDerivation] = field(
         default_factory=dict
     )
-    equivalent_geometry_keys_loaded: set[tuple[UUID, str, str]] = field(default_factory=set)
+    geometries_by_hash: dict[tuple[UUID, str, str, int, int], Geometry] = field(
+        default_factory=dict
+    )
+    # Keys populated by one PostgreSQL bulk lookup. A missing key is useful
+    # information too: it lets the frame loop skip a per-Geometry SELECT.
+    exact_geometry_keys_loaded: set[tuple[UUID, str, str, int, int]] = field(default_factory=set)
+    equivalent_geometry_by_key: dict[tuple[UUID, str, str, int, int], Geometry] = field(
+        default_factory=dict
+    )
+    equivalent_geometry_candidates: dict[tuple[UUID, str, str, int, int], tuple[UUID, ...]] = field(
+        default_factory=dict
+    )
+    equivalent_geometry_keys_loaded: set[tuple[UUID, str, str, int, int]] = field(
+        default_factory=set
+    )
     geometries_to_reconcile: dict[UUID, Geometry] = field(default_factory=dict)
     # Reaction participants are keyed by topology because reconciliation runs
     # once per newly observed Geometry.  Reusing this lookup avoids one SELECT
@@ -210,6 +216,8 @@ def _find_database_geometry_match(
             select(Geometry.id).where(
                 Geometry.topology_id == topology.id,
                 Geometry.canonicalization_version == observed.canonicalization_version,
+                Geometry.charge == record.charge,
+                Geometry.multiplicity == record.multiplicity,
                 func.geometry_internal_coordinates_equivalent(
                     Geometry.internal_coordinate_distances_angstrom,
                     Geometry.internal_coordinate_angles_degrees,
@@ -315,18 +323,20 @@ def _preload_molecular_topologies(
         _acquire_identity_locks(
             session,
             *(
-                ('molecular_formula', composition_hash)
+                ("molecular_formula", composition_hash)
                 for composition_hash in sorted(formula_hashes)
             ),
             *(
-                ('molecular_topology', schema_version, graph_hash)
+                ("molecular_topology", schema_version, graph_hash)
                 for schema_version, graph_hash in sorted(topology_identity_keys)
             ),
         )
 
     if formula_hashes:
         for formula in session.exec(
-            select(MolecularFormula).where(col(MolecularFormula.composition_hash).in_(formula_hashes))
+            select(MolecularFormula).where(
+                col(MolecularFormula.composition_hash).in_(formula_hashes)
+            )
         ).all():
             context.formulas_by_hash[formula.composition_hash] = formula
     for record in pending.values():
@@ -400,7 +410,7 @@ def _preload_molecular_topologies(
             session,
             *(
                 (
-                    'molecular_topology_derivation',
+                    "molecular_topology_derivation",
                     topology_id,
                     provenance_schema_version,
                     provenance_hash,
@@ -492,9 +502,7 @@ def persist_molecular_topology(
         record.topology.graph_hash,
     )
     topology = (
-        context.topologies_by_identity.get(topology_identity)
-        if context is not None
-        else None
+        context.topologies_by_identity.get(topology_identity) if context is not None else None
     )
     if formula is None or topology is None:
         lock_keys: list[tuple[object, ...]] = []
@@ -550,9 +558,7 @@ def persist_molecular_topology(
         record.topology_derivation.provenance_hash,
     )
     topology_derivation = (
-        context.topology_derivations_by_key.get(derivation_key)
-        if context is not None
-        else None
+        context.topology_derivations_by_key.get(derivation_key) if context is not None else None
     )
     if topology_derivation is None:
         _acquire_identity_locks(
@@ -631,6 +637,8 @@ def persist_molecular_geometry(
         topology_id,
         record.geometry.canonicalization_version,
         record.geometry.geometry_hash,
+        record.charge,
+        record.multiplicity,
     )
     geometry = context.geometries_by_hash.get(geometry_key) if context is not None else None
     equivalent_match = False
@@ -642,6 +650,8 @@ def persist_molecular_geometry(
                 Geometry.topology_id == topology.id,
                 Geometry.canonicalization_version == record.geometry.canonicalization_version,
                 Geometry.geometry_hash == record.geometry.geometry_hash,
+                Geometry.charge == record.charge,
+                Geometry.multiplicity == record.multiplicity,
             )
         ).first()
         if geometry is not None and context is not None:
@@ -770,8 +780,10 @@ def preload_molecular_geometry_context(
         context=context,
     )
 
-    keys: set[tuple[UUID, str, str]] = set()
-    records_by_key: dict[tuple[UUID, str, str], tuple[NormalizedMoleculeRecord, int | None]] = {}
+    keys: set[tuple[UUID, str, str, int, int]] = set()
+    records_by_key: dict[
+        tuple[UUID, str, str, int, int], tuple[NormalizedMoleculeRecord, int | None]
+    ] = {}
     for record, coordinate_decimal_places in records:
         topology_record = NormalizedTopologyRecord(
             formula=record.formula,
@@ -787,6 +799,8 @@ def preload_molecular_geometry_context(
             _require_id(persisted_topology.topology, label="MolecularTopology"),
             record.geometry.canonicalization_version,
             record.geometry.geometry_hash,
+            record.charge,
+            record.multiplicity,
         )
         keys.add(key)
         records_by_key.setdefault(key, (record, coordinate_decimal_places))
@@ -796,11 +810,13 @@ def preload_molecular_geometry_context(
     exact_inputs = (
         text(
             """
-            SELECT topology_id, canonicalization_version, geometry_hash
+            SELECT topology_id, canonicalization_version, geometry_hash, charge, multiplicity
             FROM jsonb_to_recordset(CAST(:payload AS jsonb)) AS input(
                 topology_id uuid,
                 canonicalization_version text,
-                geometry_hash text
+                geometry_hash text,
+                charge smallint,
+                multiplicity smallint
             )
             """
         )
@@ -811,8 +827,16 @@ def preload_molecular_geometry_context(
                         "topology_id": str(topology_id),
                         "canonicalization_version": canonicalization_version,
                         "geometry_hash": geometry_hash,
+                        "charge": charge,
+                        "multiplicity": multiplicity,
                     }
-                    for topology_id, canonicalization_version, geometry_hash in keys
+                    for (
+                        topology_id,
+                        canonicalization_version,
+                        geometry_hash,
+                        charge,
+                        multiplicity,
+                    ) in keys
                 ]
             )
         )
@@ -820,6 +844,8 @@ def preload_molecular_geometry_context(
             topology_id=PG_UUID(as_uuid=True),
             canonicalization_version=String,
             geometry_hash=String,
+            charge=SmallInteger,
+            multiplicity=SmallInteger,
         )
         .subquery("exact_geometry_inputs")
     )
@@ -841,6 +867,8 @@ def preload_molecular_geometry_context(
                 geometry_columns.canonicalization_version
                 == exact_inputs.c.canonicalization_version,
                 geometry_columns.geometry_hash == exact_inputs.c.geometry_hash,
+                geometry_columns.charge == exact_inputs.c.charge,
+                geometry_columns.multiplicity == exact_inputs.c.multiplicity,
             ),
         )
     ).all()
@@ -850,6 +878,8 @@ def preload_molecular_geometry_context(
             geometry.topology_id,
             geometry.canonicalization_version,
             geometry.geometry_hash,
+            geometry.charge,
+            geometry.multiplicity,
         )
         context.geometries_by_hash[key] = geometry
 
@@ -860,7 +890,7 @@ def preload_molecular_geometry_context(
     if not unmatched:
         return
     input_rows: list[dict[str, object]] = []
-    key_by_input: dict[str, tuple[UUID, str, str]] = {}
+    key_by_input: dict[str, tuple[UUID, str, str, int, int]] = {}
     for input_index, key in enumerate(unmatched):
         record, coordinate_decimal_places = records_by_key[key]
         distances, angles, dihedrals = _internal_coordinate_projection(
@@ -873,6 +903,8 @@ def preload_molecular_geometry_context(
                 "input_key": input_key,
                 "topology_id": str(key[0]),
                 "canonicalization_version": key[1],
+                "charge": key[3],
+                "multiplicity": key[4],
                 "distances": distances,
                 "angles": angles,
                 "dihedrals": dihedrals,
@@ -890,6 +922,8 @@ def preload_molecular_geometry_context(
                     input_key text,
                     topology_id uuid,
                     canonicalization_version text,
+                    charge smallint,
+                    multiplicity smallint,
                     distances double precision[],
                     angles double precision[],
                     dihedrals double precision[],
@@ -899,8 +933,10 @@ def preload_molecular_geometry_context(
             SELECT inputs.input_key, geometry.id
             FROM inputs
             JOIN geometry
-              ON geometry.topology_id = inputs.topology_id
+             ON geometry.topology_id = inputs.topology_id
              AND geometry.canonicalization_version = inputs.canonicalization_version
+             AND geometry.charge = inputs.charge
+             AND geometry.multiplicity = inputs.multiplicity
              AND geometry_internal_coordinates_equivalent(
                     geometry.internal_coordinate_distances_angstrom,
                     geometry.internal_coordinate_angles_degrees,

@@ -3,7 +3,7 @@
 > 状态：MolOP 契约已实现，数据库 schema 已对齐
 > 契约版本：`molop-calculation-export-v1`
 > 使用方：Example Chemistry Database（部署显示名可由环境变量覆盖）
-> 最低兼容基线：PyPI `molop>=0.2.4`、`molgr>=0.1.3`
+> 最低兼容基线：PyPI `molop>=0.2.11`、`molgr>=0.1.8`
 > 复核日期：2026-08-09
 
 ## 1. 目标
@@ -138,8 +138,8 @@ end_line
 | `MOLREQ-013` | `frame_id` 只表示当前 `ChemFile` 的追加序号 | 数据库不得用 `frame_id` 恢复原文件顺序 |
 | `MOLREQ-014` | status 必须按真实证据作用域输出 | segment termination 不伪装成逐 frame termination 事实 |
 | `MOLREQ-015` | span 必须在 locator 拆分原文时产生 | 不得通过重复 frame 文本反向搜索位置 |
-| `MOLREQ-016` | 审计导入设置 `capture_source_evidence=True`；生产快速导入可关闭 | 开启时必须保留 artifact identity、segment evidence 和 frame span；关闭时保留 artifact SHA-256、解析器 provenance/configuration、帧顺序与诊断，但源跨度/块哈希为 `NULL` |
-| `MOLREQ-017` | 关闭源证据时延迟拓扑重建并批量持久化 frame | `TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE=false` 且 `TRICYCLE_MOLOP_PARALLEL_FRAME_PERSISTENCE=true` 时，纯文本解析阶段关闭 MolOP prewarm；持久化微批次在 owning process 中展平所有 frame，通过 MolGR 原生 batch scheduler 并行重建后再转换 DTO；revision-local rows 使用 client-side UUID 和延迟 flush 批量写入；审计/重解析路径保持严格幂等写入 |
+| `MOLREQ-016` | 正式导入默认设置 `capture_source_evidence=True`；可显式关闭 | 开启时必须保留 artifact identity、segment evidence、frame span 和 MolOP frame role；关闭时保留 artifact SHA-256、解析器 provenance/configuration、帧顺序与诊断，但不能提供证据派生的 frame role，源跨度/块哈希为 `NULL` |
+| `MOLREQ-017` | 证据收集与延迟拓扑重建、批量持久化相互独立 | `TRICYCLE_MOLOP_PARALLEL_FRAME_PERSISTENCE=true` 时，纯文本解析阶段关闭 MolOP prewarm；持久化微批次在 owning process 中展平所有 frame，通过 MolGR 原生 batch scheduler 并行重建后再转换 DTO；revision-local rows 使用 client-side UUID 和延迟 flush 批量写入；审计/重解析路径保持严格幂等写入 |
 
 segment 的 `protocol` 必须是通用 `model_chemistry` 的纯 mapping 投影，
 `task_requests` 必须是通用 `QMTaskRequest` 的纯 mapping 列表。不得泄漏

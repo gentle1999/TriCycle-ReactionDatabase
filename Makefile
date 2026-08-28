@@ -1,4 +1,4 @@
-.PHONY: init frontend-install frontend-build frontend-check frontend-test-e2e serve-frontend dev \
+.PHONY: init frontend-install frontend-build frontend-check frontend-test-e2e serve-frontend dev dev-host dev-stack \
 	dev-infra-up dev-migrate dev-bootstrap \
 	format lint type test test-db test-storage test-redis test-infra audit vendor-audit check \
 	db-up db-down storage-up storage-down auth-up auth-down infra-up infra-down migrate import-artifacts \
@@ -10,10 +10,13 @@
 DEV_DATABASE_URL := postgresql+psycopg://example_user:example-local-password@127.0.0.1:5432/example_reaction_db
 DEV_RUSTFS_ENDPOINT := http://127.0.0.1:19000
 DEV_RUNTIME_ENV = \
+	OMP_NUM_THREADS=1 \
+	OPENBLAS_NUM_THREADS=1 \
+	MKL_NUM_THREADS=1 \
 	TRICYCLE_DATABASE_URL="$(DEV_DATABASE_URL)" \
 	TRICYCLE_RUSTFS_ENDPOINT_URL="$(DEV_RUSTFS_ENDPOINT)" \
-	NO_PROXY="127.0.0.1,localhost,postgres,rustfs,host.docker.internal" \
-	no_proxy="127.0.0.1,localhost,postgres,rustfs,host.docker.internal" \
+	NO_PROXY="127.0.0.1,localhost,postgres,rustfs,host.docker.internal,61.151.139.69" \
+	no_proxy="127.0.0.1,localhost,postgres,rustfs,host.docker.internal,61.151.139.69" \
 	TRICYCLE_RUSTFS_ACCESS_KEY=example-local-access \
 	TRICYCLE_RUSTFS_SECRET_KEY=example-local-secret \
 	TRICYCLE_RUSTFS_BUCKET=example-reaction-raw-files \
@@ -21,7 +24,7 @@ DEV_RUNTIME_ENV = \
 	TRICYCLE_RUSTFS_VERIFY_TLS=true \
 	TRICYCLE_ENVIRONMENT=development \
 	TRICYCLE_AUTH_MODE=development \
-	TRICYCLE_API_HOST=127.0.0.1 \
+	TRICYCLE_API_HOST=0.0.0.0 \
 	TRICYCLE_API_PORT=8000
 
 # Artifact imports default to the caller's configured runtime. Use the local
@@ -30,7 +33,10 @@ IMPORT_MODE ?= deployment
 ifeq ($(IMPORT_MODE),development)
 IMPORT_RUNTIME_ENV := $(DEV_RUNTIME_ENV)
 else ifeq ($(IMPORT_MODE),deployment)
-IMPORT_RUNTIME_ENV :=
+IMPORT_RUNTIME_ENV := \
+	OMP_NUM_THREADS=1 \
+	OPENBLAS_NUM_THREADS=1 \
+	MKL_NUM_THREADS=1
 else
 $(error IMPORT_MODE must be either development or deployment)
 endif
@@ -56,7 +62,31 @@ serve-frontend:
 
 # Start the host-based development stack. Uvicorn reloads Python changes and
 # Vite provides frontend HMR; Ctrl-C stops only the two foreground processes.
-dev: dev-infra-up dev-migrate dev-bootstrap
+dev:
+	@set -u; \
+	$(DEV_RUNTIME_ENV) TRICYCLE_DEBUG=true uv run tricycle-api & api_pid=$$!; \
+	npm --prefix frontend run dev & frontend_pid=$$!; \
+	cleanup() { \
+		kill "$$api_pid" "$$frontend_pid" 2>/dev/null || true; \
+		wait "$$api_pid" 2>/dev/null || true; \
+		wait "$$frontend_pid" 2>/dev/null || true; \
+	}; \
+	trap 'cleanup; exit 0' INT TERM; \
+	while :; do \
+		if ! kill -0 "$$api_pid" 2>/dev/null; then \
+			wait "$$api_pid"; status=$$?; cleanup; exit "$$status"; \
+		fi; \
+		if ! kill -0 "$$frontend_pid" 2>/dev/null; then \
+			wait "$$frontend_pid"; status=$$?; cleanup; exit "$$status"; \
+		fi; \
+		sleep 1; \
+	done
+
+dev-host: dev
+
+# Start the previous container-backed development stack when Compose-managed
+# infrastructure is desired.
+dev-stack: dev-infra-up dev-migrate dev-bootstrap
 	@set -u; \
 	$(DEV_RUNTIME_ENV) TRICYCLE_DEBUG=true uv run tricycle-api & api_pid=$$!; \
 	npm --prefix frontend run dev & frontend_pid=$$!; \
@@ -184,6 +214,8 @@ import-artifacts:
 		$(if $(IMPORT_USER_ID),--user-id "$(IMPORT_USER_ID)",) \
 		$(if $(IMPORT_ARTIFACT_KIND),--artifact-kind "$(IMPORT_ARTIFACT_KIND)",) \
 		$(if $(IMPORT_STATE_FILE),--state-file "$(IMPORT_STATE_FILE)",) \
+		$(if $(IMPORT_COMMIT_BATCH_FILES),--commit-batch-files "$(IMPORT_COMMIT_BATCH_FILES)",) \
+		$(if $(IMPORT_STREAM_QUEUE_SIZE),--stream-queue-size "$(IMPORT_STREAM_QUEUE_SIZE)",) \
 		$(IMPORT_ROOTS)
 
 validate-da-bench-fixture:

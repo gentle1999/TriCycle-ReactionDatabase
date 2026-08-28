@@ -15,10 +15,24 @@ export type ReactionQueryField =
   | "maximum_activation_gibbs_free_energy_kcal_mol"
   | "minimum_reaction_gibbs_free_energy_kcal_mol"
   | "maximum_reaction_gibbs_free_energy_kcal_mol"
+  | "reactant_product_changed"
   | "created_after"
   | "created_before";
 
 export type ReactionQueryLogicalOperator = "and" | "or";
+
+export type ReactionSortBy =
+  | "default"
+  | "created_at"
+  | "reaction_key"
+  | "reaction_class"
+  | "minimum_activation_gibbs_free_energy"
+  | "minimum_reaction_gibbs_free_energy";
+
+export interface ReactionSort {
+  sortBy: ReactionSortBy;
+  sortDirection: "asc" | "desc";
+}
 
 export interface ReactionQueryFilters {
   projectId?: string;
@@ -36,6 +50,7 @@ export interface ReactionQueryFilters {
   maximumReactionGibbsFreeEnergyKcalMol?: number;
   hasActivationGibbsFreeEnergy?: boolean;
   hasReactionGibbsFreeEnergy?: boolean;
+  reactantProductChanged?: boolean;
   createdAfter?: string;
   createdBefore?: string;
   filterExpression?: ReactionQueryExpression;
@@ -43,7 +58,7 @@ export interface ReactionQueryFilters {
 
 export interface ReactionQueryExpressionCondition {
   field: ReactionQueryField;
-  value: string | number;
+  value: string | number | boolean;
   negated?: boolean;
 }
 
@@ -65,7 +80,7 @@ export interface ReactionQueryCondition {
 export interface ReactionQueryFieldOption {
   value: ReactionQueryField;
   label: string;
-  kind: "text" | "smarts" | "number" | "datetime" | "class" | "reaction" | "mol_block";
+  kind: "text" | "smarts" | "number" | "datetime" | "class" | "boolean" | "reaction" | "mol_block";
 }
 
 export const reactionQueryFieldOptions: ReactionQueryFieldOption[] = [
@@ -83,6 +98,7 @@ export const reactionQueryFieldOptions: ReactionQueryFieldOption[] = [
   { value: "maximum_activation_gibbs_free_energy_kcal_mol", label: "最高活化自由能（kcal/mol）", kind: "number" },
   { value: "minimum_reaction_gibbs_free_energy_kcal_mol", label: "最低反应自由能（kcal/mol）", kind: "number" },
   { value: "maximum_reaction_gibbs_free_energy_kcal_mol", label: "最高反应自由能（kcal/mol）", kind: "number" },
+  { value: "reactant_product_changed", label: "前后体拓扑发生变化", kind: "boolean" },
   { value: "created_after", label: "创建时间不早于", kind: "datetime" },
   { value: "created_before", label: "创建时间不晚于", kind: "datetime" },
 ];

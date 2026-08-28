@@ -7,6 +7,10 @@ from typing import Any
 
 import numpy as np
 import numpy.typing as npt
+from molgr.utils.converter import (
+    METAL_UNPAIRED_ELECTRONS_PROP,
+    get_atom_unpaired_electrons,
+)
 from rdkit import Chem
 from rdkit.Geometry import Point3D
 
@@ -55,6 +59,38 @@ def _clear_rdkit_properties(mol: Chem.Mol) -> None:
             bond.ClearProp(prop_name)
 
 
+def _capture_unpaired_electron_state(mol: Chem.Mol) -> list[tuple[int, bool]]:
+    """Capture MolGR electron assignments before clearing transient properties."""
+
+    return [
+        (
+            get_atom_unpaired_electrons(atom),
+            atom.HasProp(METAL_UNPAIRED_ELECTRONS_PROP),
+        )
+        for atom in mol.GetAtoms()  # type: ignore[no-untyped-call]
+    ]
+
+
+def _restore_unpaired_electron_state(
+    mol: Chem.Mol,
+    state: list[tuple[int, bool]],
+) -> None:
+    """Restore MolGR assignments after RDKit sanitization/normalization."""
+
+    if len(state) != mol.GetNumAtoms():
+        raise ValueError("unpaired-electron state does not match atom count")
+    for atom, (count, is_metal_assignment) in zip(
+        mol.GetAtoms(),
+        state,
+        strict=True,  # type: ignore[no-untyped-call]
+    ):
+        if is_metal_assignment:
+            atom.SetNumRadicalElectrons(0)
+            atom.SetIntProp(METAL_UNPAIRED_ELECTRONS_PROP, int(count))
+        else:
+            atom.SetNumRadicalElectrons(int(count))
+
+
 def _initialize_ring_info(mol: Chem.Mol) -> None:
     """Populate graph ring metadata without requiring chemical sanitization."""
 
@@ -64,29 +100,45 @@ def _initialize_ring_info(mol: Chem.Mol) -> None:
 def _canonical_topology(
     mol: Chem.Mol,
     *,
-    skip_sanitization: bool = False,
+    sanitize: bool = True,
+    preserve_source_order: bool = False,
 ) -> tuple[Chem.Mol, list[int], TopologySanitizationStatus, str | None]:
     source_topology = Chem.Mol(mol)
     source_topology.RemoveAllConformers()
+    unpaired_electron_state = _capture_unpaired_electron_state(source_topology)
     _clear_rdkit_properties(source_topology)
     atom_count = source_topology.GetNumAtoms()
     if atom_count == 0:
         raise ValueError("molecular topology must contain at least one atom")
 
     topology = Chem.Mol(source_topology)
-    if skip_sanitization:
+    if preserve_source_order:
         # MolGR's OpenBabel fallback is explicitly untrusted.  In particular,
         # do not probe it with RDKit sanitization: valence repair can mutate the
         # graph and hides the charge/spin provenance we need to persist.
+        _initialize_ring_info(topology)
         canonical_order = list(range(atom_count))
         sanitization_status = TopologySanitizationStatus.FAILED
         sanitization_error = (
             "MolGR suspicious_fallback topology; RDKit sanitization was intentionally skipped "
             "(potential AtomValenceException)"
         )
+    elif not sanitize:
+        # MolGR owns this graph and its source atom order. Do not run any
+        # RDKit chemical repair, stereochemistry assignment, or canonical atom
+        # ranking here: those operations are post-processing on an already
+        # reconstructed QM topology and can change coordinate correspondence.
+        _initialize_ring_info(topology)
+        canonical_order = list(range(atom_count))
+        sanitization_status = TopologySanitizationStatus.SANITIZED
+        sanitization_error = None
     else:
         try:
             Chem.SanitizeMol(topology)
+            _initialize_ring_info(topology)
+            # RDKit may infer radicals from incomplete metal/charge valence during
+            # sanitization. Restore MolGR's assignments before canonical ranking.
+            _restore_unpaired_electron_state(topology, unpaired_electron_state)
             Chem.AssignStereochemistry(topology, cleanIt=True, force=True)
             ranks = list(
                 Chem.CanonicalRankAtoms(
@@ -106,11 +158,12 @@ def _canonical_topology(
             # and substructure-search this binary Mol even when chemical
             # sanitization, descriptors, and Morgan fingerprints are unavailable.
             topology = source_topology
+            _initialize_ring_info(topology)
             canonical_order = list(range(atom_count))
             sanitization_status = TopologySanitizationStatus.FAILED
             sanitization_error = f"{type(error).__name__}: {error}"
         else:
-            if any(
+            if sanitize and any(
                 atom.GetNumImplicitHs()
                 for atom in topology.GetAtoms()  # type: ignore[no-untyped-call]
             ):
@@ -118,25 +171,28 @@ def _canonical_topology(
                     "QM topology must contain every coordinate-bearing hydrogen explicitly"
                 )
 
+    _restore_unpaired_electron_state(topology, unpaired_electron_state)
+
     source_to_topology = [0] * atom_count
     for topology_index, source_index in enumerate(canonical_order):
         source_to_topology[source_index] = topology_index
 
     canonical = Chem.RenumberAtoms(topology, canonical_order)
     canonical.RemoveAllConformers()
-    if sanitization_status is TopologySanitizationStatus.FAILED:
-        # OpenBabel fallback graphs can fail valence sanitization while still
-        # carrying usable connectivity. PostgreSQL RDKit requires initialized
-        # RingInfo even for those deliberately unsanitized molecules.
-        _initialize_ring_info(canonical)
+    _initialize_ring_info(canonical)
     return canonical, source_to_topology, sanitization_status, sanitization_error
 
 
-def _graph_smiles(mol: Chem.Mol, *, all_hydrogens_explicit: bool) -> str | None:
+def _graph_smiles(
+    mol: Chem.Mol,
+    *,
+    all_hydrogens_explicit: bool,
+    canonical: bool = True,
+) -> str | None:
     try:
         return Chem.MolToSmiles(
             mol,
-            canonical=True,
+            canonical=canonical,
             isomericSmiles=True,
             allHsExplicit=all_hydrogens_explicit,
         )
@@ -221,12 +277,20 @@ def _normalized_topology_records(
     suspicious_fallback = (reconstruction_metadata or {}).get(
         "molgr_status"
     ) == "suspicious_fallback"
+    trusted_molgr_graph = (
+        reconstruction_method.startswith("molgr/")
+        or (reconstruction_metadata or {}).get("topology_source_trusted") is True
+    ) and not suspicious_fallback
     (
         topology_mol,
         source_to_topology,
         sanitization_status,
         sanitization_error,
-    ) = _canonical_topology(mol, skip_sanitization=suspicious_fallback)
+    ) = _canonical_topology(
+        mol,
+        sanitize=not trusted_molgr_graph,
+        preserve_source_order=suspicious_fallback,
+    )
     composition, hill_formula = _formula_components(topology_mol)
     composition_hash = _digest(
         {"schema_version": FORMULA_COMPOSITION_VERSION, "composition": composition}
@@ -240,17 +304,27 @@ def _normalized_topology_records(
         element_count_vector=element_count_vector_from_composition(composition),
     )
 
+    # The persisted topology string is the explicit-H graph projection.  Do
+    # not switch to an implicit-H "skeleton" projection: coordinate-bearing
+    # hydrogen atoms and MolGR's radical annotations are part of the trusted
+    # molecular graph identity.
     explicit_graph_smiles = (
         None if suspicious_fallback else _graph_smiles(topology_mol, all_hydrogens_explicit=True)
     )
-    if sanitization_status is TopologySanitizationStatus.SANITIZED:
-        display_mol = Chem.RemoveHs(Chem.Mol(topology_mol))
-        canonical_isomeric_smiles = _graph_smiles(
-            display_mol,
-            all_hydrogens_explicit=False,
+    if explicit_graph_smiles is None and trusted_molgr_graph:
+        # Canonical ranking can fail for unusual but trusted MolGR valence
+        # states.  A source-order explicit-H SMILES still preserves the graph
+        # and its electronic annotations without attempting chemical repair.
+        explicit_graph_smiles = _graph_smiles(
+            topology_mol,
+            all_hydrogens_explicit=True,
+            canonical=False,
         )
-    else:
-        canonical_isomeric_smiles = None
+    # ``canonical_isomeric_smiles`` is retained as the public field name for
+    # compatibility, but its value is now always the explicit-H projection.
+    # This makes topology strings lossless with respect to explicit hydrogen
+    # atoms and MolGR-provided radical state.
+    canonical_isomeric_smiles = explicit_graph_smiles
     identity_schema_version = (
         TOPOLOGY_IDENTITY_VERSION
         if explicit_graph_smiles is not None
@@ -266,6 +340,9 @@ def _normalized_topology_records(
             ),
         }
     )
+    radical_electron_count = 0
+    for atom in topology_mol.GetAtoms():  # type: ignore[no-untyped-call]
+        radical_electron_count += int(get_atom_unpaired_electrons(atom))
     topology = MolecularTopologyRecord(
         mol=topology_mol,
         canonical_isomeric_smiles=canonical_isomeric_smiles,
@@ -280,10 +357,7 @@ def _normalized_topology_records(
             atom.GetFormalCharge()
             for atom in topology_mol.GetAtoms()  # type: ignore[no-untyped-call]
         ),
-        radical_electron_count=sum(
-            atom.GetNumRadicalElectrons()
-            for atom in topology_mol.GetAtoms()  # type: ignore[no-untyped-call]
-        ),
+        radical_electron_count=radical_electron_count,
         fragment_count=len(Chem.GetMolFrags(topology_mol)),
         stereo_status=(
             _stereo_status(topology_mol)
@@ -361,8 +435,14 @@ def normalize_topology_with_mapping(
     suspicious_fallback = (reconstruction_metadata or {}).get(
         "molgr_status"
     ) == "suspicious_fallback"
-    if not suspicious_fallback:
+    unpaired_electron_state = _capture_unpaired_electron_state(source)
+    trusted_source_graph = (
+        reconstruction_method.startswith("molgr/")
+        or (reconstruction_metadata or {}).get("topology_source_trusted") is True
+    )
+    if not suspicious_fallback and not trusted_source_graph:
         Chem.SanitizeMol(source)
+    _restore_unpaired_electron_state(source, unpaired_electron_state)
     if add_hydrogens:
         source = Chem.AddHs(source)
     return _normalized_topology_records(
@@ -379,7 +459,9 @@ def _ordered_geometry_mol(
 ) -> Chem.Mol:
     geometry_mol = Chem.Mol(mol)
     geometry_mol.RemoveAllConformers()
+    unpaired_electron_state = _capture_unpaired_electron_state(geometry_mol)
     _clear_rdkit_properties(geometry_mol)
+    _restore_unpaired_electron_state(geometry_mol, unpaired_electron_state)
     conformer = Chem.Conformer(geometry_mol.GetNumAtoms())
     conformer.SetId(0)
     conformer.Set3D(True)
@@ -455,6 +537,8 @@ def normalize_molecule(
             "schema_version": GEOMETRY_CANONICALIZATION_VERSION,
             "graph_hash": graph_hash,
             "internal_coordinate_hash": internal_hash,
+            "charge": charge,
+            "multiplicity": multiplicity,
             "distance_unit": "angstrom",
             "angular_unit": "degree",
         }
@@ -468,6 +552,8 @@ def normalize_molecule(
         internal_coordinate_hash=internal_hash,
         geometry_hash=geometry_hash,
         canonicalization_version=GEOMETRY_CANONICALIZATION_VERSION,
+        charge=charge,
+        multiplicity=multiplicity,
     )
     return NormalizedMoleculeRecord(
         formula=formula,

@@ -15,6 +15,17 @@ export type GeometryQueryField =
 
 export type GeometryImaginaryFrequencyStatus = "present" | "absent" | "unavailable";
 
+export type GeometrySortBy =
+  | "default"
+  | "created_at"
+  | "atom_count"
+  | "calculation_count";
+
+export interface GeometrySort {
+  sortBy: GeometrySortBy;
+  sortDirection: "asc" | "desc";
+}
+
 export interface GeometryQueryFilters {
   projectId?: string;
   topologyId?: string;

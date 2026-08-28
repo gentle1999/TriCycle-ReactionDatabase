@@ -53,7 +53,10 @@ from tricycle_reaction_db.domain.enums import (
     MappedReactionKind,
     ReactionClass,
 )
-from tricycle_reaction_db.ingestion.normalization import normalize_topology
+from tricycle_reaction_db.ingestion.normalization import (
+    normalize_topology,
+    normalize_topology_with_mapping,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +66,7 @@ class _ResolvedComponent:
     template: Chem.Mol
     formula: MolecularFormula
     topology: MolecularTopology
+    topology_atom_map_numbers: list[int]
 
 
 def _resolve_components(
@@ -89,8 +93,23 @@ def _resolve_components(
                         "precomputed reaction topology record count mismatch"
                     ) from error
                 component_index += 1
+                source_atom_maps = normalized.topology_derivation.reconstruction_metadata.get(
+                    "source_atom_map_numbers"
+                )
+                if isinstance(source_atom_maps, list):
+                    topology_atom_map_numbers = [int(number) for number in source_atom_maps]
+                else:
+                    # Generic precomputed records (for example callers of the
+                    # exported reaction_topology_records helper) do not carry
+                    # endpoint provenance. Their template order is the only
+                    # available mapping evidence.
+                    template_maps = [
+                        atom.GetAtomMapNum()
+                        for atom in template.GetAtoms()  # type: ignore[no-untyped-call]
+                    ]
+                    topology_atom_map_numbers = template_maps if any(template_maps) else []
             else:
-                normalized = normalize_topology(
+                normalized, source_to_topology = normalize_topology_with_mapping(
                     template,
                     add_hydrogens=True,
                     reconstruction_method="rdkit/reaction-representation",
@@ -100,6 +119,18 @@ def _resolve_components(
                         "template_index": template_index,
                     },
                 )
+                template_atom_maps = [
+                    atom.GetAtomMapNum()
+                    for atom in template.GetAtoms()  # type: ignore[no-untyped-call]
+                ]
+                if any(template_atom_maps):
+                    topology_atom_map_numbers = [0] * normalized.topology.atom_count
+                    for source_index, topology_index in enumerate(source_to_topology):
+                        if source_index >= len(template_atom_maps):
+                            break
+                        topology_atom_map_numbers[topology_index] = template_atom_maps[source_index]
+                else:
+                    topology_atom_map_numbers = []
             existing = (
                 session.exec(
                     select(MolecularTopology).where(
@@ -125,6 +156,7 @@ def _resolve_components(
                     template=template,
                     formula=persisted.formula,
                     topology=persisted.topology,
+                    topology_atom_map_numbers=topology_atom_map_numbers,
                 )
             )
     if precomputed_topology_records is not None and component_index != len(
@@ -138,7 +170,6 @@ def reaction_topology_records(
     definition: rdChemReactions.ChemicalReaction,
 ) -> list[object]:
     """Build the exact topology records used by reaction component resolution."""
-
     return [
         normalize_topology(
             template,
@@ -307,6 +338,17 @@ def _create_reaction(
             mapped_reaction_smiles=canonical_smiles,
             mapping_hash=mapping_hash,
         ),
+        source_atom_maps_by_template={
+            (component.side, component.template_index): component.topology_atom_map_numbers
+            for component in components
+        },
+        topology_ids_by_template={
+            (component.side, component.template_index): _require_id(
+                component.topology,
+                label="MolecularTopology",
+            )
+            for component in components
+        },
     )
     reactant_node = resolve_endpoint_node(
         session,
@@ -348,7 +390,7 @@ class ReactionCommandService(UseCaseService):  # type: ignore[misc]
         cls,
         reaction: str,
         label: str | None = None,
-        reaction_class: ReactionClass = ReactionClass.CYCLOADDITION,
+        reaction_class: ReactionClass | None = None,
         cycloaddition_pattern: str | None = None,
         mapped_reaction_key: str | None = None,
         mapped_reaction_kind: MappedReactionKind = MappedReactionKind.CURATED,

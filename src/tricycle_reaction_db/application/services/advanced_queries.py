@@ -39,6 +39,7 @@ from tricycle_reaction_db.application.services.queries import (
     _required_uuid,
 )
 from tricycle_reaction_db.application.services.query_visibility import (
+    calculation_frame_is_visible,
     frame_id_is_visible,
     query_visibility_scope,
 )
@@ -130,7 +131,9 @@ class CalculationResultQueryService(UseCaseService):  # type: ignore[misc]
         """List frames that own at least one advanced result container."""
 
         scope = await query_visibility_scope()
-        predicates: list[Any] = [frame_id_is_visible(scope, col(CalculationFrame.id))]
+        predicates: list[Any] = [
+            calculation_frame_is_visible(scope, col(CalculationFrame.parse_revision_id))
+        ]
         if frame_id is not None:
             predicates.append(col(CalculationFrame.id) == frame_id)
         if artifact_file_id is not None:

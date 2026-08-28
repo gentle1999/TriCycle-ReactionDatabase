@@ -37,6 +37,7 @@ from tricycle_reaction_db.domain.enums import (
 )
 from tricycle_reaction_db.ingestion.media_type import detect_artifact_media_type
 
+
 class UploadBatchError(RuntimeError):
     pass
 

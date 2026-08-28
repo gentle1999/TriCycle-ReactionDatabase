@@ -13,6 +13,7 @@ from tricycle_reaction_db.application.services.depictions import (
     draw_molecule_molfile,
     get_geometry_dof_depiction,
     get_geometry_sdf,
+    get_geometry_xyz,
     get_topology_depiction,
     get_topology_molfile,
     get_transition_state_anchor_sdf,
@@ -303,6 +304,33 @@ async def geometry_sdf(
         media_type="chemical/x-mdl-sdfile",
         headers={
             "Cache-Control": "private, no-store",
+            "Content-Disposition": f'attachment; filename="geometry-{geometry_id}.sdf"',
+            "X-Coordinate-Unit": "angstrom",
+            "X-Geometry-Dimension": "3",
+        },
+    )
+
+
+@router.get(
+    "/api/depictions/geometry/{geometry_id}.xyz",
+    response_class=Response,
+)
+async def geometry_xyz(
+    geometry_id: UUID,
+    project_id: UUID | None = None,
+) -> Response:
+    xyz = await get_geometry_xyz(geometry_id, project_id=project_id)
+    if xyz is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="molecular geometry not found",
+        )
+    return Response(
+        content=xyz,
+        media_type="chemical/x-xyz",
+        headers={
+            "Cache-Control": "private, no-store",
+            "Content-Disposition": f'attachment; filename="geometry-{geometry_id}.xyz"',
             "X-Coordinate-Unit": "angstrom",
             "X-Geometry-Dimension": "3",
         },

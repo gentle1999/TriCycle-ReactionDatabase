@@ -87,7 +87,7 @@ class LogicalReactionRecord(BaseModel):
 
     reaction_key: str = Field(min_length=1)
     label: str | None = Field(default=None, min_length=1)
-    reaction_class: ReactionClass = ReactionClass.CYCLOADDITION
+    reaction_class: ReactionClass | None = None
     cycloaddition_pattern: str | None = Field(default=None, min_length=1, max_length=32)
     reaction_hash: str = Field(pattern=_SHA256_PATTERN)
 
@@ -99,7 +99,7 @@ class CreateReactionCommand(BaseModel):
 
     reaction: str = Field(min_length=1, max_length=16_384)
     label: str | None = Field(default=None, min_length=1)
-    reaction_class: ReactionClass = ReactionClass.CYCLOADDITION
+    reaction_class: ReactionClass | None = None
     cycloaddition_pattern: str | None = Field(default=None, min_length=1, max_length=32)
     mapped_reaction_key: str | None = Field(default=None, min_length=1)
     mapped_reaction_kind: MappedReactionKind = MappedReactionKind.CURATED

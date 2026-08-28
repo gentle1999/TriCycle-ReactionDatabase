@@ -279,12 +279,12 @@ class LogicalReaction(SQLModel, table=True):
     created_at: datetime | None = created_at_field()
     reaction_key: str = Field(sa_type=Text, nullable=False)
     label: str | None = Field(default=None, sa_type=Text)
-    reaction_class: ReactionClass = Field(
-        default=ReactionClass.CYCLOADDITION,
+    reaction_class: ReactionClass | None = Field(
+        default=None,
         sa_column=Column(
             string_enum(ReactionClass, name="reaction_class"),
-            nullable=False,
-            server_default=ReactionClass.CYCLOADDITION.value,
+            nullable=True,
+            server_default=None,
             index=True,
         ),
     )

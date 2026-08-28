@@ -317,6 +317,8 @@ class Geometry(SQLModel, table=True):
             "topology_id",
             "canonicalization_version",
             "geometry_hash",
+            "charge",
+            "multiplicity",
             name="uq_geometry_topology_hash",
         ),
         CheckConstraint(
@@ -380,6 +382,8 @@ class Geometry(SQLModel, table=True):
     minimum_coordinate_decimal_places: int | None = Field(default=None, sa_type=SMALLINT)
     internal_coordinate_hash: str = Field(max_length=64, nullable=False)
     geometry_hash: str = Field(max_length=64, nullable=False)
+    charge: int = Field(default=0, sa_type=SMALLINT, nullable=False)
+    multiplicity: int = Field(default=1, sa_type=SMALLINT, nullable=False)
     canonicalization_version: str = Field(
         default="geometry-internal-coordinates-v1",
         sa_column=Column(

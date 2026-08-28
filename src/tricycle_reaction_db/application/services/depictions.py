@@ -63,17 +63,76 @@ def draw_molecule_molfile(molecule: Chem.Mol) -> str:
     return Chem.MolToMolBlock(drawable, includeStereo=True, kekulize=False)
 
 
-def draw_geometry_sdf(molecule: Chem.Mol) -> str:
-    """Serialize one stored conformer as an SDF record without changing it."""
+def draw_geometry_sdf(
+    molecule: Chem.Mol,
+    *,
+    charge: int | None = None,
+    multiplicity: int | None = None,
+) -> str:
+    """Serialize one conformer and, when available, its global electronic state."""
 
     if molecule.GetNumConformers() != 1 or not molecule.GetConformer().Is3D():
         raise ValueError("Geometry.mol must contain exactly one three-dimensional conformer")
+    drawable = Chem.Mol(molecule)
+    if charge is not None:
+        drawable.SetIntProp("total_charge", int(charge))
+    if multiplicity is not None:
+        if multiplicity < 1:
+            raise ValueError("spin multiplicity must be positive")
+        drawable.SetIntProp("spin_multiplicity", int(multiplicity))
     buffer = StringIO()
     writer = Chem.SDWriter(buffer)
     writer.SetKekulize(False)
-    writer.write(molecule)
+    writer.write(drawable)
     writer.close()
     return buffer.getvalue()
+
+
+def draw_geometry_xyz(
+    molecule: Chem.Mol,
+    *,
+    charge: int | None = None,
+    multiplicity: int | None = None,
+) -> str:
+    """Serialize one stored conformer and its global charge/spin as XYZ text."""
+
+    if molecule.GetNumConformers() != 1 or not molecule.GetConformer().Is3D():
+        raise ValueError("Geometry.mol must contain exactly one three-dimensional conformer")
+    if multiplicity is not None and multiplicity < 1:
+        raise ValueError("spin multiplicity must be positive")
+    conformer = molecule.GetConformer()
+    total_charge = (
+        charge
+        if charge is not None
+        else sum(atom.GetFormalCharge() for atom in molecule.GetAtoms())
+    )
+    total_spin = (multiplicity - 1) / 2 if multiplicity is not None else None
+    total_spin_text = (
+        str(int(total_spin))
+        if total_spin is not None and total_spin.is_integer()
+        else str(total_spin)
+    )
+    coordinates = [
+        (
+            atom.GetSymbol(),
+            conformer.GetAtomPosition(atom_index),
+        )
+        for atom_index, atom in enumerate(molecule.GetAtoms())
+    ]
+    lines = [
+        str(molecule.GetNumAtoms()),
+        (
+            "Geometry conformer; canonical topology atom order; coordinates in angstrom; "
+            f"total_charge={total_charge}; "
+            f"spin_multiplicity={multiplicity if multiplicity is not None else 'unavailable'}; "
+            f"total_spin_S={total_spin_text if total_spin is not None else 'unavailable'}"
+        ),
+        *(
+            f"{element} {position.x:.8f} {position.y:.8f} {position.z:.8f}"
+            for element, position in coordinates
+        ),
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def _source_order_molecule(
@@ -196,6 +255,41 @@ async def get_geometry_sdf(
     return draw_geometry_sdf(molecule)
 
 
+async def _get_geometry_xyz_export(
+    geometry_id: UUID,
+    project_id: UUID | None = None,
+) -> tuple[Chem.Mol, int, int] | None:
+    """Load a visible Geometry and its persisted electronic state."""
+
+    scope = await query_visibility_scope(project_id=project_id)
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                select(Geometry.mol, Geometry.charge, Geometry.multiplicity).where(
+                    col(Geometry.id) == geometry_id,
+                    geometry_id_is_visible(scope, col(Geometry.id)),
+                )
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+    molecule, charge, multiplicity = row
+    return molecule, int(charge), int(multiplicity)
+
+
+async def get_geometry_xyz(
+    geometry_id: UUID,
+    project_id: UUID | None = None,
+) -> str | None:
+    """Load one stored Geometry.mol and export its persisted electronic state."""
+
+    geometry_export = await _get_geometry_xyz_export(geometry_id, project_id=project_id)
+    if geometry_export is None:
+        return None
+    molecule, charge, multiplicity = geometry_export
+    return draw_geometry_xyz(molecule, charge=charge, multiplicity=multiplicity)
+
+
 async def get_geometry_dof_depiction(
     geometry_id: UUID,
     project_id: UUID | None = None,
@@ -241,7 +335,11 @@ async def get_transition_state_anchor_sdf(
                 frame.observed_coordinates,
                 list(frame.observed_to_geometry_atom_indices),
             )
-            return draw_geometry_sdf(molecule)
+            return draw_geometry_sdf(
+                molecule,
+                charge=frame.charge,
+                multiplicity=frame.multiplicity,
+            )
 
         direction = TransitionStateEndpointDirection(anchor)
         endpoint_row = (
@@ -266,7 +364,11 @@ async def get_transition_state_anchor_sdf(
             endpoint.source_coordinates,
             list(endpoint.source_to_topology_atom_indices),
         )
-        return draw_geometry_sdf(molecule)
+        return draw_geometry_sdf(
+            molecule,
+            charge=endpoint.charge,
+            multiplicity=endpoint.multiplicity,
+        )
 
 
 __all__ = [
@@ -274,8 +376,10 @@ __all__ = [
     "draw_molecule_svg",
     "draw_geometry_dof_svg",
     "draw_geometry_sdf",
+    "draw_geometry_xyz",
     "get_geometry_dof_depiction",
     "get_geometry_sdf",
+    "get_geometry_xyz",
     "get_transition_state_anchor_sdf",
     "get_topology_depiction",
     "get_topology_molfile",

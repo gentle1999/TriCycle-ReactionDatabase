@@ -91,6 +91,7 @@ from tricycle_reaction_db.application.services.geometry_energy import (
     geometry_energy_composites,
 )
 from tricycle_reaction_db.application.services.query_visibility import (
+    calculation_frame_is_visible,
     frame_id_is_visible,
     geometry_id_is_visible,
     logical_reaction_id_is_visible,
@@ -231,6 +232,7 @@ _LOGICAL_REACTION_QUERY_EXPRESSION_FIELDS = frozenset(
         "maximum_activation_gibbs_free_energy_kcal_mol",
         "minimum_reaction_gibbs_free_energy_kcal_mol",
         "maximum_reaction_gibbs_free_energy_kcal_mol",
+        "reactant_product_changed",
         "created_after",
         "created_before",
     }
@@ -294,6 +296,79 @@ def _logical_reaction_structure_predicate(
         .correlate(None)
     )
     return col(LogicalReaction.id).in_(mapped_structure_ids)
+
+
+def _reaction_topology_side_signature(
+    side: LogicalReactionParticipantSide,
+    *,
+    reaction_id_column: Any | None = None,
+    correlation_entity: Any | None = None,
+) -> Any:
+    """Return an order-independent signature of one reaction side.
+
+    ``canonical_isomeric_smiles`` is the persisted, atom-order-normalized
+    topology representation. Including the stoichiometric coefficient and
+    sorting inside ``array_agg`` makes this a multiset comparison rather than
+    a comparison of input/template order.
+    """
+
+    component = func.concat(
+        func.coalesce(col(MolecularTopology.canonical_isomeric_smiles), literal("<unknown>")),
+        literal(":"),
+        sql_cast(col(LogicalReactionParticipant.stoichiometric_coefficient), Text),
+    )
+    correlation_entity = correlation_entity or (
+        MappedReaction if reaction_id_column is not None else LogicalReaction
+    )
+    correlated_reaction_id = (
+        reaction_id_column if reaction_id_column is not None else col(LogicalReaction.id)
+    )
+    return (
+        select(
+            func.array_agg(
+                aggregate_order_by(
+                    component,
+                    col(MolecularTopology.canonical_isomeric_smiles),
+                    col(LogicalReactionParticipant.stoichiometric_coefficient),
+                    col(LogicalReactionParticipant.participant_index),
+                )
+            )
+        )
+        .select_from(LogicalReactionParticipant)
+        .join(
+            MolecularTopology,
+            col(LogicalReactionParticipant.topology_id) == col(MolecularTopology.id),
+        )
+        .where(
+            col(LogicalReactionParticipant.logical_reaction_id) == correlated_reaction_id,
+            col(LogicalReactionParticipant.side) == side,
+        )
+        .correlate(correlation_entity)
+        .scalar_subquery()
+    )
+
+
+def _reaction_topology_changed_expression(
+    *,
+    reaction_id_column: Any | None = None,
+    correlation_entity: Any | None = None,
+) -> Any:
+    """Compare canonical reactant/product topology multisets in SQL."""
+
+    reactants = _reaction_topology_side_signature(
+        LogicalReactionParticipantSide.REACTANT,
+        reaction_id_column=reaction_id_column,
+        correlation_entity=correlation_entity,
+    )
+    products = _reaction_topology_side_signature(
+        LogicalReactionParticipantSide.PRODUCT,
+        reaction_id_column=reaction_id_column,
+        correlation_entity=correlation_entity,
+    )
+    return case(
+        (reactants.is_(None) | products.is_(None), literal(None, type_=Boolean)),
+        else_=reactants.is_distinct_from(products),
+    )
 
 
 def _logical_reaction_query_leaf_predicate(
@@ -384,6 +459,10 @@ def _logical_reaction_query_leaf_predicate(
             comparison,
         )
         return col(LogicalReaction.id).in_(mapped_screening_ids)
+    if field_name == "reactant_product_changed":
+        if not isinstance(value, bool):
+            raise ValueError("reactant_product_changed must be a boolean")
+        return _reaction_topology_changed_expression() == value
     if field_name in {"created_after", "created_before"}:
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"{field_name} must be an ISO 8601 datetime")
@@ -463,6 +542,10 @@ def _enum_value(value: Any) -> str:
     return str(getattr(value, "value", value))
 
 
+def _optional_enum_value(value: Any) -> str | None:
+    return None if value is None else _enum_value(value)
+
+
 def _complete_sum(values: Sequence[float | None]) -> float | None:
     if not values or any(value is None for value in values):
         return None
@@ -521,9 +604,39 @@ def _aggregate_primary_coordinates(
     )
 
 
+def _canonical_reactant_product_changed(
+    participant_rows: Sequence[tuple[LogicalReactionParticipant, MolecularTopology]],
+) -> bool | None:
+    """Compare participant topology multisets using canonical topology strings."""
+
+    signatures: dict[LogicalReactionParticipantSide, list[tuple[str | None, int]]] = {
+        LogicalReactionParticipantSide.REACTANT: [],
+        LogicalReactionParticipantSide.PRODUCT: [],
+    }
+    for participant, topology in participant_rows:
+        signatures[participant.side].append(
+            (topology.canonical_isomeric_smiles, participant.stoichiometric_coefficient)
+        )
+    if (
+        not signatures[LogicalReactionParticipantSide.REACTANT]
+        or not signatures[LogicalReactionParticipantSide.PRODUCT]
+    ):
+        return None
+    if any(smiles is None for side in signatures.values() for smiles, _coefficient in side):
+        return None
+
+    def sort_key(item: tuple[str | None, int]) -> tuple[str, int]:
+        return item[0] or "", item[1]
+
+    return sorted(signatures[LogicalReactionParticipantSide.REACTANT], key=sort_key) != sorted(
+        signatures[LogicalReactionParticipantSide.PRODUCT], key=sort_key
+    )
+
+
 def _reaction_summary(
     reaction: LogicalReaction,
     *,
+    reactant_product_changed: bool | None = None,
     reactant_topology_ids: list[UUID] | None = None,
     product_topology_ids: list[UUID] | None = None,
     transition_state_geometry_id: UUID | None = None,
@@ -536,9 +649,10 @@ def _reaction_summary(
         id=_required_uuid(reaction.id, "LogicalReaction"),
         reaction_key=reaction.reaction_key,
         label=reaction.label,
-        reaction_class=_enum_value(reaction.reaction_class),
+        reaction_class=_optional_enum_value(reaction.reaction_class),
         cycloaddition_pattern=reaction.cycloaddition_pattern,
         reaction_hash=reaction.reaction_hash,
+        reactant_product_changed=reactant_product_changed,
         created_at=reaction.created_at,
         reactant_topology_ids=reactant_topology_ids or [],
         product_topology_ids=product_topology_ids or [],
@@ -557,6 +671,7 @@ def _reaction_summary(
 def _mapped_reaction_summary(
     path: MappedReaction,
     *,
+    reactant_product_changed: bool | None = None,
     reaction_smarts_match: bool | None = None,
     similarity_score: float | None = None,
     minimum_reaction_gibbs_free_energy_kcal_mol: float | None = None,
@@ -571,6 +686,7 @@ def _mapped_reaction_summary(
         mapped_reaction_smiles=path.mapped_reaction_smiles,
         mapping_hash=path.mapping_hash,
         reaction_structural_bfp_schema_version=(path.reaction_structural_bfp_schema_version),
+        reactant_product_changed=reactant_product_changed,
         created_at=path.created_at,
         reaction_smarts_match=reaction_smarts_match,
         similarity_score=similarity_score,
@@ -718,6 +834,16 @@ def _decode_artifact_cursor(cursor: str) -> tuple[datetime, UUID]:
     return created_at, artifact_id
 
 
+def _ordered_sort_expression(expression: Any, direction: str) -> Any:
+    """Return a null-last sort expression after validating the direction."""
+
+    if direction == "asc":
+        return expression.asc().nulls_last()
+    if direction == "desc":
+        return expression.desc().nulls_last()
+    raise ValueError("sort_direction must be asc or desc")
+
+
 class ArtifactQueryService(UseCaseService):  # type: ignore[misc]
     """Browse immutable calculation and manifest artifacts."""
 
@@ -733,8 +859,26 @@ class ArtifactQueryService(UseCaseService):  # type: ignore[misc]
         limit: PageLimit = 50,
         offset: PageOffset = 0,
         cursor: str | None = None,
+        sort_by: str = "created_at",
+        sort_direction: str = "desc",
     ) -> ArtifactPage:
         """List artifact catalogue entries without exposing RustFS credentials."""
+
+        artifact_sort_fields = {
+            "created_at": col(ArtifactFile.created_at),
+            "original_filename": col(ArtifactFile.original_filename),
+            "size_bytes": col(ArtifactFile.size_bytes),
+            "artifact_kind": col(ArtifactFile.artifact_kind),
+            "storage_status": col(ArtifactFile.storage_status),
+        }
+        sort_expression = artifact_sort_fields.get(sort_by)
+        if sort_expression is None:
+            raise ValueError(
+                "sort_by must be created_at, original_filename, size_bytes, artifact_kind, "
+                "or storage_status"
+            )
+        if cursor is not None and (sort_by != "created_at" or sort_direction != "desc"):
+            raise ValueError("cursor pagination only supports created_at descending order")
 
         count_statement = sqlmodel_select(func.count()).select_from(ArtifactFile)
         statement = sqlmodel_select(ArtifactFile)
@@ -779,7 +923,7 @@ class ArtifactQueryService(UseCaseService):  # type: ignore[misc]
                 )
             )
         statement = statement.order_by(
-            col(ArtifactFile.created_at).desc(),
+            _ordered_sort_expression(sort_expression, sort_direction),
             col(ArtifactFile.id),
         )
         if not cursor_mode:
@@ -1363,13 +1507,35 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
         maximum_reaction_gibbs_free_energy_kcal_mol: float | None = None,
         has_activation_gibbs_free_energy: bool | None = None,
         has_reaction_gibbs_free_energy: bool | None = None,
+        reactant_product_changed: bool | None = None,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
         limit: PageLimit = 50,
         offset: PageOffset = 0,
         filter_expression: str | None = None,
+        sort_by: str = "default",
+        sort_direction: str = "asc",
     ) -> LogicalReactionPage:
         """List reactions, optionally restricting them by participant topology."""
+
+        if sort_direction not in {"asc", "desc"}:
+            raise ValueError("sort_direction must be asc or desc")
+        reaction_sort_fields = {
+            "created_at": col(LogicalReaction.created_at),
+            "reaction_key": col(LogicalReaction.reaction_key),
+            "reaction_class": col(LogicalReaction.reaction_class),
+        }
+        energy_sort_fields = {
+            "minimum_activation_gibbs_free_energy": (
+                "minimum_activation_gibbs_free_energy_kcal_mol"
+            ),
+            "minimum_reaction_gibbs_free_energy": ("minimum_reaction_gibbs_free_energy_kcal_mol"),
+        }
+        if sort_by not in {"default", *reaction_sort_fields, *energy_sort_fields}:
+            raise ValueError(
+                "sort_by must be default, created_at, reaction_key, reaction_class, "
+                "minimum_activation_gibbs_free_energy, or minimum_reaction_gibbs_free_energy"
+            )
 
         settings = get_settings()
         flat_filter_values = (
@@ -1385,6 +1551,7 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             maximum_activation_gibbs_free_energy_kcal_mol,
             minimum_reaction_gibbs_free_energy_kcal_mol,
             maximum_reaction_gibbs_free_energy_kcal_mol,
+            reactant_product_changed,
             created_after,
             created_before,
         )
@@ -1422,6 +1589,9 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             predicates.append(col(LogicalReaction.reaction_hash) == reaction_hash)
         if reaction_class is not None:
             predicates.append(col(LogicalReaction.reaction_class) == reaction_class)
+        if reactant_product_changed is not None:
+            changed_expression = _reaction_topology_changed_expression()
+            predicates.append(changed_expression == reactant_product_changed)
         reaction_structure_predicates: list[Any] = []
         if reaction_smarts is not None:
             if rdChemReactions.ReactionFromSmarts(reaction_smarts) is None:
@@ -1550,53 +1720,73 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                     )
                 ).scalar_one()
             )
-            reactant_component = func.concat(
-                col(MolecularTopology.canonical_isomeric_smiles),
-                literal(":"),
-                sql_cast(col(LogicalReactionParticipant.stoichiometric_coefficient), Text),
-            )
-            reactant_sort_keys = (
-                select(
-                    col(LogicalReactionParticipant.logical_reaction_id).label(
-                        "logical_reaction_id"
-                    ),
-                    func.array_agg(
-                        aggregate_order_by(
-                            reactant_component,
-                            col(MolecularTopology.canonical_isomeric_smiles),
-                            col(LogicalReactionParticipant.stoichiometric_coefficient),
-                            col(LogicalReactionParticipant.participant_index),
-                        )
-                    ).label("reactant_sort_key"),
+            reaction_statement = select(LogicalReaction).where(*predicates)
+            if sort_by == "default":
+                reactant_component = func.concat(
+                    col(MolecularTopology.canonical_isomeric_smiles),
+                    literal(":"),
+                    sql_cast(col(LogicalReactionParticipant.stoichiometric_coefficient), Text),
                 )
-                .join(
-                    MolecularTopology,
-                    col(LogicalReactionParticipant.topology_id) == col(MolecularTopology.id),
-                )
-                .where(
-                    col(LogicalReactionParticipant.side) == LogicalReactionParticipantSide.REACTANT
-                )
-                .group_by(col(LogicalReactionParticipant.logical_reaction_id))
-                .subquery()
-            )
-            reactions = (
-                (
-                    await session.execute(
-                        select(LogicalReaction)
-                        .outerjoin(
-                            reactant_sort_keys,
-                            col(LogicalReaction.id) == reactant_sort_keys.c.logical_reaction_id,
-                        )
-                        .where(*predicates)
-                        .order_by(
-                            reactant_sort_keys.c.reactant_sort_key.nulls_last(),
-                            col(LogicalReaction.created_at),
-                            col(LogicalReaction.id),
-                        )
-                        .offset(offset)
-                        .limit(limit)
+                reactant_sort_keys = (
+                    select(
+                        col(LogicalReactionParticipant.logical_reaction_id).label(
+                            "logical_reaction_id"
+                        ),
+                        func.array_agg(
+                            aggregate_order_by(
+                                reactant_component,
+                                col(MolecularTopology.canonical_isomeric_smiles),
+                                col(LogicalReactionParticipant.stoichiometric_coefficient),
+                                col(LogicalReactionParticipant.participant_index),
+                            )
+                        ).label("reactant_sort_key"),
                     )
+                    .join(
+                        MolecularTopology,
+                        col(LogicalReactionParticipant.topology_id) == col(MolecularTopology.id),
+                    )
+                    .where(
+                        col(LogicalReactionParticipant.side)
+                        == LogicalReactionParticipantSide.REACTANT
+                    )
+                    .group_by(col(LogicalReactionParticipant.logical_reaction_id))
+                    .subquery()
                 )
+                reaction_statement = reaction_statement.outerjoin(
+                    reactant_sort_keys,
+                    col(LogicalReaction.id) == reactant_sort_keys.c.logical_reaction_id,
+                ).order_by(
+                    reactant_sort_keys.c.reactant_sort_key.nulls_last(),
+                    col(LogicalReaction.created_at),
+                    col(LogicalReaction.id),
+                )
+            elif sort_by in energy_sort_fields:
+                energy_field = energy_sort_fields[sort_by]
+                energy_sort_keys = (
+                    select(
+                        col(MappedReaction.logical_reaction_id).label("logical_reaction_id"),
+                        func.min(col(getattr(MappedReaction, energy_field))).label(
+                            "energy_sort_key"
+                        ),
+                    )
+                    .where(mapped_reaction_id_is_visible(scope, col(MappedReaction.id)))
+                    .group_by(col(MappedReaction.logical_reaction_id))
+                    .subquery()
+                )
+                reaction_statement = reaction_statement.outerjoin(
+                    energy_sort_keys,
+                    col(LogicalReaction.id) == energy_sort_keys.c.logical_reaction_id,
+                ).order_by(
+                    _ordered_sort_expression(energy_sort_keys.c.energy_sort_key, sort_direction),
+                    col(LogicalReaction.id),
+                )
+            else:
+                reaction_statement = reaction_statement.order_by(
+                    _ordered_sort_expression(reaction_sort_fields[sort_by], sort_direction),
+                    col(LogicalReaction.id),
+                )
+            reactions = (
+                (await session.execute(reaction_statement.offset(offset).limit(limit)))
                 .scalars()
                 .all()
             )
@@ -1606,7 +1796,12 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             participant_rows = (
                 (
                     await session.execute(
-                        select(LogicalReactionParticipant)
+                        select(LogicalReactionParticipant, MolecularTopology)
+                        .join(
+                            MolecularTopology,
+                            col(LogicalReactionParticipant.topology_id)
+                            == col(MolecularTopology.id),
+                        )
                         .where(
                             col(LogicalReactionParticipant.logical_reaction_id).in_(
                                 page_reaction_ids
@@ -1618,16 +1813,16 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                             col(LogicalReactionParticipant.participant_index),
                         )
                     )
-                )
-                .scalars()
-                .all()
+                ).all()
                 if page_reaction_ids
                 else []
             )
-            participants_by_reaction: dict[UUID, list[LogicalReactionParticipant]] = {}
-            for participant in participant_rows:
+            participants_by_reaction: dict[
+                UUID, list[tuple[LogicalReactionParticipant, MolecularTopology]]
+            ] = {}
+            for participant, topology in participant_rows:
                 participants_by_reaction.setdefault(participant.logical_reaction_id, []).append(
-                    participant
+                    (participant, topology)
                 )
             transition_rows = (
                 (
@@ -1701,16 +1896,21 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             items=[
                 _reaction_summary(
                     reaction,
+                    reactant_product_changed=_canonical_reactant_product_changed(
+                        participants_by_reaction.get(
+                            _required_uuid(reaction.id, "LogicalReaction"), []
+                        )
+                    ),
                     reactant_topology_ids=[
                         participant.topology_id
-                        for participant in participants_by_reaction.get(
+                        for participant, _topology in participants_by_reaction.get(
                             _required_uuid(reaction.id, "LogicalReaction"), []
                         )
                         if participant.side == "reactant"
                     ],
                     product_topology_ids=[
                         participant.topology_id
-                        for participant in participants_by_reaction.get(
+                        for participant, _topology in participants_by_reaction.get(
                             _required_uuid(reaction.id, "LogicalReaction"), []
                         )
                         if participant.side == "product"
@@ -1808,6 +2008,7 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
         ]
         summary = _reaction_summary(
             reaction,
+            reactant_product_changed=_canonical_reactant_product_changed(participant_rows),
             minimum_activation_gibbs_free_energy_kcal_mol=(
                 min(path_minima) if path_minima else None
             ),
@@ -1835,7 +2036,13 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                 )
                 for participant, topology in participant_rows
             ],
-            mapped_reactions=[_mapped_reaction_summary(path) for path in paths],
+            mapped_reactions=[
+                _mapped_reaction_summary(
+                    path,
+                    reactant_product_changed=summary.reactant_product_changed,
+                )
+                for path in paths
+            ],
         )
 
 
@@ -1867,6 +2074,7 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
         maximum_activation_gibbs_free_energy_kcal_mol: float | None = None,
         minimum_reaction_gibbs_free_energy_kcal_mol: float | None = None,
         maximum_reaction_gibbs_free_energy_kcal_mol: float | None = None,
+        reactant_product_changed: bool | None = None,
         limit: PageLimit = 50,
         offset: PageOffset = 0,
     ) -> MappedReactionPage:
@@ -1912,6 +2120,13 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
             predicates.append(col(MappedReaction.mapped_reaction_kind) == mapped_reaction_kind)
         if label is not None:
             predicates.append(col(MappedReaction.label) == label)
+        if reactant_product_changed is not None:
+            predicates.append(
+                _reaction_topology_changed_expression(
+                    reaction_id_column=col(MappedReaction.logical_reaction_id)
+                )
+                == reactant_product_changed
+            )
         _validate_range(
             minimum_activation_gibbs_free_energy_kcal_mol,
             maximum_activation_gibbs_free_energy_kcal_mol,
@@ -2096,6 +2311,9 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
                 MappedReaction,
                 smarts_match.label("reaction_smarts_match"),
                 similarity_score.label("similarity_score"),
+                _reaction_topology_changed_expression(
+                    reaction_id_column=col(MappedReaction.logical_reaction_id)
+                ).label("reactant_product_changed"),
             )
             .where(*predicates)
             .order_by(*order_by)
@@ -2127,6 +2345,9 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
             items=[
                 _mapped_reaction_summary(
                     reaction,
+                    reactant_product_changed=(
+                        bool(changed_value) if changed_value is not None else None
+                    ),
                     reaction_smarts_match=(
                         bool(smarts_match_value) if smarts_match_value is not None else None
                     ),
@@ -2136,7 +2357,12 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
                         else None
                     ),
                 )
-                for reaction, smarts_match_value, similarity_score_value in rows
+                for (
+                    reaction,
+                    smarts_match_value,
+                    similarity_score_value,
+                    changed_value,
+                ) in rows
             ],
             page=PageInfo(total=total, limit=limit, offset=offset),
         )
@@ -2419,7 +2645,15 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
             )
             if node_geometry.is_primary:
                 primary_composites_by_node[node_geometry.mapped_reaction_node_id].append(composite)
-        summary = _mapped_reaction_summary(path)
+        summary = _mapped_reaction_summary(
+            path,
+            reactant_product_changed=_canonical_reactant_product_changed(
+                [
+                    (logical_participant, topology)
+                    for _, logical_participant, topology in participant_rows
+                ]
+            ),
+        )
         return MappedReactionDetail(
             **summary.model_dump(),
             reaction_key=reaction.reaction_key,
@@ -2499,9 +2733,25 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
         """List frame summaries with composable identity and calculation filters."""
 
         statement = _frame_select()
-        count_statement = select(func.count()).select_from(CalculationFrame)
         scope = await query_visibility_scope(project_id=project_id)
-        predicates: list[Any] = [frame_id_is_visible(scope, col(CalculationFrame.id))]
+        visibility_criterion = scope.artifact_predicate()
+        count_statement = (
+            select(func.count())
+            .select_from(CalculationFrame)
+            .join(
+                ParseRevision,
+                col(CalculationFrame.parse_revision_id) == col(ParseRevision.id),
+            )
+            .join(
+                ArtifactFile,
+                col(ParseRevision.artifact_file_id) == col(ArtifactFile.id),
+            )
+            .where(visibility_criterion)
+        )
+        frame_visibility_criterion = calculation_frame_is_visible(
+            scope, col(CalculationFrame.parse_revision_id)
+        )
+        predicates: list[Any] = []
         if artifact_file_id is not None:
             revision_ids = select(col(ParseRevision.id)).where(
                 col(ParseRevision.artifact_file_id) == artifact_file_id
@@ -2595,7 +2845,7 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
             predicates.append(
                 frequency_column.is_not(None) if has_frequencies else frequency_column.is_(None)
             )
-        statement = statement.where(*predicates)
+        statement = statement.where(frame_visibility_criterion, *predicates)
         count_statement = count_statement.where(*predicates)
         statement = (
             statement.order_by(
@@ -2810,6 +3060,8 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
                 TransitionStateEndpointView(
                     direction=_enum_value(endpoint.direction),
                     topology_id=endpoint.topology_id,
+                    charge=endpoint.charge,
+                    multiplicity=endpoint.multiplicity,
                     atom_count=endpoint.atom_count,
                     displacement_ratio=endpoint.displacement_ratio,
                     source_coordinate_hash=endpoint.source_coordinate_hash,

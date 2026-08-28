@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+from molgr.utils.converter import METAL_UNPAIRED_ELECTRONS_PROP
 from pydantic import ValidationError
 from rdkit import Chem
 
@@ -9,7 +10,11 @@ from tricycle_reaction_db.application.dtos import (
     NormalizedMoleculeRecord,
 )
 from tricycle_reaction_db.domain.enums import StereoStatus, TopologySanitizationStatus
-from tricycle_reaction_db.ingestion.normalization import normalize_molecule, normalize_topology
+from tricycle_reaction_db.ingestion.normalization import (
+    normalize_molecule,
+    normalize_topology,
+    normalize_topology_with_mapping,
+)
 
 
 def _explicit_molecule() -> Chem.Mol:
@@ -43,6 +48,22 @@ def _unsanitizable_ring_molecule() -> Chem.Mol:
     return molecule.GetMol()
 
 
+def _molgr_metal_electron_molecule() -> Chem.Mol:
+    """Small MolGR-like graph whose metal electron is stored as an atom property."""
+
+    molecule = Chem.RWMol()
+    oxygen = molecule.AddAtom(Chem.Atom(8))
+    aluminum = molecule.AddAtom(Chem.Atom(13))
+    molecule.AddBond(oxygen, aluminum, Chem.BondType.SINGLE)
+    result = molecule.GetMol()
+    for atom in result.GetAtoms():
+        atom.SetNoImplicit(True)
+        atom.SetNumRadicalElectrons(0)
+    result.GetAtomWithIdx(oxygen).SetFormalCharge(1)
+    result.GetAtomWithIdx(aluminum).SetIntProp(METAL_UNPAIRED_ELECTRONS_PROP, 1)
+    return result
+
+
 def test_normalization_separates_formula_topology_and_geometry() -> None:
     mol = _explicit_molecule()
     record = normalize_molecule(
@@ -74,6 +95,26 @@ def test_normalization_separates_formula_topology_and_geometry() -> None:
     assert not record.geometry.internal_coordinates.flags.writeable
     np.testing.assert_array_equal(record.observed_coordinates, _coordinates(mol.GetNumAtoms()))
     assert sorted(record.observed_to_geometry_atom_indices) == list(range(mol.GetNumAtoms()))
+
+
+def test_normalization_preserves_molgr_metal_unpaired_electrons() -> None:
+    molecule = _molgr_metal_electron_molecule()
+    record = normalize_molecule(
+        molecule,
+        _coordinates(molecule.GetNumAtoms()),
+        charge=1,
+        multiplicity=1,
+        reconstruction_method="molgr/cpp",
+        reconstruction_version="0.1.7",
+    )
+
+    assert record.topology.radical_electron_count == 1
+    metal = next(atom for atom in record.topology.mol.GetAtoms() if atom.GetSymbol() == "Al")
+    oxygen = next(atom for atom in record.topology.mol.GetAtoms() if atom.GetSymbol() == "O")
+    assert metal.GetNumRadicalElectrons() == 0
+    assert metal.GetIntProp(METAL_UNPAIRED_ELECTRONS_PROP) == 1
+    assert oxygen.GetFormalCharge() == 1
+    assert oxygen.GetNumRadicalElectrons() == 0
 
 
 def test_topology_identity_is_independent_of_source_atom_order() -> None:
@@ -160,6 +201,54 @@ def test_unsanitizable_fallback_initializes_ring_info_for_postgresql_rdkit() -> 
     assert record.geometry.mol.GetRingInfo().NumRings() == 1
     assert Chem.Mol(record.topology.mol.ToBinary()).GetRingInfo().NumRings() == 1
     assert Chem.Mol(record.geometry.mol.ToBinary()).GetRingInfo().NumRings() == 1
+
+
+def test_molgr_normalization_trusts_input_graph_without_sanitizing(monkeypatch) -> None:
+    molecule = _unsanitizable_ring_molecule()
+    for atom in molecule.GetAtoms():
+        atom.SetNoImplicit(True)
+
+    def forbidden_sanitize(*_: object, **__: object) -> object:
+        raise AssertionError("MolGR graphs must not be sanitized")
+
+    monkeypatch.setattr(Chem, "SanitizeMol", forbidden_sanitize)
+
+    record = normalize_molecule(
+        molecule,
+        _coordinates(molecule.GetNumAtoms()),
+        charge=0,
+        multiplicity=2,
+        reconstruction_method="molgr/cpp",
+        reconstruction_version="0.1.7",
+    )
+
+    assert record.topology.sanitization_status is TopologySanitizationStatus.SANITIZED
+    assert record.topology.sanitization_error is None
+    assert record.topology.mol.GetRingInfo().NumRings() == 1
+    assert record.geometry.mol.GetRingInfo().NumRings() == 1
+
+
+def test_trusted_ts_endpoint_normalization_does_not_sanitize(monkeypatch) -> None:
+    molecule = _unsanitizable_ring_molecule()
+    for atom in molecule.GetAtoms():
+        atom.SetNoImplicit(True)
+
+    def forbidden_sanitize(*_: object, **__: object) -> object:
+        raise AssertionError("trusted TS endpoint graphs must not be sanitized")
+
+    monkeypatch.setattr(Chem, "SanitizeMol", forbidden_sanitize)
+
+    record, source_to_topology = normalize_topology_with_mapping(
+        molecule,
+        add_hydrogens=False,
+        reconstruction_method="molop/possible_pre_post_ts",
+        reconstruction_version="test",
+        reconstruction_metadata={"topology_source_trusted": True},
+    )
+
+    assert record.topology.sanitization_status is TopologySanitizationStatus.SANITIZED
+    assert record.topology.mol.GetRingInfo().NumRings() == 1
+    assert sorted(source_to_topology) == list(range(molecule.GetNumAtoms()))
 
 
 def test_graph_only_normalization_adds_implicit_hydrogens_without_geometry() -> None:
@@ -327,8 +416,14 @@ def test_normalized_record_rejects_graph_charge_and_spin_inconsistency() -> None
             charge=1,
         )
 
+    inconsistent_spin_geometry = GeometryRecord(
+        **record.geometry.model_dump(exclude={"mol", "multiplicity"}),
+        mol=record.geometry.mol,
+        multiplicity=2,
+    )
     with pytest.raises(ValidationError, match="inconsistent parity"):
         NormalizedMoleculeRecord(
-            **record.model_dump(exclude={"multiplicity"}),
+            **record.model_dump(exclude={"geometry", "multiplicity"}),
+            geometry=inconsistent_spin_geometry,
             multiplicity=2,
         )
