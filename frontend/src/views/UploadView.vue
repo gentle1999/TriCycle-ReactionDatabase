@@ -17,11 +17,13 @@ import {
 } from "@lucide/vue";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { onBeforeRouteLeave, RouterLink, useRoute, useRouter } from "vue-router";
+import { useI18n } from "vue-i18n";
 import { randomUUID } from "@/uuid";
 
 import { ApiError, api } from "@/api";
 import { useProjectContext } from "@/composables/useProjectContext";
 import { useSession } from "@/composables/useSession";
+import { UiButton, UiDrawer, UiIconButton } from "@/components/ui";
 import { formatBytes, shortId } from "@/format";
 import {
   isUploadBatchActive,
@@ -81,6 +83,7 @@ const route = useRoute();
 const router = useRouter();
 const session = useSession();
 const projectContext = useProjectContext();
+const { t } = useI18n();
 const fileInput = ref<HTMLInputElement | null>(null);
 const folderInput = ref<HTMLInputElement | null>(null);
 const reattachFileInput = ref<HTMLInputElement | null>(null);
@@ -535,10 +538,6 @@ function closeTaskError(): void {
   selectedErrorTask.value = null;
 }
 
-function onKeydown(event: KeyboardEvent): void {
-  if (event.key === "Escape" && selectedErrorTask.value) closeTaskError();
-}
-
 function updateBatchProgress(selected: QueueTask[], loaded: number, total: number): void {
   const selectedBytes = selected.reduce((sum, task) => sum + task.size, 0);
   let remaining = total > 0
@@ -837,13 +836,8 @@ watch([statusFilter, queuePage], () => {
   if (remoteMode.value) void refreshRemoteItems();
 });
 watch(statusFilter, () => { queuePage.value = 0; });
-watch(selectedErrorTask, (task) => {
-  document.body.classList.toggle("drawer-open", task !== null);
-});
-
 onMounted(async () => {
   viewMounted = true;
-  window.addEventListener("keydown", onKeydown);
   progressPollTimer = window.setInterval(() => void pollUploadProgress(), 750);
   await refreshRecentBatches();
   const routeBatch = typeof route.query.batch === "string" ? route.query.batch : null;
@@ -854,7 +848,6 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   viewMounted = false;
-  window.removeEventListener("keydown", onKeydown);
   closeTaskError();
   if (progressPollTimer !== null) {
     window.clearInterval(progressPollTimer);
@@ -874,9 +867,9 @@ onBeforeUnmount(() => {
         <h1>批量文件上传</h1>
       </div>
       <div class="upload-page-header-actions">
-        <button v-if="batch" class="command-button command-button-secondary" type="button" :disabled="queueRunning" @click="newBatch">
+        <UiButton v-if="batch" variant="secondary" :disabled="queueRunning" @click="newBatch">
           <Plus :size="16" aria-hidden="true" />新建批次
-        </button>
+        </UiButton>
         <RouterLink class="command-button command-button-secondary" :to="{ name: 'artifacts', query: { project_id: selectedProjectId } }">
           <FileStack :size="16" aria-hidden="true" />文件目录
         </RouterLink>
@@ -1013,15 +1006,15 @@ onBeforeUnmount(() => {
           </select>
         </label>
         <span>{{ filteredTotal.toLocaleString() }} 项 · 第 {{ queuePage + 1 }} / {{ pageCount }} 页</span>
-        <button class="icon-button" type="button" title="上一页" aria-label="上一页" :disabled="queuePage === 0" @click="previousPage">
+        <UiIconButton :label="t('upload.previousBatch')" :disabled="queuePage === 0" @click="previousPage">
           <ChevronLeft :size="16" aria-hidden="true" />
-        </button>
-        <button class="icon-button" type="button" title="下一页" aria-label="下一页" :disabled="queuePage + 1 >= pageCount" @click="nextPage">
+        </UiIconButton>
+        <UiIconButton :label="t('upload.nextBatch')" :disabled="queuePage + 1 >= pageCount" @click="nextPage">
           <ChevronRight :size="16" aria-hidden="true" />
-        </button>
-        <button v-if="remoteMode" class="icon-button" type="button" title="刷新批次" aria-label="刷新批次" :disabled="loadingBatch" @click="refreshBatch().then(refreshRemoteItems)">
+        </UiIconButton>
+        <UiIconButton v-if="remoteMode" :label="t('upload.refreshBatch')" :disabled="loadingBatch" @click="refreshBatch().then(refreshRemoteItems)">
           <RefreshCw :size="16" aria-hidden="true" />
-        </button>
+        </UiIconButton>
       </div>
 
       <div class="upload-task-list" role="list" aria-label="上传文件状态">
@@ -1076,49 +1069,28 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
-    <Teleport to="body">
-      <Transition name="drawer">
-        <button
-          v-if="selectedErrorTask"
-          class="drawer-backdrop"
-          type="button"
-          aria-label="关闭上传错误详情"
-          @click="closeTaskError"
-        ></button>
-      </Transition>
-      <Transition name="drawer-panel">
-        <aside
-          v-if="selectedErrorTask"
-          class="detail-drawer upload-error-drawer"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="upload-error-title"
-        >
-          <header class="drawer-header">
-            <div>
-              <span class="eyebrow">Upload diagnostics</span>
-              <h2 id="upload-error-title">上传错误</h2>
-            </div>
-            <button class="icon-button" type="button" title="关闭" aria-label="关闭上传错误详情" @click="closeTaskError">
-              <X :size="18" aria-hidden="true" />
-            </button>
-          </header>
-          <div class="upload-error-content">
-            <div class="upload-error-file">
-              <strong>{{ selectedErrorTask.filename }}</strong>
-              <span>{{ selectedErrorTask.relativePath }}</span>
-            </div>
-            <dl class="upload-error-meta">
-              <div><dt>状态</dt><dd>{{ taskStatusLabel(selectedErrorTask) }}</dd></div>
-              <div><dt>尝试次数</dt><dd>{{ selectedErrorTask.attempt }}</dd></div>
-            </dl>
-            <section class="upload-error-message" aria-labelledby="upload-error-message-title">
-              <h3 id="upload-error-message-title">错误信息</h3>
-              <pre>{{ selectedErrorTask.error }}</pre>
-            </section>
-          </div>
-        </aside>
-      </Transition>
-    </Teleport>
+    <UiDrawer
+      :open="selectedErrorTask !== null"
+      :title="t('upload.errorTitle')"
+      :eyebrow="t('upload.diagnostics')"
+      title-id="upload-error-title"
+      width-class="upload-error-drawer"
+      @close="closeTaskError"
+    >
+      <div v-if="selectedErrorTask" class="upload-error-content">
+        <div class="upload-error-file">
+          <strong>{{ selectedErrorTask.filename }}</strong>
+          <span>{{ selectedErrorTask.relativePath }}</span>
+        </div>
+        <dl class="upload-error-meta">
+          <div><dt>{{ t("upload.status") }}</dt><dd>{{ taskStatusLabel(selectedErrorTask) }}</dd></div>
+          <div><dt>{{ t("upload.attempts") }}</dt><dd>{{ selectedErrorTask.attempt }}</dd></div>
+        </dl>
+        <section class="upload-error-message" aria-labelledby="upload-error-message-title">
+          <h3 id="upload-error-message-title">{{ t("upload.message") }}</h3>
+          <pre>{{ selectedErrorTask.error }}</pre>
+        </section>
+      </div>
+    </UiDrawer>
   </main>
 </template>

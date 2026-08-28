@@ -1583,7 +1583,7 @@ test("geometry catalog scrolling uses static SVG without WebGL contexts", async 
   expect(contextWarnings).toEqual([]);
 });
 
-test("authenticated artifact upload controls fit desktop and mobile", async ({ page }, testInfo) => {
+test("authenticated artifact upload controls fit desktop, tablet, and mobile", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 1440, height: 960 });
   await page.goto("/artifacts");
   await expect(page.getByRole("heading", { name: "原始文件" })).toBeVisible();
@@ -1594,10 +1594,31 @@ test("authenticated artifact upload controls fit desktop and mobile", async ({ p
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await page.screenshot({ path: testInfo.outputPath("desktop-artifact-upload.png"), fullPage: true });
 
+  await page.setViewportSize({ width: 820, height: 900 });
+  await expect(page.getByRole("button", { name: "选择文件", exact: true })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath("tablet-artifact-upload.png"), fullPage: true });
+
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(page.getByRole("button", { name: "选择文件", exact: true })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await page.screenshot({ path: testInfo.outputPath("mobile-artifact-upload.png"), fullPage: true });
+});
+
+test("locale selector switches and persists the application shell", async ({ page }) => {
+  await page.goto("/");
+  const locale = page.getByRole("combobox", { name: "界面语言" });
+  await expect(locale).toHaveValue("zh-CN");
+  await expect(page.getByRole("button", { name: "几何构象", exact: true })).toBeVisible();
+
+  await locale.selectOption("en-US");
+  await expect(page.getByRole("combobox", { name: "Language" })).toHaveValue("en-US");
+  await expect(page.getByRole("button", { name: "Geometries", exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Organizations" })).toBeVisible();
+
+  await page.reload();
+  await expect(page.getByRole("combobox", { name: "Language" })).toHaveValue("en-US");
+  await expect(page.getByRole("button", { name: "Geometries", exact: true })).toBeVisible();
 });
 
 test("upload file and folder selections append to one queue", async ({ page }) => {

@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { Check, ChevronLeft, ChevronRight } from "@lucide/vue";
 import { computed, ref, watch } from "vue";
+import { useI18n } from "vue-i18n";
 
+import { UiButton, UiIconButton } from "@/components/ui";
 import type { PageInfo } from "@/types";
 
 const props = defineProps<{
@@ -14,6 +16,7 @@ const emit = defineEmits<{
   next: [];
   jump: [offset: number];
 }>();
+const { t } = useI18n();
 
 const cursorMode = computed(() => props.page.total < 0);
 const hasPrevious = computed(() => props.page.offset > 0);
@@ -34,10 +37,14 @@ const canJump = computed(() =>
 );
 const range = computed(() =>
   cursorMode.value
-    ? `第 ${currentPage.value} 页`
+    ? t("pagination.cursorPage", { page: currentPage.value })
     : props.page.total
-    ? `${props.page.offset + 1}-${Math.min(props.page.offset + props.page.limit, props.page.total)} / ${props.page.total}`
-    : "0 / 0",
+    ? t("pagination.range", {
+      start: props.page.offset + 1,
+      end: Math.min(props.page.offset + props.page.limit, props.page.total),
+      total: props.page.total,
+    })
+    : t("pagination.empty"),
 );
 const visible = computed(() => cursorMode.value
   ? hasPrevious.value || hasNext.value
@@ -53,17 +60,17 @@ function submitJump(): void {
 
 <template>
   <nav v-if="visible" class="catalog-pagination" :aria-label="label">
-    <button class="icon-button" type="button" title="上一页" aria-label="上一页" :disabled="!hasPrevious" @click="emit('previous')">
+    <UiIconButton :label="t('common.previous')" :disabled="!hasPrevious" @click="emit('previous')">
       <ChevronLeft :size="16" aria-hidden="true" />
-    </button>
+    </UiIconButton>
     <span>{{ range }}</span>
     <form v-if="!cursorMode" class="catalog-page-jump" @submit.prevent="submitJump">
-      <label><span>页码</span><input v-model="pageInput" aria-label="跳转页码" type="number" min="1" :max="totalPages" step="1"></label>
+      <label><span>{{ t("pagination.pageInput") }}</span><input v-model="pageInput" :aria-label="t('pagination.pageInput')" type="number" min="1" :max="totalPages" step="1"></label>
       <span aria-hidden="true">/ {{ totalPages }}</span>
-      <button class="command-button pagination-jump-button" type="submit" :disabled="!canJump"><Check :size="14" aria-hidden="true" />跳转</button>
+      <UiButton class="pagination-jump-button" type="submit" :disabled="!canJump"><Check :size="14" aria-hidden="true" />{{ t("pagination.jump") }}</UiButton>
     </form>
-    <button class="icon-button" type="button" title="下一页" aria-label="下一页" :disabled="!hasNext" @click="emit('next')">
+    <UiIconButton :label="t('common.next')" :disabled="!hasNext" @click="emit('next')">
       <ChevronRight :size="16" aria-hidden="true" />
-    </button>
+    </UiIconButton>
   </nav>
 </template>

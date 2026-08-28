@@ -170,6 +170,26 @@ code {
   font: inherit;
 }
 
+.locale-selector {
+  display: inline-flex;
+  align-items: center;
+}
+
+.locale-selector select {
+  min-height: 32px;
+  padding: 0 7px;
+  color: var(--ink-soft);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 11px;
+}
+
+.locale-selector select:hover {
+  color: var(--ink);
+  border-color: var(--line-strong);
+}
+
 .state-page {
   max-width: 720px;
   margin: 56px auto;

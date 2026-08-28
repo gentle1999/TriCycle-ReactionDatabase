@@ -8,7 +8,7 @@ import { api, artifactDownloadUrl } from "@/api";
 import CalculationFrameList from "@/components/CalculationFrameList.vue";
 import FrameDrawer from "@/components/FrameDrawer.vue";
 import { useProjectContext } from "@/composables/useProjectContext";
-import { artifactLabels, formatBytes, shortId, statusTone } from "@/format";
+import { formatBytes, labelFor, shortId, statusTone } from "@/format";
 import { withoutAccessState } from "@/routeAccessState";
 import type { CalculationFrameSummary, Page } from "@/types";
 
@@ -118,7 +118,7 @@ const frameError = computed(() => frameQuery.error.value instanceof Error ? fram
           </div>
         </div>
         <dl class="detail-list artifact-detail-facts">
-          <div><dt>文件类型</dt><dd>{{ artifactLabels[artifact.artifact_kind] || artifact.artifact_kind }}</dd></div>
+          <div><dt>文件类型</dt><dd>{{ labelFor(artifact.artifact_kind) }}</dd></div>
           <div><dt>可见性</dt><dd>{{ artifact.visibility === "public" ? "公开" : "项目内" }}</dd></div>
           <div><dt>存储状态</dt><dd><span class="status-dot" :class="statusTone(artifact.storage_status)">{{ artifact.storage_status }}</span></dd></div>
           <div><dt>SHA-256</dt><dd><code :title="artifact.content_sha256">{{ shortId(artifact.content_sha256) }}</code></dd></div>

@@ -7,9 +7,11 @@ import { api, apiUrl } from "@/api";
 import { frontendAppName, frontendBrandName, frontendTagline } from "@/branding";
 import { useProjectContext } from "@/composables/useProjectContext";
 import { useSession } from "@/composables/useSession";
+import { setLocale, supportedLocales, type SupportedLocale } from "@/i18n";
 import { queryClient } from "@/queryClient";
 import { internalRedirect, withoutAccessState } from "@/routeAccessState";
 import type { HealthStatus } from "@/types";
+import { useI18n } from "vue-i18n";
 
 type ViewName = "reactions" | "artifacts" | "geometry" | "statistics";
 
@@ -17,6 +19,7 @@ const route = useRoute();
 const router = useRouter();
 const session = useSession();
 const projectContext = useProjectContext();
+const { locale, t } = useI18n();
 const user = session.user;
 const projects = projectContext.projects;
 const currentProjectId = projectContext.currentProjectId;
@@ -36,6 +39,10 @@ const loggingOut = ref(false);
 let recoveringAccessState = false;
 const apiDocsUrl = apiUrl("/docs");
 const navigationQuery = computed(() => withoutAccessState(route.query));
+const selectedLocale = computed<SupportedLocale>({
+  get: () => locale.value as SupportedLocale,
+  set: (value) => setLocale(value),
+});
 
 const activeView = computed<ViewName>(() => {
   if (route.name === "artifacts" || route.name === "artifact-detail" || route.name === "uploads") return "artifacts";
@@ -46,10 +53,10 @@ const activeView = computed<ViewName>(() => {
 });
 
 const tabs = computed(() => [
-  { id: "reactions" as const, label: "反应路径", route: "reactions" },
-  { id: "geometry" as const, label: "几何构象", route: "geometries" },
-  { id: "artifacts" as const, label: "原始文件", route: "artifacts" },
-  { id: "statistics" as const, label: "分布统计", route: "statistics" },
+  { id: "reactions" as const, label: t("app.navigation.reactions"), route: "reactions" },
+  { id: "geometry" as const, label: t("app.navigation.geometry"), route: "geometries" },
+  { id: "artifacts" as const, label: t("app.navigation.artifacts"), route: "artifacts" },
+  { id: "statistics" as const, label: t("app.navigation.statistics"), route: "statistics" },
 ]);
 
 async function refreshHealth(): Promise<void> {
@@ -124,7 +131,7 @@ watch(
 <template>
   <div class="app-shell">
     <header class="topbar">
-      <RouterLink class="brand" :to="{ name: 'reactions', query: navigationQuery }" :aria-label="`${frontendAppName}首页`">
+      <RouterLink class="brand" :to="{ name: 'reactions', query: navigationQuery }" :aria-label="`${frontendAppName}${t('app.navigation.reactions')}`">
         <span class="brand-mark" aria-hidden="true"><Database :size="21" /></span>
         <span>
           <strong>{{ frontendAppName }}</strong>
@@ -132,22 +139,22 @@ watch(
         </span>
       </RouterLink>
       <div class="topbar-actions">
-        <nav class="utility-nav" aria-label="账户导航">
-          <RouterLink class="utility-link" :to="{ name: 'organizations', query: navigationQuery }" title="组织">
-            <Building2 :size="15" aria-hidden="true" /><span>组织</span>
+        <nav class="utility-nav" :aria-label="t('app.navigation.accountNav')">
+          <RouterLink class="utility-link" :to="{ name: 'organizations', query: navigationQuery }" :title="t('app.navigation.organizations')">
+            <Building2 :size="15" aria-hidden="true" /><span>{{ t("app.navigation.organizations") }}</span>
           </RouterLink>
-          <RouterLink class="utility-link" :to="{ name: 'projects', query: navigationQuery }" title="项目">
-            <FolderKanban :size="15" aria-hidden="true" /><span>项目</span>
+          <RouterLink class="utility-link" :to="{ name: 'projects', query: navigationQuery }" :title="t('app.navigation.projects')">
+            <FolderKanban :size="15" aria-hidden="true" /><span>{{ t("app.navigation.projects") }}</span>
           </RouterLink>
-          <RouterLink class="utility-link" :to="{ name: 'nexusx', query: navigationQuery }" title="增强接口">
-            <Code2 :size="15" aria-hidden="true" /><span>NexusX</span>
+          <RouterLink class="utility-link" :to="{ name: 'nexusx', query: navigationQuery }" :title="t('app.navigation.nexusx')">
+            <Code2 :size="15" aria-hidden="true" /><span>{{ t("app.navigation.nexusx") }}</span>
           </RouterLink>
-          <RouterLink class="utility-link" :to="{ name: 'account', query: navigationQuery }" title="账户">
-            <UserRound :size="15" aria-hidden="true" /><span>账户</span>
+          <RouterLink class="utility-link" :to="{ name: 'account', query: navigationQuery }" :title="t('app.navigation.account')">
+            <UserRound :size="15" aria-hidden="true" /><span>{{ t("app.navigation.account") }}</span>
           </RouterLink>
         </nav>
         <label v-if="projects.length" class="project-selector">
-          <span>项目</span>
+          <span>{{ t("app.navigation.currentProject") }}</span>
           <select
             :value="currentProjectId ?? ''"
             aria-label="当前项目"
@@ -160,28 +167,36 @@ watch(
             </optgroup>
           </select>
         </label>
-        <span class="current-user" :title="user?.primary_email || user?.identity.subject || '未登录'">
+        <span class="current-user" :title="user?.primary_email || user?.identity.subject || t('app.navigation.anonymous')">
           <UserRound :size="14" aria-hidden="true" />
-          <span>{{ user?.display_name || "匿名访问" }}</span>
+          <span>{{ user?.display_name || t("app.navigation.anonymous") }}</span>
         </span>
-        <a v-if="!user" class="utility-link" :href="api.loginUrl(route.fullPath)" title="登录">
-          <LogIn :size="15" aria-hidden="true" /><span>登录</span>
+        <a v-if="!user" class="utility-link" :href="api.loginUrl(route.fullPath)" :title="t('app.navigation.login')">
+          <LogIn :size="15" aria-hidden="true" /><span>{{ t("app.navigation.login") }}</span>
         </a>
-        <button v-else class="icon-button" type="button" title="退出登录" aria-label="退出登录" :disabled="loggingOut" @click="logout">
+        <button v-else class="icon-button" type="button" :title="t('app.navigation.logout')" :aria-label="t('app.navigation.logout')" :disabled="loggingOut" @click="logout">
           <LogOut :size="16" aria-hidden="true" />
         </button>
         <span class="health" :class="{ 'is-ready': health, 'is-error': healthError }">
           <Activity :size="14" aria-hidden="true" />
-          <span>{{ health ? `PostgreSQL ${health.postgresql_version}` : healthError ? "数据库不可用" : "正在连接" }}</span>
+          <span>{{ health ? `PostgreSQL ${health.postgresql_version}` : healthError ? t("app.navigation.databaseUnavailable") : t("app.navigation.connecting") }}</span>
         </span>
-        <a class="api-link" :href="apiDocsUrl" target="_blank" rel="noreferrer">API 文档 <ExternalLink :size="13" aria-hidden="true" /></a>
-        <button class="icon-button" :class="{ 'is-spinning': refreshing }" type="button" title="刷新数据" aria-label="刷新数据" :disabled="refreshing" @click="refreshApplication">
+        <a class="api-link" :href="apiDocsUrl" target="_blank" rel="noreferrer">{{ t("app.navigation.apiDocs") }} <ExternalLink :size="13" aria-hidden="true" /></a>
+        <label class="locale-selector">
+          <span class="sr-only">{{ t("app.locale.label") }}</span>
+          <select v-model="selectedLocale" :aria-label="t('app.locale.label')">
+            <option v-for="value in supportedLocales" :key="value" :value="value">
+              {{ value === "zh-CN" ? t("app.locale.zhCN") : t("app.locale.enUS") }}
+            </option>
+          </select>
+        </label>
+        <button class="icon-button" :class="{ 'is-spinning': refreshing }" type="button" :title="t('app.navigation.refresh')" :aria-label="t('app.navigation.refresh')" :disabled="refreshing" @click="refreshApplication">
           <RefreshCw :size="18" aria-hidden="true" />
         </button>
       </div>
     </header>
 
-    <nav class="view-tabs" aria-label="数据视图">
+    <nav class="view-tabs" :aria-label="t('app.navigation.dataViews')">
       <button
         v-for="tab in tabs"
         :key="tab.id"

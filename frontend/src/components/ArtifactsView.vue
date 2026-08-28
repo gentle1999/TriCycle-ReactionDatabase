@@ -5,7 +5,7 @@ import { RouterLink, useRoute } from "vue-router";
 
 import { api, artifactDownloadUrl } from "@/api";
 import { emptyArtifactFilters, type ArtifactFilterValues, type ArtifactSort, type ArtifactSortBy } from "@/artifactQuery";
-import { artifactLabels, formatBytes, shortId, statusTone } from "@/format";
+import { formatBytes, labelFor, shortId, statusTone } from "@/format";
 import { withoutAccessState } from "@/routeAccessState";
 import type { ArtifactSummary, CalculationFrameSummary, CurrentUser, PageInfo } from "@/types";
 import CalculationFrameList from "./CalculationFrameList.vue";
@@ -235,7 +235,7 @@ watch(
                 </span>
               </button>
             </td>
-            <td>{{ artifactLabels[artifact.artifact_kind] || artifact.artifact_kind }}</td>
+            <td>{{ labelFor(artifact.artifact_kind) }}</td>
             <td>
               <span class="visibility-label">
                 <Globe2 v-if="artifact.visibility === 'public'" :size="14" aria-hidden="true" />

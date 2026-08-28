@@ -1,3 +1,5 @@
+import { currentLocale, i18n } from "@/i18n";
+
 export const roleLabels: Record<string, string> = {
   initial: "初始帧",
   intermediate: "优化中间帧",
@@ -22,24 +24,55 @@ export const artifactLabels: Record<string, string> = {
   auxiliary: "辅助文件",
 };
 
+const statusLabels: Record<string, string> = {
+  available: "可用",
+  unavailable: "不可用",
+  pending: "等待中",
+  queued: "等待",
+  uploading: "上传中",
+  succeeded: "成功",
+  failed: "失败",
+  cancelled: "已取消",
+  converged: "已收敛",
+  not_converged: "未收敛",
+  complete: "完成",
+  normal: "正常",
+  ok: "正常",
+  error: "错误",
+};
+
 export function labelFor(value: string | null | undefined): string {
-  if (!value) return "—";
-  return roleLabels[value] ?? value.replaceAll("_", " ");
+  if (!value) return i18n.global.t("common.none");
+  const group = Object.hasOwn(roleLabels, value)
+    ? "roles"
+    : Object.hasOwn(artifactLabels, value)
+    ? "artifacts"
+    : Object.hasOwn(statusLabels, value)
+    ? "statuses"
+    : null;
+  const translationKey = group ? `${group}.${value}` : null;
+  if (translationKey && i18n.global.te(translationKey)) return i18n.global.t(translationKey);
+  return roleLabels[value] ?? artifactLabels[value] ?? statusLabels[value] ?? value.replaceAll("_", " ");
 }
 
 export function formatEnergy(value: number | null | undefined): string {
-  return value === null || value === undefined ? "—" : value.toFixed(6);
+  return formatNumber(value, 6);
 }
 
 export function formatNumber(
   value: number | null | undefined,
   digits = 4,
 ): string {
-  return value === null || value === undefined ? "—" : value.toFixed(digits);
+  if (value === null || value === undefined) return i18n.global.t("common.none");
+  return new Intl.NumberFormat(currentLocale(), {
+    useGrouping: false,
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  }).format(value);
 }
 
 export function formatBytes(value: number | null | undefined): string {
-  if (value === null || value === undefined) return "—";
+  if (value === null || value === undefined) return i18n.global.t("common.none");
   const units = ["B", "KiB", "MiB", "GiB"];
   let size = value;
   let unit = 0;
@@ -47,11 +80,30 @@ export function formatBytes(value: number | null | undefined): string {
     size /= 1024;
     unit += 1;
   }
-  return `${size >= 10 || unit === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unit]}`;
+  const digits = size >= 10 || unit === 0 ? 0 : 1;
+  const formatted = new Intl.NumberFormat(currentLocale(), {
+    useGrouping: false,
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  }).format(size);
+  return `${formatted} ${units[unit]}`;
 }
 
 export function shortId(value: string | null | undefined): string {
-  return value ? `${value.slice(0, 8)}…${value.slice(-4)}` : "—";
+  return value ? `${value.slice(0, 8)}…${value.slice(-4)}` : i18n.global.t("common.none");
+}
+
+export function formatDateTime(value: string | number | Date | null | undefined): string {
+  if (value === null || value === undefined || value === "") return i18n.global.t("common.none");
+  return new Intl.DateTimeFormat(currentLocale(), {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(value));
+}
+
+export function formatDate(value: string | number | Date | null | undefined): string {
+  if (value === null || value === undefined || value === "") return i18n.global.t("common.none");
+  return new Intl.DateTimeFormat(currentLocale(), { dateStyle: "medium" }).format(new Date(value));
 }
 
 export function statusTone(value: string | null | undefined): string {
