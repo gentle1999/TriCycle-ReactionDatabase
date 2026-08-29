@@ -86,7 +86,8 @@ class Settings(BaseSettings):
     # Fast ingestion batches revision-local frame rows in one transaction.
     # Evidence capture no longer disables deferred topology reconstruction.
     molop_parallel_frame_persistence: bool = True
-    # Bound the end-to-end time spent parsing and reconstructing one source file.
+    # Baseline end-to-end budget for a 10 MiB source; larger files scale this
+    # budget proportionally while smaller files retain the baseline.
     molop_file_parse_timeout_seconds: float = Field(default=60.0, gt=0.0, le=86400.0)
     molecule_query_rate_limit_requests: int = Field(default=10_000, ge=1, le=1_000_000)
     depiction_rate_limit_requests: int = Field(default=10_000, ge=1, le=1_000_000)

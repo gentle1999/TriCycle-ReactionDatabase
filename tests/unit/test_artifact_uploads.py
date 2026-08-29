@@ -23,6 +23,7 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
     _FailedInference,
     _fast_molop_ingestion_enabled,
     _materialize_parsed_artifacts,
+    _molop_file_parse_timeout_seconds,
     _parse_calculation_output,
     _parse_calculation_outputs_batch,
     _parser_payload,
@@ -204,6 +205,37 @@ async def test_file_pipeline_timeout_isolated_to_one_file(monkeypatch: pytest.Mo
     monkeypatch.setattr(upload_module, "_run_isolated_molop_file", slow_file)
     with pytest.raises(MolOPFileParseTimeoutError, match="exceeded 0.01s"):
         await _run_molop_file_pipeline(b"source", "slow.log")
+
+
+@pytest.mark.parametrize(
+    ("size_bytes", "expected_seconds"),
+    [
+        (5 * 1024 * 1024, 60.0),
+        (10 * 1024 * 1024, 60.0),
+        (20 * 1024 * 1024, 120.0),
+    ],
+)
+def test_file_parse_timeout_scales_with_source_size(
+    monkeypatch: pytest.MonkeyPatch,
+    size_bytes: int,
+    expected_seconds: float,
+) -> None:
+    settings = Settings(_env_file=None, molop_file_parse_timeout_seconds=60.0)
+    monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
+
+    assert _molop_file_parse_timeout_seconds(b"0" * size_bytes) == expected_seconds
+
+
+def test_file_parse_timeout_scales_path_sources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(_env_file=None, molop_file_parse_timeout_seconds=60.0)
+    monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
+    source = tmp_path / "large.log"
+    source.write_bytes(b"0" * (30 * 1024 * 1024))
+
+    assert _molop_file_parse_timeout_seconds(source) == 180.0
 
 
 @pytest.mark.asyncio
@@ -953,6 +985,27 @@ def test_batch_service_rejects_resource_limits_before_authorization_or_storage(
                 user_id=DEVELOPMENT_USER_ID,
             )
         )
+
+
+def test_local_streaming_pipeline_can_exceed_http_file_count_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        upload_module,
+        "get_settings",
+        lambda: Settings(_env_file=None, max_batch_files=1),
+    )
+
+    inspected = _require_batch_upload_budget(
+        [
+            ArtifactUploadPayload("one.log", "text/plain", b"one"),
+            ArtifactUploadPayload("two.log", "text/plain", b"two"),
+        ],
+        enforce_batch_files=False,
+        enforce_batch_bytes=False,
+    )
+
+    assert set(inspected) == {0, 1}
 
 
 def test_molop_progress_callback_runs_before_parser_batch_finishes() -> None:

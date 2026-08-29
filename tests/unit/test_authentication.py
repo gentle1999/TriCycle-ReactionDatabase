@@ -106,6 +106,7 @@ def test_production_oidc_discovery_rejects_unsafe_metadata(
     [
         ("GET", "/api/depictions/geometry/example.sdf", True),
         ("GET", "/api/depictions/topology/example.mol", True),
+        ("GET", "/api/depictions/calculation-frame/example/transition-state.svg", True),
         ("POST", "/api/depictions/geometry/example.sdf", False),
         ("GET", "/api/logical-reactions", False),
     ],

@@ -1,5 +1,7 @@
 # 部署与配置指南
 
+> English edition: [Deployment and configuration](en/deployment-configuration.md).
+
 本文说明反应数据库服务的开发和生产部署配置。仓库中的 `Example Chemistry Database`、组织名和项目名
 都是可替换的开发占位默认值，不是生产部署身份。环境变量示例见
 [.env.example](../.env.example)，前端变量见
@@ -358,6 +360,7 @@ OMP_NUM_THREADS=1
 OPENBLAS_NUM_THREADS=1
 MKL_NUM_THREADS=1
 TRICYCLE_MOLOP_BATCH_N_JOBS=2
+# Baseline budget for a 10 MiB file; larger files scale proportionally.
 TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS=60
 ~~~
 

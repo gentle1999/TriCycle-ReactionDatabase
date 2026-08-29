@@ -9,6 +9,7 @@ import {
   artifactQueryFieldOption,
   artifactQueryFieldOptions,
   emptyArtifactFilters,
+  ingestionStatusOptions,
   storageStatusOptions,
   type ArtifactFilterValues,
   type ArtifactQueryCondition,
@@ -61,6 +62,7 @@ function reset(): void {
     ["original_filename_contains", initial.originalFilenameContains],
     ["artifact_kind", initial.artifactKind],
     ["storage_status", initial.storageStatus],
+    ["ingestion_status", initial.ingestionStatus],
   ];
   conditions.value = values
     .filter(([, value]) => Boolean(value))
@@ -145,6 +147,7 @@ function buildFilters(): ArtifactFilterValues | null {
     if (condition.field === "original_filename_contains") filters.originalFilenameContains = value;
     if (condition.field === "artifact_kind") filters.artifactKind = value;
     if (condition.field === "storage_status") filters.storageStatus = value;
+    if (condition.field === "ingestion_status") filters.ingestionStatus = value;
   }
   validationError.value = "";
   return filters;
@@ -241,6 +244,10 @@ onBeforeUnmount(() => {
                 <select v-else-if="condition.field === 'storage_status'" v-model="condition.value" :aria-label="`${artifactQueryFieldOption(condition.field).label}条件值`">
                   <option value="">选择存储状态</option>
                   <option v-for="option in storageStatusOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+                </select>
+                <select v-else-if="condition.field === 'ingestion_status'" v-model="condition.value" :aria-label="`${artifactQueryFieldOption(condition.field).label}条件值`">
+                  <option value="">选择解析状态</option>
+                  <option v-for="option in ingestionStatusOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
                 </select>
                 <input v-else v-model="condition.value" type="text" placeholder="输入文件名片段" :aria-label="`${artifactQueryFieldOption(condition.field).label}条件值`">
               </div>

@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { ArrowLeft, Download, FileText } from "@lucide/vue";
 import { useQuery } from "@tanstack/vue-query";
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 
 import { api, artifactDownloadUrl } from "@/api";
+import ArtifactIngestionStatus from "@/components/ArtifactIngestionStatus.vue";
 import CalculationFrameList from "@/components/CalculationFrameList.vue";
 import FrameDrawer from "@/components/FrameDrawer.vue";
 import { useProjectContext } from "@/composables/useProjectContext";
@@ -24,6 +25,7 @@ const artifactQuery = useQuery({
   queryFn: ({ signal }) => api.artifact(artifactId.value ?? "", signal),
   enabled: computed(() => artifactId.value !== null),
   staleTime: 60_000,
+  refetchInterval: 5_000,
 });
 
 const artifact = computed(() => artifactQuery.data.value ?? null);
@@ -66,6 +68,13 @@ const framesQuery = useQuery({
   enabled: computed(() => artifact.value !== null),
   staleTime: 30_000,
 });
+
+watch(
+  () => artifact.value?.ingestion_status,
+  (status, previousStatus) => {
+    if (previousStatus === "pending" && status !== "pending") void framesQuery.refetch();
+  },
+);
 
 const frameQuery = useQuery({
   queryKey: computed(() => ["artifact-detail-frame", { frameId: selectedFrameId.value, projectId: artifact.value?.project_id }]),
@@ -120,11 +129,21 @@ const frameError = computed(() => frameQuery.error.value instanceof Error ? fram
         <dl class="detail-list artifact-detail-facts">
           <div><dt>文件类型</dt><dd>{{ labelFor(artifact.artifact_kind) }}</dd></div>
           <div><dt>可见性</dt><dd>{{ artifact.visibility === "public" ? "公开" : "项目内" }}</dd></div>
-          <div><dt>存储状态</dt><dd><span class="status-dot" :class="statusTone(artifact.storage_status)">{{ artifact.storage_status }}</span></dd></div>
+          <div><dt>存储状态</dt><dd><span class="status-dot" :class="statusTone(artifact.storage_status)">{{ labelFor(artifact.storage_status) }}</span></dd></div>
+          <div><dt>解析状态</dt><dd><ArtifactIngestionStatus :status="artifact.ingestion_status" :error-message="artifact.ingestion_error_message" /></dd></div>
+          <div><dt>计算帧</dt><dd>{{ artifact.source_frame_count ?? "—" }}</dd></div>
+          <div><dt>过渡态帧</dt><dd>{{ artifact.transition_state_frame_count ?? "—" }}</dd></div>
           <div><dt>SHA-256</dt><dd><code :title="artifact.content_sha256">{{ shortId(artifact.content_sha256) }}</code></dd></div>
           <div><dt>项目 ID</dt><dd><code>{{ artifact.project_id }}</code></dd></div>
           <div><dt>验证时间</dt><dd>{{ artifact.storage_verified_at ? new Date(artifact.storage_verified_at).toLocaleString("zh-CN") : "—" }}</dd></div>
         </dl>
+      </section>
+
+      <section v-if="artifact.ingestion_status === 'filtered'" class="artifact-detail-section" aria-label="解析结果">
+        <div class="artifact-detail-empty">文件已保存，但其中没有可识别的计算帧，因此未进入计算数据目录。</div>
+      </section>
+      <section v-else-if="artifact.ingestion_status === 'failed'" class="artifact-detail-section" aria-label="解析错误">
+        <div class="artifact-detail-empty is-error" role="alert">{{ artifact.ingestion_error_message ?? "文件解析失败" }}</div>
       </section>
 
       <section class="artifact-detail-section" aria-labelledby="artifact-content-title">

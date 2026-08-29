@@ -10,6 +10,7 @@ import type { CalculationFrameDetail, ScientificArrayPreview } from "@/types";
 
 import ChemDoodleGeometry3D from "./ChemDoodleGeometry3D.vue";
 import ChemDoodleTransitionStateMode3D from "./ChemDoodleTransitionStateMode3D.vue";
+import TransitionStateModeDofPreview from "./TransitionStateModeDofPreview.vue";
 
 const props = defineProps<{
   frame: CalculationFrameDetail;
@@ -93,6 +94,35 @@ function arrayPreviewData(id: string): ScientificArrayPreview | null {
 
 function arrayDownloadUrl(id: string): string {
   return apiUrl(`/api/scientific-arrays/${encodeURIComponent(id)}.npy`);
+}
+
+function arrayDisplayLabel(array: CalculationFrameDetail["scientific_arrays"][number]): string {
+  if (array.kind === "atomic_population") {
+    const populationName =
+      array.population_name ??
+      array.source_field?.match(/populations\.([^\.]+)\.values$/)?.[1];
+    if (typeof populationName === "string" && populationName.length > 0) {
+      return populationName;
+    }
+  }
+  return `${array.kind} #${array.ordinal}`;
+}
+
+function arrayDisplaySource(array: CalculationFrameDetail["scientific_arrays"][number]): string {
+  if (array.kind === "atomic_population" && array.population_source_label) {
+    return array.population_source_label;
+  }
+  return array.source_field ?? "MolOP";
+}
+
+function arrayDisplayDetails(array: CalculationFrameDetail["scientific_arrays"][number]): string {
+  if (array.kind === "atomic_population") {
+    const details = [array.population_scheme, array.population_quantity, array.unit].filter(
+      (value): value is string => Boolean(value),
+    );
+    return details.length ? details.join(" · ") : array.unit;
+  }
+  return [array.kind, array.dtype, array.shape.join(" × "), array.unit].join(" · ");
 }
 
 function formatArrayValue(value: unknown): string {
@@ -218,13 +248,16 @@ onBeforeUnmount(() => previewController?.abort());
       :label="frame.canonical_isomeric_smiles ?? undefined"
       :height="280"
     />
-    <ChemDoodleTransitionStateMode3D
-      v-if="frame.transition_state_endpoints.length === 2"
-      :frame-id="frame.id"
-      :negative-displacement-ratio="frame.transition_state_endpoints.find((item) => item.direction === 'negative')?.displacement_ratio"
-      :positive-displacement-ratio="frame.transition_state_endpoints.find((item) => item.direction === 'positive')?.displacement_ratio"
-      :height="340"
-    />
+    <section v-if="frame.transition_state_endpoints.length === 2" class="transition-state-mode-views" aria-label="虚频模式插值视图">
+      <ChemDoodleTransitionStateMode3D
+        :frame-id="frame.id"
+        :project-id="projectId"
+        :negative-displacement-ratio="frame.transition_state_endpoints.find((item) => item.direction === 'negative')?.displacement_ratio"
+        :positive-displacement-ratio="frame.transition_state_endpoints.find((item) => item.direction === 'positive')?.displacement_ratio"
+        :height="340"
+      />
+      <TransitionStateModeDofPreview :frame-id="frame.id" :project-id="projectId" :height="340" />
+    </section>
     <code class="drawer-smiles">{{ frame.canonical_isomeric_smiles ?? "SMILES 不可用" }}</code>
 
     <dl class="drawer-metrics">
@@ -306,7 +339,7 @@ onBeforeUnmount(() => previewController?.abort());
         <article v-for="array in frame.scientific_arrays" :key="array.id" class="array-list-item">
           <div class="array-list-row">
             <button type="button" class="array-toggle" :aria-expanded="expandedArrayId === array.id" @click="void toggleArray(array.id)">
-              <span><strong>{{ array.kind }} #{{ array.ordinal }}</strong><small>{{ array.dtype }} · {{ array.shape.join(" × ") }} · {{ array.unit }} · {{ formatBytes(array.array_nbytes) }}</small></span>
+              <span><strong>{{ arrayDisplayLabel(array) }}</strong><small>{{ arrayDisplaySource(array) }} · {{ arrayDisplayDetails(array) }} · {{ formatBytes(array.array_nbytes) }}</small></span>
               <ChevronDown :size="16" :class="{ 'is-rotated': expandedArrayId === array.id }" aria-hidden="true" />
             </button>
             <a class="array-download" :href="arrayDownloadUrl(array.id)" download :title="`下载 ${array.kind} NPY`" :aria-label="`下载 ${array.kind} NPY`" @click.stop><Download :size="15" aria-hidden="true" /></a>

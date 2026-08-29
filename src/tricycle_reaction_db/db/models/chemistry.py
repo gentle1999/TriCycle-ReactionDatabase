@@ -321,6 +321,17 @@ class Geometry(SQLModel, table=True):
             "multiplicity",
             name="uq_geometry_topology_hash",
         ),
+        # Geometry equivalence matching does not constrain geometry_hash. Keep
+        # the cheap identity predicates contiguous so PostgreSQL can narrow the
+        # candidate set before evaluating the internal-coordinate function.
+        Index(
+            "ix_geometry_match_candidates",
+            "topology_id",
+            "canonicalization_version",
+            "charge",
+            "multiplicity",
+        ),
+        Index("ix_geometry_created_id", "created_at", "id"),
         CheckConstraint(
             f"internal_coordinate_hash ~ '{_HASH_PATTERN}'",
             name="ck_geometry_internal_coordinate_hash_hex",

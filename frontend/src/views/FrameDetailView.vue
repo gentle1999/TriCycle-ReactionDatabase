@@ -20,6 +20,7 @@ const frameQuery = useQuery({
   queryFn: ({ signal }) => api.frame(frameId.value ?? "", { projectId: currentProjectId.value ?? undefined }, signal),
   enabled: computed(() => frameId.value !== null && currentProjectId.value !== null),
   staleTime: 60_000,
+  refetchOnMount: "always",
 });
 
 const error = computed(() => frameQuery.error.value instanceof Error ? frameQuery.error.value.message : "");

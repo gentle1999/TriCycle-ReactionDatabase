@@ -32,6 +32,7 @@ import {
 } from "@/uploadQueueState";
 import type {
   ArtifactUploadResult,
+  ArtifactSummary,
   UploadBatch,
   UploadBatchItem,
   UploadBatchItemStatus,
@@ -55,6 +56,8 @@ interface QueueTask {
   loaded: number;
   error: string;
   artifactId: string | null;
+  ingestionStatus: ArtifactSummary["ingestion_status"];
+  ingestionError: string;
   parsePhase: string | null;
   parseCompleted: number;
   parseTotal: number;
@@ -194,8 +197,10 @@ function queueTaskFromRemote(item: UploadBatchItem, file: File | null = null): Q
     status: item.status,
     attempt: item.attempt_count,
     loaded: item.status === "succeeded" ? item.size_bytes : 0,
-    error: item.error_message ?? "",
+    error: item.error_message ?? item.ingestion_error_message ?? "",
     artifactId: item.artifact_file_id,
+    ingestionStatus: item.ingestion_status,
+    ingestionError: item.ingestion_error_message ?? "",
     parsePhase: progress?.phase ?? null,
     parseCompleted: progress?.completed ?? 0,
     parseTotal: progress?.total ?? 0,
@@ -217,6 +222,8 @@ function createQueuedTask(file: File, relativePath = fileRelativePath(file)): Qu
     loaded: 0,
     error: "",
     artifactId: null,
+    ingestionStatus: null,
+    ingestionError: "",
     parsePhase: null,
     parseCompleted: 0,
     parseTotal: 0,
@@ -522,8 +529,10 @@ function applyItem(task: QueueTask, item: UploadBatchItem): void {
   task.attempt = item.attempt_count;
   if (item.status === "succeeded") task.loaded = task.size;
   else if (item.status !== "uploading") task.loaded = 0;
-  task.error = item.error_message ?? "";
+  task.error = item.error_message ?? item.ingestion_error_message ?? "";
   task.artifactId = item.artifact_file_id;
+  task.ingestionStatus = item.ingestion_status;
+  task.ingestionError = item.ingestion_error_message ?? "";
   const progress = uploadProgress(item.metadata);
   task.parsePhase = progress?.phase ?? task.parsePhase;
   task.parseCompleted = progress?.completed ?? task.parseCompleted;
@@ -763,6 +772,8 @@ async function retryFailed(): Promise<void> {
       if (task.status === "failed" && task.file) {
         task.status = "queued";
         task.error = "";
+        task.ingestionStatus = null;
+        task.ingestionError = "";
       }
     }
     queueCancelled.value = false;
@@ -773,6 +784,11 @@ async function retryFailed(): Promise<void> {
 }
 
 function taskStatusLabel(task: QueueTask): string {
+  if (task.ingestionStatus === "pending") return "已上传，正在解析";
+  if (task.ingestionStatus === "partial") return "已解析，部分计算帧可用";
+  if (task.ingestionStatus === "filtered") return "已保存，无可识别计算帧";
+  if (task.ingestionStatus === "failed") return "文件已上传，解析失败";
+  if (task.ingestionStatus === "succeeded") return "解析完成";
   if (task.status === "uploading" && task.parsePhase === "parsing") {
     const suffix = task.parseTotal > 0 ? ` · ${task.parseCompleted}/${task.parseTotal}` : "";
     return `解析中${suffix}`;
@@ -1020,7 +1036,7 @@ onBeforeUnmount(() => {
       <div class="upload-task-list" role="list" aria-label="上传文件状态">
         <div v-if="loadingBatch" class="table-loading">正在加载上传批次</div>
         <div v-else-if="!visibleTasks.length" class="compact-empty">队列为空</div>
-        <div v-for="task in visibleTasks" v-else :key="task.clientFileId" class="upload-task-row" :class="`is-${task.status}`" role="listitem">
+        <div v-for="task in visibleTasks" v-else :key="task.clientFileId" class="upload-task-row" :class="[`is-${task.status}`, { 'is-parsing': task.ingestionStatus === 'pending' }]" role="listitem">
           <span class="upload-task-status" :title="taskStatusLabel(task)"></span>
           <div class="upload-task-name"><strong>{{ task.filename }}</strong><span>{{ task.relativePath }}</span></div>
           <span class="upload-task-size">{{ formatBytes(task.size) }}</span>

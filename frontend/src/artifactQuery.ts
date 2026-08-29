@@ -3,7 +3,8 @@ export type ArtifactQueryField =
   | "content_sha256"
   | "original_filename_contains"
   | "artifact_kind"
-  | "storage_status";
+  | "storage_status"
+  | "ingestion_status";
 
 export type ArtifactSortBy =
   | "created_at"
@@ -23,6 +24,7 @@ export interface ArtifactFilterValues {
   originalFilenameContains: string | null;
   artifactKind: string | null;
   storageStatus: string | null;
+  ingestionStatus: string | null;
 }
 
 export interface ArtifactQueryCondition {
@@ -43,6 +45,7 @@ export const artifactQueryFieldOptions: ArtifactQueryFieldOption[] = [
   { value: "original_filename_contains", label: "文件名包含", kind: "text" },
   { value: "artifact_kind", label: "文件类型", kind: "enum" },
   { value: "storage_status", label: "存储状态", kind: "enum" },
+  { value: "ingestion_status", label: "解析状态", kind: "enum" },
 ];
 
 export function artifactQueryFieldOption(field: ArtifactQueryField): ArtifactQueryFieldOption {
@@ -63,6 +66,14 @@ export const storageStatusOptions = [
   { value: "corrupt", label: "损坏" },
 ] as const;
 
+export const ingestionStatusOptions = [
+  { value: "succeeded", label: "成功" },
+  { value: "partial", label: "部分成功" },
+  { value: "filtered", label: "已过滤（无计算帧）" },
+  { value: "pending", label: "正在解析" },
+  { value: "failed", label: "失败" },
+] as const;
+
 export function emptyArtifactFilters(): ArtifactFilterValues {
   return {
     artifactId: null,
@@ -70,5 +81,6 @@ export function emptyArtifactFilters(): ArtifactFilterValues {
     originalFilenameContains: null,
     artifactKind: null,
     storageStatus: null,
+    ingestionStatus: null,
   };
 }

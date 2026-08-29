@@ -272,6 +272,14 @@ class LogicalReaction(SQLModel, table=True):
     __tablename__ = "logical_reaction"  # pyright: ignore[reportAssignmentType]
     __table_args__ = (
         UniqueConstraint("reaction_hash", name="uq_logical_reaction_hash"),
+        Index("ix_logical_reaction_created_id", "created_at", "id"),
+        Index("ix_logical_reaction_reaction_key", "reaction_key"),
+        Index(
+            "ix_logical_reaction_reactant_sort_created_id",
+            "reactant_sort_key",
+            "created_at",
+            "id",
+        ),
         CheckConstraint(f"reaction_hash ~ '{_HASH_PATTERN}'", name="ck_reaction_hash_hex"),
     )
 
@@ -290,6 +298,12 @@ class LogicalReaction(SQLModel, table=True):
     )
     cycloaddition_pattern: str | None = Field(default=None, max_length=32, index=True)
     reaction_hash: str = Field(max_length=64, index=True, nullable=False)
+    # Persisted in participant order so the default catalogue sort does not
+    # aggregate every reactant on every request.
+    reactant_sort_key: list[str] | None = Field(
+        default=None,
+        sa_column=Column(ARRAY(Text), nullable=True),
+    )
     participants: list["LogicalReactionParticipant"] = Relationship(
         back_populates="logical_reaction", cascade_delete=True, passive_deletes=True
     )

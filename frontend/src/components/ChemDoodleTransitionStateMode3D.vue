@@ -28,6 +28,7 @@ interface MovieApi extends ChemDoodleApi {
 
 const props = withDefaults(defineProps<{
   frameId: string;
+  projectId?: string;
   negativeDisplacementRatio?: number;
   positiveDisplacementRatio?: number;
   height?: number;
@@ -260,9 +261,9 @@ async function loadMovie(): Promise<void> {
     const ChemDoodle = await loadChemRenderer() as MovieApi;
     if (!ChemDoodle?.MovieCanvas3D) throw new Error("ChemDoodle MovieCanvas3D 未加载");
     const [negative, center, positive] = await Promise.all([
-      getTransitionStateAnchorSdf(props.frameId, "negative", undefined, controller.signal),
-      getTransitionStateAnchorSdf(props.frameId, "center", undefined, controller.signal),
-      getTransitionStateAnchorSdf(props.frameId, "positive", undefined, controller.signal),
+      getTransitionStateAnchorSdf(props.frameId, "negative", props.projectId, controller.signal),
+      getTransitionStateAnchorSdf(props.frameId, "center", props.projectId, controller.signal),
+      getTransitionStateAnchorSdf(props.frameId, "positive", props.projectId, controller.signal),
     ]);
     if (controller.signal.aborted) return;
     cachedMolecules = buildInterpolatedFrames(ChemDoodle, { negative, center, positive });
@@ -321,7 +322,7 @@ onMounted(() => {
   void loadMovie();
 });
 
-watch(() => props.frameId, () => void loadMovie());
+watch(() => [props.frameId, props.projectId], () => void loadMovie());
 
 onBeforeUnmount(() => {
   releaseMovie();

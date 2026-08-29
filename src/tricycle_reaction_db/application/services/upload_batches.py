@@ -31,9 +31,10 @@ from tricycle_reaction_db.application.services.authorization import (
     ProjectPermission,
 )
 from tricycle_reaction_db.core.config import get_settings
-from tricycle_reaction_db.db.models import UploadBatch, UploadBatchItem
+from tricycle_reaction_db.db.models import ArtifactIngestion, UploadBatch, UploadBatchItem
 from tricycle_reaction_db.db.session import session_factory
 from tricycle_reaction_db.domain.enums import (
+    ArtifactIngestionStatus,
     UploadBatchItemStatus,
     UploadBatchStatus,
 )
@@ -94,6 +95,8 @@ class _UploadItemOutcome:
     artifact_file_id: UUID | None
     error_code: str | None
     error_message: str | None
+    ingestion_status: ArtifactIngestionStatus | None = None
+    ingestion_error_message: str | None = None
 
 
 def _required_uuid(value: UUID | None, label: str) -> UUID:
@@ -140,7 +143,13 @@ def _batch_view(batch: UploadBatch) -> UploadBatchView:
     )
 
 
-def _item_view(item: UploadBatchItem) -> UploadBatchItemView:
+def _item_view(
+    item: UploadBatchItem,
+    ingestion: ArtifactIngestion | None = None,
+    *,
+    ingestion_status: ArtifactIngestionStatus | None = None,
+    ingestion_error_message: str | None = None,
+) -> UploadBatchItemView:
     return UploadBatchItemView(
         id=_required_uuid(item.id, "UploadBatchItem"),
         created_at=_required_datetime(item.created_at, "UploadBatchItem.created_at"),
@@ -154,6 +163,10 @@ def _item_view(item: UploadBatchItem) -> UploadBatchItemView:
         status=item.status,
         attempt_count=item.attempt_count,
         artifact_file_id=item.artifact_file_id,
+        ingestion_status=ingestion.status if ingestion is not None else ingestion_status,
+        ingestion_error_message=(
+            ingestion.error_message if ingestion is not None else ingestion_error_message
+        ),
         error_code=item.error_code,
         error_message=item.error_message,
         metadata=item.metadata_json,
@@ -386,17 +399,42 @@ class UploadBatchService:
                     )
                 ).one()
             )
-            items = (
-                await session.exec(
-                    select(UploadBatchItem)
-                    .where(*criteria)
-                    .order_by(col(UploadBatchItem.position), col(UploadBatchItem.id))
-                    .offset(offset)
-                    .limit(limit)
-                )
-            ).all()
+            items = list(
+                (
+                    await session.exec(
+                        select(UploadBatchItem)
+                        .where(*criteria)
+                        .order_by(col(UploadBatchItem.position), col(UploadBatchItem.id))
+                        .offset(offset)
+                        .limit(limit)
+                    )
+                ).all()
+            )
+            artifact_ids = {
+                artifact_id for item in items if (artifact_id := item.artifact_file_id) is not None
+            }
+            ingestions_by_artifact_id: dict[UUID, ArtifactIngestion] = {}
+            if artifact_ids:
+                ingestions = (
+                    await session.exec(
+                        select(ArtifactIngestion).where(
+                            col(ArtifactIngestion.artifact_file_id).in_(artifact_ids)
+                        )
+                    )
+                ).all()
+                ingestions_by_artifact_id = {
+                    ingestion.artifact_file_id: ingestion for ingestion in ingestions
+                }
         return UploadBatchItemPage(
-            items=[_item_view(item) for item in items],
+            items=[
+                _item_view(
+                    item,
+                    ingestions_by_artifact_id.get(item.artifact_file_id)
+                    if item.artifact_file_id is not None
+                    else None,
+                )
+                for item in items
+            ],
             total=total,
             limit=limit,
             offset=offset,
@@ -705,6 +743,11 @@ class UploadBatchService:
                             ),
                             error_code=outcome.error_code,
                             error_message=outcome.error_message,
+                            ingestion_status=(
+                                outcome.result.ingestion_status
+                                if outcome.result is not None
+                                else None
+                            ),
                         )
                     ],
                     user_id=user_id,
@@ -791,6 +834,9 @@ class UploadBatchService:
                     artifact_file_id=item.result.artifact_id if item.result is not None else None,
                     error_code=item.error_code,
                     error_message=item.error_message,
+                    ingestion_status=(
+                        item.result.ingestion_status if item.result is not None else None
+                    ),
                 )
                 for (client_file_id, _), item in zip(pending_files, result.items, strict=True)
             ],
@@ -850,8 +896,18 @@ class UploadBatchService:
             _finish_batch_if_terminal(batch)
             session.add(batch)
             await session.commit()
+            outcomes_by_client_id = {
+                outcome.client_file_id: outcome for outcome in outcomes
+            }
             return [
-                _item_view(items_by_client_id[client_file_id]) for client_file_id in client_file_ids
+                _item_view(
+                    items_by_client_id[client_file_id],
+                    ingestion_status=outcomes_by_client_id[client_file_id].ingestion_status,
+                    ingestion_error_message=(
+                        outcomes_by_client_id[client_file_id].ingestion_error_message
+                    ),
+                )
+                for client_file_id in client_file_ids
             ]
 
 

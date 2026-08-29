@@ -24,6 +24,7 @@ interface CatalogQueryOptions {
   artifactContentShaFilter: ComputedRef<string | null>;
   artifactFilenameFilter: ComputedRef<string | null>;
   artifactStorageStatusFilter: ComputedRef<string | null>;
+  artifactIngestionStatusFilter: ComputedRef<string | null>;
   reactionId: Ref<string | null>;
   mappedReactionId: Ref<string | null>;
   frameId: Ref<string | null>;
@@ -163,6 +164,7 @@ export function useCatalogQueries(options: CatalogQueryOptions) {
       originalFilenameContains: options.artifactFilenameFilter.value,
       projectId: options.projectId.value,
       storageStatus: options.artifactStorageStatusFilter.value,
+      ingestionStatus: options.artifactIngestionStatusFilter.value,
       sort: options.artifactSort.value,
       limit: 50,
       offset,
@@ -177,6 +179,7 @@ export function useCatalogQueries(options: CatalogQueryOptions) {
       originalFilenameContains: options.artifactFilenameFilter.value ?? undefined,
       projectId: options.projectId.value ?? undefined,
       storageStatus: options.artifactStorageStatusFilter.value ?? undefined,
+      ingestionStatus: options.artifactIngestionStatusFilter.value ?? undefined,
       ...options.artifactSort.value,
       limit: 50,
       offset,
@@ -193,6 +196,7 @@ export function useCatalogQueries(options: CatalogQueryOptions) {
     fetchPage: fetchArtifactPage,
     queryKeyForOffset: artifactPageQueryKey,
     staleTime: 30_000,
+    refetchInterval: 5_000,
   });
 
   const artifactPreview = useQuery({

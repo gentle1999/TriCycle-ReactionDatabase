@@ -129,6 +129,7 @@ export interface GeometrySummary {
   multiplicity: number;
   calculation_count: number;
   reaction_binding_count: number;
+  is_transition_state: boolean;
   imaginary_frequency_status: "present" | "absent" | "unavailable";
 }
 
@@ -381,16 +382,7 @@ export interface CalculationFrameDetail extends CalculationFrameSummary {
   }>;
   thermochemistry: Record<string, number | null> | null;
   calculation_status: Record<string, boolean | null> | null;
-  scientific_arrays: Array<{
-    id: string;
-    kind: string;
-    ordinal: number;
-    unit: string;
-    dtype: string;
-    shape: number[];
-    array_nbytes: number;
-    payload_sha256: string;
-  }>;
+  scientific_arrays: ScientificArraySummary[];
 }
 
 export interface GeometryOptimization {
@@ -424,6 +416,28 @@ export interface ScientificArrayPreview {
   truncated: boolean;
 }
 
+export interface ScientificArraySummary {
+  id: string;
+  kind: string;
+  ordinal: number;
+  unit: string;
+  dtype: string;
+  shape: number[];
+  array_nbytes: number;
+  payload_sha256: string;
+  owner_kind?: string | null;
+  owner_id?: string | null;
+  slot?: string | null;
+  slot_ordinal?: number | null;
+  source_field?: string | null;
+  source_unit?: string | null;
+  population_name?: string | null;
+  population_scheme?: string | null;
+  population_quantity?: string | null;
+  population_spin_channel?: string | null;
+  population_source_label?: string | null;
+}
+
 export interface ArtifactSummary {
   id: string;
   project_id: string;
@@ -437,6 +451,11 @@ export interface ArtifactSummary {
   storage_status: string;
   storage_verified_at: string | null;
   preview_available: boolean;
+  ingestion_status: "pending" | "succeeded" | "partial" | "filtered" | "failed" | null;
+  source_frame_count: number | null;
+  transition_state_frame_count: number | null;
+  ingestion_error_code: string | null;
+  ingestion_error_message: string | null;
 }
 
 export interface CurrentUser {
@@ -599,7 +618,7 @@ export interface ArtifactUploadResult {
   artifact_kind: "calculation_output" | "input" | "workflow_manifest" | "auxiliary";
   storage_status: string;
   ingestion_id: string | null;
-  ingestion_status: "pending" | "succeeded" | "partial" | "failed" | null;
+  ingestion_status: "pending" | "succeeded" | "partial" | "filtered" | "failed" | null;
   source_frame_count: number | null;
   transition_state_frame_count: number | null;
   inferred_reaction_count: number;
@@ -680,6 +699,8 @@ export interface UploadBatchItem {
   status: UploadBatchItemStatus;
   attempt_count: number;
   artifact_file_id: string | null;
+  ingestion_status: ArtifactSummary["ingestion_status"];
+  ingestion_error_message: string | null;
   error_code: string | null;
   error_message: string | null;
   metadata: Record<string, unknown>;

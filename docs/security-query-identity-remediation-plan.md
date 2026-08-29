@@ -1,5 +1,7 @@
 # 安全、查询与身份服务重构修复计划
 
+> English edition: [Security, query, and identity remediation plan](en/security-query-identity-remediation-plan.md). This is a dated plan.
+
 > 状态：S1-S4、Q1-Q3、D1、D2、I1 已实现并完成全量验证；身份服务决策为保留 Keycloak（复查日期：2026-11-16）
 >
 > 建立日期：2026-08-16

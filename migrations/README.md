@@ -1,5 +1,7 @@
 # Database migrations
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 Alembic owns every database schema change. Run migrations with:
 
 ```bash

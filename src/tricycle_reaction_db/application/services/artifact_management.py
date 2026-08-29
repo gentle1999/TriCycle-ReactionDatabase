@@ -8,7 +8,8 @@ from typing import cast
 from uuid import UUID
 
 from botocore.exceptions import BotoCoreError, ClientError
-from sqlmodel import Session
+from sqlalchemy.orm import selectinload
+from sqlmodel import Session, select
 
 from tricycle_reaction_db.application.dtos import ArtifactMetadataUpdate, ArtifactSummary
 from tricycle_reaction_db.application.services._persistence import _acquire_identity_locks
@@ -46,6 +47,7 @@ class ArtifactMetadataConflictError(ArtifactRemovalError):
 def _artifact_summary(artifact: ArtifactFile) -> ArtifactSummary:
     if artifact.id is None:
         raise RuntimeError("persisted artifact is missing its UUID")
+    ingestion = artifact.ingestion
     return ArtifactSummary(
         id=artifact.id,
         project_id=artifact.project_id,
@@ -59,6 +61,13 @@ def _artifact_summary(artifact: ArtifactFile) -> ArtifactSummary:
         storage_status=artifact.storage_status.value,
         storage_verified_at=artifact.storage_verified_at,
         preview_available=artifact_preview_available(artifact.media_type),
+        ingestion_status=ingestion.status.value if ingestion is not None else None,
+        source_frame_count=ingestion.source_frame_count if ingestion is not None else None,
+        transition_state_frame_count=(
+            ingestion.transition_state_frame_count if ingestion is not None else None
+        ),
+        ingestion_error_code=ingestion.error_code if ingestion is not None else None,
+        ingestion_error_message=ingestion.error_message if ingestion is not None else None,
     )
 
 
@@ -99,7 +108,14 @@ class ArtifactManagementService:
             raise ArtifactMetadataConflictError("artifact filename must be a plain filename")
 
         async with session_factory() as session:
-            artifact = await session.get(ArtifactFile, artifact_id, with_for_update=True)
+            artifact = (
+                await session.exec(
+                    select(ArtifactFile)
+                    .options(selectinload(ArtifactFile.ingestion))
+                    .where(ArtifactFile.id == artifact_id)
+                    .with_for_update()
+                )
+            ).one_or_none()
             if artifact is None or artifact.storage_status is StorageStatus.RETIRED:
                 raise ArtifactRemovalNotFoundError("artifact not found")
             await AuthorizationService.require_project_permission(

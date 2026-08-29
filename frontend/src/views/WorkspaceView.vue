@@ -46,6 +46,7 @@ const artifactKindFilter = computed(() => route.name === "artifacts" ? artifactR
 const artifactContentShaFilter = computed(() => route.name === "artifacts" ? artifactRouteQueryValue("content_sha256") : null);
 const artifactFilenameFilter = computed(() => route.name === "artifacts" ? artifactRouteQueryValue("original_filename_contains") : null);
 const artifactStorageStatusFilter = computed(() => route.name === "artifacts" ? artifactRouteQueryValue("storage_status") : null);
+const artifactIngestionStatusFilter = computed(() => route.name === "artifacts" ? artifactRouteQueryValue("ingestion_status") : null);
 const artifactFilterText = computed(() =>
   artifactFilterId.value
   ?? artifactContentShaFilter.value
@@ -58,6 +59,7 @@ const artifactQueryFilters = computed<ArtifactFilterValues>(() => ({
   originalFilenameContains: artifactFilenameFilter.value,
   artifactKind: artifactKindFilter.value,
   storageStatus: artifactStorageStatusFilter.value,
+  ingestionStatus: artifactIngestionStatusFilter.value,
 }));
 const selectedMappedId = ref<string | null>(routeMappedReactionId.value);
 const selectedFrameId = ref<string | null>(null);
@@ -84,6 +86,7 @@ const queries = useCatalogQueries({
   artifactContentShaFilter,
   artifactFilenameFilter,
   artifactStorageStatusFilter,
+  artifactIngestionStatusFilter,
   reactionId: routeReactionId,
   mappedReactionId,
   frameId: selectedFrameId,
@@ -101,6 +104,10 @@ const artifactPreview = computed(() => queries.artifactPreview.data.value ?? nul
 const reactionPage = computed<PageInfo>(() => queries.reactions.data.value?.page ?? { total: 0, limit: 12, offset: reactionOffset.value });
 const artifactPage = computed<PageInfo>(() => queries.artifacts.data.value?.page ?? { total: 0, limit: 50, offset: artifactOffset.value });
 const loading = computed(() => activeView.value === "reactions" ? queries.reactions.isLoading.value : queries.artifacts.isLoading.value);
+const querying = computed(() => {
+  const query = activeView.value === "reactions" ? queries.reactions : queries.artifacts;
+  return query.isFetching.value && (query.isLoading.value || query.isPlaceholderData.value);
+});
 const globalError = computed(() => {
   const errors = activeView.value === "reactions"
     ? [queries.reactions.error.value, queries.reaction.error.value, queries.mappedReaction.error.value]
@@ -139,6 +146,7 @@ watch(
     artifactContentShaFilter,
     artifactFilenameFilter,
     artifactStorageStatusFilter,
+    artifactIngestionStatusFilter,
   ],
   () => {
     resetArtifactPagination();
@@ -197,6 +205,7 @@ const artifactFilterQueryKeys = [
   "content_sha256",
   "original_filename_contains",
   "storage_status",
+  "ingestion_status",
 ] as const;
 
 function artifactFilterQuery(filters: ArtifactFilterValues): LocationQueryRaw {
@@ -207,6 +216,7 @@ function artifactFilterQuery(filters: ArtifactFilterValues): LocationQueryRaw {
   if (filters.originalFilenameContains) query.original_filename_contains = filters.originalFilenameContains;
   if (filters.artifactKind) query.artifact_kind = filters.artifactKind;
   if (filters.storageStatus) query.storage_status = filters.storageStatus;
+  if (filters.ingestionStatus) query.ingestion_status = filters.ingestionStatus;
   return query;
 }
 
@@ -283,6 +293,7 @@ function jumpArtifactPage(offset: number): void {
       :mapped-reaction="mappedReaction"
       :selected-mapped-id="selectedMappedId"
       :loading="loading"
+      :querying="querying"
       :mapped-loading="queries.mappedReaction.isLoading.value"
       :project-id="currentProjectId"
       :total="reactionPage.total"
@@ -304,6 +315,7 @@ function jumpArtifactPage(offset: number): void {
       :query-filters="artifactQueryFilters"
       :filter-text="artifactFilterText"
       :loading="loading"
+      :querying="querying"
       :current-user="currentUser"
       :selected-project-id="currentProjectId"
       :expanded-artifact-id="expandedArtifactId"

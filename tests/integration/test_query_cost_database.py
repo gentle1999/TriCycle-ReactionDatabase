@@ -48,7 +48,9 @@ async def test_slow_query_log_omits_bound_values(
             {"delay": 0.01, "sensitive": sensitive},
         )
 
-    record = next(record for record in caplog.records if record.message == "slow database query")
+    record = next(
+        record for record in caplog.records if record.message.startswith("slow database query")
+    )
     query_elapsed_ms = float(record.__dict__["query_elapsed_ms"])
     query_statement = str(record.__dict__["query_statement"])
     assert query_elapsed_ms >= 1

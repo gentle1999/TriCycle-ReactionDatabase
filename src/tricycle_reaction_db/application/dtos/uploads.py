@@ -200,6 +200,8 @@ class UploadBatchItemView(BaseModel):
     status: UploadBatchItemStatus
     attempt_count: int = Field(ge=0)
     artifact_file_id: UUID | None = None
+    ingestion_status: ArtifactIngestionStatus | None = None
+    ingestion_error_message: str | None = None
     error_code: str | None = None
     error_message: str | None = None
     metadata: dict[str, Any]

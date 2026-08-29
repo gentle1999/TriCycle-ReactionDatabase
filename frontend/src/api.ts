@@ -648,7 +648,7 @@ export const api = {
       `/api/scientific-arrays/${encodeURIComponent(id)}/preview?max_elements=${options.maxElements ?? 512}`,
       signal,
     ),
-  artifacts: (options: Partial<ArtifactSort> & { artifactId?: string; artifactKind?: string; contentSha256?: string; originalFilenameContains?: string; projectId?: string; storageStatus?: string; limit?: number; offset?: number; cursor?: string } = {}, signal?: AbortSignal) =>
+  artifacts: (options: Partial<ArtifactSort> & { artifactId?: string; artifactKind?: string; contentSha256?: string; originalFilenameContains?: string; projectId?: string; storageStatus?: string; ingestionStatus?: string; limit?: number; offset?: number; cursor?: string } = {}, signal?: AbortSignal) =>
     request<Page<ArtifactSummary>>(
       `/api/artifacts?${new URLSearchParams({
         limit: String(options.limit ?? 50),
@@ -659,6 +659,7 @@ export const api = {
         ...(options.originalFilenameContains ? { original_filename_contains: options.originalFilenameContains } : {}),
         ...(options.projectId ? { project_id: options.projectId } : {}),
         ...(options.storageStatus ? { storage_status: options.storageStatus } : {}),
+        ...(options.ingestionStatus ? { ingestion_status: options.ingestionStatus } : {}),
         ...(options.cursor !== undefined ? { cursor: options.cursor } : {}),
         ...(options.sortBy ? { sort_by: options.sortBy } : {}),
         ...(options.sortDirection ? { sort_direction: options.sortDirection } : {}),
@@ -833,6 +834,11 @@ export async function getTransitionStateAnchorSdf(
   );
   if (!response.ok) throw new ApiError(response.status, response.statusText);
   return response.text();
+}
+
+export function transitionStateModeDofAnimationUrl(frameId: string, projectId?: string): string {
+  const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
+  return apiUrl(`/api/depictions/calculation-frame/${encodeURIComponent(frameId)}/transition-state.svg${query}`);
 }
 
 export function geometryDepictionUrl(geometryId: string, projectId?: string): string {

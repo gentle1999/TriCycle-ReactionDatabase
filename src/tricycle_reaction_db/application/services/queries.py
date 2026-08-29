@@ -37,6 +37,7 @@ from rdkit.Chem import rdChemReactions
 from sqlalchemy import Boolean, Text, and_, case, func, literal, not_, or_, select
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.dialects.postgresql import ARRAY, aggregate_order_by, array
+from sqlalchemy.orm import defer, load_only, selectinload
 from sqlmodel import col
 from sqlmodel import select as sqlmodel_select
 
@@ -91,7 +92,6 @@ from tricycle_reaction_db.application.services.geometry_energy import (
     geometry_energy_composites,
 )
 from tricycle_reaction_db.application.services.query_visibility import (
-    calculation_frame_is_visible,
     frame_id_is_visible,
     geometry_id_is_visible,
     logical_reaction_id_is_visible,
@@ -106,6 +106,7 @@ from tricycle_reaction_db.application.services.reaction_geometry_policy import (
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
+    ArtifactIngestion,
     CalculationFrame,
     CalculationProtocol,
     CalculationSegment,
@@ -126,6 +127,7 @@ from tricycle_reaction_db.db.models import (
     MolecularTopology,
     MolecularTopologyDerivation,
     ParseRevision,
+    ProjectGeometryCatalog,
     ScientificArray,
     ScientificArrayAssignment,
     ThermochemistryResult,
@@ -134,6 +136,7 @@ from tricycle_reaction_db.db.models import (
 )
 from tricycle_reaction_db.db.session import session_factory
 from tricycle_reaction_db.domain.enums import (
+    ArtifactIngestionStatus,
     ArtifactKind,
     FrameRole,
     LogicalReactionParticipantSide,
@@ -766,8 +769,33 @@ def _array_assignment_owner(
     raise RuntimeError("ScientificArrayAssignment has no result owner")
 
 
-def _frame_select() -> Any:
-    return (
+def _array_population_name(array: ScientificArray) -> str | None:
+    metadata = array.array_metadata or {}
+    name = metadata.get("population_name")
+    if isinstance(name, str) and name:
+        return name
+    source_field = metadata.get("source_field")
+    prefix = "charge_spin_populations.populations."
+    suffix = ".values"
+    if (
+        isinstance(source_field, str)
+        and source_field.startswith(prefix)
+        and source_field.endswith(suffix)
+    ):
+        candidate = source_field[len(prefix) : -len(suffix)]
+        return candidate or None
+    return None
+
+
+def _frame_select(*, lightweight: bool = False) -> Any:
+    """Build frame joins, optionally limiting columns for list summaries.
+
+    A full ``MolecularTopology`` includes a PostgreSQL RDKit ``mol`` value.
+    Deserializing that value for every row is unnecessary for a list page,
+    which only displays the topology id and serialized SMILES.
+    """
+
+    statement = (
         select(
             CalculationFrame,
             CalculationSegment,
@@ -794,9 +822,43 @@ def _frame_select() -> Any:
             col(Geometry.topology_id) == col(MolecularTopology.id),
         )
     )
+    if lightweight:
+        statement = statement.options(
+            load_only(
+                CalculationFrame.id,
+                CalculationFrame.parse_revision_id,
+                CalculationFrame.segment_id,
+                CalculationFrame.frame_index,
+                CalculationFrame.file_frame_index,
+                CalculationFrame.frame_role,
+                CalculationFrame.geometry_id,
+                CalculationFrame.topology_derivation_id,
+                CalculationFrame.charge,
+                CalculationFrame.multiplicity,
+                CalculationFrame.coordinate_decimal_places,
+                CalculationFrame.scf_status,
+                CalculationFrame.optimization_status,
+                CalculationFrame.selected_energy_hartree,
+                CalculationFrame.selected_energy_kind,
+                CalculationFrame.frequency_count,
+                CalculationFrame.negative_frequency_count,
+                CalculationFrame.running_time_seconds,
+            ),
+            load_only(
+                CalculationSegment.id,
+                CalculationSegment.segment_index,
+                CalculationSegment.protocol_id,
+            ),
+            load_only(ParseRevision.id, ParseRevision.artifact_file_id),
+            load_only(ArtifactFile.id, ArtifactFile.original_filename),
+            load_only(Geometry.id, Geometry.topology_id),
+            load_only(MolecularTopology.id, MolecularTopology.canonical_isomeric_smiles),
+        )
+    return statement
 
 
 def _artifact_summary(artifact: ArtifactFile) -> ArtifactSummary:
+    ingestion = artifact.ingestion
     return ArtifactSummary(
         id=_required_uuid(artifact.id, "ArtifactFile"),
         project_id=artifact.project_id,
@@ -810,6 +872,13 @@ def _artifact_summary(artifact: ArtifactFile) -> ArtifactSummary:
         storage_status=_enum_value(artifact.storage_status),
         storage_verified_at=artifact.storage_verified_at,
         preview_available=artifact_preview_available(artifact.media_type),
+        ingestion_status=_enum_value(ingestion.status) if ingestion is not None else None,
+        source_frame_count=(ingestion.source_frame_count if ingestion is not None else None),
+        transition_state_frame_count=(
+            ingestion.transition_state_frame_count if ingestion is not None else None
+        ),
+        ingestion_error_code=ingestion.error_code if ingestion is not None else None,
+        ingestion_error_message=ingestion.error_message if ingestion is not None else None,
     )
 
 
@@ -855,6 +924,7 @@ class ArtifactQueryService(UseCaseService):  # type: ignore[misc]
         project_id: UUID | None = None,
         content_sha256: str | None = None,
         storage_status: StorageStatus | None = None,
+        ingestion_status: ArtifactIngestionStatus | None = None,
         original_filename_contains: str | None = None,
         limit: PageLimit = 50,
         offset: PageOffset = 0,
@@ -881,7 +951,9 @@ class ArtifactQueryService(UseCaseService):  # type: ignore[misc]
             raise ValueError("cursor pagination only supports created_at descending order")
 
         count_statement = sqlmodel_select(func.count()).select_from(ArtifactFile)
-        statement = sqlmodel_select(ArtifactFile)
+        statement = sqlmodel_select(ArtifactFile).options(
+            selectinload(cast(Any, ArtifactFile.ingestion))
+        )
         active_criterion = col(ArtifactFile.storage_status) != StorageStatus.RETIRED
         count_statement = count_statement.where(active_criterion)
         statement = statement.where(active_criterion)
@@ -903,6 +975,18 @@ class ArtifactQueryService(UseCaseService):  # type: ignore[misc]
                 criterion = col(exact_field) == exact_value
                 count_statement = count_statement.where(criterion)
                 statement = statement.where(criterion)
+        if ingestion_status is not None:
+            criterion = (
+                select(literal(1))
+                .select_from(ArtifactIngestion)
+                .where(
+                    col(ArtifactIngestion.artifact_file_id) == col(ArtifactFile.id),
+                    col(ArtifactIngestion.status) == ingestion_status,
+                )
+                .exists()
+            )
+            count_statement = count_statement.where(criterion)
+            statement = statement.where(criterion)
         if original_filename_contains is not None:
             criterion = col(ArtifactFile.original_filename).ilike(f"%{original_filename_contains}%")
             count_statement = count_statement.where(criterion)
@@ -946,7 +1030,9 @@ class ArtifactQueryService(UseCaseService):  # type: ignore[misc]
         async with session_factory() as session:
             artifact = (
                 await session.exec(
-                    sqlmodel_select(ArtifactFile).where(
+                    sqlmodel_select(ArtifactFile)
+                    .options(selectinload(cast(Any, ArtifactFile.ingestion)))
+                    .where(
                         col(ArtifactFile.id) == artifact_id,
                         scope.artifact_predicate(),
                     )
@@ -1047,6 +1133,10 @@ class MolecularTopologyQueryService(UseCaseService):  # type: ignore[misc]
         )
         statement = (
             sqlmodel_select(MolecularTopology, MolecularFormula)
+            .add_columns(
+                col(MolecularTopology.morgan_bfp).is_not(None).label("morgan_bfp_available")
+            )
+            .options(defer(MolecularTopology.mol), defer(MolecularTopology.morgan_bfp))
             .join(
                 MolecularFormula,
                 col(MolecularTopology.formula_id) == col(MolecularFormula.id),
@@ -1082,7 +1172,7 @@ class MolecularTopologyQueryService(UseCaseService):  # type: ignore[misc]
                     sanitization_error=topology.sanitization_error,
                     substructure_match_count=None,
                     morgan_bfp_schema_version=topology.morgan_bfp_schema_version,
-                    morgan_bfp_available=topology.morgan_bfp is not None,
+                    morgan_bfp_available=bool(morgan_bfp_available),
                     similarity_score=None,
                     molecular_weight=None,
                     logp=None,
@@ -1092,7 +1182,7 @@ class MolecularTopologyQueryService(UseCaseService):  # type: ignore[misc]
                     ring_count=None,
                     scaffold_smiles=None,
                 )
-                for topology, formula in rows
+                for topology, formula, morgan_bfp_available in rows
             ],
             page=PageInfo(total=total, limit=limit, offset=offset),
         )
@@ -1394,7 +1484,9 @@ class MolecularTopologyQueryService(UseCaseService):  # type: ignore[misc]
                 hbd_count.label("hbd_count"),
                 ring_count.label("ring_count"),
                 scaffold.label("scaffold_smiles"),
+                col(MolecularTopology.morgan_bfp).is_not(None).label("morgan_bfp_available"),
             )
+            .options(defer(MolecularTopology.mol), defer(MolecularTopology.morgan_bfp))
             .join(
                 MolecularFormula,
                 col(MolecularTopology.formula_id) == col(MolecularFormula.id),
@@ -1450,7 +1542,7 @@ class MolecularTopologyQueryService(UseCaseService):  # type: ignore[misc]
                         int(match_count_value) if match_count_value is not None else None
                     ),
                     morgan_bfp_schema_version=topology.morgan_bfp_schema_version,
-                    morgan_bfp_available=topology.morgan_bfp is not None,
+                    morgan_bfp_available=bool(morgan_bfp_available),
                     similarity_score=(
                         float(similarity_score_value)
                         if similarity_score_value is not None
@@ -1480,6 +1572,7 @@ class MolecularTopologyQueryService(UseCaseService):  # type: ignore[misc]
                     hbd_count_value,
                     ring_count_value,
                     scaffold_value,
+                    morgan_bfp_available,
                 ) in rows
             ],
             page=PageInfo(total=total, limit=limit, offset=offset),
@@ -1722,41 +1815,8 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             )
             reaction_statement = select(LogicalReaction).where(*predicates)
             if sort_by == "default":
-                reactant_component = func.concat(
-                    col(MolecularTopology.canonical_isomeric_smiles),
-                    literal(":"),
-                    sql_cast(col(LogicalReactionParticipant.stoichiometric_coefficient), Text),
-                )
-                reactant_sort_keys = (
-                    select(
-                        col(LogicalReactionParticipant.logical_reaction_id).label(
-                            "logical_reaction_id"
-                        ),
-                        func.array_agg(
-                            aggregate_order_by(
-                                reactant_component,
-                                col(MolecularTopology.canonical_isomeric_smiles),
-                                col(LogicalReactionParticipant.stoichiometric_coefficient),
-                                col(LogicalReactionParticipant.participant_index),
-                            )
-                        ).label("reactant_sort_key"),
-                    )
-                    .join(
-                        MolecularTopology,
-                        col(LogicalReactionParticipant.topology_id) == col(MolecularTopology.id),
-                    )
-                    .where(
-                        col(LogicalReactionParticipant.side)
-                        == LogicalReactionParticipantSide.REACTANT
-                    )
-                    .group_by(col(LogicalReactionParticipant.logical_reaction_id))
-                    .subquery()
-                )
-                reaction_statement = reaction_statement.outerjoin(
-                    reactant_sort_keys,
-                    col(LogicalReaction.id) == reactant_sort_keys.c.logical_reaction_id,
-                ).order_by(
-                    reactant_sort_keys.c.reactant_sort_key.nulls_last(),
+                reaction_statement = reaction_statement.order_by(
+                    col(LogicalReaction.reactant_sort_key).nulls_last(),
                     col(LogicalReaction.created_at),
                     col(LogicalReaction.id),
                 )
@@ -1797,6 +1857,7 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                 (
                     await session.execute(
                         select(LogicalReactionParticipant, MolecularTopology)
+                        .options(defer(MolecularTopology.mol))
                         .join(
                             MolecularTopology,
                             col(LogicalReactionParticipant.topology_id)
@@ -1959,6 +2020,7 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             participant_rows = (
                 await session.execute(
                     select(LogicalReactionParticipant, MolecularTopology)
+                    .options(defer(MolecularTopology.mol))
                     .join(
                         MolecularTopology,
                         col(LogicalReactionParticipant.topology_id) == col(MolecularTopology.id),
@@ -2732,7 +2794,9 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
     ) -> CalculationFramePage:
         """List frame summaries with composable identity and calculation filters."""
 
-        statement = _frame_select()
+        # The list response never needs source payloads or the RDKit molecule
+        # stored on MolecularTopology.  Keep this query column-limited.
+        statement = _frame_select(lightweight=True)
         scope = await query_visibility_scope(project_id=project_id)
         visibility_criterion = scope.artifact_predicate()
         count_statement = (
@@ -2748,15 +2812,13 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
             )
             .where(visibility_criterion)
         )
-        frame_visibility_criterion = calculation_frame_is_visible(
-            scope, col(CalculationFrame.parse_revision_id)
-        )
         predicates: list[Any] = []
         if artifact_file_id is not None:
-            revision_ids = select(col(ParseRevision.id)).where(
-                col(ParseRevision.artifact_file_id) == artifact_file_id
-            )
-            predicates.append(col(CalculationFrame.parse_revision_id).in_(revision_ids))
+            # The query already joins ParseRevision and ArtifactFile.  Keep
+            # this as a direct equality instead of an ``IN`` subquery; the
+            # latter makes PostgreSQL consider a broad semi-join over every
+            # visible frame before applying the requested file filter.
+            predicates.append(col(ParseRevision.artifact_file_id) == artifact_file_id)
         if geometry_id is not None:
             predicates.append(col(CalculationFrame.geometry_id) == geometry_id)
         if topology_id is not None:
@@ -2845,18 +2907,38 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
             predicates.append(
                 frequency_column.is_not(None) if has_frequencies else frequency_column.is_(None)
             )
-        statement = statement.where(frame_visibility_criterion, *predicates)
+        # The statement joins ArtifactFile directly, so its visibility
+        # predicate both enforces authorization and gives PostgreSQL a
+        # selective artifact/revision/frame join order.  The revision-level
+        # visibility expression is equivalent here and would introduce a
+        # broad semi-join over all visible frames.
+        statement = statement.where(visibility_criterion, *predicates)
         count_statement = count_statement.where(*predicates)
-        statement = (
-            statement.order_by(
+        if artifact_file_id is not None:
+            # A file has one stable filename.  Ordering directly by the
+            # revision/file index avoids sorting the joined topology rows and
+            # keeps pagination deterministic when a file has been reparsed.
+            statement = statement.order_by(
+                col(ParseRevision.revision_number),
+                col(CalculationFrame.file_frame_index),
+            )
+        else:
+            statement = statement.order_by(
                 col(ArtifactFile.original_filename),
                 col(CalculationFrame.file_frame_index),
             )
-            .offset(offset)
-            .limit(limit)
-        )
+        statement = statement.offset(offset).limit(limit)
         async with session_factory() as session:
-            total = int((await session.execute(count_statement)).scalar_one())
+            if scope.uses_project_geometry_catalog and not predicates:
+                # The project catalogue already maintains one frame count per
+                # visible Geometry.  Avoid joining every frame to its artifact
+                # merely to populate the catalogue totals panel.
+                total_statement = select(
+                    func.coalesce(func.sum(ProjectGeometryCatalog.frame_count), 0)
+                ).where(col(ProjectGeometryCatalog.project_id) == scope.requested_project_id)
+                total = int((await session.execute(total_statement)).scalar_one())
+            else:
+                total = int((await session.execute(count_statement)).scalar_one())
             rows = (await session.execute(statement)).all()
         return CalculationFramePage(
             items=[_frame_summary(*row) for row in rows],
@@ -3093,6 +3175,17 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
                     owner_id=_array_assignment_owner(assignment)[1],
                     slot=assignment.slot if assignment is not None else None,
                     slot_ordinal=(assignment.slot_ordinal if assignment is not None else None),
+                    source_field=(array.array_metadata or {}).get("source_field"),
+                    source_unit=(array.array_metadata or {}).get("source_unit") or array.unit,
+                    population_name=_array_population_name(array),
+                    population_scheme=(array.array_metadata or {}).get("population_scheme"),
+                    population_quantity=(array.array_metadata or {}).get("population_quantity"),
+                    population_spin_channel=(array.array_metadata or {}).get(
+                        "population_spin_channel"
+                    ),
+                    population_source_label=(array.array_metadata or {}).get(
+                        "population_source_label"
+                    ),
                 )
                 for array, assignment in array_rows
             ],

@@ -55,8 +55,13 @@ def _log_slow_query(
         return
     elapsed_ms = (perf_counter() - float(started_at)) * 1000
     if elapsed_ms >= settings.slow_query_threshold_ms:
+        statement_preview = " ".join(statement.split())
+        if len(statement_preview) > 1_000:
+            statement_preview = f"{statement_preview[:997]}..."
         logger.warning(
-            "slow database query",
+            "slow database query elapsed_ms=%s statement=%s",
+            round(elapsed_ms, 3),
+            statement_preview,
             extra={
                 "query_elapsed_ms": round(elapsed_ms, 3),
                 "query_statement": statement,

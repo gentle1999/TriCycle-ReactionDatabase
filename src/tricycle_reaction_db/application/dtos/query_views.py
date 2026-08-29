@@ -34,6 +34,11 @@ class ArtifactSummary(QueryView):
     storage_status: str
     storage_verified_at: datetime | None = None
     preview_available: bool
+    ingestion_status: str | None = None
+    source_frame_count: int | None = None
+    transition_state_frame_count: int | None = None
+    ingestion_error_code: str | None = None
+    ingestion_error_message: str | None = None
 
 
 class ArtifactPreview(QueryView):
@@ -120,6 +125,7 @@ class GeometrySummary(QueryView):
     multiplicity: int
     calculation_count: int
     reaction_binding_count: int
+    is_transition_state: bool
     imaginary_frequency_status: str
 
 
@@ -500,6 +506,15 @@ class ScientificArraySummary(QueryView):
     owner_id: UUID | None = None
     slot: str | None = None
     slot_ordinal: int | None = None
+    # Scalar provenance fields keep the NexusX schema portable (it does not
+    # expose arbitrary JSON mappings) while retaining MolOP population names.
+    source_field: str | None = None
+    source_unit: str | None = None
+    population_name: str | None = None
+    population_scheme: str | None = None
+    population_quantity: str | None = None
+    population_spin_channel: str | None = None
+    population_source_label: str | None = None
 
 
 class ScientificArrayPreview(QueryView):
@@ -537,6 +552,7 @@ class AtomicPopulationSeriesView(QueryView):
     series_key: str
     scheme: str
     quantity: str
+    unit: str = "dimensionless"
     value_count: int
     spin_channel: str | None = None
     source_label: str | None = None

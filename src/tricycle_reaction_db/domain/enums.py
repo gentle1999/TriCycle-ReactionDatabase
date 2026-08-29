@@ -100,6 +100,7 @@ class ArtifactIngestionStatus(StrEnum):
     PENDING = "pending"
     SUCCEEDED = "succeeded"
     PARTIAL = "partial"
+    FILTERED = "filtered"
     FAILED = "failed"
 
 

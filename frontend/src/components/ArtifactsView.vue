@@ -8,6 +8,7 @@ import { emptyArtifactFilters, type ArtifactFilterValues, type ArtifactSort, typ
 import { formatBytes, labelFor, shortId, statusTone } from "@/format";
 import { withoutAccessState } from "@/routeAccessState";
 import type { ArtifactSummary, CalculationFrameSummary, CurrentUser, PageInfo } from "@/types";
+import ArtifactIngestionStatus from "./ArtifactIngestionStatus.vue";
 import CalculationFrameList from "./CalculationFrameList.vue";
 import ArtifactAdvancedQueryModal from "./ArtifactAdvancedQueryModal.vue";
 import ChemDoodleFrameMovie3D from "./ChemDoodleFrameMovie3D.vue";
@@ -19,6 +20,7 @@ const props = defineProps<{
   queryFilters: ArtifactFilterValues;
   filterText: string;
   loading: boolean;
+  querying: boolean;
   currentUser: CurrentUser | null;
   selectedProjectId: string | null;
   expandedArtifactId: string | null;
@@ -167,7 +169,7 @@ watch(
           <QueryValidationIndicator :status="quickValidation.status" :message="quickValidation.message" />
         </label>
         <div class="filter-actions">
-          <button class="command-button" type="submit"><Search :size="15" aria-hidden="true" />查询</button>
+          <button class="command-button" type="submit" :disabled="querying"><LoaderCircle v-if="querying" class="is-spinning" :size="15" aria-hidden="true" /><Search v-else :size="15" aria-hidden="true" />{{ querying ? "正在查询" : "查询" }}</button>
           <button class="command-button command-button-muted" type="button" @click="advancedQueryOpen = true"><ListFilter :size="15" aria-hidden="true" />高级筛选</button>
           <RouterLink class="icon-button" :to="{ name: 'artifact-query-help' }" title="原始文件查询帮助" aria-label="原始文件查询帮助"><CircleHelp :size="16" aria-hidden="true" /></RouterLink>
           <button class="icon-button" type="button" title="清空文件筛选" aria-label="清空文件筛选" @click="clearFilters"><RotateCcw :size="15" aria-hidden="true" /></button>
@@ -180,7 +182,7 @@ watch(
       <div class="filter-result-count"><strong>{{ total >= 0 ? total : artifacts.length }}</strong><span>{{ total >= 0 ? "个匹配文件" : "个本页文件" }}</span></div>
     </aside>
 
-    <section class="artifact-results" aria-labelledby="artifact-results-title">
+    <section class="artifact-results" aria-labelledby="artifact-results-title" :aria-busy="querying">
       <header class="artifact-results-header">
         <div>
           <span class="eyebrow">Artifact catalog</span>
@@ -194,6 +196,9 @@ watch(
           <PaginationControls :page="page" label="原始文件分页（顶部）" @previous="emit('previousPage')" @next="emit('nextPage')" @jump="emit('jumpPage', $event)" />
         </div>
       </header>
+      <div class="catalog-query-status-slot" aria-live="polite">
+        <div v-if="querying" class="catalog-query-status" role="status"><LoaderCircle class="is-spinning" :size="16" aria-hidden="true" /><span>{{ artifacts.length ? "正在查询，当前显示上次结果" : "正在查询筛选结果" }}</span></div>
+      </div>
       <div class="artifact-upload-toolbar">
         <RouterLink v-if="canUpload" class="command-button" :to="{ name: 'uploads', query: { ...navigationQuery, project_id: selectedProjectId } }">
           <UploadCloud :size="16" aria-hidden="true" />批量上传
@@ -212,6 +217,7 @@ watch(
             <th>可见性</th>
             <th>大小</th>
             <th>存储状态</th>
+            <th>解析状态</th>
             <th>SHA-256</th>
             <th>验证时间</th>
             <th><span class="sr-only">文件操作</span></th>
@@ -219,10 +225,10 @@ watch(
         </thead>
         <tbody>
           <tr v-if="loading && !artifacts.length">
-            <td colspan="8"><div class="table-loading">正在加载原始文件</div></td>
+            <td colspan="9"><div class="table-loading">正在加载原始文件</div></td>
           </tr>
           <tr v-else-if="!artifacts.length">
-            <td colspan="8"><div class="compact-empty">没有匹配的原始文件</div></td>
+            <td colspan="9"><div class="compact-empty">没有匹配的原始文件</div></td>
           </tr>
           <template v-for="artifact in artifacts" v-else :key="artifact.id">
           <tr class="artifact-row" :class="{ 'is-expanded': artifact.id === expandedArtifactId }" @click="emit('toggleFrames', artifact.id)">
@@ -244,7 +250,10 @@ watch(
               </span>
             </td>
             <td class="number-cell">{{ formatBytes(artifact.size_bytes) }}</td>
-            <td><span class="status-dot" :class="statusTone(artifact.storage_status)">{{ artifact.storage_status }}</span></td>
+            <td><span class="status-dot" :class="statusTone(artifact.storage_status)">{{ labelFor(artifact.storage_status) }}</span></td>
+            <td>
+              <ArtifactIngestionStatus :status="artifact.ingestion_status" :error-message="artifact.ingestion_error_message" />
+            </td>
             <td><code :title="artifact.content_sha256">{{ shortId(artifact.content_sha256) }}</code></td>
             <td>{{ artifact.storage_verified_at ? new Date(artifact.storage_verified_at).toLocaleString("zh-CN") : "—" }}</td>
             <td>
@@ -281,7 +290,7 @@ watch(
             </td>
           </tr>
           <tr v-if="artifact.id === expandedArtifactId" class="artifact-frames-row">
-            <td colspan="8">
+            <td colspan="9">
               <div class="artifact-frames-panel">
                 <div class="artifact-frames-content">
                   <section class="artifact-frame-list-pane">

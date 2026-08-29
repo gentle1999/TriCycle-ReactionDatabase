@@ -33,6 +33,7 @@ from tricycle_reaction_db.application.services.queries import (
     PageLimit,
     PageOffset,
     _array_assignment_owner,
+    _array_population_name,
     _enum_value,
     _frame_select,
     _frame_summary,
@@ -111,6 +112,13 @@ def _array_view(
         owner_id=owner_id,
         slot=assignment.slot if assignment is not None else None,
         slot_ordinal=assignment.slot_ordinal if assignment is not None else None,
+        source_field=(array.array_metadata or {}).get("source_field"),
+        source_unit=(array.array_metadata or {}).get("source_unit") or array.unit,
+        population_name=_array_population_name(array),
+        population_scheme=(array.array_metadata or {}).get("population_scheme"),
+        population_quantity=(array.array_metadata or {}).get("population_quantity"),
+        population_spin_channel=(array.array_metadata or {}).get("population_spin_channel"),
+        population_source_label=(array.array_metadata or {}).get("population_source_label"),
     )
 
 
@@ -420,6 +428,7 @@ class CalculationResultQueryService(UseCaseService):  # type: ignore[misc]
                             series_key=series.series_key,
                             scheme=series.scheme,
                             quantity=series.quantity,
+                            unit="dimensionless",
                             value_count=series.value_count,
                             spin_channel=series.spin_channel,
                             source_label=series.source_label,

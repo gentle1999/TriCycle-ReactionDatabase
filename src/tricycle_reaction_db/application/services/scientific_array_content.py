@@ -38,6 +38,7 @@ class ScientificArrayDownload:
     filename: str
     content: bytes
     payload_sha256: str
+    unit: str
     dtype: str
     shape: tuple[int, ...]
 
@@ -107,6 +108,7 @@ class ScientificArrayContentService:
             filename=f"{array.kind.value}-{array.ordinal}-{array_id}.npy",
             content=content,
             payload_sha256=array.payload_sha256,
+            unit=array.unit,
             dtype=array.dtype,
             shape=tuple(array.shape),
         )

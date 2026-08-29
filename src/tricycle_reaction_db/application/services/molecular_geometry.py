@@ -120,6 +120,9 @@ class GeometryPersistenceContext:
 
 
 GEOMETRY_MATCH_POLICY_VERSION = "geometry-internal-coordinate-match-v3"
+# Keep each set-based equivalence statement below the database statement
+# timeout even when one file batch contains many thousands of frame keys.
+GEOMETRY_MATCH_INPUT_BATCH_SIZE = 128
 
 
 class GeometryAssignmentAmbiguityError(ValueError):
@@ -884,8 +887,9 @@ def preload_molecular_geometry_context(
         context.geometries_by_hash[key] = geometry
 
     # For non-exact hashes, evaluate the existing PostgreSQL equivalence
-    # function for every input in one set-based query. This replaces one
-    # network round trip per frame with a single JSONB recordset + join.
+    # function in bounded set-based queries. A file batch may contain many
+    # thousands of frame keys; putting all of them in one statement makes the
+    # nested candidate scans exceed the database statement timeout.
     unmatched = [key for key in keys if key not in context.geometries_by_hash]
     if not unmatched:
         return
@@ -911,53 +915,53 @@ def preload_molecular_geometry_context(
                 "coordinate_decimal_places": coordinate_decimal_places,
             }
         )
-    matches = (
-        session.connection()
-        .execute(
-            text(
-                """
-            WITH inputs AS (
-                SELECT *
-                FROM jsonb_to_recordset(CAST(:payload AS jsonb)) AS input(
-                    input_key text,
-                    topology_id uuid,
-                    canonicalization_version text,
-                    charge smallint,
-                    multiplicity smallint,
-                    distances double precision[],
-                    angles double precision[],
-                    dihedrals double precision[],
-                    coordinate_decimal_places smallint
-                )
-            )
-            SELECT inputs.input_key, geometry.id
-            FROM inputs
-            JOIN geometry
-             ON geometry.topology_id = inputs.topology_id
-             AND geometry.canonicalization_version = inputs.canonicalization_version
-             AND geometry.charge = inputs.charge
-             AND geometry.multiplicity = inputs.multiplicity
-             AND geometry_internal_coordinates_equivalent(
-                    geometry.internal_coordinate_distances_angstrom,
-                    geometry.internal_coordinate_angles_degrees,
-                    geometry.internal_coordinate_dihedrals_degrees,
-                    geometry.minimum_coordinate_decimal_places,
-                    inputs.distances,
-                    inputs.angles,
-                    inputs.dihedrals,
-                    inputs.coordinate_decimal_places
-                )
-            ORDER BY inputs.input_key, geometry.id
-            """
-            ),
-            {"payload": json.dumps(input_rows, separators=(",", ":"))},
-        )
-        .all()
-    )
     matched_ids: dict[str, list[UUID]] = {}
-    for input_key, geometry_id in matches:
-        if isinstance(input_key, str) and isinstance(geometry_id, UUID):
-            matched_ids.setdefault(input_key, []).append(geometry_id)
+    statement = text(
+        """
+        WITH inputs AS (
+            SELECT *
+            FROM jsonb_to_recordset(CAST(:payload AS jsonb)) AS input(
+                input_key text,
+                topology_id uuid,
+                canonicalization_version text,
+                charge smallint,
+                multiplicity smallint,
+                distances double precision[],
+                angles double precision[],
+                dihedrals double precision[],
+                coordinate_decimal_places smallint
+            )
+        )
+        SELECT inputs.input_key, geometry.id
+        FROM inputs
+        JOIN geometry
+         ON geometry.topology_id = inputs.topology_id
+         AND geometry.canonicalization_version = inputs.canonicalization_version
+         AND geometry.charge = inputs.charge
+         AND geometry.multiplicity = inputs.multiplicity
+         AND geometry_internal_coordinates_equivalent(
+                geometry.internal_coordinate_distances_angstrom,
+                geometry.internal_coordinate_angles_degrees,
+                geometry.internal_coordinate_dihedrals_degrees,
+                geometry.minimum_coordinate_decimal_places,
+                inputs.distances,
+                inputs.angles,
+                inputs.dihedrals,
+                inputs.coordinate_decimal_places
+            )
+        ORDER BY inputs.input_key, geometry.id
+        """
+    )
+    connection = session.connection()
+    for start in range(0, len(input_rows), GEOMETRY_MATCH_INPUT_BATCH_SIZE):
+        chunk = input_rows[start : start + GEOMETRY_MATCH_INPUT_BATCH_SIZE]
+        matches = connection.execute(
+            statement,
+            {"payload": json.dumps(chunk, separators=(",", ":"))},
+        ).all()
+        for input_key, geometry_id in matches:
+            if isinstance(input_key, str) and isinstance(geometry_id, UUID):
+                matched_ids.setdefault(input_key, []).append(geometry_id)
     all_matching_ids = {
         geometry_id for geometry_ids in matched_ids.values() for geometry_id in geometry_ids
     }

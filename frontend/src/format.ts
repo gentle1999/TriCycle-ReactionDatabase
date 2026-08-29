@@ -30,8 +30,11 @@ const statusLabels: Record<string, string> = {
   pending: "等待中",
   queued: "等待",
   uploading: "上传中",
+  parsing: "正在解析",
   succeeded: "成功",
   failed: "失败",
+  partial: "部分成功",
+  filtered: "已过滤（无计算帧）",
   cancelled: "已取消",
   converged: "已收敛",
   not_converged: "未收敛",
@@ -111,5 +114,6 @@ export function statusTone(value: string | null | undefined): string {
     return "ok";
   }
   if (["failed", "error", "unavailable"].includes(value ?? "")) return "bad";
+  if (["partial", "filtered"].includes(value ?? "")) return "warn";
   return "neutral";
 }

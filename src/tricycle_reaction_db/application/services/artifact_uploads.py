@@ -144,6 +144,11 @@ PERSISTENCE_PRELOAD_BATCH_SIZE = 16
 # keep all configured workers busy across a multi-file batch.
 FRAME_CONVERSION_CHUNK_SIZE = 32
 INFERENCE_PERSIST_BATCH_SIZE = 16
+# The configured timeout is the budget for a 10 MiB source. Larger source
+# files receive a proportionally larger budget; smaller files retain the
+# configured baseline so normal parsing is not cut off by an arbitrarily low
+# byte-scaled timeout.
+MOLOP_PARSE_TIMEOUT_REFERENCE_BYTES = 10 * 1024 * 1024
 
 
 class ArtifactUploadError(RuntimeError):
@@ -307,15 +312,6 @@ class _RetiredArtifactReservation:
     version_id: str | None
     etag: str | None
     storage_verified_at: datetime | None
-
-
-@dataclass(frozen=True, slots=True)
-class _RetiredArtifactObject:
-    bucket: str
-    object_key: str
-    version_id: str | None
-    content_sha256: str
-    size_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -927,7 +923,7 @@ async def _run_molop_file_pipeline(
     retain the legacy path for tests and integrations.
     """
 
-    timeout_seconds = get_settings().molop_file_parse_timeout_seconds
+    timeout_seconds = _molop_file_parse_timeout_seconds(source)
     acquired_file_slot = False
     effective_file_slots = file_slots or _file_worker_submission_slots()
     try:
@@ -964,6 +960,20 @@ async def _run_molop_file_pipeline(
     finally:
         if acquired_file_slot:
             effective_file_slots.release()
+
+
+def _source_size_bytes(source: bytes | Path) -> int:
+    """Return the source size used to scale the per-file parse budget."""
+
+    return len(source) if isinstance(source, bytes) else source.stat().st_size
+
+
+def _molop_file_parse_timeout_seconds(source: bytes | Path) -> float:
+    """Scale the configured 10 MiB parse budget for a source file."""
+
+    baseline = get_settings().molop_file_parse_timeout_seconds
+    size_scale = max(1.0, _source_size_bytes(source) / MOLOP_PARSE_TIMEOUT_REFERENCE_BYTES)
+    return baseline * size_scale
 
 
 def _recover_aborted_batch_sync(
@@ -1203,12 +1213,13 @@ def _inspect_upload_source(
 def _require_batch_upload_budget(
     files: list[ArtifactUploadPayload],
     *,
+    enforce_batch_files: bool = True,
     enforce_batch_bytes: bool = True,
 ) -> dict[int, _InspectedUploadSource]:
     """Validate every batch dimension before authorization, storage, or parsing."""
 
     settings = get_settings()
-    if len(files) > settings.max_batch_files:
+    if enforce_batch_files and len(files) > settings.max_batch_files:
         raise ArtifactUploadLimitError(
             f"upload batch exceeds the {settings.max_batch_files}-file limit"
         )
@@ -2428,64 +2439,7 @@ def _delete_reserved_object(
         store.delete(object_key, version_id=metadata.version_id)
 
 
-def _retire_artifacts_without_calculation_frames(
-    session: Session,
-    *,
-    artifact_ids: set[UUID],
-) -> dict[UUID, _RetiredArtifactObject]:
-    if not artifact_ids:
-        return {}
-    artifacts = session.exec(
-        select(ArtifactFile).where(col(ArtifactFile.id).in_(artifact_ids))
-    ).all()
-    _acquire_identity_locks(
-        session,
-        *sorted(
-            {("artifact-content", artifact.content_sha256) for artifact in artifacts},
-            key=str,
-        ),
-    )
-    retired: dict[UUID, _RetiredArtifactObject] = {}
-    for artifact in artifacts:
-        artifact_id = _require_id(artifact, label="ArtifactFile")
-        if artifact.storage_status is StorageStatus.RETIRED:
-            continue
-        retired[artifact_id] = _RetiredArtifactObject(
-            bucket=artifact.bucket,
-            object_key=artifact.object_key,
-            version_id=artifact.version_id,
-            content_sha256=artifact.content_sha256,
-            size_bytes=artifact.size_bytes,
-        )
-        artifact.storage_status = StorageStatus.RETIRED
-        session.add(artifact)
-    return retired
-
-
-def _delete_retired_artifact_object(reservation: _RetiredArtifactObject) -> None:
-    settings = RustFSSettings().model_copy(update={"bucket": reservation.bucket})
-    with RustFSObjectStore(settings) as store:
-        if not store.exists(reservation.object_key, version_id=reservation.version_id):
-            return
-        metadata = store.head(reservation.object_key, version_id=reservation.version_id)
-        if metadata.size != reservation.size_bytes or metadata.sha256 != reservation.content_sha256:
-            raise ArtifactUploadError(
-                "stored object metadata no longer matches the rejected artifact identity"
-            )
-        store.delete(reservation.object_key, version_id=reservation.version_id)
-
-
-async def _delete_retired_artifact_objects(
-    reservations: Mapping[UUID, _RetiredArtifactObject],
-) -> None:
-    for artifact_id, reservation in reservations.items():
-        try:
-            await asyncio.to_thread(_delete_retired_artifact_object, reservation)
-        except Exception:
-            logger.exception("failed to remove rejected artifact %s from RustFS", artifact_id)
-
-
-async def _reject_artifact_without_calculation_frames(
+async def _filter_artifact_without_calculation_frames(
     *,
     ingestion_id: UUID,
 ) -> ArtifactUploadResult:
@@ -2498,7 +2452,7 @@ async def _reject_artifact_without_calculation_frames(
         )
         await session.run_sync(
             partial(
-                _run_mark_ingestion_failed,
+                _run_mark_ingestion_filtered,
                 ingestion_id=ingestion_id,
                 error=error,
                 error_code="no_calculation_frames",
@@ -2507,19 +2461,6 @@ async def _reject_artifact_without_calculation_frames(
                 transition_state_frame_count=0,
             )
         )
-        artifact_id = ingestion.artifact_file_id
-        retired = await session.run_sync(
-            cast(
-                Any,
-                partial(
-                    _retire_artifacts_without_calculation_frames,
-                    artifact_ids={artifact_id},
-                ),
-            )
-        )
-        # Keep the content advisory lock held until the object has been
-        # verified and removed. This closes the unversioned-object retry race.
-        await _delete_retired_artifact_objects(retired)
         await session.commit()
     async with session_factory() as session:
         return await session.run_sync(partial(_run_result, ingestion_id=ingestion_id))
@@ -3537,6 +3478,34 @@ def _mark_ingestion_failed(
     session.add(ingestion)
 
 
+def _mark_ingestion_filtered(
+    session: Session,
+    *,
+    ingestion_id: UUID,
+    error: Exception,
+    error_code: str,
+    completed_at: datetime,
+    ingestion: ArtifactIngestion | None = None,
+    source_frame_count: int = 0,
+    transition_state_frame_count: int = 0,
+) -> None:
+    _mark_ingestion_failed(
+        session,
+        ingestion_id=ingestion_id,
+        error=error,
+        error_code=error_code,
+        completed_at=completed_at,
+        ingestion=ingestion,
+        source_frame_count=source_frame_count,
+        transition_state_frame_count=transition_state_frame_count,
+    )
+    resolved = ingestion or session.get(ArtifactIngestion, ingestion_id)
+    if resolved is None:
+        raise RuntimeError("artifact ingestion disappeared while marking it filtered")
+    resolved.status = ArtifactIngestionStatus.FILTERED
+    session.add(resolved)
+
+
 def _result(
     session: Session,
     ingestion_id: UUID,
@@ -3741,6 +3710,29 @@ def _run_mark_ingestion_failed(
     transition_state_frame_count: int | None = None,
 ) -> None:
     _mark_ingestion_failed(
+        cast(Session, session),
+        ingestion_id=ingestion_id,
+        error=error,
+        error_code=error_code,
+        completed_at=completed_at,
+        ingestion=ingestion,
+        source_frame_count=source_frame_count,
+        transition_state_frame_count=transition_state_frame_count,
+    )
+
+
+def _run_mark_ingestion_filtered(
+    session: SQLAlchemySession,
+    *,
+    ingestion_id: UUID,
+    error: Exception,
+    error_code: str,
+    completed_at: datetime,
+    ingestion: ArtifactIngestion | None = None,
+    source_frame_count: int = 0,
+    transition_state_frame_count: int = 0,
+) -> None:
+    _mark_ingestion_filtered(
         cast(Session, session),
         ingestion_id=ingestion_id,
         error=error,
@@ -4251,7 +4243,7 @@ class ArtifactUploadService:
                 )
 
         if parsed.source_frame_count == 0:
-            return await _reject_artifact_without_calculation_frames(
+            return await _filter_artifact_without_calculation_frames(
                 ingestion_id=ingestion_id,
             )
 
@@ -4359,7 +4351,7 @@ class ArtifactUploadService:
             raise ArtifactUploadError(str(error) or type(error).__name__) from error
 
         if parsed.source_frame_count == 0 and not had_parse_revision:
-            return await _reject_artifact_without_calculation_frames(
+            return await _filter_artifact_without_calculation_frames(
                 ingestion_id=ingestion_id,
             )
 
@@ -4655,6 +4647,8 @@ class ArtifactUploadService:
         on_file_parsed: Callable[[int, bool], Awaitable[None]] | None = None,
         on_file_committed: Callable[[int, ArtifactBatchUploadItem], Awaitable[None]] | None = None,
         streaming: bool = False,
+        persistence_batch_files: int = PERSISTENCE_PRELOAD_BATCH_SIZE,
+        enforce_batch_file_limit: bool = True,
     ) -> ArtifactBatchUploadResult:
         """Prepare once, then advance files through an asynchronous pipeline.
 
@@ -4666,6 +4660,8 @@ class ArtifactUploadService:
         request.
         """
 
+        if persistence_batch_files < 1:
+            raise ValueError("persistence_batch_files must be positive")
         timings: dict[str, float] = {}
         started = perf_counter()
         if streaming and any(file.payload is not None for file in files):
@@ -4677,6 +4673,7 @@ class ArtifactUploadService:
         # aggregate source size crosses the HTTP request budget.
         source_inspections = _require_batch_upload_budget(
             files,
+            enforce_batch_files=enforce_batch_file_limit,
             enforce_batch_bytes=not streaming,
         )
         timings["validate_budget_ms"] = (perf_counter() - started) * 1000
@@ -4875,7 +4872,7 @@ class ArtifactUploadService:
 
         pipeline_result_queue: asyncio.Queue[
             tuple[int, Exception | None, _ParsedArtifact | Exception | None]
-        ] = asyncio.Queue(maxsize=PERSISTENCE_PRELOAD_BATCH_SIZE)
+        ] = asyncio.Queue(maxsize=persistence_batch_files)
 
         async def enqueue_pipeline_result(
             index: int,
@@ -5103,7 +5100,11 @@ class ArtifactUploadService:
                     persist_write_started = perf_counter()
                     await session.run_sync(
                         partial(
-                            _run_mark_ingestion_failed,
+                            (
+                                _run_mark_ingestion_filtered
+                                if original_index in no_frame_indices
+                                else _run_mark_ingestion_failed
+                            ),
                             ingestion_id=_require_prepared_ingestion_id(reservation),
                             error=parse_error,
                             error_code=(
@@ -5188,28 +5189,6 @@ class ArtifactUploadService:
                         + (perf_counter() - inference_started) * 1000
                     )
 
-                window_no_frame_ids = {
-                    prepared[index].artifact_id
-                    for index in completed_indices
-                    if index in no_frame_indices
-                }
-                retired_no_frame_objects: dict[UUID, _RetiredArtifactObject] = {}
-                if window_no_frame_ids:
-                    retire_started = perf_counter()
-                    retired_no_frame_objects = await session.run_sync(
-                        cast(
-                            Any,
-                            partial(
-                                _retire_artifacts_without_calculation_frames,
-                                artifact_ids=window_no_frame_ids,
-                            ),
-                        )
-                    )
-                    timings["persist_retire_no_frame_ms"] = (
-                        timings.get("persist_retire_no_frame_ms", 0.0)
-                        + (perf_counter() - retire_started) * 1000
-                    )
-
                 window_parse_indices = [
                     index for index in completed_indices if index in local_index_by_original
                 ]
@@ -5257,10 +5236,11 @@ class ArtifactUploadService:
                         )
                         item_by_index[original_index] = ArtifactBatchUploadItem(
                             filename=files[original_index].filename,
-                            succeeded=(
-                                parse_error is None
-                                and result.ingestion_status is not ArtifactIngestionStatus.FAILED
-                            ),
+                            succeeded=result.ingestion_status
+                            not in {
+                                ArtifactIngestionStatus.FAILED,
+                                ArtifactIngestionStatus.FILTERED,
+                            },
                             result=result,
                             error_code=error_code,
                             error_message=(
@@ -5306,7 +5286,6 @@ class ArtifactUploadService:
                             ),
                         )
 
-                await _delete_retired_artifact_objects(retired_no_frame_objects)
                 commit_started = perf_counter()
                 await session.commit()
                 timings["persist_commit_db_ms"] = (
@@ -5374,7 +5353,7 @@ class ArtifactUploadService:
                     local_index = local_index_by_original.get(index)
                 if storage_error is None and local_index is not None:
                     await persist_completed_file(local_index, parsed)
-                if len(pending_completed_indices) >= PERSISTENCE_PRELOAD_BATCH_SIZE:
+                if len(pending_completed_indices) >= persistence_batch_files:
                     completed = pending_completed_indices.copy()
                     pending_completed_indices.clear()
                     parsed_batch = pending_preload.copy()
@@ -5518,7 +5497,10 @@ class ArtifactUploadService:
                 )
                 if not isinstance(prepared, ArtifactUploadResult):
                     raise RuntimeError("prepare-hook adapters must return ArtifactUploadResult")
-                succeeded = prepared.ingestion_status is not ArtifactIngestionStatus.FAILED
+                succeeded = prepared.ingestion_status not in {
+                    ArtifactIngestionStatus.FAILED,
+                    ArtifactIngestionStatus.FILTERED,
+                }
                 items.append(
                     ArtifactBatchUploadItem(
                         filename=file.filename,

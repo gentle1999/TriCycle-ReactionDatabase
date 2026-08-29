@@ -82,6 +82,9 @@ def _record(
         "source": "molop",
         "source_field": source_field,
         "source_unit": source_unit,
+        # Keep the normalized unit alongside the column for clients consuming
+        # provenance without hydrating the ScientificArray row itself.
+        "unit": unit,
     }
     if metadata:
         array_metadata.update(metadata)
@@ -363,6 +366,15 @@ def _scientific_array_export_from_molop_frame(
     populations = frame_payload["charge_spin_populations"]
     if populations is not None:
         for series_key, series in populations["populations"].items():
+            population_metadata = {
+                # ``series_key`` is MolOP's stable, human-meaningful name
+                # (for example ``mulliken_charges``), not an ordinal generated here.
+                "population_name": series_key,
+                "population_scheme": series.get("scheme"),
+                "population_quantity": series.get("quantity"),
+                "population_spin_channel": series.get("spin_channel"),
+                "population_source_label": series.get("source_label"),
+            }
             append_owned(
                 kind=ScientificArrayKind.ATOMIC_POPULATION,
                 unit="dimensionless",
@@ -372,6 +384,7 @@ def _scientific_array_export_from_molop_frame(
                 owner_kind=ScientificArrayOwnerKind.ATOMIC_POPULATION_SERIES,
                 owner_key=series_key,
                 slot="values",
+                metadata=population_metadata,
             )
 
     polarizability = frame_payload["polarizability"]

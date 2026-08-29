@@ -1401,6 +1401,7 @@ async def test_depiction_authorization_matrix_covers_all_roles_and_formats(
         f"/api/depictions/calculation-frame/{ts_frame_id}/transition-state/negative.sdf",
         f"/api/depictions/calculation-frame/{ts_frame_id}/transition-state/center.sdf",
         f"/api/depictions/calculation-frame/{ts_frame_id}/transition-state/positive.sdf",
+        f"/api/depictions/calculation-frame/{ts_frame_id}/transition-state.svg",
     ]
     denied_urls = [
         f"/api/depictions/geometry/{sample.private_geometry_id}.svg",

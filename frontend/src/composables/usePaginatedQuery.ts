@@ -13,6 +13,7 @@ interface PaginatedQueryOptions<T> {
   queryKeyForOffset: (offset: number) => QueryKey;
   staleTime: number;
   prefetchRadius?: number;
+  refetchInterval?: number | false;
 }
 
 /** Keep the active page visible and warm a bounded window on either side. */
@@ -23,6 +24,7 @@ export function usePaginatedQuery<T>(options: PaginatedQueryOptions<T>) {
     queryFn: ({ signal }) => options.fetchPage(options.offset.value, signal),
     enabled: options.enabled,
     staleTime: options.staleTime,
+    refetchInterval: options.refetchInterval,
     placeholderData: keepPreviousData,
   });
 

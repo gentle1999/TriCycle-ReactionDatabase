@@ -53,6 +53,7 @@ from tricycle_reaction_db.application.services import (
 from tricycle_reaction_db.db.models import MolecularFormula, MolecularTopology
 from tricycle_reaction_db.db.session import session_factory
 from tricycle_reaction_db.domain.enums import (
+    ArtifactIngestionStatus,
     ArtifactKind,
     FrameRole,
     MappedReactionKind,
@@ -195,6 +196,7 @@ async def list_artifacts(
     project_id: UUID | None = None,
     content_sha256: str | None = None,
     storage_status: StorageStatus | None = None,
+    ingestion_status: ArtifactIngestionStatus | None = None,
     original_filename_contains: str | None = None,
     limit: CoreLimit = 50,
     offset: CoreOffset = 0,
@@ -211,6 +213,7 @@ async def list_artifacts(
                 project_id=project_id,
                 content_sha256=content_sha256,
                 storage_status=storage_status,
+                ingestion_status=ingestion_status,
                 original_filename_contains=original_filename_contains,
                 limit=limit,
                 offset=offset,
@@ -580,6 +583,7 @@ async def download_scientific_array(
             "Cache-Control": "private, no-store",
             "Content-Disposition": f'attachment; filename="{download.filename}"',
             "X-Payload-SHA256": download.payload_sha256,
+            "X-Array-Unit": download.unit,
             "X-Array-Dtype": download.dtype,
             "X-Array-Shape": ",".join(str(size) for size in download.shape),
         },

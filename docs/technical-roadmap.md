@@ -1,5 +1,7 @@
 # 技术方案与实施路线图
 
+> English edition: [Technical roadmap](en/technical-roadmap.md). This is a dated architecture and planning record.
+
 > 状态：已接受  
 > 生效日期：2026-07-12  
 > 当前阶段：M1-M3 已完成 / M6 只读查询原型实现 / M4-M5 待继续  

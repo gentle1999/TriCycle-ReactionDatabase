@@ -35,6 +35,7 @@ def test_nexusx_registers_complete_read_query_surface() -> None:
         "/api/depictions/geometry/{geometry_id}.sdf",
         "/api/depictions/geometry/{geometry_id}.xyz",
         "/api/depictions/geometry/{geometry_id}.svg",
+        "/api/depictions/calculation-frame/{frame_id}/transition-state.svg",
         "/api/depictions/topology/{topology_id}.svg",
         "/api/depictions/topology/{topology_id}.mol",
         "/api/mapped-reactions/{mapped_reaction_id}/thermodynamics",

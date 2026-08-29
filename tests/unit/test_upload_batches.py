@@ -13,6 +13,7 @@ from tricycle_reaction_db.application.dtos import (
 )
 from tricycle_reaction_db.application.services.upload_batches import UploadBatchService
 from tricycle_reaction_db.domain.enums import (
+    ArtifactIngestionStatus,
     ArtifactKind,
     UploadBatchItemStatus,
     UploadBatchStatus,
@@ -54,6 +55,7 @@ def _item_view(
     artifact_id: UUID = ARTIFACT_ID,
     filename: str = "notes.txt",
     position: int = 0,
+    ingestion_status: ArtifactIngestionStatus | None = ArtifactIngestionStatus.PENDING,
 ) -> UploadBatchItemView:
     return UploadBatchItemView(
         id=ITEM_ID,
@@ -68,6 +70,7 @@ def _item_view(
         status=UploadBatchItemStatus.SUCCEEDED,
         attempt_count=1,
         artifact_file_id=artifact_id,
+        ingestion_status=ingestion_status,
         metadata={"campaign": "screen-42"},
     )
 
@@ -185,6 +188,7 @@ async def test_upload_batch_file_uses_client_file_id_as_idempotency_binding(
     assert response.status_code == 200
     assert response.json()["status"] == "succeeded"
     assert response.json()["artifact_file_id"] == str(ARTIFACT_ID)
+    assert response.json()["ingestion_status"] == "pending"
     assert response.json()["metadata"] == {"campaign": "screen-42"}
 
 

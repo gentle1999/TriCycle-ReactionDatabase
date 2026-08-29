@@ -61,16 +61,6 @@ def upgrade() -> None:
         LANGUAGE plpgsql
         AS $$
         BEGIN
-            IF NOT EXISTS (
-                SELECT 1
-                FROM old_frames
-                JOIN new_frames USING (id)
-                WHERE old_frames.parse_revision_id IS DISTINCT FROM new_frames.parse_revision_id
-                   OR old_frames.geometry_id IS DISTINCT FROM new_frames.geometry_id
-            ) THEN
-                RETURN NULL;
-            END IF;
-
             WITH decrements AS (
                 SELECT
                     artifact_file.project_id,

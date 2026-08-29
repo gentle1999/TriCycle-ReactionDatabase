@@ -9,6 +9,7 @@ from tricycle_reaction_db.application.services.depictions import (
     draw_geometry_xyz,
     draw_molecule_molfile,
     draw_molecule_svg,
+    draw_transition_state_mode_dof_svg,
 )
 
 
@@ -121,6 +122,32 @@ def test_geometry_dof_svg_uses_stored_depth_without_mutating_molecule() -> None:
     assert "<svg" in svg
     assert "opacity" in svg
     assert molecule.GetConformer().GetPositions() == pytest.approx(expected_positions)
+
+
+def test_transition_state_mode_dof_svg_uses_native_smil_animation() -> None:
+    frames: list[Chem.Mol] = []
+    for displacement in (-0.2, 0.0, 0.2):
+        molecule = Chem.AddHs(Chem.MolFromSmiles("CO"))
+        conformer = Chem.Conformer(molecule.GetNumAtoms())
+        conformer.Set3D(True)
+        for atom_index in range(molecule.GetNumAtoms()):
+            conformer.SetAtomPosition(
+                atom_index,
+                (
+                    float(atom_index) + displacement,
+                    float(atom_index % 2),
+                    float(atom_index) / 3.0,
+                ),
+            )
+        molecule.AddConformer(conformer)
+        frames.append(molecule)
+
+    svg = draw_transition_state_mode_dof_svg(frames, width=320, height=210)
+
+    assert "<svg" in svg
+    assert "<animate " in svg
+    assert 'repeatCount="indefinite"' in svg
+    assert 'dur="0.42s"' in svg
 
 
 @pytest.mark.asyncio

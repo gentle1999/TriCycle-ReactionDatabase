@@ -541,6 +541,12 @@ class CalculationFrame(SQLModel, table=True):
             "parse_revision_id",
             postgresql_include=("id", "geometry_id"),
         ),
+        Index(
+            "ix_calculation_frame_geometry_revision",
+            "geometry_id",
+            "parse_revision_id",
+            postgresql_include=("id", "frequency_count", "negative_frequency_count"),
+        ),
     )
     __mapper_args__ = {
         "properties": {
@@ -772,16 +778,68 @@ class CalculationFrame(SQLModel, table=True):
 
 
 class ProjectGeometryCatalog(SQLModel, table=True):
-    """Visible geometry membership and frame cardinality for one project."""
+    """Project-visible geometry membership and list-query summary fields."""
 
     __tablename__ = "project_geometry_catalog"  # pyright: ignore[reportAssignmentType]
     __table_args__ = (
         CheckConstraint("frame_count > 0", name="ck_project_geometry_catalog_frame_count"),
+        Index(
+            "ix_project_geometry_catalog_frame_count_asc",
+            "project_id",
+            "frame_count",
+            "geometry_id",
+        ),
+        Index(
+            "ix_project_geometry_catalog_frame_count_desc",
+            "project_id",
+            text("frame_count DESC NULLS LAST"),
+            text("geometry_id ASC"),
+        ),
+        Index(
+            "ix_project_geometry_catalog_thermo_frame_count_asc",
+            "project_id",
+            "frame_count",
+            "geometry_id",
+            postgresql_where=text("has_thermodynamic_property"),
+        ),
+        Index(
+            "ix_project_geometry_catalog_thermo_frame_count_desc",
+            "project_id",
+            text("frame_count DESC NULLS LAST"),
+            text("geometry_id ASC"),
+            postgresql_where=text("has_thermodynamic_property"),
+        ),
     )
 
     project_id: UUID = Field(primary_key=True, nullable=False)
     geometry_id: UUID = Field(primary_key=True, nullable=False)
     frame_count: int = Field(sa_type=BigInteger, nullable=False)
+    geometry_created_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(
+            DateTime(timezone=True),
+            nullable=False,
+            server_default=text("now()"),
+        ),
+    )
+    has_frequency_data: bool = Field(default=False, nullable=False)
+    has_imaginary_frequency: bool = Field(default=False, nullable=False)
+    has_thermodynamic_property: bool = Field(default=False, nullable=False)
+
+
+class ProjectGeometryCatalogCount(SQLModel, table=True):
+    """Exact Geometry catalogue cardinality maintained per project."""
+
+    __tablename__ = "project_geometry_catalog_count"  # pyright: ignore[reportAssignmentType]
+    __table_args__ = (
+        CheckConstraint(
+            "geometry_count >= 0",
+            name="ck_project_geometry_catalog_count_nonnegative",
+        ),
+    )
+
+    project_id: UUID = Field(primary_key=True, nullable=False)
+    geometry_count: int = Field(sa_type=BigInteger, nullable=False)
 
 
 _scientific_array_data_column: Column[npt.NDArray[np.generic]] = Column(

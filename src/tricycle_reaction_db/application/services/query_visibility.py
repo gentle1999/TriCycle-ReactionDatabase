@@ -229,19 +229,31 @@ def topology_id_is_visible(scope: QueryVisibilityScope, topology_id: Any) -> Any
     )
 
 
-def _mapped_reaction_ids_with_calculations(geometry_ids: Any) -> Any:
-    return (
-        select(col(MappedReactionNode.mapped_reaction_id))
-        .join(
-            MappedReactionNodeGeometry,
-            col(MappedReactionNodeGeometry.mapped_reaction_node_id) == col(MappedReactionNode.id),
-        )
-        .where(
-            col(MappedReactionNodeGeometry.geometry_id).in_(geometry_ids),
-            geometry_has_thermodynamic_property_predicate(
-                col(MappedReactionNodeGeometry.geometry_id)
+def _mapped_reaction_ids_with_calculations(
+    scope: QueryVisibilityScope,
+    geometry_ids: Any,
+) -> Any:
+    # A permitted project has a materialized geometry directory. Joining that
+    # directory is both the visibility check and the project restriction; an
+    # additional ``geometry_id IN (SELECT catalog ...)`` repeats the same
+    # million-row catalogue scan in every reaction query.
+    statement = select(col(MappedReactionNode.mapped_reaction_id)).join(
+        MappedReactionNodeGeometry,
+        col(MappedReactionNodeGeometry.mapped_reaction_node_id) == col(MappedReactionNode.id),
+    )
+    if scope.uses_project_geometry_catalog:
+        return statement.join(
+            ProjectGeometryCatalog,
+            and_(
+                col(ProjectGeometryCatalog.project_id) == scope.requested_project_id,
+                col(ProjectGeometryCatalog.geometry_id)
+                == col(MappedReactionNodeGeometry.geometry_id),
+                col(ProjectGeometryCatalog.has_thermodynamic_property),
             ),
         )
+    return statement.where(
+        col(MappedReactionNodeGeometry.geometry_id).in_(geometry_ids),
+        geometry_has_thermodynamic_property_predicate(col(MappedReactionNodeGeometry.geometry_id)),
     )
 
 
@@ -280,16 +292,68 @@ def _mapped_reaction_id_has_visible_source(
     mapped_reaction_id: Any,
 ) -> Any:
     return or_(
-        mapped_reaction_id.in_(_mapped_reaction_ids_with_calculations(visible_geometry_ids(scope))),
+        mapped_reaction_id.in_(
+            _mapped_reaction_ids_with_calculations(scope, visible_geometry_ids(scope))
+        ),
         mapped_reaction_id.in_(
             _mapped_reaction_ids_with_inferences(visible_parse_revision_ids(scope))
         ),
     )
 
 
+def _mapped_reaction_id_has_project_source(
+    scope: QueryVisibilityScope,
+    mapped_reaction_id: Any,
+) -> Any:
+    """Correlated source check for a permitted project.
+
+    Keep the mapping ID correlated all the way through the source tables.  An
+    uncorrelated ``id IN (SELECT ...)`` allows PostgreSQL to materialize all
+    project mappings and then compare them against every ordered reaction.
+    """
+
+    calculation_source = (
+        select(1)
+        .select_from(MappedReactionNode)
+        .join(
+            MappedReactionNodeGeometry,
+            col(MappedReactionNodeGeometry.mapped_reaction_node_id) == col(MappedReactionNode.id),
+        )
+        .join(
+            ProjectGeometryCatalog,
+            and_(
+                col(ProjectGeometryCatalog.project_id) == scope.requested_project_id,
+                col(ProjectGeometryCatalog.geometry_id)
+                == col(MappedReactionNodeGeometry.geometry_id),
+                col(ProjectGeometryCatalog.has_thermodynamic_property),
+            ),
+        )
+        .where(col(MappedReactionNode.mapped_reaction_id) == mapped_reaction_id)
+        .exists()
+    )
+    inference_source = (
+        select(1)
+        .select_from(TransitionStateInference)
+        .join(
+            ParseRevision,
+            col(ParseRevision.id) == col(TransitionStateInference.parse_revision_id),
+        )
+        .join(ArtifactFile, col(ArtifactFile.id) == col(ParseRevision.artifact_file_id))
+        .where(
+            col(TransitionStateInference.mapped_reaction_id) == mapped_reaction_id,
+            col(ArtifactFile.project_id) == scope.requested_project_id,
+            col(ArtifactFile.storage_status) != StorageStatus.RETIRED,
+        )
+        .exists()
+    )
+    return or_(calculation_source, inference_source)
+
+
 def mapped_reaction_id_is_visible(scope: QueryVisibilityScope, mapped_reaction_id: Any) -> Any:
     if scope.unrestricted:
         return true()
+    if scope.uses_project_geometry_catalog:
+        return _mapped_reaction_id_has_project_source(scope, mapped_reaction_id)
     visible_source = _mapped_reaction_id_has_visible_source(scope, mapped_reaction_id)
     if not scope.is_authenticated:
         return visible_source
@@ -301,10 +365,19 @@ def mapped_reaction_id_is_visible(scope: QueryVisibilityScope, mapped_reaction_i
 def logical_reaction_id_is_visible(scope: QueryVisibilityScope, logical_reaction_id: Any) -> Any:
     if scope.unrestricted:
         return true()
-    return logical_reaction_id.in_(
-        select(col(MappedReaction.logical_reaction_id)).where(
-            mapped_reaction_id_is_visible(scope, col(MappedReaction.id))
+    mapped_reaction = aliased(MappedReaction)
+    # Correlating on the indexed logical_reaction_id lets PostgreSQL stop at
+    # the first visible mapping.  The previous ``IN (SELECT ...)`` shape was
+    # planned as a nested semi-join against every reaction when an ORDER BY
+    # used the reaction_class index.
+    return (
+        select(1)
+        .select_from(mapped_reaction)
+        .where(
+            col(mapped_reaction.logical_reaction_id) == logical_reaction_id,
+            mapped_reaction_id_is_visible(scope, col(mapped_reaction.id)),
         )
+        .exists()
     )
 
 

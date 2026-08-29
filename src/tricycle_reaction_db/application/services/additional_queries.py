@@ -10,8 +10,9 @@ from molalchemy.rdkit.functions import mol_from_smiles
 from molalchemy.types import CString
 from nexusx import UseCaseService, query  # type: ignore[import-untyped]
 from rdkit import Chem
-from sqlalchemy import Text, and_, desc, func, not_, or_, select
+from sqlalchemy import Text, and_, desc, func, not_, or_, select, true
 from sqlalchemy import cast as sql_cast
+from sqlalchemy.orm import defer
 from sqlmodel import col
 
 from tricycle_reaction_db.application.dtos import (
@@ -58,6 +59,7 @@ from tricycle_reaction_db.application.services.queries import (
     PageLimit,
     PageOffset,
     _array_assignment_owner,
+    _array_population_name,
     _enum_value,
     _frame_select,
     _frame_summary,
@@ -99,13 +101,14 @@ from tricycle_reaction_db.db.models import (
     MolecularTopologyDerivation,
     ParseRevision,
     ProjectGeometryCatalog,
+    ProjectGeometryCatalogCount,
     ScientificArray,
     ScientificArrayAssignment,
     ThermochemistryResult,
     TransitionStateInference,
 )
 from tricycle_reaction_db.db.session import session_factory
-from tricycle_reaction_db.domain.enums import ArtifactIngestionStatus
+from tricycle_reaction_db.domain.enums import ArtifactIngestionStatus, MappedReactionNodeRole
 from tricycle_reaction_db.domain.precision import round_energy_hartree
 
 # NexusX's schema builder accepts constrained scalar aliases, but not a Pydantic
@@ -175,6 +178,7 @@ def _geometry_summary(
     topology: MolecularTopology,
     calculation_count: int,
     reaction_binding_count: int,
+    is_transition_state: bool,
     has_frequency_data: bool,
     has_imaginary_frequency: bool,
 ) -> GeometrySummary:
@@ -193,6 +197,7 @@ def _geometry_summary(
         multiplicity=geometry.multiplicity,
         calculation_count=calculation_count,
         reaction_binding_count=reaction_binding_count,
+        is_transition_state=is_transition_state,
         imaginary_frequency_status=imaginary_frequency_status,
     )
 
@@ -216,6 +221,24 @@ def _geometry_has_imaginary_frequency_predicate(scope: Any, geometry_id: Any) ->
             col(CalculationFrame.geometry_id) == geometry_id,
             calculation_frame_is_visible(scope, col(CalculationFrame.parse_revision_id)),
             col(CalculationFrame.negative_frequency_count) > 0,
+        )
+        .exists()
+    )
+
+
+def _geometry_is_transition_state_predicate(scope: Any, geometry_id: Any) -> Any:
+    """Identify mapped transition-state geometries independently of frequency data."""
+
+    return (
+        select(col(MappedReactionNodeGeometry.id))
+        .join(
+            MappedReactionNode,
+            col(MappedReactionNodeGeometry.mapped_reaction_node_id) == col(MappedReactionNode.id),
+        )
+        .where(
+            col(MappedReactionNodeGeometry.geometry_id) == geometry_id,
+            col(MappedReactionNode.role) == MappedReactionNodeRole.TRANSITION_STATE,
+            mapped_reaction_id_is_visible(scope, col(MappedReactionNode.mapped_reaction_id)),
         )
         .exists()
     )
@@ -478,6 +501,13 @@ def _array_summary(
         owner_id=owner_id,
         slot=assignment.slot if assignment is not None else None,
         slot_ordinal=assignment.slot_ordinal if assignment is not None else None,
+        source_field=(array.array_metadata or {}).get("source_field"),
+        source_unit=(array.array_metadata or {}).get("source_unit") or array.unit,
+        population_name=_array_population_name(array),
+        population_scheme=(array.array_metadata or {}).get("population_scheme"),
+        population_quantity=(array.array_metadata or {}).get("population_quantity"),
+        population_spin_channel=(array.array_metadata or {}).get("population_spin_channel"),
+        population_source_label=(array.array_metadata or {}).get("population_source_label"),
     )
 
 
@@ -672,13 +702,21 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
         if sort_by == "calculation_count" and not scope.uses_project_geometry_catalog:
             raise ValueError("calculation_count sorting requires an authorized project scope")
         visibility_criterion = geometry_id_is_visible(scope, col(Geometry.id))
+        uses_catalog_summary = scope.uses_project_geometry_catalog
+        listing_visibility_criterion = true() if uses_catalog_summary else visibility_criterion
         predicates: list[Any] = []
         topology_predicates: list[Any] = []
-        has_frequency_data = _geometry_has_frequency_data_predicate(scope, col(Geometry.id))
-        has_imaginary_frequency = _geometry_has_imaginary_frequency_predicate(
-            scope,
-            col(Geometry.id),
-        )
+        requires_geometry_count_join = False
+        requires_topology_count_join = False
+        if uses_catalog_summary:
+            has_frequency_data = col(ProjectGeometryCatalog.has_frequency_data)
+            has_imaginary_frequency = col(ProjectGeometryCatalog.has_imaginary_frequency)
+        else:
+            has_frequency_data = _geometry_has_frequency_data_predicate(scope, col(Geometry.id))
+            has_imaginary_frequency = _geometry_has_imaginary_frequency_predicate(
+                scope,
+                col(Geometry.id),
+            )
         if filter_expression is not None:
             if len(filter_expression) > get_settings().structure_query_max_characters:
                 raise ValueError("filter_expression exceeds the configured character budget")
@@ -687,6 +725,11 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
             except json.JSONDecodeError as error:
                 raise ValueError("filter_expression must contain valid JSON") from error
             predicates.append(_geometry_query_expression_predicate(expression, scope))
+            requires_geometry_count_join = True
+            # A composable expression can refer to MolecularTopology fields;
+            # retain the join for its count query even when the expression is
+            # otherwise represented as a single SQL predicate.
+            requires_topology_count_join = True
         for field, value in (
             (Geometry.topology_id, topology_id),
             (Geometry.geometry_hash, geometry_hash),
@@ -695,6 +738,7 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
         ):
             if value is not None:
                 predicates.append(col(field) == value)
+                requires_geometry_count_join = True
         if topology_derivation_id is not None:
             predicates.append(
                 select(col(CalculationFrame.id))
@@ -705,6 +749,7 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                 )
                 .exists()
             )
+            requires_geometry_count_join = True
         if reaction_node_role is not None:
             predicates.append(
                 select(col(MappedReactionNodeGeometry.id))
@@ -726,8 +771,14 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                 )
                 .exists()
             )
+            requires_geometry_count_join = True
         if thermodynamic_only:
-            predicates.append(geometry_has_thermodynamic_property_predicate(col(Geometry.id)))
+            predicates.append(
+                col(ProjectGeometryCatalog.has_thermodynamic_property)
+                if uses_catalog_summary
+                else geometry_has_thermodynamic_property_predicate(col(Geometry.id))
+            )
+            requires_geometry_count_join = requires_geometry_count_join or not uses_catalog_summary
         if imaginary_frequency_status == "present":
             predicates.append(has_imaginary_frequency)
         elif imaginary_frequency_status == "absent":
@@ -768,16 +819,32 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
             maximum_name="maximum_atom_count",
         )
         if minimum_atom_count is not None or maximum_atom_count is not None:
+            requires_geometry_count_join = True
             if minimum_atom_count is not None:
                 topology_predicates.append(col(MolecularTopology.atom_count) >= minimum_atom_count)
             if maximum_atom_count is not None:
                 topology_predicates.append(col(MolecularTopology.atom_count) <= maximum_atom_count)
-        if scope.uses_project_geometry_catalog and not predicates and not topology_predicates:
+        if uses_catalog_summary and not predicates and not topology_predicates:
+            count_statement = select(ProjectGeometryCatalogCount.geometry_count).where(
+                col(ProjectGeometryCatalogCount.project_id) == scope.requested_project_id
+            )
+        elif uses_catalog_summary:
             count_statement = (
                 select(func.count())
                 .select_from(ProjectGeometryCatalog)
                 .where(col(ProjectGeometryCatalog.project_id) == scope.requested_project_id)
             )
+            if requires_geometry_count_join or topology_predicates:
+                count_statement = count_statement.join(
+                    Geometry,
+                    col(ProjectGeometryCatalog.geometry_id) == col(Geometry.id),
+                )
+            if requires_topology_count_join or topology_predicates:
+                count_statement = count_statement.join(
+                    MolecularTopology,
+                    col(Geometry.topology_id) == col(MolecularTopology.id),
+                )
+            count_statement = count_statement.where(*predicates, *topology_predicates)
         elif not scope.unrestricted and not predicates and not topology_predicates:
             # Visibility for a Geometry is defined by at least one visible frame.
             # Counting those distinct geometry IDs avoids a second full Geometry scan.
@@ -785,11 +852,19 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                 calculation_frame_is_visible(scope, col(CalculationFrame.parse_revision_id))
             )
         else:
-            count_statement = (
-                select(func.count())
-                .select_from(Geometry)
-                .join(MolecularTopology, col(Geometry.topology_id) == col(MolecularTopology.id))
-                .where(visibility_criterion, *predicates, *topology_predicates)
+            # The topology join is only needed for structure/atom filters. For
+            # ordinary geometry filters, counting directly from Geometry keeps
+            # this request index-only and avoids touching the large mol column.
+            count_statement = select(func.count()).select_from(Geometry)
+            if requires_topology_count_join or topology_predicates:
+                count_statement = count_statement.join(
+                    MolecularTopology,
+                    col(Geometry.topology_id) == col(MolecularTopology.id),
+                )
+            count_statement = count_statement.where(
+                visibility_criterion,
+                *predicates,
+                *topology_predicates,
             )
         calculation_count = (
             select(func.count())
@@ -804,38 +879,26 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
             .scalar_subquery()
             .label("calculation_count")
         )
-        if scope.uses_project_geometry_catalog:
+        if uses_catalog_summary:
             calculation_count = col(ProjectGeometryCatalog.frame_count).label("calculation_count")
-        reaction_binding_count = (
-            select(func.count())
-            .select_from(MappedReactionNodeGeometry)
-            .join(
-                MappedReactionNode,
-                col(MappedReactionNodeGeometry.mapped_reaction_node_id)
-                == col(MappedReactionNode.id),
+        base_statement = (
+            select(
+                Geometry,
+                MolecularTopology,
+                calculation_count,
+                has_frequency_data.label("has_frequency_data"),
+                has_imaginary_frequency.label("has_imaginary_frequency"),
             )
-            .where(
-                col(MappedReactionNodeGeometry.geometry_id) == col(Geometry.id),
-                mapped_reaction_id_is_visible(
-                    scope,
-                    col(MappedReactionNode.mapped_reaction_id),
-                ),
-                geometry_has_thermodynamic_property_predicate(
-                    col(MappedReactionNodeGeometry.geometry_id)
-                ),
+            .options(
+                defer(Geometry.mol),
+                defer(Geometry.internal_coordinate_distances_angstrom),
+                defer(Geometry.internal_coordinate_angles_degrees),
+                defer(Geometry.internal_coordinate_dihedrals_degrees),
+                defer(MolecularTopology.mol),
             )
-            .scalar_subquery()
-            .label("reaction_binding_count")
+            .join(MolecularTopology, col(Geometry.topology_id) == col(MolecularTopology.id))
         )
-        base_statement = select(
-            Geometry,
-            MolecularTopology,
-            calculation_count,
-            reaction_binding_count,
-            has_frequency_data.label("has_frequency_data"),
-            has_imaginary_frequency.label("has_imaginary_frequency"),
-        ).join(MolecularTopology, col(Geometry.topology_id) == col(MolecularTopology.id))
-        if scope.uses_project_geometry_catalog:
+        if uses_catalog_summary:
             base_statement = base_statement.join(
                 ProjectGeometryCatalog,
                 and_(
@@ -844,11 +907,15 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                 ),
             )
         filtered_statement = base_statement.where(
-            visibility_criterion,
+            listing_visibility_criterion,
             *predicates,
             *topology_predicates,
         )
-        catalogue_order_by = (col(Geometry.created_at), col(Geometry.id))
+        catalogue_order_by = (
+            (col(ProjectGeometryCatalog.geometry_created_at), col(Geometry.id))
+            if uses_catalog_summary
+            else (col(Geometry.created_at), col(Geometry.id))
+        )
         fast_catalogue_page = (
             sort_by == "default"
             and not scope.unrestricted
@@ -856,8 +923,69 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
             and not topology_predicates
         )
         async with session_factory() as session:
-            total = int((await session.execute(count_statement)).scalar_one())
-            if fast_catalogue_page:
+            total_value = (await session.execute(count_statement)).scalar_one_or_none()
+            total = int(total_value or 0)
+            if fast_catalogue_page and uses_catalog_summary:
+                # Page the narrow catalogue index first. Joining Geometry before
+                # applying OFFSET makes PostgreSQL sort/scan the multi-GB table
+                # for deep pages.
+                thermodynamic_catalog = (
+                    select(col(ProjectGeometryCatalog.geometry_id))
+                    .where(
+                        col(ProjectGeometryCatalog.project_id) == scope.requested_project_id,
+                        col(ProjectGeometryCatalog.has_thermodynamic_property),
+                    )
+                    .order_by(
+                        col(ProjectGeometryCatalog.geometry_created_at),
+                        col(ProjectGeometryCatalog.geometry_id),
+                    )
+                )
+                non_thermodynamic_catalog = (
+                    select(col(ProjectGeometryCatalog.geometry_id))
+                    .where(
+                        col(ProjectGeometryCatalog.project_id) == scope.requested_project_id,
+                        ~col(ProjectGeometryCatalog.has_thermodynamic_property),
+                    )
+                    .order_by(
+                        col(ProjectGeometryCatalog.geometry_created_at),
+                        col(ProjectGeometryCatalog.geometry_id),
+                    )
+                )
+                thermodynamic_total = int(
+                    (
+                        await session.execute(
+                            select(func.count())
+                            .select_from(ProjectGeometryCatalog)
+                            .where(
+                                col(ProjectGeometryCatalog.project_id)
+                                == scope.requested_project_id,
+                                col(ProjectGeometryCatalog.has_thermodynamic_property),
+                            )
+                        )
+                    ).scalar_one()
+                )
+                if offset < thermodynamic_total:
+                    page_ids = thermodynamic_catalog.offset(offset).limit(limit)
+                    thermodynamic_statement = filtered_statement.where(
+                        col(Geometry.id).in_(page_ids)
+                    ).order_by(*catalogue_order_by)
+                    rows = (await session.execute(thermodynamic_statement)).all()
+                    remaining = limit - len(rows)
+                    if remaining:
+                        page_ids = non_thermodynamic_catalog.limit(remaining)
+                        non_thermodynamic_statement = filtered_statement.where(
+                            col(Geometry.id).in_(page_ids)
+                        ).order_by(*catalogue_order_by)
+                        rows.extend((await session.execute(non_thermodynamic_statement)).all())
+                else:
+                    page_ids = non_thermodynamic_catalog.offset(offset - thermodynamic_total).limit(
+                        limit
+                    )
+                    non_thermodynamic_statement = filtered_statement.where(
+                        col(Geometry.id).in_(page_ids)
+                    ).order_by(*catalogue_order_by)
+                    rows = (await session.execute(non_thermodynamic_statement)).all()
+            elif fast_catalogue_page:
                 thermodynamic_geometry_ids = geometry_ids_with_thermodynamic_property(
                     calculation_frame_is_visible(scope, col(CalculationFrame.parse_revision_id))
                 ).distinct()
@@ -895,11 +1023,60 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                             )
                         )
                     ).all()
+            elif (
+                uses_catalog_summary
+                and sort_by in {"created_at", "calculation_count"}
+                and not topology_predicates
+                and not requires_geometry_count_join
+            ):
+                page_order = (
+                    (
+                        col(ProjectGeometryCatalog.geometry_created_at)
+                        if sort_by == "created_at"
+                        else col(ProjectGeometryCatalog.frame_count)
+                    ).asc()
+                    if sort_direction == "asc"
+                    else (
+                        col(ProjectGeometryCatalog.geometry_created_at)
+                        if sort_by == "created_at"
+                        else col(ProjectGeometryCatalog.frame_count)
+                    )
+                    .desc()
+                    .nulls_last()
+                )
+                page_id_order = (
+                    col(ProjectGeometryCatalog.geometry_id).asc()
+                    if sort_direction == "asc"
+                    else col(ProjectGeometryCatalog.geometry_id).desc()
+                )
+                page_ids = (
+                    select(col(ProjectGeometryCatalog.geometry_id))
+                    .where(
+                        col(ProjectGeometryCatalog.project_id) == scope.requested_project_id,
+                        *predicates,
+                    )
+                    .order_by(page_order, page_id_order)
+                    .offset(offset)
+                    .limit(limit)
+                )
+                rows = (
+                    await session.execute(
+                        filtered_statement.where(col(Geometry.id).in_(page_ids)).order_by(
+                            page_order,
+                            page_id_order,
+                        )
+                    )
+                ).all()
             elif sort_by == "default":
+                thermodynamic_sort = (
+                    col(ProjectGeometryCatalog.has_thermodynamic_property)
+                    if uses_catalog_summary
+                    else geometry_has_thermodynamic_property_predicate(col(Geometry.id))
+                )
                 rows = (
                     await session.execute(
                         filtered_statement.order_by(
-                            desc(geometry_has_thermodynamic_property_predicate(col(Geometry.id))),
+                            desc(thermodynamic_sort),
                             *catalogue_order_by,
                         )
                         .offset(offset)
@@ -908,7 +1085,11 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                 ).all()
             else:
                 geometry_sort_fields = {
-                    "created_at": col(Geometry.created_at),
+                    "created_at": (
+                        col(ProjectGeometryCatalog.geometry_created_at)
+                        if uses_catalog_summary
+                        else col(Geometry.created_at)
+                    ),
                     "atom_count": col(MolecularTopology.atom_count),
                     "calculation_count": calculation_count,
                 }
@@ -928,13 +1109,71 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                         .limit(limit)
                     )
                 ).all()
+            page_geometry_ids = [
+                _required_uuid(geometry.id, "Geometry") for geometry, _, _, _, _ in rows
+            ]
+            reaction_binding_counts: dict[UUID, int] = {}
+            transition_state_geometry_ids: set[UUID] = set()
+            if page_geometry_ids:
+                binding_rows = (
+                    await session.execute(
+                        select(
+                            col(MappedReactionNodeGeometry.geometry_id),
+                            func.count().label("reaction_binding_count"),
+                        )
+                        .join(
+                            MappedReactionNode,
+                            col(MappedReactionNodeGeometry.mapped_reaction_node_id)
+                            == col(MappedReactionNode.id),
+                        )
+                        .where(
+                            col(MappedReactionNodeGeometry.geometry_id).in_(page_geometry_ids),
+                            mapped_reaction_id_is_visible(
+                                scope,
+                                col(MappedReactionNode.mapped_reaction_id),
+                            ),
+                            geometry_has_thermodynamic_property_predicate(
+                                col(MappedReactionNodeGeometry.geometry_id)
+                            ),
+                        )
+                        .group_by(col(MappedReactionNodeGeometry.geometry_id))
+                    )
+                ).all()
+                reaction_binding_counts = {
+                    geometry_id: int(binding_count) for geometry_id, binding_count in binding_rows
+                }
+                transition_state_geometry_ids = set(
+                    (
+                        await session.execute(
+                            select(col(MappedReactionNodeGeometry.geometry_id))
+                            .distinct()
+                            .join(
+                                MappedReactionNode,
+                                col(MappedReactionNodeGeometry.mapped_reaction_node_id)
+                                == col(MappedReactionNode.id),
+                            )
+                            .where(
+                                col(MappedReactionNodeGeometry.geometry_id).in_(page_geometry_ids),
+                                col(MappedReactionNode.role)
+                                == MappedReactionNodeRole.TRANSITION_STATE,
+                                mapped_reaction_id_is_visible(
+                                    scope,
+                                    col(MappedReactionNode.mapped_reaction_id),
+                                ),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
         return GeometryPage(
             items=[
                 _geometry_summary(
                     geometry,
                     topology,
                     int(calculations),
-                    int(bindings),
+                    reaction_binding_counts.get(_required_uuid(geometry.id, "Geometry"), 0),
+                    _required_uuid(geometry.id, "Geometry") in transition_state_geometry_ids,
                     bool(has_frequency_data),
                     bool(has_imaginary_frequency),
                 )
@@ -942,7 +1181,6 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                     geometry,
                     topology,
                     calculations,
-                    bindings,
                     has_frequency_data,
                     has_imaginary_frequency,
                 ) in rows
@@ -971,11 +1209,12 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
             if row is None:
                 return None
             geometry, topology = row
-            has_frequency_data, has_imaginary_frequency = (
+            has_frequency_data, has_imaginary_frequency, is_transition_state = (
                 await session.execute(
                     select(
                         _geometry_has_frequency_data_predicate(scope, geometry_id),
                         _geometry_has_imaginary_frequency_predicate(scope, geometry_id),
+                        _geometry_is_transition_state_predicate(scope, geometry_id),
                     )
                 )
             ).one()
@@ -1017,6 +1256,7 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                         )
                     ).scalar_one()
                 ),
+                bool(is_transition_state),
                 bool(has_frequency_data),
                 bool(has_imaginary_frequency),
             )

@@ -537,7 +537,13 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         )
         assert geometry_page.page.total == 1
         assert [item.id for item in geometry_page.items] == [geometry.id]
+        assert geometry_page.items[0].is_transition_state is True
         assert geometry_page.items[0].imaginary_frequency_status == "present"
+
+        geometry_detail = asyncio.run(GeometryQueryService.get_geometry(geometry_id=geometry.id))
+        assert geometry_detail is not None
+        assert geometry_detail.is_transition_state is True
+        assert geometry_detail.imaginary_frequency_status == "present"
 
         geometry_and_page = asyncio.run(
             GeometryQueryService.list_geometries(
@@ -653,6 +659,27 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         )
         assert mapped_second_page.page.total == 1
         assert mapped_second_page.items == []
+
+        # A negative frequency alone must not classify a geometry as a transition state.
+        with Session(engine) as session:
+            node = (
+                session.execute(
+                    select(MappedReactionNode).where(
+                        col(MappedReactionNode.mapped_reaction_id) == mapped_reaction.id
+                    )
+                )
+                .scalars()
+                .one()
+            )
+            node.role = MappedReactionNodeRole.INTERMEDIATE
+            session.add(node)
+            session.commit()
+        non_transition_state_detail = asyncio.run(
+            GeometryQueryService.get_geometry(geometry_id=geometry.id)
+        )
+        assert non_transition_state_detail is not None
+        assert non_transition_state_detail.is_transition_state is False
+        assert non_transition_state_detail.imaginary_frequency_status == "present"
 
         logical_page = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(

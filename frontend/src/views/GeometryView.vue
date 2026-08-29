@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { useQuery } from "@tanstack/vue-query";
 import { RouterLink, useRoute, useRouter } from "vue-router";
-import { ArrowUpRight, CircleHelp, ListFilter, RotateCcw, Search, X } from "@lucide/vue";
+import { ArrowUpRight, CircleHelp, ListFilter, LoaderCircle, RotateCcw, Search } from "@lucide/vue";
 
 import GeometryCatalogCard from "@/components/GeometryCatalogCard.vue";
 import GeometryDetailContent from "@/components/GeometryDetailContent.vue";
@@ -10,6 +10,7 @@ import GeometryAdvancedQueryModal from "@/components/GeometryAdvancedQueryModal.
 import FrameDrawer from "@/components/FrameDrawer.vue";
 import PaginationControls from "@/components/PaginationControls.vue";
 import QueryValidationIndicator from "@/components/QueryValidationIndicator.vue";
+import { UiDrawer } from "@/components/ui";
 import { api } from "@/api";
 import { useGeometryQueries } from "@/composables/useGeometryQueries";
 import { useProjectContext } from "@/composables/useProjectContext";
@@ -71,6 +72,10 @@ const listError = computed(() => {
   return error instanceof Error ? error.message : "";
 });
 const catalogLoading = computed(() => queries.list.isLoading.value);
+const catalogQuerying = computed(() =>
+  queries.list.isFetching.value
+  && (queries.list.isLoading.value || queries.list.isPlaceholderData.value),
+);
 const detailError = computed(() => queries.detail.error.value instanceof Error ? queries.detail.error.value.message : "");
 const advancedConditionCount = computed(() => advancedFilters.value?.filterExpression?.conditions.length ?? 0);
 
@@ -211,7 +216,7 @@ onBeforeUnmount(() => {
       <header class="panel-heading"><span class="eyebrow">Geometry</span><h1 id="geometry-view-title">几何构象</h1><p>输入 SMILES 快速查询，复杂条件使用高级查询。</p></header>
       <form class="geometry-filter-form" @submit.prevent="submitSearch">
         <label class="search-field" :class="`is-validation-${quickValidation.status}`"><Search :size="15" aria-hidden="true" /><span class="sr-only">SMILES 快速查询</span><input v-model="quickSmilesInput" type="search" placeholder="输入 SMILES，例如 CCO" aria-label="SMILES 快速查询" :aria-invalid="quickValidation.status === 'invalid'"><QueryValidationIndicator :status="quickValidation.status" :message="quickValidation.message" /></label>
-        <div class="filter-actions"><button class="command-button" type="submit"><Search :size="15" aria-hidden="true" />查询</button><button class="command-button command-button-muted" type="button" @click="advancedQueryOpen = true"><ListFilter :size="15" aria-hidden="true" />高级查询</button><RouterLink class="icon-button" :to="{ name: 'geometry-query-help' }" title="几何构象查询帮助" aria-label="几何构象查询帮助"><CircleHelp :size="16" aria-hidden="true" /></RouterLink><button class="icon-button" type="button" title="清空查询" aria-label="清空查询" @click="clearFilters"><RotateCcw :size="15" aria-hidden="true" /></button></div>
+        <div class="filter-actions"><button class="command-button" type="submit" :disabled="catalogQuerying"><LoaderCircle v-if="catalogQuerying" class="is-spinning" :size="15" aria-hidden="true" /><Search v-else :size="15" aria-hidden="true" />{{ catalogQuerying ? "正在查询" : "查询" }}</button><button class="command-button command-button-muted" type="button" @click="advancedQueryOpen = true"><ListFilter :size="15" aria-hidden="true" />高级查询</button><RouterLink class="icon-button" :to="{ name: 'geometry-query-help' }" title="几何构象查询帮助" aria-label="几何构象查询帮助"><CircleHelp :size="16" aria-hidden="true" /></RouterLink><button class="icon-button" type="button" title="清空查询" aria-label="清空查询" @click="clearFilters"><RotateCcw :size="15" aria-hidden="true" /></button></div>
       </form>
       <label class="toggle-filter">
         <input v-model="thermodynamicOnly" type="checkbox" aria-label="仅显示含有热力学属性的几何" :disabled="advancedConditionCount > 0">
@@ -224,7 +229,7 @@ onBeforeUnmount(() => {
       <div class="filter-result-count"><strong>{{ page.total }}</strong><span>个匹配构象</span></div>
     </aside>
 
-    <section class="geometry-results">
+    <section class="geometry-results" :aria-busy="catalogQuerying">
       <header class="geometry-results-header">
         <div><span class="eyebrow">Conformer catalog</span><h2>{{ advancedConditionCount ? "高级查询结果" : topologySmiles ? "SMILES 查询结果" : thermodynamicOnly ? "含热力学属性的几何构象" : "全部几何构象" }}</h2></div>
         <div class="catalog-header-actions">
@@ -235,6 +240,9 @@ onBeforeUnmount(() => {
           <PaginationControls :page="page" label="几何构象分页" @previous="previousPage" @next="nextPage" @jump="jumpPage" />
         </div>
       </header>
+      <div class="catalog-query-status-slot" aria-live="polite">
+        <div v-if="catalogQuerying" class="catalog-query-status" role="status"><LoaderCircle class="is-spinning" :size="16" aria-hidden="true" /><span>{{ geometries.length ? "正在查询，当前显示上次结果" : "正在查询筛选结果" }}</span></div>
+      </div>
       <div v-if="listError" class="notice" role="alert">{{ listError }}</div>
       <div v-if="catalogLoading" class="geometry-card-grid"><div v-for="i in 6" :key="i" class="geometry-card geometry-card-skeleton"><div></div><span></span><span></span></div></div>
       <div v-else-if="!geometries.length" class="workspace-empty"><strong>没有匹配的 Geometry</strong><p>请调整 SMILES，或使用高级查询组合其他条件。</p></div>
@@ -245,13 +253,29 @@ onBeforeUnmount(() => {
       <p class="table-summary">显示 {{ geometries.length }} / {{ page.total }} 个构象</p>
     </section>
 
-    <aside v-if="selectedGeometryId" class="geometry-detail-drawer" aria-labelledby="geometry-detail-title">
-      <header class="drawer-header"><div><span class="eyebrow">Geometry detail</span><h2 id="geometry-detail-title">构象详情</h2></div><div class="drawer-actions"><RouterLink class="icon-button" :to="{ name: 'geometry-detail', params: { geometryId: selectedGeometryId }, query: withoutAccessState(route.query) }" title="在独立页面打开" aria-label="在独立页面打开几何构象"><ArrowUpRight :size="18" aria-hidden="true" /></RouterLink><button class="icon-button" type="button" title="关闭详情" aria-label="关闭详情" @click="closeGeometry"><X :size="18" /></button></div></header>
+    <UiDrawer
+      :open="selectedGeometryId !== null"
+      title="构象详情"
+      eyebrow="Geometry detail"
+      title-id="geometry-detail-title"
+      close-label="关闭构象详情"
+      width-class="geometry-detail-drawer"
+      @close="closeGeometry"
+    >
+      <template #actions>
+        <RouterLink
+          v-if="selectedGeometryId"
+          class="icon-button"
+          :to="{ name: 'geometry-detail', params: { geometryId: selectedGeometryId }, query: withoutAccessState(route.query) }"
+          title="在独立页面打开"
+          aria-label="在独立页面打开几何构象"
+        ><ArrowUpRight :size="18" aria-hidden="true" /></RouterLink>
+      </template>
       <div v-if="queries.detail.isLoading.value" class="drawer-loading"><div class="loading-block"></div><div class="loading-block is-wide"></div></div>
       <div v-else-if="detailError" class="drawer-error">{{ detailError }}</div>
       <div v-else-if="!selectedGeometry" class="drawer-error">Geometry 不存在或当前项目不可见</div>
       <GeometryDetailContent v-else-if="selectedGeometry" :geometry="selectedGeometry" :project-id="currentProjectId ?? undefined" @open-frame="openFrame" />
-    </aside>
+    </UiDrawer>
     <FrameDrawer :open="selectedFrameId !== null" :loading="frameLoading" :error="frameError" :frame="frame" :project-id="currentProjectId ?? undefined" @close="closeFrame" />
     <GeometryAdvancedQueryModal :open="advancedQueryOpen" :project-id="currentProjectId" @close="advancedQueryOpen = false" @apply="applyAdvancedQuery" />
     </section>

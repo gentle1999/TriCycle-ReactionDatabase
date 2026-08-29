@@ -1,5 +1,7 @@
 # QM parser fixtures
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 `minimal_orca_water_sp.orcaout` is a reduced ORCA 6.1.1 single-point output derived from the
 field structure of a real ORCA output supplied for ingestion testing. It retains only the parser
 contract evidence needed for a deterministic water calculation: banner/version, printed input,

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { CircleHelp, FlaskConical, ListFilter, RotateCcw, Search, X } from "@lucide/vue";
+import { CircleHelp, FlaskConical, ListFilter, LoaderCircle, RotateCcw, Search, X } from "@lucide/vue";
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { RouterLink } from "vue-router";
 
@@ -20,6 +20,7 @@ const props = defineProps<{
   mappedReaction: MappedReactionDetail | null;
   selectedMappedId: string | null;
   loading: boolean;
+  querying: boolean;
   mappedLoading: boolean;
   projectId: string | null;
   total: number;
@@ -222,7 +223,7 @@ onBeforeUnmount(() => {
           <QueryValidationIndicator :status="quickValidation.status" :message="quickValidation.message" />
         </label>
         <div class="filter-actions">
-          <button class="command-button" type="submit"><Search :size="15" aria-hidden="true" />查询</button>
+          <button class="command-button" type="submit" :disabled="querying"><LoaderCircle v-if="querying" class="is-spinning" :size="15" aria-hidden="true" /><Search v-else :size="15" aria-hidden="true" />{{ querying ? "正在查询" : "查询" }}</button>
           <button class="command-button command-button-muted" type="button" @click="advancedQueryOpen = true"><ListFilter :size="15" aria-hidden="true" />高级查询</button>
           <RouterLink class="icon-button" :to="{ name: 'reaction-query-help' }" title="反应查询帮助" aria-label="反应查询帮助">
             <CircleHelp :size="16" aria-hidden="true" />
@@ -256,7 +257,7 @@ onBeforeUnmount(() => {
       <div class="filter-summary"><strong>{{ total }}</strong><span>个匹配反应</span></div>
     </aside>
 
-    <section class="reaction-results" aria-labelledby="reaction-results-title">
+    <section class="reaction-results" aria-labelledby="reaction-results-title" :aria-busy="querying">
       <header class="reaction-results-header">
         <div>
           <span class="eyebrow">Reaction catalog</span>
@@ -270,6 +271,9 @@ onBeforeUnmount(() => {
           <PaginationControls :page="page" label="反应分页（顶部）" @previous="emit('previousPage')" @next="emit('nextPage')" @jump="emit('jumpPage', $event)" />
         </div>
       </header>
+      <div class="catalog-query-status-slot" aria-live="polite">
+        <div v-if="querying" class="catalog-query-status" role="status"><LoaderCircle class="is-spinning" :size="16" aria-hidden="true" /><span>{{ reactions.length ? "正在查询，当前显示上次结果" : "正在查询筛选结果" }}</span></div>
+      </div>
       <div v-if="loading && !reactions.length" class="workspace-loading"><div class="loading-block is-wide"></div><div class="loading-block is-wide"></div></div>
       <div v-else-if="!reactions.length" class="workspace-empty"><FlaskConical :size="32" /><strong>没有匹配的逻辑反应</strong><p>请调整反应 SMILES，或使用高级查询组合其他条件。</p></div>
       <div v-else class="reaction-card-list">

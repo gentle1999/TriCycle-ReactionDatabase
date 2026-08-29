@@ -94,12 +94,14 @@ from tricycle_reaction_db.application.services.depictions import (
     draw_geometry_xyz,
     draw_molecule_molfile,
     draw_molecule_svg,
+    draw_transition_state_mode_dof_svg,
     get_geometry_dof_depiction,
     get_geometry_sdf,
     get_geometry_xyz,
     get_topology_depiction,
     get_topology_molfile,
     get_transition_state_anchor_sdf,
+    get_transition_state_mode_dof_depiction,
 )
 from tricycle_reaction_db.application.services.graphql_catalog import GraphQLCatalogService
 from tricycle_reaction_db.application.services.invitations import (
@@ -262,6 +264,7 @@ __all__ = [
     "draw_geometry_dof_svg",
     "draw_geometry_sdf",
     "draw_geometry_xyz",
+    "draw_transition_state_mode_dof_svg",
     "finalize_parse_revision",
     "persist_atomic_population_series",
     "persist_bond_order_result",
@@ -293,6 +296,7 @@ __all__ = [
     "get_geometry_dof_depiction",
     "get_geometry_sdf",
     "get_geometry_xyz",
+    "get_transition_state_mode_dof_depiction",
     "get_transition_state_anchor_sdf",
     "get_topology_molfile",
     "iter_artifact_download",

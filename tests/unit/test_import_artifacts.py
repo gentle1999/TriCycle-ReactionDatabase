@@ -172,8 +172,8 @@ def test_import_files_records_zero_frame_outputs_as_filtered(
                     result=ArtifactUploadResult(
                         artifact_id=UUID("00000000-0000-7000-0000-000000000301"),
                         artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
-                        storage_status=StorageStatus.RETIRED,
-                        ingestion_status=ArtifactIngestionStatus.FAILED,
+                        storage_status=StorageStatus.AVAILABLE,
+                        ingestion_status=ArtifactIngestionStatus.FILTERED,
                         source_frame_count=0,
                         transition_state_frame_count=0,
                         inferred_reaction_count=0,
@@ -284,7 +284,7 @@ def test_import_files_isolates_deterministic_batch_failures(monkeypatch, tmp_pat
     }
 
 
-def test_import_files_streams_small_commit_batches_and_checkpoints_each_batch(
+def test_import_files_keeps_pipeline_window_independent_from_persistence_batch(
     monkeypatch,
     tmp_path: Path,
 ) -> None:  # type: ignore[no-untyped-def]
@@ -295,11 +295,14 @@ def test_import_files_streams_small_commit_batches_and_checkpoints_each_batch(
         sources.append(source)
     state_path = tmp_path / "state.jsonl"
     calls: list[list[str]] = []
+    persistence_batch_sizes: list[int] = []
     state_lines_seen_before_call: list[int] = []
 
     async def fake_upload_batch(**kwargs: object) -> ArtifactBatchUploadResult:
         payloads = cast(list[ArtifactUploadPayload], kwargs["files"])
         assert kwargs["streaming"] is True
+        assert kwargs["enforce_batch_file_limit"] is False
+        persistence_batch_sizes.append(cast(int, kwargs["persistence_batch_files"]))
         calls.append([payload.filename for payload in payloads])
         state_lines_seen_before_call.append(
             len(state_path.read_text(encoding="utf-8").splitlines()) if state_path.exists() else 0
@@ -342,13 +345,15 @@ def test_import_files_streams_small_commit_batches_and_checkpoints_each_batch(
             artifact_kind=ArtifactKind.INPUT,
             state=ImportState(state_path),
             dry_run=False,
-            commit_batch_files=8,
+            commit_batch_files=2,
+            pipeline_window_files=8,
             stream_queue_size=2,
         )
     )
 
     assert summary.succeeded == 17
     assert [len(call) for call in calls] == [8, 8, 1]
+    assert persistence_batch_sizes == [2, 2, 2]
     # The second service call observes the first microbatch's durable state.
     assert state_lines_seen_before_call == [0, 8, 16]
 
@@ -478,6 +483,7 @@ def test_import_files_starts_upload_before_fingerprinting_all_candidates(
             dry_run=False,
             fingerprint_workers=2,
             commit_batch_files=16,
+            pipeline_window_files=16,
             stream_queue_size=2,
         )
     )

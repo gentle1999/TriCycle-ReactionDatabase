@@ -1,5 +1,7 @@
 # 项目重构与上线计划
 
+> English edition: [Refactor and release plan](en/refactor-plan.md). This is a dated plan and acceptance record.
+
 > 状态：已固化，执行状态以本文的阶段表和验收记录为准
 >
 > 建立日期：2026-08-19

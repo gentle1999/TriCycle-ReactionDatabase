@@ -1,11 +1,13 @@
 # 开发环境
 
+> English edition: [Development environment](en/development.md).
+
 ## 前置条件
 
 - `uv 0.9` 或更高版本
 - Docker 与 Docker Compose
 - Linux/amd64 开发环境
-- 对内部 MolOP/MolGR Git 服务的访问权限
+- 能够访问 PyPI 以安装 MolOP/MolGR 发布包
 
 项目首个支持的 Python 版本是 3.12，具体解释器和全部 Python 依赖由
 `.python-version` 与 `uv.lock` 固定。
@@ -466,7 +468,7 @@ writer endpoint 对应用呈现为同一个逻辑 engine，节点数量不会变
 | `TRICYCLE_STRUCTURE_QUERY_MAX_CHARACTERS` | `16384` | SMILES/SMARTS/reaction 输入长度上限 |
 | `TRICYCLE_STRUCTURE_CANDIDATE_LIMIT` | `50000` | 需要逐候选后处理的最大关系行数 |
 | `TRICYCLE_MOLOP_BATCH_N_JOBS` | `2` | 同时处理的文件级 MolOP worker 数；每个文件使用可终止的独立 worker，`-1` 在开发环境使用全部可用 CPU，生产环境必须显式限界 |
-| `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS` | `60` | 单个文件的 MolOP 解析与 MolGR 帧重建最长允许时间；超时文件单独失败，批次继续处理 |
+| `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS` | `60` | 10 MiB 文件的 MolOP 解析与 MolGR 帧重建基准时长；更大文件按体积等比例放大，较小文件至少使用该基准；超时文件单独失败，批次继续处理 |
 
 描述符、Murcko scaffold、手性和匹配次数等逐候选计算必须先通过 Formula、
 Topology 或
@@ -534,7 +536,7 @@ make seed-da-bench
 
 ### 直接批量导入存量文件
 
-大量存量文件不需要经过浏览器或 HTTP API。`tricycle-import-artifacts` 在服务端进程内递归读取文件，直接调用 Artifact 入库服务，写入 PostgreSQL/RustFS，并按现有 MolOP 解析流程处理计算输出。指纹计算也采用有界的顺序释放流水线，不会先扫描并哈希完整目录后才开始解析。导入使用有界流式队列，默认每 16 个完成文件进入一次持久化微批；文件解析、RustFS 写入和数据库持久化可以流水线重叠。磁盘流模式按文件数和单文件大小限制资源，不把 `max_batch_bytes` 当作处理屏障；该配置仍保护 HTTP 批量上传请求。每个微批提交后立即追加逐文件检查点，内容 SHA-256 由 Artifact 唯一约束负责幂等去重。
+大量存量文件不需要经过浏览器或 HTTP API。`tricycle-import-artifacts` 在服务端进程内递归读取文件，直接调用 Artifact 入库服务，写入 PostgreSQL/RustFS，并按现有 MolOP 解析流程处理计算输出。指纹计算也采用有界的顺序释放流水线，不会先扫描并哈希完整目录后才开始解析。导入默认一次向解析流水线提供 128 个候选文件，实际并发槽位由 `TRICYCLE_MOLOP_BATCH_N_JOBS` 独立控制；任一文件结束后，候选池中的下一文件会立即补位。完成结果每 16 个进入一次持久化微批，文件解析、RustFS 写入和数据库持久化可以流水线重叠。本地磁盘流模式不把 HTTP 请求的 `max_batch_files` 或 `max_batch_bytes` 当作处理屏障，但仍执行单文件大小限制；远程上传仍受这些请求级限制保护。每个微批提交后立即追加逐文件检查点，内容 SHA-256 由 Artifact 唯一约束负责幂等去重。
 
 先启动 PostgreSQL、RustFS、完成 migration 和 development bootstrap，然后执行：
 
@@ -548,8 +550,9 @@ uv run tricycle-import-artifacts \
 参数说明：
 
 - 可以传入多个文件或目录；目录会递归扫描，符号链接不会展开。
-- `--commit-batch-files` 控制本地解析及持久化微批的目标文件数，默认 `16`；也可通过 `IMPORT_COMMIT_BATCH_FILES` 传给 `make import-artifacts`。该值只控制提交频率，不改变单文件解析队列。
-- `--stream-queue-size` 控制待读取文件的有界队列大小，默认 `32`；也可通过 `IMPORT_STREAM_QUEUE_SIZE` 传给 `make import-artifacts`。
+- `--pipeline-window-files` 控制一次交给解析流水线的候选文件数，默认 `128`；也可通过 `IMPORT_PIPELINE_WINDOW_FILES` 传给 `make import-artifacts`。该窗口应明显大于解析槽位数，以便槽位释放后立即补位。
+- `--commit-batch-files` 控制已完成结果的持久化微批大小，默认 `16`；也可通过 `IMPORT_COMMIT_BATCH_FILES` 传给 `make import-artifacts`。它不限制候选池或解析并发。
+- `--stream-queue-size` 只控制文件发现/指纹阶段到流水线窗口之间的有界缓冲，默认 `128`；也可通过 `IMPORT_STREAM_QUEUE_SIZE` 传给 `make import-artifacts`。
 - 默认导入 `calculation_output`，可用 `--artifact-kind input|workflow_manifest|auxiliary` 覆盖。
 - `--state-file` 是追加写入的 JSONL 检查点。重复执行会按路径、大小、mtime 和 SHA-256 跳过已成功文件；文件发生变化后会重新导入。
 - 使用 `--dry-run` 只扫描并输出统计，不写数据库或对象存储。
@@ -623,7 +626,7 @@ payload hash 和 metadata。
 
 ## 依赖约束
 
-MolOP `>=0.2.4` 与 MolGR `>=0.1.3` 直接从官方 PyPI 安装；`pyproject.toml` 声明最低
+MolOP `>=0.2.11` 与 MolGR `>=0.1.8` 直接从官方 PyPI 安装；`pyproject.toml` 声明最低
 兼容版本，`uv.lock` 记录当前解析版本。项目不再使用内网 Git source 或
 `override-dependencies`。
 

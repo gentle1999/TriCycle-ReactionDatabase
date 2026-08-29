@@ -1,5 +1,7 @@
 # 前端重构计划
 
+> English edition: [Frontend refactor plan](en/frontend-refactor-plan.md). This is a dated planning record.
+
 > 状态：已接受
 >
 > 生效日期：2026-08-14

@@ -215,6 +215,7 @@ import-artifacts:
 		$(if $(IMPORT_ARTIFACT_KIND),--artifact-kind "$(IMPORT_ARTIFACT_KIND)",) \
 		$(if $(IMPORT_STATE_FILE),--state-file "$(IMPORT_STATE_FILE)",) \
 		$(if $(IMPORT_COMMIT_BATCH_FILES),--commit-batch-files "$(IMPORT_COMMIT_BATCH_FILES)",) \
+		$(if $(IMPORT_PIPELINE_WINDOW_FILES),--pipeline-window-files "$(IMPORT_PIPELINE_WINDOW_FILES)",) \
 		$(if $(IMPORT_STREAM_QUEUE_SIZE),--stream-queue-size "$(IMPORT_STREAM_QUEUE_SIZE)",) \
 		$(IMPORT_ROOTS)
 

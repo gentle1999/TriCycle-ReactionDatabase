@@ -1,5 +1,7 @@
 # MolOP 计算结果导出需求
 
+> English edition: [MolOP calculation-result export requirements](en/molop-export-requirements.md).
+
 > 状态：MolOP 契约已实现，数据库 schema 已对齐
 > 契约版本：`molop-calculation-export-v1`
 > 使用方：Example Chemistry Database（部署显示名可由环境变量覆盖）
@@ -139,7 +141,7 @@ end_line
 | `MOLREQ-014` | status 必须按真实证据作用域输出 | segment termination 不伪装成逐 frame termination 事实 |
 | `MOLREQ-015` | span 必须在 locator 拆分原文时产生 | 不得通过重复 frame 文本反向搜索位置 |
 | `MOLREQ-016` | 正式导入默认设置 `capture_source_evidence=True`；可显式关闭 | 开启时必须保留 artifact identity、segment evidence、frame span 和 MolOP frame role；关闭时保留 artifact SHA-256、解析器 provenance/configuration、帧顺序与诊断，但不能提供证据派生的 frame role，源跨度/块哈希为 `NULL` |
-| `MOLREQ-017` | 证据收集与延迟拓扑重建、批量持久化相互独立 | `TRICYCLE_MOLOP_PARALLEL_FRAME_PERSISTENCE=true` 时，纯文本解析阶段关闭 MolOP prewarm；持久化微批次在 owning process 中展平所有 frame，通过 MolGR 原生 batch scheduler 并行重建后再转换 DTO；revision-local rows 使用 client-side UUID 和延迟 flush 批量写入；审计/重解析路径保持严格幂等写入 |
+| `MOLREQ-017` | 证据收集、角色判定与图重建彼此独立 | MolOP `0.2.11` 的 evidence collection 不再隐式重建分子图；导入保持 evidence enabled，由 MolGR 在归一化阶段重建图。文件级 worker、候选窗口与完成结果持久化微批独立控制；审计/重解析路径保持严格幂等写入。 |
 
 segment 的 `protocol` 必须是通用 `model_chemistry` 的纯 mapping 投影，
 `task_requests` 必须是通用 `QMTaskRequest` 的纯 mapping 列表。不得泄漏
@@ -151,7 +153,7 @@ Gaussian/ORCA 专用 Pydantic 类型。协议从 segment metadata 生成，因�
 | ID | 需求 | 验收标准 |
 | --- | --- | --- |
 | `MOLREQ-020` | 每个 frame 必须输出实际计算几何、元素顺序、charge 和 multiplicity | atom count、元素和坐标维度相互一致 |
-| `MOLREQ-021` | 必须提供 portable topology | 至少包含 canonical isomeric SMILES、map-free V3000 MolBlock 和重建 provenance |
+| `MOLREQ-021` | 必须提供 portable topology | 至少包含显式氢 isomeric SMILES（字段名保留 `canonical_isomeric_smiles` 以兼容 API）、map-free V3000 MolBlock 和重建 provenance；SMILES 失败不能丢弃可信二进制图。 |
 | `MOLREQ-022` | 只对可信 topology 输出 source 到 topology 的 permutation | permutation 完整、无重复；失败或歧义时省略，并输出 `parse_failed` 和稳定 diagnostic |
 | `MOLREQ-023` | ORCA 必须输出实际观察坐标与 `coordinate_decimal_places` | 数据库可据打印精度设置匹配容差并独立计算 RMSD |
 | `MOLREQ-024` | 各后端的观测几何来自公开 `frame.coords` | 诊断坐标不创建第二个 Geometry；匹配由数据库执行 |
@@ -290,10 +292,11 @@ MolOP 当前已实现：
 
 数据库接入状态：
 
-1. 依赖要求为 PyPI MolOP `>=0.2.4` 与 MolGR `>=0.1.3`。Gaussian 进程内导入直接消费 MolOP
+1. 依赖要求为 PyPI MolOP `>=0.2.11` 与 MolGR `>=0.1.8`。Gaussian 进程内导入直接消费 MolOP
    公共模型的 `model_dump(mode="python", exclude_none=False)` payload，不重复实现
    locator、状态判断、拓扑重建或模型校验。数据库侧只做字段裁剪、Quantity 单位归一化、
-   ndarray sidecar 摘要/转换和数据库 identity 绑定。
+   ndarray sidecar 摘要/转换和数据库 identity 绑定。可信 MolGR 图只重建 ring info；数据库不再
+   `SanitizeMol`、补隐式氢、推断自由基或重排原子顺序。
 2. 已用 DA minimum、TS 和多 Link1 fixture 验证 9 个 segment、45 个 frame、227 个数组、
    4 个热化学结果、49 条 typed energy observation、14 个 molecular-orbital result、
    14 个 population result（18 条 series）和 14 个 polarizability result。

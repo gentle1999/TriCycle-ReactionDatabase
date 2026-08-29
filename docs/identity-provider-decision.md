@@ -1,5 +1,7 @@
 # 身份提供方决策记录
 
+> English edition: [Identity-provider decision record](en/identity-provider-decision.md). This is a dated decision record.
+
 建立日期：2026-08-16
 
 ## 决策

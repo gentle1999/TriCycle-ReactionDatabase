@@ -1,5 +1,7 @@
 # ChemDoodle Web Components
 
+[English](README.md) | [简体中文说明](README.zh-CN.md)
+
 - Version: `11.0.0`
 - Upstream: <https://web.chemdoodle.com/downloads/ChemDoodleWeb-11.0.0.zip>
 - Archive SHA-256: `23bd18e8d32f2b287d63dccb0976070e06f24df6a0f2c81ad8b995341fa9e505`

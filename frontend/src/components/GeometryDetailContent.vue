@@ -9,6 +9,7 @@ import { withoutAccessState } from "@/routeAccessState";
 import type { GeometryDetail } from "@/types";
 
 import ChemDoodleGeometry3D from "./ChemDoodleGeometry3D.vue";
+import GeometryDofPreview from "./GeometryDofPreview.vue";
 
 const props = defineProps<{
   geometry: GeometryDetail;
@@ -22,6 +23,11 @@ const totalSpin = computed<number | null>(() => {
   const multiplicity = props.geometry.multiplicity;
   return multiplicity === null ? null : (multiplicity - 1) / 2;
 });
+const imaginaryFrequencyLabel = computed(() => ({
+  present: "含虚频",
+  absent: "无虚频",
+  unavailable: "未提供频率",
+})[props.geometry.imaginary_frequency_status]);
 
 function energySourceLabel(id: string | null): string {
   return id ? shortId(id) : "未选择";
@@ -53,12 +59,23 @@ function geometryDownloadUrl(format: "sdf" | "xyz"): string {
         <Download :size="15" aria-hidden="true" /><span>下载 SDF</span>
       </a>
     </nav>
-    <ChemDoodleGeometry3D :geometry-id="geometry.id" :project-id="projectId" :label="geometry.canonical_isomeric_smiles ?? undefined" :height="320" />
+    <section class="geometry-structure-views" aria-label="几何构象结构视图">
+      <section class="geometry-structure-view">
+        <header><strong>3D 构象</strong></header>
+        <ChemDoodleGeometry3D :geometry-id="geometry.id" :project-id="projectId" :label="geometry.canonical_isomeric_smiles ?? undefined" :height="320" />
+      </section>
+      <section class="geometry-structure-view">
+        <header><strong>分子拓扑</strong></header>
+        <GeometryDofPreview :geometry-id="geometry.id" :project-id="projectId" :label="geometry.canonical_isomeric_smiles ?? '几何构象拓扑视图'" :height="320" />
+      </section>
+    </section>
     <header class="geometry-detail-identity"><strong class="geometry-detail-smiles">{{ geometry.canonical_isomeric_smiles ?? "SMILES 不可用" }}</strong><code :title="geometry.id">{{ geometry.id }}</code></header>
     <dl class="energy-facts">
       <div><dt>总电荷</dt><dd>{{ geometry.charge }}</dd></div>
       <div><dt>自旋多重度</dt><dd>{{ geometry.multiplicity }}</dd></div>
       <div><dt>总自旋 S</dt><dd>{{ formatSpin(totalSpin) }}</dd></div>
+      <div><dt>构象角色</dt><dd><span class="geometry-transition-state-status" :class="{ 'is-not-transition-state': !geometry.is_transition_state }">{{ geometry.is_transition_state ? "过渡态" : "未标记为过渡态" }}</span></dd></div>
+      <div><dt>虚频</dt><dd><span class="geometry-frequency-status" :class="`is-${geometry.imaginary_frequency_status}`">{{ imaginaryFrequencyLabel }}</span></dd></div>
       <div><dt>电子能</dt><dd>{{ formatEnergy(geometry.energy_view.electronic_energy_hartree) }}</dd></div>
       <div><dt>焓 H</dt><dd>{{ formatEnergy(geometry.energy_view.enthalpy_hartree) }}</dd></div>
       <div><dt>Gibbs G</dt><dd>{{ formatEnergy(geometry.energy_view.gibbs_free_energy_hartree) }}</dd></div>

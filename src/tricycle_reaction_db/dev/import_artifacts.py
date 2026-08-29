@@ -28,16 +28,17 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
 )
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.session import engine
-from tricycle_reaction_db.domain.enums import ArtifactKind
+from tricycle_reaction_db.domain.enums import ArtifactIngestionStatus, ArtifactKind
 
 HASH_CHUNK_BYTES = 1024 * 1024
 MAX_FINGERPRINT_WORKERS = 32
-# The service still enforces its configured upload limits, but local imports
-# should commit frequently enough that a slow or interrupted run has a small
-# recovery window. The queue is deliberately larger than one commit window so
-# parsing can stay ahead of persistence without retaining the whole import.
+# Parsing concurrency, the queued candidate window, and persistence commit
+# frequency are independent controls. A 128-file window keeps a 32-worker
+# parser supplied when individual files finish at different times, while
+# completed results are still committed in smaller recovery-friendly groups.
 IMPORT_COMMIT_BATCH_FILES = 16
-IMPORT_STREAM_QUEUE_SIZE = 32
+IMPORT_PIPELINE_WINDOW_FILES = 128
+IMPORT_STREAM_QUEUE_SIZE = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,13 +329,15 @@ async def import_files(
     dry_run: bool,
     fingerprint_workers: int | None = None,
     commit_batch_files: int = IMPORT_COMMIT_BATCH_FILES,
+    pipeline_window_files: int = IMPORT_PIPELINE_WINDOW_FILES,
     stream_queue_size: int = IMPORT_STREAM_QUEUE_SIZE,
     metrics: ImportMetrics | None = None,
 ) -> ImportSummary:
     metrics = metrics or ImportMetrics()
-    settings = get_settings()
     if commit_batch_files < 1:
         raise ValueError("commit_batch_files must be positive")
+    if pipeline_window_files < 1:
+        raise ValueError("pipeline_window_files must be positive")
     if stream_queue_size < 1:
         raise ValueError("stream_queue_size must be positive")
     summary = ImportSummary(scanned=len(candidates))
@@ -403,7 +406,10 @@ async def import_files(
 
             candidate = batch[index]
             fingerprint = fingerprints[candidate]
-            filtered = item.error_code == "no_calculation_frames" or (
+            filtered = (
+                item.result is not None
+                and item.result.ingestion_status is ArtifactIngestionStatus.FILTERED
+            ) or item.error_code == "no_calculation_frames" or (
                 item.result is not None and item.result.source_frame_count == 0
             )
             status = "filtered" if filtered else "succeeded" if item.succeeded else "failed"
@@ -434,6 +440,8 @@ async def import_files(
                 user_id=user_id,
                 on_file_committed=checkpoint,
                 streaming=True,
+                persistence_batch_files=commit_batch_files,
+                enforce_batch_file_limit=False,
             )
             service_elapsed_ms = (perf_counter() - service_started) * 1000
             metrics.add_phase_timing("upload_batch_service_ms", service_elapsed_ms)
@@ -494,7 +502,10 @@ async def import_files(
         for index, (candidate, item) in enumerate(zip(batch, result.items, strict=True)):
             fingerprint = fingerprints[candidate]
             artifact_id = item.result.artifact_id if item.result is not None else None
-            filtered = item.error_code == "no_calculation_frames" or (
+            filtered = (
+                item.result is not None
+                and item.result.ingestion_status is ArtifactIngestionStatus.FILTERED
+            ) or item.error_code == "no_calculation_frames" or (
                 item.result is not None and item.result.source_frame_count == 0
             )
             if filtered:
@@ -527,11 +538,11 @@ async def import_files(
                 )
         return batch_summary
 
-    # Feed candidates through a bounded queue instead of constructing all
-    # upload tasks at once. A microbatch is intentionally governed by the
-    # commit target. On-disk streaming uploads do not use the HTTP aggregate
-    # byte limit as a processing boundary; each source is still checked against
-    # the per-file upload limit by the shared upload service.
+    # Feed candidates through a bounded discovery/fingerprint queue. The
+    # consumer collects an independent pipeline window, whose files become the
+    # parser's waiting task pool. On-disk imports do not use HTTP request batch
+    # limits as processing boundaries; the shared service still enforces the
+    # per-file upload limit.
     candidate_queue: asyncio.Queue[tuple[ImportCandidate, ImportFingerprint] | None] = (
         asyncio.Queue(maxsize=stream_queue_size)
     )
@@ -599,7 +610,6 @@ async def import_files(
 
     batches_started_at = perf_counter()
     producer_task = asyncio.create_task(produce_candidates())
-    commit_limit = min(commit_batch_files, settings.max_batch_files)
     producer_finished = False
     try:
         while not producer_finished:
@@ -609,7 +619,7 @@ async def import_files(
                 break
 
             batch_with_fingerprints = [first]
-            while len(batch_with_fingerprints) < commit_limit:
+            while len(batch_with_fingerprints) < pipeline_window_files:
                 next_item = await candidate_queue.get()
                 if next_item is None:
                     producer_finished = True
@@ -680,6 +690,15 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--pipeline-window-files",
+        type=int,
+        default=IMPORT_PIPELINE_WINDOW_FILES,
+        help=(
+            "number of candidate files queued into each parser pipeline window "
+            f"(default: {IMPORT_PIPELINE_WINDOW_FILES})"
+        ),
+    )
+    parser.add_argument(
         "--stream-queue-size",
         type=int,
         default=IMPORT_STREAM_QUEUE_SIZE,
@@ -712,6 +731,7 @@ async def _run(args: argparse.Namespace) -> int:
             state=state,
             dry_run=args.dry_run,
             commit_batch_files=args.commit_batch_files,
+            pipeline_window_files=args.pipeline_window_files,
             stream_queue_size=args.stream_queue_size,
             metrics=metrics,
         )

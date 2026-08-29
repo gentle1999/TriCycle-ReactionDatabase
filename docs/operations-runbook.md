@@ -1,5 +1,7 @@
 # 生产运维与恢复 Runbook
 
+> English edition: [Production operations and recovery runbook](en/operations-runbook.md).
+
 本文覆盖多主机部署的备份、恢复、监控和定时维护。所有恢复命令先在隔离环境执行；不要把
 `pg_restore --clean`、bucket 删除或 lifecycle 变更直接指向生产目标。
 

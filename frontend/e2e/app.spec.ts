@@ -616,6 +616,11 @@ test("TS frame detail interpolates persisted signed mode anchors", async ({ page
   }
   expect(openedModeFrame).toBe(true);
   await expect(modeRenderer).toBeVisible();
+  const dofModeRenderer = page.locator('[data-renderer="rdkit-dof-ts-mode"]');
+  await expect(dofModeRenderer).toBeVisible();
+  await expect(dofModeRenderer).toHaveAttribute("data-animation", "smil");
+  await expect(dofModeRenderer.locator("img")).toHaveAttribute("src", /transition-state\.svg/);
+  await expect(dofModeRenderer.locator(".molecule-state")).toHaveCount(0);
   const frameId = (await page.locator(".drawer-identity code").first().innerText()).trim();
   const detailResponse = await page.request.get(
     `/api/calculation-frames/${encodeURIComponent(frameId)}?project_id=00000000-0000-7000-8000-000000000201`,
@@ -1160,13 +1165,21 @@ test("geometry cards preserve drawer preview and link to a standalone detail pag
   await expect(page).toHaveURL(/\/geometries\?.*preview_geometry=/);
   await expect(page.locator("#geometry-detail-title")).toBeVisible();
   await expect(page.locator(".geometry-detail-drawer .geometry-canvas-3d canvas")).toHaveCount(1);
+  await expect(page.locator('.geometry-detail-drawer [data-renderer="rdkit-dof"] img')).toHaveCount(1);
   await expect(page.locator(".geometry-detail-drawer .molecule-state")).toHaveCount(0);
+  await page.locator('button.drawer-backdrop[aria-label="关闭构象详情"]').click({ position: { x: 20, y: 20 } });
+  await expect(page.locator("#geometry-detail-title")).toHaveCount(0);
+  await expect(page).toHaveURL(/\/geometries(?:\?|$)/);
+
+  await page.locator(".geometry-card").first().click();
+  await expect(page.locator("#geometry-detail-title")).toBeVisible();
   const detailLink = page.locator('.geometry-detail-drawer .drawer-header a[aria-label="在独立页面打开几何构象"]');
   await expect(detailLink).toHaveAttribute("href", /\/geometries\/[^?]+\?/);
   await detailLink.click();
   await expect(page.getByRole("heading", { name: "几何构象详情" })).toBeVisible();
   await expect(page.locator(".geometry-detail-page-content .geometry-canvas-3d")).toHaveAttribute("data-webgl-state", "ready", { timeout: 20_000 });
   const geometryRenderer = page.locator(".geometry-detail-page-content .geometry-canvas-3d");
+  await expect(page.locator('.geometry-detail-page-content [data-renderer="rdkit-dof"] img')).toHaveCount(1);
   expect(await webGlCanvasHasDrawing(geometryRenderer)).toBe(true);
   await expect(page.getByText("总电荷", { exact: true })).toBeVisible();
   await expect(page.getByText("自旋多重度", { exact: true })).toBeVisible();
@@ -2064,6 +2077,52 @@ test("an interrupted upload batch can be returned to the waiting queue", async (
   await expect(page.getByRole("alert")).toContainText("已恢复到等待队列");
   await expect(page.locator(".upload-task-row").filter({ hasText: "interrupted.log" })).toContainText("等待");
   await expect(page.getByRole("button", { name: "重新选择文件", exact: true })).toBeVisible();
+});
+
+test("upload queue shows artifact parsing after transport succeeds", async ({ page }) => {
+  const batchId = "00000000-0000-7000-8000-000000000818";
+  const clientFileId = "00000000-0000-7000-8000-000000000819";
+
+  await page.route("**/api/upload-batches**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (url.pathname === "/api/upload-batches" && request.method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          items: [uploadBatchFixture(batchId, { status: "completed", succeeded_count: 1, total_count: 1 })],
+          total: 1,
+          limit: 25,
+          offset: 0,
+        }),
+      });
+      return;
+    }
+    if (url.pathname === `/api/upload-batches/${batchId}` && request.method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify(uploadBatchFixture(batchId, { status: "completed", succeeded_count: 1, total_count: 1 })),
+      });
+      return;
+    }
+    if (url.pathname === `/api/upload-batches/${batchId}/items` && request.method() === "GET") {
+      const item = uploadBatchItemFixture(clientFileId, "background-parse.log", {
+        ingestion_status: "pending",
+        ingestion_error_message: null,
+      });
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ items: [item], total: 1, limit: 100, offset: 0 }),
+      });
+      return;
+    }
+    await route.fallback();
+  });
+
+  await page.goto(`/uploads?batch=${batchId}`);
+  const row = page.locator(".upload-task-row").filter({ hasText: "background-parse.log" });
+  await expect(row).toContainText("已上传，正在解析");
+  await expect(row).toHaveClass(/is-parsing/);
 });
 
 test("ten-thousand-file queue keeps the rendered list paginated", async ({ page }) => {

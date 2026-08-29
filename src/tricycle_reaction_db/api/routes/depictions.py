@@ -17,6 +17,7 @@ from tricycle_reaction_db.application.services.depictions import (
     get_topology_depiction,
     get_topology_molfile,
     get_transition_state_anchor_sdf,
+    get_transition_state_mode_dof_depiction,
 )
 
 router = APIRouter(tags=["molecular representations"])
@@ -232,6 +233,32 @@ async def validate_chemistry_representation(
                 "mol_block": "MOL block 无法解析",
             }[request.kind],
         )
+
+
+@router.get(
+    "/api/depictions/calculation-frame/{frame_id}/transition-state.svg",
+    response_class=Response,
+)
+async def transition_state_mode_dof_depiction(
+    frame_id: UUID,
+    project_id: UUID | None = None,
+) -> Response:
+    svg = await get_transition_state_mode_dof_depiction(frame_id, project_id=project_id)
+    if svg is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="transition-state mode anchors not found",
+        )
+    return Response(
+        content=svg,
+        media_type="image/svg+xml",
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Depiction-Renderer": "rdkit-dof",
+            "X-Depiction-Animation": "smil",
+            "X-Transition-State-Frame-Count": "21",
+        },
+    )
 
 
 @router.get(

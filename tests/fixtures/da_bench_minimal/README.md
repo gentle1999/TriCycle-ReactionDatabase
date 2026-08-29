@@ -1,5 +1,7 @@
 # DA benchmark minimal fixture
 
+[中文](README.md) | [English](README.en.md)
+
 该 fixture 是从用户提供的 `.tmp` DA-bench 快照冻结出的自包含测试子集。测试和开发
 seed 直接使用仓库内的压缩日志与元数据，不依赖原始目录继续存在，也不要求用户预先整理
 上传文件。

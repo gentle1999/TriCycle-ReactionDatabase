@@ -1,5 +1,7 @@
 # 实施目标清单
 
+> English edition: [Implementation backlog](en/implementation-backlog.md). This is a dated planning record.
+
 > 状态：执行中
 >
 > 建立日期：2026-08-12

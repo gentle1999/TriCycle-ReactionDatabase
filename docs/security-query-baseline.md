@@ -1,5 +1,7 @@
 # 安全与查询重构基线
 
+> English edition: [Security and query baseline](en/security-query-baseline.md). This is a dated baseline.
+
 记录日期：2026-08-17
 
 本文件保存 `security-query-identity-remediation-plan.md` 的 F0 可复现证据。结果来自本地开发

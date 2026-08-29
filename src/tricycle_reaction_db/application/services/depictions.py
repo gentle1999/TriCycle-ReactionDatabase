@@ -1,5 +1,6 @@
 """Molecular representations derived from stored topology and geometry molecules."""
 
+from collections.abc import Sequence
 from io import StringIO
 from typing import Any, Literal, cast
 from uuid import UUID
@@ -9,7 +10,11 @@ from rdkit import Chem
 from rdkit.Chem import rdDepictor
 from rdkit.Chem.Draw import rdMolDraw2D
 from rdkit.Geometry import Point3D
-from rdkit_dof import DofDrawSettings, MolToDofImage  # type: ignore[import-untyped]
+from rdkit_dof import (  # type: ignore[import-untyped]
+    DofDrawSettings,
+    MolsToDofSvgAnimation,
+    MolToDofImage,
+)
 from sqlalchemy.orm import undefer
 from sqlmodel import col, select
 
@@ -26,7 +31,6 @@ from tricycle_reaction_db.db.models import (
     TransitionStateEndpoint,
 )
 from tricycle_reaction_db.db.session import session_factory
-from tricycle_reaction_db.domain.enums import TransitionStateEndpointDirection
 
 _CARD_BACKGROUND = (248 / 255, 250 / 255, 247 / 255)
 _GEOMETRY_DOF_SETTINGS = DofDrawSettings(
@@ -187,6 +191,36 @@ def draw_geometry_dof_svg(
     return rendered
 
 
+def draw_transition_state_mode_dof_svg(
+    molecules: Sequence[Chem.Mol],
+    *,
+    width: int = 480,
+    height: int = 320,
+    frame_duration_ms: int = 140,
+) -> str:
+    """Render stored TS-mode coordinates with rdkit-dof's native SVG animation."""
+
+    if not molecules:
+        raise ValueError("transition-state mode must contain at least one frame")
+    for molecule in molecules:
+        if molecule.GetNumConformers() != 1 or not molecule.GetConformer().Is3D():
+            raise ValueError("each TS-mode frame must contain one three-dimensional conformer")
+    rendered = MolsToDofSvgAnimation(
+        [Chem.Mol(molecule) for molecule in molecules],
+        size=(width, height),
+        duration=frame_duration_ms,
+        loop=0,
+        return_image=False,
+        settings=_GEOMETRY_DOF_SETTINGS,
+        clearBackground=False,
+        padding=0.06,
+        bondLineWidth=1.8,
+    )
+    if not isinstance(rendered, str):
+        raise TypeError("rdkit-dof did not return animated SVG text")
+    return rendered
+
+
 async def _get_topology_molecule(
     topology_id: UUID,
     project_id: UUID | None = None,
@@ -302,12 +336,19 @@ async def get_geometry_dof_depiction(
     return draw_geometry_dof_svg(molecule)
 
 
-async def get_transition_state_anchor_sdf(
+TransitionStateAnchor = Literal["negative", "center", "positive"]
+_TRANSITION_STATE_ANCHORS: tuple[TransitionStateAnchor, ...] = (
+    "negative",
+    "center",
+    "positive",
+)
+
+
+async def _get_transition_state_anchor_molecules(
     frame_id: UUID,
-    anchor: Literal["negative", "center", "positive"],
     project_id: UUID | None = None,
-) -> str | None:
-    """Return one TS-mode anchor in the shared MolOP source coordinate frame."""
+) -> dict[TransitionStateAnchor, tuple[Chem.Mol, int, int]] | None:
+    """Load TS anchors in the original MolOP source atom order."""
 
     scope = await query_visibility_scope(project_id=project_id)
     async with session_factory() as session:
@@ -329,58 +370,154 @@ async def get_transition_state_anchor_sdf(
         if frame_row is None:
             return None
         frame, frame_topology = frame_row
-        if anchor == "center":
-            molecule = _source_order_molecule(
-                frame_topology.mol,
-                frame.observed_coordinates,
-                list(frame.observed_to_geometry_atom_indices),
-            )
-            return draw_geometry_sdf(
-                molecule,
-                charge=frame.charge,
-                multiplicity=frame.multiplicity,
-            )
-
-        direction = TransitionStateEndpointDirection(anchor)
-        endpoint_row = (
+        endpoint_rows = (
             await session.execute(
                 select(TransitionStateEndpoint, MolecularTopology)
                 .join(
                     MolecularTopology,
                     col(TransitionStateEndpoint.topology_id) == col(MolecularTopology.id),
                 )
-                .where(
-                    col(TransitionStateEndpoint.calculation_frame_id) == frame_id,
-                    col(TransitionStateEndpoint.direction) == direction,
-                )
+                .where(col(TransitionStateEndpoint.calculation_frame_id) == frame_id)
                 .options(undefer(cast(Any, TransitionStateEndpoint.source_coordinates)))
             )
-        ).first()
-        if endpoint_row is None:
-            return None
-        endpoint, endpoint_topology = endpoint_row
-        molecule = _source_order_molecule(
-            endpoint_topology.mol,
-            endpoint.source_coordinates,
-            list(endpoint.source_to_topology_atom_indices),
+        ).all()
+
+    anchors: dict[TransitionStateAnchor, tuple[Chem.Mol, int, int]] = {
+        "center": (
+            _source_order_molecule(
+                frame_topology.mol,
+                frame.observed_coordinates,
+                list(frame.observed_to_geometry_atom_indices),
+            ),
+            frame.charge,
+            frame.multiplicity,
         )
-        return draw_geometry_sdf(
-            molecule,
-            charge=endpoint.charge,
-            multiplicity=endpoint.multiplicity,
+    }
+    for endpoint, endpoint_topology in endpoint_rows:
+        direction = endpoint.direction.value
+        if direction not in {"negative", "positive"}:
+            continue
+        anchors[cast(TransitionStateAnchor, direction)] = (
+            _source_order_molecule(
+                endpoint_topology.mol,
+                endpoint.source_coordinates,
+                list(endpoint.source_to_topology_atom_indices),
+            ),
+            endpoint.charge,
+            endpoint.multiplicity,
         )
+    if any(anchor not in anchors for anchor in _TRANSITION_STATE_ANCHORS):
+        return None
+    return anchors
+
+
+def _interpolate_transition_state_mode_frame(
+    template: Chem.Mol,
+    center: Chem.Mol,
+    endpoint: Chem.Mol,
+    fraction: float,
+) -> Chem.Mol:
+    """Copy one stored endpoint graph and interpolate only source-ordered coordinates."""
+
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError("TS-mode interpolation fraction must be between zero and one")
+    atom_count = center.GetNumAtoms()
+    if template.GetNumAtoms() != atom_count or endpoint.GetNumAtoms() != atom_count:
+        raise ValueError("TS-mode anchors have incompatible atom counts")
+    template_atoms = template.GetAtoms()  # type: ignore[no-untyped-call]
+    center_atoms = center.GetAtoms()  # type: ignore[no-untyped-call]
+    endpoint_atoms = endpoint.GetAtoms()  # type: ignore[no-untyped-call]
+    if any(
+        template_atom.GetAtomicNum() != center_atom.GetAtomicNum()
+        or endpoint_atom.GetAtomicNum() != center_atom.GetAtomicNum()
+        for template_atom, center_atom, endpoint_atom in zip(
+            template_atoms, center_atoms, endpoint_atoms, strict=True
+        )
+    ):
+        raise ValueError("TS-mode anchors have incompatible source atom order")
+    for molecule in (template, center, endpoint):
+        if molecule.GetNumConformers() != 1 or not molecule.GetConformer().Is3D():
+            raise ValueError("TS-mode anchor must contain one three-dimensional conformer")
+
+    center_coordinates = center.GetConformer().GetPositions()
+    endpoint_coordinates = endpoint.GetConformer().GetPositions()
+    if (
+        center_coordinates.shape != (atom_count, 3)
+        or endpoint_coordinates.shape != (atom_count, 3)
+        or not np.isfinite(center_coordinates).all()
+        or not np.isfinite(endpoint_coordinates).all()
+    ):
+        raise ValueError("TS-mode anchor coordinates are invalid")
+    interpolated = Chem.Mol(template)
+    conformer = interpolated.GetConformer()
+    for atom_index, coordinates in enumerate(
+        center_coordinates + fraction * (endpoint_coordinates - center_coordinates)
+    ):
+        conformer.SetAtomPosition(
+            atom_index,
+            Point3D(float(coordinates[0]), float(coordinates[1]), float(coordinates[2])),
+        )
+    return interpolated
+
+
+def _interpolate_transition_state_mode_frames(
+    anchors: dict[TransitionStateAnchor, tuple[Chem.Mol, int, int]],
+) -> list[Chem.Mol]:
+    """Match ChemDoodle's persisted signed-anchor sequence without graph rebuilding."""
+
+    negative = anchors["negative"][0]
+    center = anchors["center"][0]
+    positive = anchors["positive"][0]
+    frames = [
+        _interpolate_transition_state_mode_frame(negative, center, negative, step / 10)
+        for step in range(10, 0, -1)
+    ]
+    frames.append(Chem.Mol(center))
+    frames.extend(
+        _interpolate_transition_state_mode_frame(positive, center, positive, step / 10)
+        for step in range(1, 11)
+    )
+    return frames
+
+
+async def get_transition_state_mode_dof_depiction(
+    frame_id: UUID,
+    project_id: UUID | None = None,
+) -> str | None:
+    """Return a looping rdkit-dof SMIL animation for a persisted TS imaginary mode."""
+
+    anchors = await _get_transition_state_anchor_molecules(frame_id, project_id=project_id)
+    if anchors is None:
+        return None
+    return draw_transition_state_mode_dof_svg(_interpolate_transition_state_mode_frames(anchors))
+
+
+async def get_transition_state_anchor_sdf(
+    frame_id: UUID,
+    anchor: Literal["negative", "center", "positive"],
+    project_id: UUID | None = None,
+) -> str | None:
+    """Return one TS-mode anchor in the shared MolOP source coordinate frame."""
+
+    anchors = await _get_transition_state_anchor_molecules(frame_id, project_id=project_id)
+    if anchors is None:
+        return None
+    molecule, charge, multiplicity = anchors[anchor]
+    return draw_geometry_sdf(molecule, charge=charge, multiplicity=multiplicity)
 
 
 __all__ = [
     "draw_molecule_molfile",
     "draw_molecule_svg",
     "draw_geometry_dof_svg",
+    "draw_transition_state_mode_dof_svg",
     "draw_geometry_sdf",
     "draw_geometry_xyz",
     "get_geometry_dof_depiction",
     "get_geometry_sdf",
     "get_geometry_xyz",
     "get_transition_state_anchor_sdf",
+    "get_transition_state_mode_dof_depiction",
     "get_topology_depiction",
     "get_topology_molfile",
 ]

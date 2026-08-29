@@ -1,5 +1,7 @@
 # 数据库实体关系图
 
+> English edition: [Database entity relationship diagram](en/database-erd.md).
+
 > 当前 schema：Alembic `20260813_0038`  
 > 生成来源：`tricycle_reaction_db.db.models.metadata`  
 > 完整性：51 张表、605 个列、

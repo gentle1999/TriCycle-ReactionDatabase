@@ -8,7 +8,10 @@ from molop import AutoParser, molopconfig
 
 from tricycle_reaction_db.db.types import summarize_numpy_array
 from tricycle_reaction_db.domain.enums import ScientificArrayKind
-from tricycle_reaction_db.ingestion import scientific_array_records_from_molop_frame
+from tricycle_reaction_db.ingestion import (
+    scientific_array_export_from_molop_frame,
+    scientific_array_records_from_molop_frame,
+)
 from tricycle_reaction_db.ingestion.molop_arrays import _rotational_constant_difference
 
 
@@ -99,6 +102,8 @@ def test_da_bench_exports_every_supported_molop_array(
         assert record.data.flags.c_contiguous
         assert record.data.dtype == np.dtype("<f8")
         assert np.isfinite(record.data).all()
+        assert record.array_metadata is not None
+        assert record.array_metadata["unit"] == record.unit
 
 
 def test_ts_vibrational_temperatures_map_only_positive_frequency_modes(
@@ -123,3 +128,50 @@ def test_ts_vibrational_temperatures_map_only_positive_frequency_modes(
     assert temperatures.array_metadata["frequency_mode_indices"] == list(
         range(1, positive_mode_count + 1)
     )
+
+
+def test_atomic_population_array_keeps_molop_name_and_normalized_unit() -> None:
+    class _Frame:
+        def model_dump(self, *, mode: str, exclude_none: bool) -> dict[str, Any]:
+            del mode, exclude_none
+            return {}
+
+    payload: dict[str, Any] = {
+        "thermal_informations": None,
+        "forces": None,
+        "hessian": None,
+        "rotation_constants": None,
+        "vibrations": None,
+        "molecular_orbitals": None,
+        "charge_spin_populations": {
+            "populations": {
+                "npa_charges": {
+                    "scheme": "npa",
+                    "quantity": "charge",
+                    "values": [0.1, -0.1],
+                    "spin_channel": None,
+                    "source_label": "Natural Population Analysis",
+                }
+            }
+        },
+        "polarizability": None,
+        "nmr": None,
+        "bond_orders": None,
+        "single_point_properties": None,
+        "electronic_states": None,
+        "multireference_result": None,
+    }
+
+    records, assignments = scientific_array_export_from_molop_frame(
+        _Frame(), frame_payload=payload
+    )
+
+    assert len(records) == len(assignments) == 1
+    record = records[0]
+    assert record.kind is ScientificArrayKind.ATOMIC_POPULATION
+    assert record.unit == "dimensionless"
+    assert record.array_metadata is not None
+    assert record.array_metadata["unit"] == "dimensionless"
+    assert record.array_metadata["population_name"] == "npa_charges"
+    assert record.array_metadata["population_source_label"] == "Natural Population Analysis"
+    assert assignments[0].owner_key == "npa_charges"

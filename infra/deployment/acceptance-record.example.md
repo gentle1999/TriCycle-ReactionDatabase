@@ -1,5 +1,7 @@
 # Production deployment acceptance record
 
+[English](acceptance-record.example.md) | [简体中文](acceptance-record.example.zh-CN.md)
+
 This is a blank evidence template. Replace every `PENDING` value from the target deployment; an
 unfilled copy is not release approval.
 
