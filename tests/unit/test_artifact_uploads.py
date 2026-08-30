@@ -9,7 +9,8 @@ import pytest
 from molgr.config import CONFIG as molgr_config
 from molop import molopconfig
 from molop.io.base_models import Molecule as molop_molecule_module
-from rdkit.Chem import rdChemReactions
+from rdkit import Chem
+from rdkit.Chem import rdChemReactions, rdDepictor
 
 from tricycle_reaction_db.application.dtos import ArtifactUploadResult
 from tricycle_reaction_db.application.services import artifact_uploads as upload_module
@@ -517,6 +518,78 @@ def test_suspicious_ts_endpoint_is_not_used_for_reaction_inference(
 
     assert isinstance(inference, _FailedInference)
     assert inference.error_code == "ts_topology_untrusted"
+
+
+def test_inferred_endpoint_repairs_stereo_before_fragment_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assigned = Chem.AddHs(Chem.MolFromSmiles("F/C=C/F.[Na+]"))
+    rdDepictor.Compute2DCoords(assigned)
+    endpoint = Chem.MolFromMolBlock(
+        Chem.MolToMolBlock(assigned),
+        sanitize=False,
+        removeHs=False,
+        strictParsing=True,
+    )
+    assert endpoint is not None
+    for assigned_bond, endpoint_bond in zip(
+        assigned.GetBonds(), endpoint.GetBonds(), strict=True
+    ):
+        endpoint_bond.SetStereo(assigned_bond.GetStereo())
+        stereo_atoms = list(assigned_bond.GetStereoAtoms())
+        if len(stereo_atoms) == 2:
+            endpoint_bond.SetStereoAtoms(*stereo_atoms)
+        endpoint_bond.SetBondDir(Chem.BondDir.NONE)
+
+    incomplete_smiles = Chem.MolToSmiles(
+        endpoint,
+        canonical=True,
+        isomericSmiles=True,
+        allHsExplicit=True,
+    )
+    assert "/" not in incomplete_smiles and "\\" not in incomplete_smiles
+    assert endpoint.GetNumConformers() == 1
+
+    repair_inputs: list[tuple[int, int]] = []
+    repair_stereo = upload_module.ensure_serializable_double_bond_stereochemistry
+
+    def record_repair_input(molecule: Chem.Mol) -> Chem.Mol:
+        repair_inputs.append((len(Chem.GetMolFrags(molecule)), molecule.GetNumConformers()))
+        return repair_stereo(molecule)
+
+    monkeypatch.setattr(
+        upload_module,
+        "ensure_serializable_double_bond_stereochemistry",
+        record_repair_input,
+    )
+
+    inferred = _SuccessfulInference(
+        file_frame_index=0,
+        imaginary_mode_index=0,
+        imaginary_frequency_cm1=-100.0,
+        reaction_smiles="test",
+        negative_endpoint=endpoint,
+        positive_endpoint=Chem.Mol(endpoint),
+        negative_displacement_ratio=1.0,
+        positive_displacement_ratio=1.0,
+        charge=1,
+        multiplicity=1,
+    )
+    records = upload_module._inference_topology_records(inferred)
+
+    assert repair_inputs == [(2, 1), (2, 1)]
+    endpoint_smiles = [record.topology.canonical_isomeric_smiles for record in records[:2]]
+    participant_smiles = [
+        record.topology.canonical_isomeric_smiles
+        for record in records[2:]
+        if record.topology.atom_count > 1
+    ]
+    assert all(smiles is not None for smiles in endpoint_smiles + participant_smiles)
+    assert all(
+        "/" in smiles or "\\" in smiles
+        for smiles in endpoint_smiles + participant_smiles
+        if smiles is not None
+    )
 
 
 def test_gzip_parser_payload_keeps_logical_source_identity_separate() -> None:

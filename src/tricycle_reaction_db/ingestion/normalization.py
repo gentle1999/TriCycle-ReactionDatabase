@@ -447,6 +447,15 @@ def ensure_serializable_double_bond_stereochemistry(mol: Chem.Mol) -> Chem.Mol:
     serialized_stereo = _serialized_e_z_stereo(repaired)
     if not stereo_bonds or len(serialized_stereo) == len(stereo_bonds):
         return repaired
+    # RDKit's molecule pickle preserves the MolGR E/Z designation and stereo
+    # atom pair, but can drop the neighboring single-bond directions used by
+    # the SMILES writer. Re-project those directions directly from the trusted
+    # stereo state before consulting coordinates; this does not discover or
+    # reassign stereochemistry.
+    Chem.SetDoubleBondNeighborDirections(repaired)
+    serialized_stereo = _serialized_e_z_stereo(repaired)
+    if len(serialized_stereo) == len(stereo_bonds):
+        return repaired
     if repaired.GetNumConformers() != 1:
         raise ValueError(
             "MolGR assigned E/Z stereochemistry without a serializable SMILES projection"
@@ -534,6 +543,11 @@ def _normalized_topology_records(
         preserve_source_order=suspicious_fallback,
         preserve_stereochemistry=preserve_stereochemistry,
     )
+    if preserve_stereochemistry:
+        # RDKit copies can retain the E/Z designation while dropping the
+        # neighboring writer directions. Restore the lossless projection on
+        # the complete topology before any endpoint fragment is extracted.
+        topology_mol = ensure_serializable_double_bond_stereochemistry(topology_mol)
     composition, hill_formula = _formula_components(topology_mol)
     composition_hash = _digest(
         {"schema_version": FORMULA_COMPOSITION_VERSION, "composition": composition}
@@ -563,6 +577,16 @@ def _normalized_topology_records(
                 source_to_topology,
                 smiles_atom_order,
             )
+            if preserve_stereochemistry:
+                topology_mol = ensure_serializable_double_bond_stereochemistry(topology_mol)
+                explicit_graph_smiles = _graph_smiles(
+                    topology_mol,
+                    all_hydrogens_explicit=True,
+                )
+                if explicit_graph_smiles is None:
+                    raise ValueError(
+                        "projected MolGR topology lost its explicit-H SMILES serialization"
+                    )
             stable_topology_projection = True
         else:
             _clear_smiles_output_order(topology_mol)

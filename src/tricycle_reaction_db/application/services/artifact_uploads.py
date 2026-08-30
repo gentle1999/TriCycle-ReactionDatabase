@@ -4051,10 +4051,16 @@ def _inference_topology_records(
     same normalization/serialization validation as every other MolGR graph.
     """
 
+    # Repair writer direction metadata while the endpoint still has its single
+    # displaced conformer.  Fragment extraction below intentionally removes
+    # conformers, so doing this after ``RemoveAllConformers`` would make a
+    # valid MolGR E/Z assignment impossible to serialize.
+    negative_endpoint = ensure_serializable_double_bond_stereochemistry(inferred.negative_endpoint)
+    positive_endpoint = ensure_serializable_double_bond_stereochemistry(inferred.positive_endpoint)
     records: list[Any] = []
     for endpoint, direction in (
-        (inferred.negative_endpoint, TransitionStateEndpointDirection.NEGATIVE),
-        (inferred.positive_endpoint, TransitionStateEndpointDirection.POSITIVE),
+        (negative_endpoint, TransitionStateEndpointDirection.NEGATIVE),
+        (positive_endpoint, TransitionStateEndpointDirection.POSITIVE),
     ):
         record, _source_to_topology = _normalize_transition_state_endpoint_topology(
             endpoint,
@@ -4063,7 +4069,7 @@ def _inference_topology_records(
         records.append(record)
     if reaction_records is None:
         endpoints = sorted(
-            (inferred.negative_endpoint, inferred.positive_endpoint),
+            (negative_endpoint, positive_endpoint),
             key=lambda endpoint: len(Chem.GetMolFrags(endpoint)),
             reverse=True,
         )
