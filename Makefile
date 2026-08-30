@@ -2,7 +2,7 @@
 	dev-infra-up dev-migrate dev-bootstrap \
 	format lint type test test-db test-storage test-redis test-infra audit vendor-audit check \
 	db-up db-down storage-up storage-down auth-up auth-down infra-up infra-down migrate import-artifacts \
-	backfill-thermodynamics bootstrap-development bootstrap-production seed-da-bench serve serve-nexusx storage-gc auth-session-cleanup \
+	backfill-thermodynamics reconcile-reaction-geometries bootstrap-development bootstrap-production seed-da-bench serve serve-nexusx storage-gc auth-session-cleanup \
 	benchmark-upload-resources benchmark-remote-upload-resources capture-query-plan-evidence probe-shared-rate-limit probe-upload-limit \
 	validate-da-bench-fixture validate-restore deployment-smoke validate-deployment-acceptance \
 	stack-build stack-up stack-down stack-logs
@@ -202,6 +202,17 @@ bootstrap-production:
 
 backfill-thermodynamics:
 	uv run python scripts/backfill_mapped_reaction_thermodynamics.py
+
+reconcile-reaction-geometries:
+	uv run tricycle-reconcile-reaction-geometries \
+		$(if $(RECONCILE_BATCH_SIZE),--batch-size "$(RECONCILE_BATCH_SIZE)",) \
+		$(if $(RECONCILE_LIMIT),--limit "$(RECONCILE_LIMIT)",) \
+		$(if $(RECONCILE_START_AFTER),--start-after "$(RECONCILE_START_AFTER)",) \
+		$(if $(RECONCILE_MAPPED_REACTION_ID),--mapped-reaction-id "$(RECONCILE_MAPPED_REACTION_ID)",) \
+		$(if $(RECONCILE_STATEMENT_TIMEOUT_MS),--statement-timeout-ms "$(RECONCILE_STATEMENT_TIMEOUT_MS)",) \
+		$(if $(RECONCILE_REACTION_TIMEOUT_SECONDS),--reaction-timeout-seconds "$(RECONCILE_REACTION_TIMEOUT_SECONDS)",) \
+		$(if $(filter true 1 yes,$(RECONCILE_SCAN_ALL)),--scan-all,) \
+		$(if $(filter true 1 yes,$(RECONCILE_DRY_RUN)),--dry-run,)
 
 seed-da-bench:
 	uv run tricycle-seed-da-bench

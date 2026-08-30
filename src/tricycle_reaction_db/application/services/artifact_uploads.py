@@ -329,6 +329,8 @@ class _PreparedCalculationUpload:
     needs_storage: bool = True
     check_existing_object: bool = True
     skip_parse: bool = False
+    force_new_revision: bool = False
+    ingestion_status: ArtifactIngestionStatus | None = None
     duplicate_of: int | None = None
 
 
@@ -1726,8 +1728,7 @@ def _materialize_parsed_artifacts(
                 ),
                 stage=("conversion" if item.record is None else "inference"),
                 segment_index=int(
-                    getattr(frames_by_index.get(item.file_frame_index), "segment_index", 0)
-                    or 0
+                    getattr(frames_by_index.get(item.file_frame_index), "segment_index", 0) or 0
                 ),
             )
             for item in processed
@@ -1838,9 +1839,7 @@ async def _process_parsed_artifact_frames(
     diagnostics.extend(
         _frame_failure_diagnostic(
             file_frame_index=item.file_frame_index,
-            error=ValueError(
-                item.error_message or item.error_code or "frame processing failed"
-            ),
+            error=ValueError(item.error_message or item.error_code or "frame processing failed"),
             stage=("conversion" if item.record is None else "inference"),
             segment_index=int(
                 getattr(frames_by_index.get(item.file_frame_index), "segment_index", 0) or 0
@@ -2185,10 +2184,6 @@ def _persist_uploaded_artifact(
     record: ArtifactFileRecord,
 ) -> ArtifactFile:
     artifact = persist_artifact_file(session, record)
-    if artifact.project_id != record.project_id:
-        raise ArtifactUploadConflictError(
-            "an identical artifact already belongs to a different project"
-        )
     if artifact.artifact_kind is not record.artifact_kind:
         raise ArtifactUploadConflictError(
             "an identical artifact is already registered with a different artifact kind"
@@ -2210,23 +2205,41 @@ def _prepare_pending_upload(
     """
 
     _acquire_identity_locks(session, ("artifact-content", record.content_sha256))
-    artifact = session.exec(
+    content_artifacts = session.exec(
         select(ArtifactFile).where(ArtifactFile.content_sha256 == record.content_sha256)
-    ).first()
+    ).all()
+    if any(item.artifact_kind is not record.artifact_kind for item in content_artifacts):
+        raise ArtifactUploadConflictError(
+            "an identical artifact is already registered with a different artifact kind"
+        )
+    artifact = next(
+        (item for item in content_artifacts if item.project_id == record.project_id),
+        None,
+    )
+    shared_available = next(
+        (
+            item
+            for item in content_artifacts
+            if item.storage_status is StorageStatus.AVAILABLE and item.bucket == record.bucket
+        ),
+        None,
+    )
     if artifact is None:
-        artifact = ArtifactFile(**record.model_dump())
+        values = record.model_dump()
+        if shared_available is not None:
+            values.update(
+                bucket=shared_available.bucket,
+                object_key=shared_available.object_key,
+            )
+        artifact = ArtifactFile(**values)
         if session.info.get("tricycle_fast_insert", False):
             _prepare_new_entity(session, artifact)
         else:
             session.add(artifact)
             session.flush()
-        return artifact, None, False
+        return artifact, None, shared_available is not None
     if artifact.size_bytes != record.size_bytes:
         raise ValueError("artifact SHA-256 resolved to a different byte size")
-    if artifact.project_id != record.project_id:
-        raise ArtifactUploadConflictError(
-            "an identical artifact already belongs to a different project"
-        )
     if artifact.artifact_kind is not record.artifact_kind:
         raise ArtifactUploadConflictError(
             "an identical artifact is already registered with a different artifact kind"
@@ -2245,7 +2258,10 @@ def _prepare_pending_upload(
             storage_verified_at=artifact.storage_verified_at,
         )
     if artifact.storage_status is not StorageStatus.AVAILABLE:
-        if not (
+        if shared_available is not None and shared_available.id != artifact.id:
+            artifact.object_key = shared_available.object_key
+            artifact.bucket = shared_available.bucket
+        elif not (
             artifact.storage_status is StorageStatus.PENDING
             and _is_partitioned_upload_key(artifact.object_key)
         ):
@@ -2275,29 +2291,46 @@ def _prepare_pending_uploads(
         session,
         *(("artifact-content", digest) for digest in sorted(by_digest)),
     )
-    existing_by_digest = {
-        artifact.content_sha256: artifact
-        for artifact in session.exec(
-            select(ArtifactFile).where(col(ArtifactFile.content_sha256).in_(by_digest))
-        ).all()
-    }
+    existing_by_digest: dict[str, list[ArtifactFile]] = {}
+    for existing in session.exec(
+        select(ArtifactFile).where(col(ArtifactFile.content_sha256).in_(by_digest))
+    ).all():
+        existing_by_digest.setdefault(existing.content_sha256, []).append(existing)
     prepared: dict[
         str,
         tuple[ArtifactFile, _RetiredArtifactReservation | None, bool],
     ] = {}
     for digest, record in by_digest.items():
-        artifact = existing_by_digest.get(digest)
+        content_artifacts = existing_by_digest.get(digest, [])
+        if any(item.artifact_kind is not record.artifact_kind for item in content_artifacts):
+            raise ArtifactUploadConflictError(
+                "an identical artifact is already registered with a different artifact kind"
+            )
+        artifact = next(
+            (item for item in content_artifacts if item.project_id == record.project_id),
+            None,
+        )
+        shared_available = next(
+            (
+                item
+                for item in content_artifacts
+                if item.storage_status is StorageStatus.AVAILABLE and item.bucket == record.bucket
+            ),
+            None,
+        )
         if artifact is None:
-            artifact = ArtifactFile(**record.model_dump())
+            values = record.model_dump()
+            if shared_available is not None:
+                values.update(
+                    bucket=shared_available.bucket,
+                    object_key=shared_available.object_key,
+                )
+            artifact = ArtifactFile(**values)
             _prepare_new_entity(session, artifact)
-            prepared[digest] = (artifact, None, False)
+            prepared[digest] = (artifact, None, shared_available is not None)
             continue
         if artifact.size_bytes != record.size_bytes:
             raise ValueError("artifact SHA-256 resolved to a different byte size")
-        if artifact.project_id != record.project_id:
-            raise ArtifactUploadConflictError(
-                "an identical artifact already belongs to a different project"
-            )
         if artifact.artifact_kind is not record.artifact_kind:
             raise ArtifactUploadConflictError(
                 "an identical artifact is already registered with a different artifact kind"
@@ -2316,7 +2349,10 @@ def _prepare_pending_uploads(
                 storage_verified_at=artifact.storage_verified_at,
             )
         if artifact.storage_status is not StorageStatus.AVAILABLE:
-            if not (
+            if shared_available is not None and shared_available.id != artifact.id:
+                artifact.object_key = shared_available.object_key
+                artifact.bucket = shared_available.bucket
+            elif not (
                 artifact.storage_status is StorageStatus.PENDING
                 and _is_partitioned_upload_key(artifact.object_key)
             ):
@@ -2419,7 +2455,15 @@ def _begin_upload_compensation(
         return None, True
     if artifact.storage_status is StorageStatus.AVAILABLE or artifact.object_key != object_key:
         return artifact_id, False
-    return artifact_id, True
+    shared_reference = session.exec(
+        select(ArtifactFile.id).where(
+            ArtifactFile.id != artifact_id,
+            ArtifactFile.bucket == artifact.bucket,
+            ArtifactFile.object_key == object_key,
+            ArtifactFile.storage_status != StorageStatus.RETIRED,
+        )
+    ).first()
+    return artifact_id, shared_reference is None
 
 
 def _delete_reserved_object(
@@ -2512,15 +2556,13 @@ async def _compensate_upload(
                 )
             )
             reserved_artifact_id, should_delete = reservation
-            if not should_delete:
-                await session.commit()
-                return
-            await asyncio.to_thread(
-                _delete_reserved_object,
-                settings,
-                object_key=object_key,
-                content_sha256=content_sha256,
-            )
+            if should_delete:
+                await asyncio.to_thread(
+                    _delete_reserved_object,
+                    settings,
+                    object_key=object_key,
+                    content_sha256=content_sha256,
+                )
             await session.run_sync(
                 lambda sync_session: _finish_upload_compensation(
                     cast(Session, sync_session),
@@ -2846,6 +2888,9 @@ def _resolve_and_bind_transition_state_reaction(
             ),
             defer_thermodynamic_refresh=is_transition_state_frame_eligible(
                 calculation_frame.frame_role
+            ),
+            defer_geometry_reconciliation=(
+                topology_context is not None and topology_context.reconciliation_cache is not None
             ),
             topology_context=topology_context,
             include_creation_metadata=topology_context is None,
@@ -3893,6 +3938,12 @@ def _run_persist_deferred_inferences(
     topology_context: GeometryPersistenceContext,
 ) -> None:
     typed_session = cast(Session, session)
+    # In a persistence microbatch, reactions are created after Geometry rows
+    # have been flushed.  Keep one cache alive while reactions and TS evidence
+    # are attached; the final Geometry reconciliation will preload the
+    # participant rows and reuse these path identities.
+    if topology_context.reconciliation_cache is None:
+        topology_context.reconciliation_cache = ReconciliationBatchCache()
     previous_fast_insert = typed_session.info.get("tricycle_fast_insert", False)
     typed_session.info["tricycle_fast_insert"] = True
     try:
@@ -4453,6 +4504,7 @@ class ArtifactUploadService:
         project_id: UUID,
         user_id: UUID,
         source_inspections: Mapping[int, _InspectedUploadSource] | None = None,
+        reparse_failed_ingestions: bool = False,
     ) -> tuple[
         dict[int, _PreparedCalculationUpload],
         dict[int, ArtifactBatchUploadItem],
@@ -4573,11 +4625,35 @@ class ArtifactUploadService:
                     artifact_id = _require_id(artifact, label="ArtifactFile")
                     ingestion_id: UUID | None = None
                     skip_parse = False
+                    force_new_revision = False
+                    ingestion_status: ArtifactIngestionStatus | None = None
                     if artifact_kind is ArtifactKind.CALCULATION_OUTPUT:
                         ingestion, created = ingestions_by_artifact_id[artifact_id]
                         ingestion_id = _require_id(ingestion, label="ArtifactIngestion")
+                        ingestion_status = ingestion.status
+                        retry_failed = (
+                            reparse_failed_ingestions
+                            and not created
+                            and ingestion.status is ArtifactIngestionStatus.FAILED
+                        )
+                        if retry_failed:
+                            # Reopen the durable ingestion reservation. Existing
+                            # revisions, if any, are retained as provenance and
+                            # the parser result is written as a new revision.
+                            ingestion.status = ArtifactIngestionStatus.PENDING
+                            ingestion.started_at = started_at
+                            ingestion.completed_at = None
+                            ingestion.source_frame_count = None
+                            ingestion.transition_state_frame_count = None
+                            ingestion.error_code = None
+                            ingestion.error_message = None
+                            session.add(ingestion)
+                            ingestion_status = ArtifactIngestionStatus.PENDING
+                            force_new_revision = True
                         skip_parse = (
-                            not created and ingestion.status is not ArtifactIngestionStatus.PENDING
+                            not created
+                            and not retry_failed
+                            and ingestion.status is not ArtifactIngestionStatus.PENDING
                         )
                     reservations[index] = _PreparedCalculationUpload(
                         settings=settings,
@@ -4593,6 +4669,8 @@ class ArtifactUploadService:
                         needs_storage=artifact.storage_status is not StorageStatus.AVAILABLE,
                         check_existing_object=check_existing_object,
                         skip_parse=skip_parse,
+                        force_new_revision=force_new_revision,
+                        ingestion_status=ingestion_status,
                         duplicate_of=None,
                     )
                 # Duplicate content identities reuse the first reservation and
@@ -4613,6 +4691,8 @@ class ArtifactUploadService:
                         needs_storage=False,
                         check_existing_object=False,
                         skip_parse=True,
+                        force_new_revision=False,
+                        ingestion_status=source.ingestion_status,
                         duplicate_of=first_index,
                     )
                 await session.run_sync(_run_flush)
@@ -4632,6 +4712,8 @@ class ArtifactUploadService:
             artifact_id=reservation.artifact_id,
             artifact_kind=artifact_kind,
             storage_status=StorageStatus.AVAILABLE,
+            ingestion_id=reservation.ingestion_id,
+            ingestion_status=reservation.ingestion_status,
             inferred_reaction_count=0,
             inferences=[],
         )
@@ -4649,6 +4731,7 @@ class ArtifactUploadService:
         streaming: bool = False,
         persistence_batch_files: int = PERSISTENCE_PRELOAD_BATCH_SIZE,
         enforce_batch_file_limit: bool = True,
+        reparse_failed_ingestions: bool = False,
     ) -> ArtifactBatchUploadResult:
         """Prepare once, then advance files through an asynchronous pipeline.
 
@@ -4657,7 +4740,9 @@ class ArtifactUploadService:
         expires only that worker is terminated and the next queued file can
         acquire the released slot. A single bounded consumer writes parse
         results to the database; the final transaction remains atomic for the
-        request.
+        request. ``reparse_failed_ingestions`` reopens existing failed parse
+        records so a retry runs MolOP instead of only confirming the stored
+        content-addressed object.
         """
 
         if persistence_batch_files < 1:
@@ -4702,6 +4787,7 @@ class ArtifactUploadService:
             project_id=project_id,
             user_id=user_id,
             source_inspections=source_inspections,
+            reparse_failed_ingestions=reparse_failed_ingestions,
         )
         timings["prepare_db_ms"] = (perf_counter() - phase_started) * 1000
 
@@ -5046,6 +5132,7 @@ class ArtifactUploadService:
                                     started_at=reservation.started_at,
                                     completed_at=datetime.now(UTC),
                                     geometry_context=geometry_context,
+                                    force_new_revision=reservation.force_new_revision,
                                     preload_geometry_context=False,
                                     ingestion=ingestion,
                                     existing_revision_ids=batch_revision_ids[
@@ -5164,17 +5251,6 @@ class ArtifactUploadService:
                         timings[metric_key] = timings.get(metric_key, 0.0) + float(
                             cast(Any, bulk_diagnostics.get(key, 0))
                         )
-                reconcile_started = perf_counter()
-                await session.run_sync(
-                    partial(
-                        _run_reconcile_molop_geometry_context,
-                        context=geometry_context,
-                    )
-                )
-                timings["persist_reconcile_geometry_ms"] = (
-                    timings.get("persist_reconcile_geometry_ms", 0.0)
-                    + (perf_counter() - reconcile_started) * 1000
-                )
                 if new_deferred:
                     inference_started = perf_counter()
                     await session.run_sync(
@@ -5188,6 +5264,26 @@ class ArtifactUploadService:
                         timings.get("persist_deferred_inferences_ms", 0.0)
                         + (perf_counter() - inference_started) * 1000
                     )
+                    # Failed inferences and the last successful inference
+                    # may still have rows in the fast-insert queue.  Make the
+                    # reaction participants visible before reconciliation.
+                    await session.run_sync(_run_flush)
+
+                # Geometry reconciliation must run after deferred reactions
+                # and participants are durable in this transaction.  Running
+                # it before inference persistence can permanently miss the
+                # newly-created endpoint participants.
+                reconcile_started = perf_counter()
+                await session.run_sync(
+                    partial(
+                        _run_reconcile_molop_geometry_context,
+                        context=geometry_context,
+                    )
+                )
+                timings["persist_reconcile_geometry_ms"] = (
+                    timings.get("persist_reconcile_geometry_ms", 0.0)
+                    + (perf_counter() - reconcile_started) * 1000
+                )
 
                 window_parse_indices = [
                     index for index in completed_indices if index in local_index_by_original
@@ -5263,17 +5359,25 @@ class ArtifactUploadService:
                         else:
                             pending_duplicate_indices.add(original_index)
                     elif reservation.ingestion_id is None or reservation.skip_parse:
+                        stored_result = (
+                            cls._batch_result_for_stored_artifact(
+                                reservation,
+                                artifact_kind=artifact_kind,
+                            )
+                            if original_index not in storage_errors
+                            else None
+                        )
                         item_by_index[original_index] = ArtifactBatchUploadItem(
                             filename=files[original_index].filename,
-                            succeeded=original_index not in storage_errors,
-                            result=(
-                                cls._batch_result_for_stored_artifact(
-                                    reservation,
-                                    artifact_kind=artifact_kind,
-                                )
-                                if original_index not in storage_errors
-                                else None
+                            succeeded=(
+                                stored_result is not None
+                                and stored_result.ingestion_status
+                                not in {
+                                    ArtifactIngestionStatus.FAILED,
+                                    ArtifactIngestionStatus.FILTERED,
+                                }
                             ),
+                            result=stored_result,
                             error_code=(
                                 "artifact_storage_failed"
                                 if original_index in storage_errors
@@ -5435,7 +5539,14 @@ class ArtifactUploadService:
                 continue
             item_by_index[index] = ArtifactBatchUploadItem(
                 filename=files[index].filename,
-                succeeded=index not in storage_errors,
+                succeeded=(
+                    index not in storage_errors
+                    and reservation.ingestion_status
+                    not in {
+                        ArtifactIngestionStatus.FAILED,
+                        ArtifactIngestionStatus.FILTERED,
+                    }
+                ),
                 result=(
                     cls._batch_result_for_stored_artifact(reservation, artifact_kind=artifact_kind)
                     if index not in storage_errors

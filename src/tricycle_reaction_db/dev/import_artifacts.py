@@ -442,6 +442,7 @@ async def import_files(
                 streaming=True,
                 persistence_batch_files=commit_batch_files,
                 enforce_batch_file_limit=False,
+                reparse_failed_ingestions=True,
             )
             service_elapsed_ms = (perf_counter() - service_started) * 1000
             metrics.add_phase_timing("upload_batch_service_ms", service_elapsed_ms)

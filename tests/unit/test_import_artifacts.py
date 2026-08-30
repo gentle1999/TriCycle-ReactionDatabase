@@ -96,6 +96,7 @@ def test_import_files_passes_local_paths_to_upload_service(monkeypatch, tmp_path
 
     async def fake_upload_batch(**kwargs: object) -> ArtifactBatchUploadResult:
         payloads = cast(list[ArtifactUploadPayload], kwargs["files"])
+        assert kwargs["reparse_failed_ingestions"] is True
         calls.append(payloads)
         return ArtifactBatchUploadResult(
             total_count=1,

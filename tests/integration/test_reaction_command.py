@@ -5,7 +5,7 @@ from hashlib import sha256
 import numpy as np
 import pytest
 from rdkit import Chem
-from sqlalchemy import create_engine, func
+from sqlalchemy import create_engine, delete, func
 from sqlmodel import Session, col, select
 
 from tricycle_reaction_db.application.dtos import (
@@ -43,6 +43,9 @@ from tricycle_reaction_db.db.models import (
     MappedReactionNodeGeometry,
     MappedReactionParticipant,
     MolecularTopology,
+)
+from tricycle_reaction_db.dev.reconcile_reaction_geometries import (
+    reconcile_reaction_geometry_batch,
 )
 from tricycle_reaction_db.domain.enums import (
     ArtifactKind,
@@ -799,6 +802,37 @@ def test_later_converged_frame_links_to_preexisting_reaction(tmp_path) -> None:
             assert {binding.geometry_id for binding in backfilled_node_geometries} == {
                 persisted.geometry.id
             }
+
+            binding_ids = {
+                binding.id for binding in backfilled_node_geometries if binding.id is not None
+            }
+            session.exec(
+                delete(MappedReactionNodeGeometry).where(
+                    col(MappedReactionNodeGeometry.id).in_(binding_ids)
+                )
+            )
+            session.flush()
+
+            repaired = reconcile_reaction_geometry_batch(
+                session,
+                batch_size=1,
+                mapped_reaction_id=backfilled.mapped_reaction_id,
+            )
+            assert repaired.scanned_reactions == 1
+            assert repaired.reconciled_reactions == 1
+            assert repaired.created_bindings == 2
+            assert repaired.failed_reactions == 0
+
+            repeated = reconcile_reaction_geometry_batch(
+                session,
+                batch_size=1,
+                mapped_reaction_id=backfilled.mapped_reaction_id,
+            )
+            assert repeated.scanned_reactions == 1
+            assert repeated.reconciled_reactions == 1
+            assert repeated.matched_bindings == 2
+            assert repeated.created_bindings == 0
+            assert repeated.failed_reactions == 0
     finally:
         transaction.rollback()
         connection.close()

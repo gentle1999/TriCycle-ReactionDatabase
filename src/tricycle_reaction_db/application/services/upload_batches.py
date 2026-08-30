@@ -641,6 +641,7 @@ class UploadBatchService:
 
             pending_files: list[tuple[UUID, ArtifactUploadPayload]] = []
             completed_items: dict[UUID, UploadBatchItemView] = {}
+            reparse_failed_ingestions = False
             for client_file_id, upload in files:
                 item = items_by_client_id[client_file_id]
                 payload_size = (
@@ -664,6 +665,11 @@ class UploadBatchService:
                     raise UploadBatchConflictError("cancelled upload batch files cannot be retried")
                 if item.status is UploadBatchItemStatus.FAILED:
                     batch.failed_count -= 1
+                    # A failed queue item may already have a durable artifact
+                    # and failed ingestion. Tell the shared upload service to
+                    # reopen that ingestion and run MolOP again instead of
+                    # treating the content-addressed artifact as complete.
+                    reparse_failed_ingestions = True
                 resolved_media_type = _upload_media_type(
                     upload,
                     item.original_filename,
@@ -772,6 +778,7 @@ class UploadBatchService:
                 user_id=user_id,
                 on_file_committed=on_file_committed,
                 streaming=True,
+                reparse_failed_ingestions=reparse_failed_ingestions,
             )
         except asyncio.CancelledError:
             await cls._finish_items(

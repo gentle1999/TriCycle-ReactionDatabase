@@ -44,7 +44,18 @@ class ArtifactFile(SQLModel, table=True):
 
     __tablename__ = "artifact_file"  # pyright: ignore[reportAssignmentType]
     __table_args__ = (
-        UniqueConstraint("bucket", "object_key", name="uq_artifact_file_object"),
+        UniqueConstraint(
+            "project_id",
+            "content_sha256",
+            name="uq_artifact_file_project_content",
+        ),
+        Index(
+            "ix_artifact_file_object_reference",
+            "bucket",
+            "object_key",
+            "storage_status",
+            "id",
+        ),
         Index(
             "ix_artifact_file_storage_status_created_at",
             "storage_status",
@@ -105,7 +116,7 @@ class ArtifactFile(SQLModel, table=True):
     bucket: str = Field(max_length=255, nullable=False)
     object_key: str = Field(sa_type=Text, nullable=False)
     version_id: str | None = Field(default=None, sa_type=Text, nullable=True)
-    content_sha256: str = Field(max_length=64, unique=True, nullable=False)
+    content_sha256: str = Field(max_length=64, index=True, nullable=False)
     size_bytes: int = Field(sa_type=BigInteger, nullable=False)
     original_filename: str = Field(sa_type=Text, nullable=False)
     media_type: str = Field(max_length=255, nullable=False)

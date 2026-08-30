@@ -178,6 +178,28 @@ frame 或不相关文件。
 生产启动会拒绝 development auth、默认 session secret、不安全 cookie、明文数据服务 endpoint
 或未设置的必需 OIDC 配置。完整说明和多主机配置见[部署与配置指南](docs/deployment-configuration.md)。
 
+## 维护命令
+
+可以用以下命令修复旧批量导入流程可能遗漏的反应参与组分与 Geometry 绑定：
+
+```bash
+# 只检查预计工作量，不提交数据库改动。
+uv run tricycle-reconcile-reaction-geometries --dry-run
+
+# 每批处理 100 个确实缺少绑定的候选反应。
+uv run tricycle-reconcile-reaction-geometries --batch-size 100
+
+# 直接检查一个 mapped reaction。
+uv run tricycle-reconcile-reaction-geometries \
+  --mapped-reaction-id 00000000-0000-7000-8000-000000000000
+```
+
+该命令可重复执行，以有界分页读取候选，并为每个反应使用独立事务。化学回填在可替换的
+worker 进程中运行；原生库崩溃或超过 `--reaction-timeout-seconds` 时会记录失败并继续扫描。
+可通过 `--start-after UUID` 从 UUID 游标恢复扫描，通过 `--scan-all` 检查未被缺失候选查询
+选中的反应。对应的 Make 入口是 `make reconcile-reaction-geometries`，可选变量使用 Makefile
+中列出的 `RECONCILE_*` 前缀。
+
 ## 开发与测试
 
 ```bash

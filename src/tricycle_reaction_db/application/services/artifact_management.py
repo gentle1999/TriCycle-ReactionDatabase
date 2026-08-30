@@ -181,6 +181,19 @@ class ArtifactManagementService:
                 ):
                     await session.commit()
                     return
+                shared_reference = (
+                    await session.exec(
+                        select(ArtifactFile.id).where(
+                            ArtifactFile.id != artifact_id,
+                            ArtifactFile.bucket == bucket,
+                            ArtifactFile.object_key == object_key,
+                            ArtifactFile.storage_status != StorageStatus.RETIRED,
+                        )
+                    )
+                ).first()
+                if shared_reference is not None:
+                    await session.commit()
+                    return
                 await asyncio.to_thread(
                     _delete_artifact_object,
                     bucket=bucket,

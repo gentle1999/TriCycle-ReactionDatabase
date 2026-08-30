@@ -16,9 +16,19 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
     ArtifactUploadPayload,
     ArtifactUploadService,
 )
-from tricycle_reaction_db.db.models import ArtifactIngestion, ParseRevision
+from tricycle_reaction_db.db.models import (
+    ArtifactIngestion,
+    CalculationFrame,
+    MappedReactionNodeGeometry,
+    MappedReactionParticipant,
+    ParseRevision,
+)
 from tricycle_reaction_db.db.session import engine
-from tricycle_reaction_db.domain.enums import ArtifactIngestionStatus, ArtifactKind
+from tricycle_reaction_db.domain.enums import (
+    ArtifactIngestionStatus,
+    ArtifactKind,
+    LogicalReactionParticipantSide,
+)
 from tricycle_reaction_db.domain.identity import DEVELOPMENT_USER_ID, SYSTEM_PROJECT_ID
 from tricycle_reaction_db.storage.rustfs import RustFSObjectStore, RustFSSettings
 
@@ -38,6 +48,10 @@ GAUSSIAN_FIXTURE = (
     "000000000000_000000403256_00_conf_01_ts.43b3faa8fcc9.log.gz"
 )
 ORCA_FIXTURE = FIXTURE_ROOT / "qm/minimal_orca_water_sp.orcaout"
+PRODUCT_FIXTURE = (
+    FIXTURE_ROOT / "da_bench_minimal/complete_set/000000000000_000000403256/00/prod/"
+    "000000000000_000000403256_00_00.prod.log.gz"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -228,6 +242,29 @@ async def test_mixed_raw_batch_persists_independently_and_failed_reparse_preserv
                 assert batch.source_frame_count == 24
                 assert batch.transition_state_frame_count == 1
                 assert batch.inferred_reaction_count == 1
+
+                # Retrying an item whose content-addressed artifact already
+                # exists must reopen its failed ingestion and run MolOP again;
+                # merely confirming the RustFS object is not a successful retry.
+                invalid_retry = await ArtifactUploadService.upload_batch(
+                    files=[
+                        ArtifactUploadPayload(
+                            "unstructured-invalid.bin",
+                            "application/octet-stream",
+                            invalid_payload,
+                        )
+                    ],
+                    artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+                    project_id=SYSTEM_PROJECT_ID,
+                    user_id=DEVELOPMENT_USER_ID,
+                    reparse_failed_ingestions=True,
+                )
+                assert invalid_retry.items[0].succeeded is False
+                assert invalid_retry.items[0].result is not None
+                assert (
+                    invalid_retry.items[0].result.ingestion_status
+                    is ArtifactIngestionStatus.FAILED
+                )
                 # One ingestion/artifact preload, then one ingestion/artifact
                 # result read and one inference result read cover every item.
                 assert len(completed_result_queries) == 3
@@ -314,6 +351,104 @@ async def test_mixed_raw_batch_persists_independently_and_failed_reparse_preserv
                         artifact_id=artifact_id,
                     )
                     == before
+                )
+            finally:
+                await transaction.rollback()
+    finally:
+        settings = RustFSSettings()
+        with RustFSObjectStore(settings) as store:
+            for object_key in written_keys:
+                if store.exists(object_key):
+                    store.delete(object_key)
+
+
+@pytest.mark.asyncio
+async def test_batch_reconciles_geometry_after_deferred_reaction_participants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later inferred reaction binds eligible Geometry from the same batch."""
+
+    run_marker = str(uuid4()).encode()
+    product_payload = gzip.decompress(PRODUCT_FIXTURE.read_bytes()) + b"\n" + run_marker + b"\n"
+    ts_payload = gzip.decompress(GAUSSIAN_FIXTURE.read_bytes()) + b"\n" + run_marker + b"\n"
+    written_keys: set[str] = set()
+    original_store = ArtifactUploadService._store_payload
+
+    def track_store(
+        settings: RustFSSettings,
+        object_key: str,
+        payload: bytes,
+        media_type: str,
+    ) -> object:
+        stored = original_store(settings, object_key, payload, media_type)
+        written_keys.add(object_key)
+        return stored
+
+    monkeypatch.setattr(ArtifactUploadService, "_store_payload", staticmethod(track_store))
+
+    try:
+        async with engine.connect() as connection:
+            transaction = await connection.begin()
+            isolated_factory = async_sessionmaker(
+                bind=connection,
+                class_=AsyncSession,
+                expire_on_commit=False,
+                join_transaction_mode="create_savepoint",
+            )
+            monkeypatch.setattr(uploads, "session_factory", isolated_factory)
+            try:
+                batch = await ArtifactUploadService.upload_batch(
+                    files=[
+                        ArtifactUploadPayload(
+                            PRODUCT_FIXTURE.name.removesuffix(".gz"),
+                            "text/plain",
+                            product_payload,
+                        ),
+                        ArtifactUploadPayload(
+                            GAUSSIAN_FIXTURE.name.removesuffix(".gz"),
+                            "text/plain",
+                            ts_payload,
+                        ),
+                    ],
+                    artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+                    project_id=SYSTEM_PROJECT_ID,
+                    user_id=DEVELOPMENT_USER_ID,
+                )
+                assert batch.succeeded_count == 2
+                product_result = batch.items[0].result
+                ts_result = batch.items[1].result
+                assert product_result is not None
+                assert product_result.parse_revision_id is not None
+                assert ts_result is not None
+                assert len(ts_result.inferences) == 1
+                mapped_reaction_id = ts_result.inferences[0].mapped_reaction_id
+                assert mapped_reaction_id is not None
+
+                async with isolated_factory() as session:
+                    product_geometry_ids = set(
+                        (
+                            await session.exec(
+                                select(CalculationFrame.geometry_id).where(
+                                    CalculationFrame.parse_revision_id
+                                    == product_result.parse_revision_id
+                                )
+                            )
+                        ).all()
+                    )
+                    product_bindings = (
+                        await session.exec(
+                            select(MappedReactionNodeGeometry)
+                            .join(MappedReactionParticipant)
+                            .where(
+                                MappedReactionParticipant.mapped_reaction_id == mapped_reaction_id,
+                                MappedReactionParticipant.side
+                                == LogicalReactionParticipantSide.PRODUCT,
+                            )
+                        )
+                    ).all()
+                assert product_bindings
+                assert product_geometry_ids.intersection(
+                    binding.geometry_id for binding in product_bindings
                 )
             finally:
                 await transaction.rollback()

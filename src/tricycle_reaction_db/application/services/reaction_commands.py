@@ -255,6 +255,7 @@ def _create_reaction(
     command: CreateReactionCommand,
     *,
     defer_thermodynamic_refresh: bool = False,
+    defer_geometry_reconciliation: bool = False,
     topology_context: GeometryPersistenceContext | None = None,
     include_creation_metadata: bool = True,
     reconciliation_cache: ReconciliationBatchCache | None = None,
@@ -362,12 +363,17 @@ def _create_reaction(
         LogicalReactionParticipantSide.PRODUCT,
         cache=reconciliation_cache,
     )
-    reconcile_mapped_reaction_with_geometries(
-        session,
-        mapped_reaction,
-        refresh_thermodynamics=not defer_thermodynamic_refresh,
-        cache=reconciliation_cache,
-    )
+    # Batch ingestion persists Geometry rows before the inferred reaction
+    # participants.  Defer this candidate scan until the batch barrier so the
+    # query can see every participant and run once over the complete Geometry
+    # context.  The endpoint nodes above are still created immediately.
+    if not defer_geometry_reconciliation:
+        reconcile_mapped_reaction_with_geometries(
+            session,
+            mapped_reaction,
+            refresh_thermodynamics=not defer_thermodynamic_refresh,
+            cache=reconciliation_cache,
+        )
     return CreateReactionResult(
         logical_reaction_id=_require_id(logical_reaction, label="LogicalReaction"),
         mapped_reaction_id=_require_id(mapped_reaction, label="MappedReaction"),

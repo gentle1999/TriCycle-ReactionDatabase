@@ -152,18 +152,20 @@ def _update_run_counts(
     session.add(run)
 
 
-def _artifact_for_object(
+def _artifacts_for_object(
     session: Session,
     *,
     bucket: str,
     object_key: str,
-) -> ArtifactFile | None:
-    return session.exec(
-        select(ArtifactFile).where(
-            ArtifactFile.bucket == bucket,
-            ArtifactFile.object_key == object_key,
-        )
-    ).first()
+) -> list[ArtifactFile]:
+    return list(
+        session.exec(
+            select(ArtifactFile).where(
+                ArtifactFile.bucket == bucket,
+                ArtifactFile.object_key == object_key,
+            )
+        ).all()
+    )
 
 
 def _reconcile_stale_pending_rows(
@@ -195,7 +197,15 @@ def _reconcile_stale_pending_rows(
             or _utc(created_at) >= cutoff
         ):
             continue
-        if store.exists(artifact.object_key):
+        shared_reference = session.exec(
+            select(ArtifactFile.id).where(
+                ArtifactFile.id != artifact.id,
+                ArtifactFile.bucket == artifact.bucket,
+                ArtifactFile.object_key == artifact.object_key,
+                ArtifactFile.storage_status != StorageStatus.RETIRED,
+            )
+        ).first()
+        if shared_reference is None and store.exists(artifact.object_key):
             store.delete(artifact.object_key)
             deleted += 1
         session.delete(artifact)
@@ -274,14 +284,14 @@ def run_incremental_storage_gc(
                         if modified_at < scan_after or modified_at >= scan_until:
                             continue
                         seen += 1
-                        artifact = _artifact_for_object(
+                        artifacts = _artifacts_for_object(
                             session,
                             bucket=listed_object.bucket,
                             object_key=listed_object.key,
                         )
-                        if (
-                            artifact is not None
-                            and artifact.storage_status is StorageStatus.AVAILABLE
+                        if any(
+                            artifact.storage_status is StorageStatus.AVAILABLE
+                            for artifact in artifacts
                         ):
                             retained += 1
                             _update_run_counts(
@@ -295,20 +305,27 @@ def run_incremental_storage_gc(
                             session.commit()
                             continue
 
-                        pending_reservation = bool(
-                            artifact is not None
-                            and artifact.storage_status is StorageStatus.PENDING
-                        )
-                        if artifact is not None and pending_reservation:
-                            _acquire_identity_locks(
+                        pending_artifacts = [
+                            artifact
+                            for artifact in artifacts
+                            if artifact.storage_status is StorageStatus.PENDING
+                        ]
+                        if pending_artifacts:
+                            for digest in sorted(
+                                {artifact.content_sha256 for artifact in pending_artifacts}
+                            ):
+                                _acquire_identity_locks(
+                                    session,
+                                    ("artifact-content", digest),
+                                )
+                            artifacts = _artifacts_for_object(
                                 session,
-                                ("artifact-content", artifact.content_sha256),
+                                bucket=listed_object.bucket,
+                                object_key=listed_object.key,
                             )
-                            session.refresh(artifact)
-                            artifact_created_at = artifact.created_at
-                            if (
+                            if any(
                                 artifact.storage_status is StorageStatus.AVAILABLE
-                                and artifact.object_key == listed_object.key
+                                for artifact in artifacts
                             ):
                                 retained += 1
                                 _update_run_counts(
@@ -321,28 +338,17 @@ def run_incremental_storage_gc(
                                 )
                                 session.commit()
                                 continue
-                            if (
-                                artifact.storage_status is StorageStatus.PENDING
-                                and artifact.object_key == listed_object.key
+                            pending_artifacts = [
+                                artifact
+                                for artifact in artifacts
+                                if artifact.storage_status is StorageStatus.PENDING
+                            ]
+                            if any(
+                                artifact.created_at is None
+                                or _utc(artifact.created_at) >= scan_until
+                                for artifact in pending_artifacts
                             ):
-                                if (
-                                    artifact_created_at is None
-                                    or _utc(artifact_created_at) >= scan_until
-                                ):
-                                    retained += 1
-                                    _update_run_counts(
-                                        session,
-                                        run,
-                                        seen=seen,
-                                        deleted=deleted,
-                                        retained=retained,
-                                        failed=failed,
-                                    )
-                                    session.commit()
-                                    continue
-                                store.delete(listed_object.key)
-                                deleted += 1
-                                session.delete(artifact)
+                                retained += 1
                                 _update_run_counts(
                                     session,
                                     run,
@@ -353,6 +359,20 @@ def run_incremental_storage_gc(
                                 )
                                 session.commit()
                                 continue
+                            store.delete(listed_object.key)
+                            deleted += 1
+                            for artifact in pending_artifacts:
+                                session.delete(artifact)
+                            _update_run_counts(
+                                session,
+                                run,
+                                seen=seen,
+                                deleted=deleted,
+                                retained=retained,
+                                failed=failed,
+                            )
+                            session.commit()
+                            continue
 
                         store.delete(listed_object.key)
                         deleted += 1

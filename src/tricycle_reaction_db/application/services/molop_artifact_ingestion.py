@@ -733,7 +733,13 @@ def reconcile_molop_geometry_context(
         session,
         set(context.geometries_to_reconcile),
     )
-    reconciliation_cache = ReconciliationBatchCache()
+    # Deferred TS inference may already have populated path/node identities in
+    # this cache before participant reconciliation.  Reuse it so those rows
+    # remain visible to the final geometry pass; a fresh cache would discard
+    # the in-memory identities and repeat work unnecessarily.
+    reconciliation_cache = context.reconciliation_cache
+    if not isinstance(reconciliation_cache, ReconciliationBatchCache):
+        reconciliation_cache = ReconciliationBatchCache()
     reconciliation_cache.thermodynamic_property_geometry_ids.update(reconcilable_ids)
     context.reconciliation_cache = reconciliation_cache
     preload_reconciliation_context(

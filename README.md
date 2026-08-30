@@ -221,6 +221,32 @@ For a two-host or production deployment, use the
 covers network boundaries, private CA bundles, OIDC, Redis-backed rate limits,
 Caddy, backups, and service separation.
 
+## Maintenance
+
+Repair historical reaction-participant Geometry links that may have been
+missed by an older batch-ingestion ordering:
+
+```bash
+# Inspect the expected work without committing it.
+uv run tricycle-reconcile-reaction-geometries --dry-run
+
+# Reconcile only missing-binding candidates in batches of 100.
+uv run tricycle-reconcile-reaction-geometries --batch-size 100
+
+# Check one mapped reaction directly.
+uv run tricycle-reconcile-reaction-geometries \
+  --mapped-reaction-id 00000000-0000-7000-8000-000000000000
+```
+
+The command is idempotent, fetches candidates in bounded pages, and commits
+each reaction independently. Chemical reconciliation runs in a replaceable
+worker process, so a native-library crash or `--reaction-timeout-seconds`
+expiry is recorded without terminating the remaining scan. Use
+`--start-after UUID` to resume a keyset scan and `--scan-all` to check
+reactions already excluded by the missing-binding candidate query. The equivalent Make target is
+`make reconcile-reaction-geometries`; its optional variables use the
+`RECONCILE_*` prefix shown in the Makefile.
+
 ## Development and Testing
 
 | Command | What it checks |
