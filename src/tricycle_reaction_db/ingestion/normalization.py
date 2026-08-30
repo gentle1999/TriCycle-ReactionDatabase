@@ -58,6 +58,7 @@ _STEREOCHEMISTRY_PROPERTIES = frozenset(
         "_MolFileBondCfg",
     }
 )
+_SMILES_OUTPUT_ORDER_PROPERTIES = ("_smilesAtomOutputOrder", "_smilesBondOutputOrder")
 
 
 def _is_stereochemistry_property(prop_name: str) -> bool:
@@ -94,6 +95,81 @@ def _clear_rdkit_properties(
             if preserve_stereochemistry and _is_stereochemistry_property(prop_name):
                 continue
             bond.ClearProp(prop_name)
+
+
+def _copy_rdkit_property(source: Any, target: Any, prop_name: str) -> None:
+    """Copy one typed RDKit property without rebuilding chemical state."""
+
+    value = source.GetPropsAsDict(includePrivate=True, includeComputed=True).get(prop_name)
+    if isinstance(value, bool):
+        target.SetBoolProp(prop_name, value)
+    elif isinstance(value, int):
+        target.SetIntProp(prop_name, value)
+    elif isinstance(value, float):
+        target.SetDoubleProp(prop_name, value)
+    else:
+        target.SetProp(prop_name, source.GetProp(prop_name))
+
+
+def _renumber_atoms_preserving_stereochemistry(
+    mol: Chem.Mol,
+    order: list[int],
+) -> Chem.Mol:
+    """Apply a deterministic projection while retaining MolGR stereo caches."""
+
+    renumbered = Chem.RenumberAtoms(mol, order)
+    for prop_name in mol.GetPropNames(includePrivate=True, includeComputed=True):
+        if prop_name == "__computedProps" or not _is_stereochemistry_property(prop_name):
+            continue
+        _copy_rdkit_property(mol, renumbered, prop_name)
+    return renumbered
+
+
+def _canonical_smiles_atom_order(mol: Chem.Mol) -> list[int] | None:
+    """Read the atom traversal emitted by the preceding canonical SMILES write."""
+
+    value = mol.GetPropsAsDict(includePrivate=True, includeComputed=True).get(
+        "_smilesAtomOutputOrder"
+    )
+    if value is None:
+        return None
+    order = [int(index) for index in value]
+    if sorted(order) != list(range(mol.GetNumAtoms())):
+        return None
+    return order
+
+
+def _clear_smiles_output_order(mol: Chem.Mol) -> None:
+    for prop_name in _SMILES_OUTPUT_ORDER_PROPERTIES:
+        if mol.HasProp(prop_name):
+            mol.ClearProp(prop_name)
+
+
+def _apply_topology_projection(
+    topology: Chem.Mol,
+    source_to_topology: list[int],
+    order: list[int],
+) -> tuple[Chem.Mol, list[int]]:
+    """Compose source mapping with a new-index-to-old-index atom projection."""
+
+    atom_count = topology.GetNumAtoms()
+    if sorted(source_to_topology) != list(range(atom_count)):
+        raise ValueError("source-to-topology atom indices must be a full permutation")
+    if sorted(order) != list(range(atom_count)):
+        raise ValueError("topology projection must be a full atom permutation")
+    old_to_new = [0] * atom_count
+    for new_index, old_index in enumerate(order):
+        old_to_new[old_index] = new_index
+    projected_mapping = [old_to_new[index] for index in source_to_topology]
+    projected = (
+        topology
+        if order == list(range(atom_count))
+        else _renumber_atoms_preserving_stereochemistry(topology, order)
+    )
+    _clear_smiles_output_order(projected)
+    projected.RemoveAllConformers()
+    _initialize_ring_info(projected)
+    return projected, projected_mapping
 
 
 def _capture_unpaired_electron_state(mol: Chem.Mol) -> list[tuple[int, bool]]:
@@ -166,10 +242,9 @@ def _canonical_topology(
         )
     elif not sanitize:
         # MolGR owns this graph and its source atom order. Do not run any
-        # RDKit chemical repair or canonical atom ranking here. Clearing
-        # transient properties above preserves MolGR's computed stereo caches,
-        # so isomeric serialization keeps its E/Z and tetrahedral assignments
-        # without repeating the post-processing pass.
+        # RDKit chemical repair or stereochemistry assignment here. A later
+        # canonical SMILES write supplies its own deterministic atom traversal,
+        # which is reused as the persisted topology projection.
         _initialize_ring_info(topology)
         canonical_order = list(range(atom_count))
         sanitization_status = TopologySanitizationStatus.SANITIZED
@@ -179,20 +254,10 @@ def _canonical_topology(
             Chem.SanitizeMol(topology)
             _initialize_ring_info(topology)
             # RDKit may infer radicals from incomplete metal/charge valence during
-            # sanitization. Restore MolGR's assignments before canonical ranking.
+            # sanitization. Restore MolGR's assignments before serialization.
             _restore_unpaired_electron_state(topology, unpaired_electron_state)
             Chem.AssignStereochemistry(topology, cleanIt=True, force=True)
-            ranks = list(
-                Chem.CanonicalRankAtoms(
-                    topology,
-                    breakTies=True,
-                    includeChirality=True,
-                    includeIsotopes=True,
-                    includeAtomMaps=False,
-                    includeChiralPresence=True,
-                )
-            )
-            canonical_order = sorted(range(atom_count), key=ranks.__getitem__)
+            canonical_order = list(range(atom_count))
             sanitization_status = TopologySanitizationStatus.SANITIZED
             sanitization_error = None
         except Exception as error:
@@ -219,13 +284,12 @@ def _canonical_topology(
     for topology_index, source_index in enumerate(canonical_order):
         source_to_topology[source_index] = topology_index
 
-    # MolGR and other trusted source-order graphs already use the coordinate
-    # atom order.  Avoid an identity RenumberAtoms call: RDKit rebuilds the
-    # molecule there and drops computed stereo properties such as _CIPRank.
+    # Avoid identity RenumberAtoms: RDKit drops molecule-level computed stereo
+    # state even though atom-level CIP properties survive.
     if canonical_order == list(range(atom_count)):
         canonical = topology
     else:
-        canonical = Chem.RenumberAtoms(topology, canonical_order)
+        canonical = _renumber_atoms_preserving_stereochemistry(topology, canonical_order)
     canonical.RemoveAllConformers()
     _initialize_ring_info(canonical)
     return canonical, source_to_topology, sanitization_status, sanitization_error
@@ -361,6 +425,18 @@ def _normalized_topology_records(
     explicit_graph_smiles = (
         None if suspicious_fallback else _graph_smiles(topology_mol, all_hydrogens_explicit=True)
     )
+    stable_topology_projection = False
+    if explicit_graph_smiles is not None:
+        smiles_atom_order = _canonical_smiles_atom_order(topology_mol)
+        if smiles_atom_order is not None:
+            topology_mol, source_to_topology = _apply_topology_projection(
+                topology_mol,
+                source_to_topology,
+                smiles_atom_order,
+            )
+            stable_topology_projection = True
+        else:
+            _clear_smiles_output_order(topology_mol)
     if explicit_graph_smiles is None and trusted_molgr_graph:
         # Canonical ranking can fail for unusual but trusted MolGR valence
         # states.  A source-order explicit-H SMILES still preserves the graph
@@ -370,6 +446,7 @@ def _normalized_topology_records(
             all_hydrogens_explicit=True,
             canonical=False,
         )
+        _clear_smiles_output_order(topology_mol)
     # ``canonical_isomeric_smiles`` is retained as the public field name for
     # compatibility, but its value is now always the explicit-H projection.
     # This makes topology strings lossless with respect to explicit hydrogen
@@ -377,7 +454,7 @@ def _normalized_topology_records(
     canonical_isomeric_smiles = explicit_graph_smiles
     identity_schema_version = (
         TOPOLOGY_IDENTITY_VERSION
-        if explicit_graph_smiles is not None
+        if explicit_graph_smiles is not None and stable_topology_projection
         else "topology-source-order-identity-v1"
     )
     graph_hash = _digest(
@@ -385,7 +462,7 @@ def _normalized_topology_records(
             "schema_version": identity_schema_version,
             **(
                 {"explicit_graph_smiles": explicit_graph_smiles}
-                if explicit_graph_smiles is not None
+                if explicit_graph_smiles is not None and stable_topology_projection
                 else {"source_order_graph": _source_order_graph_signature(topology_mol)}
             ),
         }

@@ -28,6 +28,53 @@ def _coordinates(atom_count: int) -> np.ndarray:
     return np.arange(atom_count * 3, dtype=np.float64).reshape(atom_count, 3) / 10
 
 
+def _assert_source_mapping_matches_topology(
+    source: Chem.Mol,
+    topology: Chem.Mol,
+    source_to_topology: list[int],
+) -> None:
+    atom_count = source.GetNumAtoms()
+    assert topology.GetNumAtoms() == atom_count
+    assert sorted(source_to_topology) == list(range(atom_count))
+    for source_index, topology_index in enumerate(source_to_topology):
+        source_atom = source.GetAtomWithIdx(source_index)
+        topology_atom = topology.GetAtomWithIdx(topology_index)
+        assert topology_atom.GetAtomicNum() == source_atom.GetAtomicNum()
+        assert topology_atom.GetFormalCharge() == source_atom.GetFormalCharge()
+        assert topology_atom.GetNumRadicalElectrons() == source_atom.GetNumRadicalElectrons()
+    for source_bond in source.GetBonds():
+        topology_bond = topology.GetBondBetweenAtoms(
+            source_to_topology[source_bond.GetBeginAtomIdx()],
+            source_to_topology[source_bond.GetEndAtomIdx()],
+        )
+        assert topology_bond is not None
+        assert topology_bond.GetBondType() == source_bond.GetBondType()
+
+
+def _indexed_graph_signature(molecule: Chem.Mol) -> tuple[object, ...]:
+    atoms = tuple(
+        (
+            atom.GetAtomicNum(),
+            atom.GetFormalCharge(),
+            atom.GetNumRadicalElectrons(),
+            int(atom.GetChiralTag()),
+        )
+        for atom in molecule.GetAtoms()
+    )
+    bonds = tuple(
+        sorted(
+            (
+                min(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()),
+                max(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()),
+                str(bond.GetBondType()),
+                int(bond.GetStereo()),
+            )
+            for bond in molecule.GetBonds()
+        )
+    )
+    return atoms, bonds
+
+
 def _unsanitizable_molecule() -> Chem.Mol:
     molecule = Chem.RWMol()
     carbon_index = molecule.AddAtom(Chem.Atom(6))
@@ -279,7 +326,11 @@ def test_trusted_molgr_normalization_preserves_e_z_stereochemistry(
             reconstruction_version="0.1.8",
         )
         normalized.append(record)
-        assert source_to_topology == list(range(molecule.GetNumAtoms()))
+        _assert_source_mapping_matches_topology(
+            molecule,
+            record.topology.mol,
+            source_to_topology,
+        )
 
     trans, cis = normalized
     assert trans.topology.canonical_isomeric_smiles is not None
@@ -290,15 +341,16 @@ def test_trusted_molgr_normalization_preserves_e_z_stereochemistry(
     assert trans.topology.stereo_status is StereoStatus.ASSIGNED
     assert cis.topology.stereo_status is StereoStatus.ASSIGNED
 
-    chiral_record, _ = normalize_topology_with_mapping(
+    chiral_record, chiral_mapping = normalize_topology_with_mapping(
         chiral_source,
         add_hydrogens=False,
         reconstruction_method="molgr/cpp",
         reconstruction_version="0.1.8",
     )
-    chiral_atom = chiral_record.topology.mol.GetAtomWithIdx(1)
+    chiral_atom = chiral_record.topology.mol.GetAtomWithIdx(chiral_mapping[1])
     assert chiral_atom.HasProp("_CIPRank")
     assert chiral_atom.GetProp("_CIPCode") == "R"
+    assert chiral_record.topology.mol.GetIntProp("_StereochemDone") == 1
 
     # NormalizedMoleculeRecord validation independently checks the topology and
     # geometry serialization and may assign stereo on its temporary copies.
@@ -311,9 +363,43 @@ def test_trusted_molgr_normalization_preserves_e_z_stereochemistry(
         reconstruction_method="molgr/cpp",
         reconstruction_version="0.1.8",
     )
-    geometry_atom = full_record.geometry.mol.GetAtomWithIdx(1)
+    geometry_atom = full_record.geometry.mol.GetAtomWithIdx(
+        full_record.observed_to_geometry_atom_indices[1]
+    )
     assert geometry_atom.HasProp("_CIPRank")
     assert geometry_atom.GetProp("_CIPCode") == "R"
+    assert full_record.geometry.mol.GetIntProp("_StereochemDone") == 1
+
+
+def test_trusted_molgr_projection_is_stable_across_source_atom_order() -> None:
+    source = Chem.AddHs(Chem.MolFromSmiles("F/C=C(/[C@H](Cl)Br)I"))
+    Chem.AssignStereochemistry(source, cleanIt=True, force=True)
+    reverse_order = list(reversed(range(source.GetNumAtoms())))
+    reordered = Chem.RenumberAtoms(source, reverse_order)
+
+    first, first_mapping = normalize_topology_with_mapping(
+        source,
+        add_hydrogens=False,
+        reconstruction_method="molgr/cpp",
+        reconstruction_version="0.1.8",
+    )
+    second, second_mapping = normalize_topology_with_mapping(
+        reordered,
+        add_hydrogens=False,
+        reconstruction_method="molgr/cpp",
+        reconstruction_version="0.1.8",
+    )
+
+    assert first.topology.graph_hash == second.topology.graph_hash
+    assert first.topology.canonical_isomeric_smiles == second.topology.canonical_isomeric_smiles
+    assert _indexed_graph_signature(first.topology.mol) == _indexed_graph_signature(
+        second.topology.mol
+    )
+    _assert_source_mapping_matches_topology(source, first.topology.mol, first_mapping)
+    _assert_source_mapping_matches_topology(reordered, second.topology.mol, second_mapping)
+    # Persistence reuses the first projection for the shared graph hash.  A
+    # mapping produced by any later source order must remain valid against it.
+    _assert_source_mapping_matches_topology(reordered, first.topology.mol, second_mapping)
 
 
 def test_graph_only_normalization_adds_implicit_hydrogens_without_geometry() -> None:

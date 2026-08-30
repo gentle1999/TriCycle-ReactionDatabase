@@ -230,9 +230,16 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
             mapping = inferred_geometry.mapping_bindings[0]
             expected_map_set = list(range(1, ts_frame.geometry.atom_count + 1))
             frame_source_to_geometry = list(ts_frame.observed_to_geometry_atom_indices)
-            # MolGR topology order is the calculation-frame source order; no
-            # additional canonical atom permutation is introduced here.
-            assert frame_source_to_geometry == list(range(ts_frame.geometry.atom_count))
+            parsed_ts_frame = next(
+                record
+                for record in parsed.frame_records
+                if record.frame.file_frame_index == ts_frame.file_frame_index
+            )
+            assert sorted(frame_source_to_geometry) == list(range(ts_frame.geometry.atom_count))
+            assert [
+                ts_frame.geometry.mol.GetAtomWithIdx(geometry_index).GetAtomicNum()
+                for geometry_index in frame_source_to_geometry
+            ] == parsed_ts_frame.molecule.observed_atomic_numbers
             assert mapping.geometry_atom_map_numbers == atom_maps_from_source_order(
                 ts_frame.geometry,
                 expected_map_set,
@@ -265,6 +272,13 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
                 TransitionStateEndpointDirection.NEGATIVE,
                 TransitionStateEndpointDirection.POSITIVE,
             }
+            for endpoint in endpoints:
+                endpoint_mapping = list(endpoint.source_to_topology_atom_indices)
+                assert sorted(endpoint_mapping) == list(range(endpoint.atom_count))
+                assert [
+                    endpoint.topology.mol.GetAtomWithIdx(topology_index).GetAtomicNum()
+                    for topology_index in endpoint_mapping
+                ] == parsed_ts_frame.molecule.observed_atomic_numbers
             endpoint_by_direction = {endpoint.direction: endpoint for endpoint in endpoints}
             mapped_reaction = session.get(MappedReaction, inference.mapped_reaction_id)
             assert mapped_reaction is not None
