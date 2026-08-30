@@ -12,7 +12,7 @@ import os
 import tempfile
 import threading
 import zlib
-from collections.abc import Awaitable, Callable, Mapping, MutableMapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, MutableMapping
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -1079,12 +1079,15 @@ async def _recover_aborted_batch(
     try:
         async with session_factory() as session:
             await session.run_sync(
-                partial(
-                    _recover_aborted_batch_sync,
-                    prepared=prepared,
-                    stored=stored,
-                    error=error,
-                    completed_at=datetime.now(UTC),
+                cast(
+                    Any,
+                    partial(
+                        _recover_aborted_batch_sync,
+                        prepared=prepared,
+                        stored=stored,
+                        error=error,
+                        completed_at=datetime.now(UTC),
+                    ),
                 )
             )
             await session.commit()
@@ -1099,7 +1102,7 @@ async def _pipeline_task_lifecycle(
     tasks: list[asyncio.Task[Any]],
     *,
     on_abort: Callable[[BaseException], Awaitable[None]] | None = None,
-) -> Any:
+) -> AsyncIterator[None]:
     """Ensure file tasks cannot outlive a failed/cancelled batch request."""
 
     async def cancel_unfinished_tasks() -> None:
@@ -1437,7 +1440,10 @@ def _infer_ts_frame(frame: BaseCalcFrame[Any], fallback_index: int) -> _Inferenc
             reverse=True,
         )
         for endpoint in (negative_endpoint, positive_endpoint, reactant, product):
-            endpoint_atoms = [atom.GetAtomicNum() for atom in endpoint.GetAtoms()]
+            endpoint_atoms = [
+                atom.GetAtomicNum()
+                for atom in endpoint.GetAtoms()  # type: ignore[no-untyped-call]
+            ]
             if endpoint_atoms != frame.atoms:
                 raise ValueError("MolOP TS endpoint atom order differs from the TS source frame")
         return _SuccessfulInference(
@@ -2718,7 +2724,10 @@ def _persist_transition_state_endpoint(
         raise ValueError("TS vibration endpoint coordinates are invalid")
     if endpoint.GetNumAtoms() != len(calculation_frame.observed_to_geometry_atom_indices):
         raise ValueError("TS vibration endpoint atom count differs from its source frame")
-    endpoint_charge = sum(atom.GetFormalCharge() for atom in endpoint.GetAtoms())
+    endpoint_charge = sum(
+        atom.GetFormalCharge()
+        for atom in endpoint.GetAtoms()  # type: ignore[no-untyped-call]
+    )
     if endpoint_charge != calculation_frame.charge:
         raise ValueError(
             "TS vibration endpoint atom formal-charge sum differs from its CalculationFrame charge"
@@ -2758,7 +2767,7 @@ def _persist_transition_state_endpoint(
     endpoint_row = (
         _new_entity(session, TransitionStateEndpoint, **endpoint_values)
         if _fast_insert_enabled(session)
-        else TransitionStateEndpoint(**endpoint_values)
+        else cast(Any, TransitionStateEndpoint)(**endpoint_values)
     )
     _flush_new_entity(session, endpoint_row, label="TransitionStateEndpoint")
     if not defer_flush:
@@ -3004,7 +3013,7 @@ def _persist_successful_inference(
     inference = (
         _new_entity(session, TransitionStateInference, **inference_values)
         if _fast_insert_enabled(session)
-        else TransitionStateInference(**inference_values)
+        else cast(Any, TransitionStateInference)(**inference_values)
     )
     _flush_new_entity(session, inference, label="TransitionStateInference")
     if _fast_insert_enabled(session):
@@ -3056,7 +3065,7 @@ def _add_failed_inference(
     failed_inference = (
         _new_entity(session, TransitionStateInference, **values)
         if _fast_insert_enabled(session)
-        else TransitionStateInference(**values)
+        else cast(Any, TransitionStateInference)(**values)
     )
     _flush_new_entity(session, failed_inference, label="TransitionStateInference")
     if _fast_insert_enabled(session):
@@ -3151,7 +3160,7 @@ def _restore_inference_context(
     for name, saved in context_state.items():
         current = getattr(topology_context, name)
         current.clear()
-        current.update(saved)  # type: ignore[arg-type]
+        current.update(saved)
     topology_context.inferred_reaction_cache_hits = cache_hits
     cache = topology_context.reconciliation_cache
     if cache_state is None or not isinstance(cache, ReconciliationBatchCache):
@@ -3159,7 +3168,7 @@ def _restore_inference_context(
     for name, saved in cache_state.items():
         current = getattr(cache, name)
         current.clear()
-        current.update(saved)  # type: ignore[arg-type]
+        current.update(saved)
 
 
 def _persist_inference_batch(
@@ -4027,7 +4036,9 @@ def _inference_topology_records(
             for endpoint in endpoints:
                 source = Chem.Mol(endpoint)
                 source.RemoveAllConformers()
-                for atom_index, atom in enumerate(source.GetAtoms()):
+                for atom_index, atom in enumerate(
+                    source.GetAtoms()  # type: ignore[no-untyped-call]
+                ):
                     atom.SetAtomMapNum(atom_index + 1)
                 for fragment in Chem.GetMolFrags(source, asMols=True, sanitizeFrags=False):
                     fragment_maps = frozenset(atom.GetAtomMapNum() for atom in fragment.GetAtoms())
@@ -4055,7 +4066,8 @@ def _inference_topology_records(
                                 "topology_source_trusted": True,
                                 "source_fragment": True,
                                 "source_atom_map_numbers": [
-                                    atom.GetAtomMapNum() for atom in fragment.GetAtoms()
+                                    atom.GetAtomMapNum()
+                                    for atom in fragment.GetAtoms()  # type: ignore[no-untyped-call]
                                 ],
                                 "side": side,
                                 "template_index": template_index,
@@ -5082,6 +5094,7 @@ class ArtifactUploadService:
                     for inferred in parsed.inferences:
                         if not isinstance(inferred, _SuccessfulInference):
                             continue
+                        cached = None
                         try:
                             cached = geometry_context.inferred_reaction_topology_records.get(
                                 inferred.reaction_smiles
@@ -5187,10 +5200,11 @@ class ArtifactUploadService:
                     persist_write_started = perf_counter()
                     await session.run_sync(
                         partial(
-                            (
+                            cast(
+                                Any,
                                 _run_mark_ingestion_filtered
                                 if original_index in no_frame_indices
-                                else _run_mark_ingestion_failed
+                                else _run_mark_ingestion_failed,
                             ),
                             ingestion_id=_require_prepared_ingestion_id(reservation),
                             error=parse_error,

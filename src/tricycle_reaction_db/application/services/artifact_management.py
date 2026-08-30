@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import cast
+from typing import Any, cast
 from uuid import UUID
 
 from botocore.exceptions import BotoCoreError, ClientError
@@ -111,7 +111,7 @@ class ArtifactManagementService:
             artifact = (
                 await session.exec(
                     select(ArtifactFile)
-                    .options(selectinload(ArtifactFile.ingestion))
+                    .options(selectinload(cast(Any, ArtifactFile.ingestion)))
                     .where(ArtifactFile.id == artifact_id)
                     .with_for_update()
                 )

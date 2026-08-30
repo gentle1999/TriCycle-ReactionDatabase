@@ -27,7 +27,7 @@ class NumpyArraySummary:
     sha256: str
 
 
-class EncodedNumpyArray(np.ndarray):
+class EncodedNumpyArray(np.ndarray[Any, np.dtype[np.generic]]):
     """An array carrying the exact NPY payload generated for it.
 
     The payload is only attached to arrays created by ``encode_numpy_array``.

@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { Download, RefreshCw } from "@lucide/vue";
-import { useQuery } from "@tanstack/vue-query";
+import { Download, ListFilter, RefreshCw, RotateCcw, Search } from "@lucide/vue";
+import { keepPreviousData, useQuery } from "@tanstack/vue-query";
 import type { EChartsOption } from "echarts";
 import { BarChart, ScatterChart } from "echarts/charts";
 import {
   GridComponent,
   LegendComponent,
+  MarkLineComponent,
   TitleComponent,
   TooltipComponent,
 } from "echarts/components";
@@ -16,8 +17,10 @@ import VChart from "vue-echarts";
 import { useRoute, useRouter } from "vue-router";
 
 import { api } from "@/api";
+import ReactionAdvancedQueryModal from "@/components/ReactionAdvancedQueryModal.vue";
 import { useProjectContext } from "@/composables/useProjectContext";
 import { shortId } from "@/format";
+import type { ReactionQueryFilters } from "@/reactionQuery";
 import { withoutAccessState } from "@/routeAccessState";
 import type { ThermodynamicDistributionBin, ThermodynamicScatterPoint } from "@/types";
 
@@ -27,6 +30,7 @@ use([
   CanvasRenderer,
   GridComponent,
   LegendComponent,
+  MarkLineComponent,
   TitleComponent,
   TooltipComponent,
 ]);
@@ -39,6 +43,26 @@ const currentProject = projectContext.currentProject;
 const navigationQuery = computed(() => withoutAccessState(route.query));
 const downloading = ref(false);
 const downloadError = ref("");
+const filters = ref<ReactionQueryFilters>({});
+const quickReactionInput = ref("");
+const hasActivationGibbsFreeEnergy = ref(false);
+const hasReactionGibbsFreeEnergy = ref(false);
+const reactantProductChanged = ref<boolean | null>(null);
+const advancedQueryOpen = ref(false);
+const filterError = ref("");
+const validatingQuickFilter = ref(false);
+
+const appliedFilters = computed<ReactionQueryFilters>(() => ({
+  ...filters.value,
+  ...(currentProjectId.value ? { projectId: currentProjectId.value } : {}),
+}));
+const activeFilterCount = computed(() => (
+  (filters.value.reactionSmarts ? 1 : 0)
+  + (filters.value.filterExpression?.conditions.length ?? 0)
+  + (filters.value.hasActivationGibbsFreeEnergy ? 1 : 0)
+  + (filters.value.hasReactionGibbsFreeEnergy ? 1 : 0)
+  + (filters.value.reactantProductChanged === undefined ? 0 : 1)
+));
 
 interface ScatterDatum {
   value: [number, number];
@@ -52,13 +76,14 @@ interface ScatterEvent {
 }
 
 const statistics = useQuery({
-  queryKey: computed(() => ["thermodynamic-statistics", { projectId: currentProjectId.value }]),
+  queryKey: computed(() => ["thermodynamic-statistics", appliedFilters.value]),
   queryFn: ({ signal }) => api.mappedReactionThermodynamicStatistics(
-    { projectId: currentProjectId.value ?? undefined },
+    appliedFilters.value,
     signal,
   ),
   enabled: computed(() => currentProjectId.value !== null),
   staleTime: 60_000,
+  placeholderData: keepPreviousData,
 });
 
 const errorMessage = computed(() => {
@@ -119,8 +144,8 @@ function escapeHtml(value: string): string {
 function scatterDatum(point: ThermodynamicScatterPoint): ScatterDatum {
   return {
     value: [
-      point.activation_gibbs_free_energy_kcal_mol,
       point.reaction_gibbs_free_energy_kcal_mol,
+      point.activation_gibbs_free_energy_kcal_mol,
     ],
     mappedReactionId: point.mapped_reaction_id,
     mappedReactionSmiles: point.mapped_reaction_smiles,
@@ -147,14 +172,14 @@ function scatterTooltip(params: unknown): string {
   if (!candidate || typeof candidate !== "object") return "";
   const data = (candidate as { data?: unknown }).data;
   if (!isScatterDatum(data)) return "";
-  const [activation, reaction] = data.value;
+  const [reaction, activation] = data.value;
   return [
     '<div class="thermo-point-tooltip">',
     '<span class="thermo-point-tooltip-label">Mapped reaction</span>',
     `<code>${escapeHtml(data.mappedReactionSmiles)}</code>`,
     '<dl>',
-    `<div><dt>ΔG‡</dt><dd>${activation.toFixed(2)} kcal/mol</dd></div>`,
     `<div><dt>ΔG</dt><dd>${reaction.toFixed(2)} kcal/mol</dd></div>`,
+    `<div><dt>ΔG‡</dt><dd>${activation.toFixed(2)} kcal/mol</dd></div>`,
     `<div><dt>ID</dt><dd>${escapeHtml(shortId(data.mappedReactionId))}</dd></div>`,
     '</dl>',
     `<a href="${escapeHtml(data.detailHref)}">映射反应详情 ↗</a>`,
@@ -173,6 +198,18 @@ function openScatterPoint(params: ScatterEvent): void {
 
 const scatterOption = computed<EChartsOption>(() => {
   const points = statistics.data.value?.scatter ?? [];
+  const energyValues = points.flatMap((point) => [
+    point.reaction_gibbs_free_energy_kcal_mol,
+    point.activation_gibbs_free_energy_kcal_mol,
+  ]);
+  const dataMinimum = energyValues.length ? Math.min(...energyValues) : 0;
+  const dataMaximum = energyValues.length ? Math.max(...energyValues) : 0;
+  const dataSpan = dataMaximum - dataMinimum;
+  const padding = dataSpan > 0
+    ? dataSpan * 0.08
+    : Math.max(Math.abs(dataMinimum) * 0.08, 1);
+  const referenceMinimum = Math.floor(dataMinimum - padding);
+  const referenceMaximum = Math.ceil(dataMaximum + padding);
   return {
     animation: false,
     grid: { top: 16, right: 18, bottom: 48, left: 56 },
@@ -185,8 +222,22 @@ const scatterOption = computed<EChartsOption>(() => {
       className: "thermo-scatter-tooltip",
       formatter: scatterTooltip,
     },
-    xAxis: { type: "value", name: "ΔG‡ / kcal/mol", nameLocation: "middle", nameGap: 30 },
-    yAxis: { type: "value", name: "ΔG / kcal/mol", nameLocation: "middle", nameGap: 42 },
+    xAxis: {
+      type: "value",
+      name: "ΔG / kcal/mol",
+      nameLocation: "middle",
+      nameGap: 30,
+      min: referenceMinimum,
+      max: referenceMaximum,
+    },
+    yAxis: {
+      type: "value",
+      name: "ΔG‡ / kcal/mol",
+      nameLocation: "middle",
+      nameGap: 42,
+      min: referenceMinimum,
+      max: referenceMaximum,
+    },
     series: [{
       name: "thermodynamic profile",
       type: "scatter",
@@ -197,6 +248,22 @@ const scatterOption = computed<EChartsOption>(() => {
       emphasis: {
         scale: 1.7,
         itemStyle: { color: "#a63e35", opacity: 1, borderColor: "#ffffff", borderWidth: 1 },
+      },
+      markLine: {
+        silent: true,
+        symbol: ["none", "none"],
+        label: {
+          show: true,
+          formatter: "ΔG‡ = ΔG",
+          position: "insideEndTop",
+          color: "#4d5751",
+          fontSize: 10,
+        },
+        lineStyle: { color: "#6f7872", type: "dashed", width: 1.2, opacity: 0.9 },
+        data: [[
+          { coord: [referenceMinimum, referenceMinimum] },
+          { coord: [referenceMaximum, referenceMaximum] },
+        ]],
       },
     }],
   };
@@ -241,12 +308,84 @@ function formatCoverage(value: number, denominator: number): string {
   return `${value} / ${denominator}（${((value / denominator) * 100).toFixed(1)}%）`;
 }
 
+function selectedOuterFilters(): ReactionQueryFilters {
+  return {
+    ...(hasActivationGibbsFreeEnergy.value ? { hasActivationGibbsFreeEnergy: true } : {}),
+    ...(hasReactionGibbsFreeEnergy.value ? { hasReactionGibbsFreeEnergy: true } : {}),
+    ...(reactantProductChanged.value === null
+      ? {}
+      : { reactantProductChanged: reactantProductChanged.value }),
+  };
+}
+
+async function applyQuickFilter(): Promise<void> {
+  const reactionSmarts = quickReactionInput.value.trim();
+  if (reactionSmarts && !reactionSmarts.includes(">>")) {
+    filterError.value = "请输入“反应物>>产物”格式的反应 SMILES";
+    return;
+  }
+  if (reactionSmarts) {
+    validatingQuickFilter.value = true;
+    try {
+      const validation = await api.validateChemistryRepresentation({
+        kind: "rxn_smiles",
+        value: reactionSmarts,
+      });
+      if (!validation.valid) {
+        filterError.value = validation.error ?? "反应格式无法解析";
+        return;
+      }
+    } catch (error) {
+      filterError.value = error instanceof Error ? error.message : "反应格式校验失败";
+      return;
+    } finally {
+      validatingQuickFilter.value = false;
+    }
+  }
+  filterError.value = "";
+  filters.value = {
+    ...selectedOuterFilters(),
+    ...(reactionSmarts ? { reactionSmarts } : {}),
+  };
+}
+
+function applyOuterFilters(): void {
+  filterError.value = "";
+  filters.value = { ...filters.value, ...selectedOuterFilters() };
+  if (!hasActivationGibbsFreeEnergy.value) {
+    delete filters.value.hasActivationGibbsFreeEnergy;
+  }
+  if (!hasReactionGibbsFreeEnergy.value) {
+    delete filters.value.hasReactionGibbsFreeEnergy;
+  }
+  if (reactantProductChanged.value === null) {
+    delete filters.value.reactantProductChanged;
+  }
+}
+
+function applyAdvancedFilter(nextFilters: ReactionQueryFilters): void {
+  quickReactionInput.value = "";
+  filterError.value = "";
+  advancedQueryOpen.value = false;
+  filters.value = { ...nextFilters, ...selectedOuterFilters() };
+}
+
+function clearFilters(): void {
+  quickReactionInput.value = "";
+  hasActivationGibbsFreeEnergy.value = false;
+  hasReactionGibbsFreeEnergy.value = false;
+  reactantProductChanged.value = null;
+  advancedQueryOpen.value = false;
+  filterError.value = "";
+  filters.value = {};
+}
+
 async function downloadExport(): Promise<void> {
   if (!currentProjectId.value || downloading.value) return;
   downloading.value = true;
   downloadError.value = "";
   try {
-    const blob = await api.mappedReactionThermodynamicExport({ projectId: currentProjectId.value });
+    const blob = await api.mappedReactionThermodynamicExport(appliedFilters.value);
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
@@ -273,8 +412,59 @@ async function downloadExport(): Promise<void> {
       </div>
       <button class="command-button" type="button" :disabled="downloading || !currentProjectId" @click="downloadExport">
         <Download :size="15" aria-hidden="true" />
-        <span>{{ downloading ? "正在导出" : "导出热力学 CSV" }}</span>
+        <span>{{ downloading ? "正在导出" : "导出筛选结果 CSV" }}</span>
       </button>
+    </section>
+
+    <section class="analytics-filters" aria-label="反应路径统计筛选">
+      <form class="analytics-filter-form" @submit.prevent="applyQuickFilter">
+        <label class="search-field is-wide">
+          <Search :size="15" aria-hidden="true" />
+          <span class="sr-only">反应 SMILES 快速查询</span>
+          <input
+            v-model="quickReactionInput"
+            type="search"
+            placeholder="反应物>>产物，例如 C=C>>CC"
+            aria-label="反应 SMILES 快速查询"
+          >
+        </label>
+        <button class="command-button" type="submit" :disabled="validatingQuickFilter">
+          <RefreshCw v-if="validatingQuickFilter" class="is-spinning" :size="15" aria-hidden="true" />
+          <Search v-else :size="15" aria-hidden="true" />
+          {{ validatingQuickFilter ? "正在校验" : "查询统计" }}
+        </button>
+        <button class="command-button command-button-muted" type="button" @click="advancedQueryOpen = true">
+          <ListFilter :size="15" aria-hidden="true" />高级查询
+        </button>
+        <button class="icon-button" type="button" title="清空筛选" aria-label="清空筛选" @click="clearFilters">
+          <RotateCcw :size="15" aria-hidden="true" />
+        </button>
+      </form>
+      <div class="analytics-filter-options">
+        <label class="analytics-filter-toggle">
+          <input v-model="hasActivationGibbsFreeEnergy" type="checkbox" aria-label="仅显示含有活化自由能的反应路径" @change="applyOuterFilters">
+          <span>含有活化自由能</span>
+        </label>
+        <label class="analytics-filter-toggle">
+          <input v-model="hasReactionGibbsFreeEnergy" type="checkbox" aria-label="仅显示含有反应自由能的反应路径" @change="applyOuterFilters">
+          <span>含有反应自由能</span>
+        </label>
+        <label class="filter-select-field analytics-change-filter">
+          <span>前后体拓扑</span>
+          <select v-model="reactantProductChanged" aria-label="前后体拓扑是否发生变化" @change="applyOuterFilters">
+            <option :value="null">全部反应</option>
+            <option :value="true">发生变化</option>
+            <option :value="false">未发生变化</option>
+          </select>
+        </label>
+        <span v-if="activeFilterCount" class="analytics-active-filter-count">{{ activeFilterCount }} 个筛选条件</span>
+      </div>
+      <p v-if="filterError" class="filter-error" role="alert">{{ filterError }}</p>
+      <div class="analytics-query-status" aria-live="polite">
+        <span v-if="statistics.isFetching.value && !statistics.isLoading.value">
+          <RefreshCw class="is-spinning" :size="14" aria-hidden="true" />正在更新筛选统计
+        </span>
+      </div>
     </section>
 
     <div v-if="errorMessage" class="notice analytics-notice" role="alert">{{ errorMessage }}</div>
@@ -315,5 +505,12 @@ async function downloadExport(): Promise<void> {
       </section>
     </template>
     <div v-else class="analytics-state">当前项目暂无可统计的热力学 profile。</div>
+
+    <ReactionAdvancedQueryModal
+      :open="advancedQueryOpen"
+      :project-id="currentProjectId"
+      @close="advancedQueryOpen = false"
+      @apply="applyAdvancedFilter"
+    />
   </main>
 </template>

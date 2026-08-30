@@ -466,9 +466,7 @@ def _validate_benchmark(path: Path, capacity: CapacityEvidence, errors: list[str
             )
         timings = result.get("phase_timings_ms")
         if not isinstance(timings, dict):
-            errors.append(
-                f"capacity.benchmark.results[{index}].phase_timings_ms must be an object"
-            )
+            errors.append(f"capacity.benchmark.results[{index}].phase_timings_ms must be an object")
             continue
         missing_phases = EXPECTED_UPLOAD_BENCHMARK_TIMING_PHASES - timings.keys()
         if missing_phases:

@@ -162,9 +162,7 @@ def test_atomic_population_array_keeps_molop_name_and_normalized_unit() -> None:
         "multireference_result": None,
     }
 
-    records, assignments = scientific_array_export_from_molop_frame(
-        _Frame(), frame_payload=payload
-    )
+    records, assignments = scientific_array_export_from_molop_frame(_Frame(), frame_payload=payload)
 
     assert len(records) == len(assignments) == 1
     record = records[0]

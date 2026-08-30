@@ -6,7 +6,6 @@ from uuid import uuid4
 
 import pytest
 
-from tricycle_reaction_db.application.services.query_visibility import QueryVisibilityScope
 from tricycle_reaction_db.application.services.reaction_thermodynamic_analytics import (
     ReactionThermodynamicAnalyticsService,
     _level_label,
@@ -85,14 +84,8 @@ async def test_export_csv_preserves_profile_columns_and_quotes_smiles(
         "tricycle_reaction_db.application.services.reaction_thermodynamic_analytics.session_factory",
         lambda: _SessionContext(rows),
     )
-    scope = QueryVisibilityScope(
-        principal=None,
-        project_ids=frozenset(),
-        unrestricted=True,
-    )
-
     payload = "".join(
-        [chunk async for chunk in ReactionThermodynamicAnalyticsService._export_csv_rows(scope)]
+        [chunk async for chunk in ReactionThermodynamicAnalyticsService._export_csv_rows(True)]
     )
     exported = list(csv.DictReader(io.StringIO(payload)))
 

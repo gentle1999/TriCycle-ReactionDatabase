@@ -903,9 +903,7 @@ class UploadBatchService:
             _finish_batch_if_terminal(batch)
             session.add(batch)
             await session.commit()
-            outcomes_by_client_id = {
-                outcome.client_file_id: outcome for outcome in outcomes
-            }
+            outcomes_by_client_id = {outcome.client_file_id: outcome for outcome in outcomes}
             return [
                 _item_view(
                     items_by_client_id[client_file_id],

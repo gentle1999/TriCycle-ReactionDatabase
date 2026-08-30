@@ -162,7 +162,8 @@ async def test_fastapi_does_not_serve_frontend_or_static_assets() -> None:
 
 
 def test_combined_app_exposes_core_rest_routes() -> None:
-    paths = {route.path for route in create_app().routes}
+    routes = create_app().routes
+    paths = {route.path for route in routes}
 
     assert "/api/logical-reactions" in paths
     assert "/api/artifacts/{artifact_id}/preview" in paths
@@ -173,6 +174,17 @@ def test_combined_app_exposes_core_rest_routes() -> None:
     assert "/api/mapped-reactions/{mapped_reaction_id}" in paths
     assert "/api/mapped-reactions/thermodynamics/statistics" in paths
     assert "/api/mapped-reactions/thermodynamics/export.csv" in paths
+    for analytics_path in (
+        "/api/mapped-reactions/thermodynamics/statistics",
+        "/api/mapped-reactions/thermodynamics/export.csv",
+    ):
+        methods = {
+            method
+            for route in routes
+            if route.path == analytics_path
+            for method in (route.methods or set())
+        }
+        assert {"GET", "POST"}.issubset(methods)
     assert "/api/calculation-frames" in paths
     assert "/api/depictions/geometry/{geometry_id}.sdf" in paths
     assert "/api/depictions/geometry/{geometry_id}.xyz" in paths

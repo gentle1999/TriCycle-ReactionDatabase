@@ -182,7 +182,7 @@ class RustFSObjectStore:
                 read_timeout=settings.read_timeout_seconds,
                 retries={"mode": "standard", "max_attempts": 3},
                 s3={"addressing_style": "path"},
-                **({"proxies": {}} if local_endpoint else {}),
+                proxies={} if local_endpoint else None,
             ),
         )
 

@@ -462,6 +462,14 @@ def test_real_da_subset_round_trips_manifest_reaction_path_and_frame_bindings(
                     mapped_reaction_smiles=canonical_mapped_smiles,
                     mapping_hash=mapping_hash,
                 ),
+                source_atom_maps_by_template={
+                    (side, declaration["participant_index"]): atom_maps
+                    for declaration, _persisted, side, atom_maps in participant_payloads
+                },
+                topology_ids_by_template={
+                    (side, declaration["participant_index"]): persisted.topology.id
+                    for declaration, persisted, side, _atom_maps in participant_payloads
+                },
             )
             mapped_participants = {
                 participant.logical_reaction_participant_id: participant

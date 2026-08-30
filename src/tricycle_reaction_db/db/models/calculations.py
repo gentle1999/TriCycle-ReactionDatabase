@@ -9,6 +9,7 @@ import numpy.typing as npt
 from pydantic import ConfigDict
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     Column,
     DateTime,
@@ -784,6 +785,26 @@ class ProjectGeometryCatalog(SQLModel, table=True):
     __table_args__ = (
         CheckConstraint("frame_count > 0", name="ck_project_geometry_catalog_frame_count"),
         Index(
+            "ix_project_geometry_catalog_created_page",
+            "project_id",
+            "geometry_created_at",
+            "geometry_id",
+        ),
+        Index(
+            "ix_project_geometry_catalog_thermodynamic_page",
+            "project_id",
+            "geometry_created_at",
+            "geometry_id",
+            postgresql_where=text("has_thermodynamic_property"),
+        ),
+        Index(
+            "ix_project_geometry_catalog_nonthermodynamic_page",
+            "project_id",
+            "geometry_created_at",
+            "geometry_id",
+            postgresql_where=text("NOT has_thermodynamic_property"),
+        ),
+        Index(
             "ix_project_geometry_catalog_frame_count_asc",
             "project_id",
             "frame_count",
@@ -822,9 +843,18 @@ class ProjectGeometryCatalog(SQLModel, table=True):
             server_default=text("now()"),
         ),
     )
-    has_frequency_data: bool = Field(default=False, nullable=False)
-    has_imaginary_frequency: bool = Field(default=False, nullable=False)
-    has_thermodynamic_property: bool = Field(default=False, nullable=False)
+    has_frequency_data: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default=text("false")),
+    )
+    has_imaginary_frequency: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default=text("false")),
+    )
+    has_thermodynamic_property: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default=text("false")),
+    )
 
 
 class ProjectGeometryCatalogCount(SQLModel, table=True):

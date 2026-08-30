@@ -119,7 +119,10 @@ def test_representative_query_plans_execute_with_buffers_and_expected_indexes() 
         "topology fingerprint KNN": {"ix_molecular_topology_morgan_bfp_gist"},
         "reaction SMARTS": {"ix_mapped_reaction_reaction_gist"},
         "reaction fingerprint KNN": {"ix_mapped_reaction_structural_bfp_gist"},
-        "geometry topology": {"ix_geometry_topology_id"},
+        "geometry topology": {
+            "ix_geometry_topology_id",
+            "ix_geometry_match_candidates",
+        },
         "frame topology derivation": {"ix_calculation_frame_topology_derivation_id"},
         "artifact filename contains": {"ix_artifact_file_original_filename_trgm"},
         # Both plans are valid on tiny fixtures: PostgreSQL may scan the

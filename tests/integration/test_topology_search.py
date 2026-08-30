@@ -77,6 +77,17 @@ def _formula(
     )
 
 
+def _explicit_h_smiles(smiles: str) -> str:
+    parsed = Chem.MolFromSmiles(smiles)
+    assert parsed is not None
+    return Chem.MolToSmiles(
+        Chem.AddHs(parsed),
+        canonical=True,
+        isomericSmiles=True,
+        allHsExplicit=True,
+    )
+
+
 def _topology(formula: MolecularFormula, smiles: str, suffix: str) -> MolecularTopology:
     parsed = Chem.MolFromSmiles(smiles)
     assert parsed is not None
@@ -86,11 +97,7 @@ def _topology(formula: MolecularFormula, smiles: str, suffix: str) -> MolecularT
     return MolecularTopology(
         formula=formula,
         mol=molecule,
-        canonical_isomeric_smiles=Chem.MolToSmiles(
-            display_molecule,
-            canonical=True,
-            isomericSmiles=True,
-        ),
+        canonical_isomeric_smiles=_explicit_h_smiles(smiles),
         graph_hash=hashlib.sha256(f"topology-search-{suffix}-{uuid4()}".encode()).hexdigest(),
         identity_schema_version="topology-search-test-v1",
         atom_count=molecule.GetNumAtoms(),
@@ -345,8 +352,8 @@ def test_formula_prefilter_exact_smiles_and_substructure_counts(
         )
     )
     assert {item.canonical_isomeric_smiles for item in formula_prefiltered.items} == {
-        "CCO",
-        "COC",
+        _explicit_h_smiles("CCO"),
+        _explicit_h_smiles("COC"),
     }
     assert all(item.hill_formula == "C2H6O" for item in formula_prefiltered.items)
 
@@ -357,7 +364,7 @@ def test_formula_prefilter_exact_smiles_and_substructure_counts(
             offset=0,
         )
     )
-    assert [item.canonical_isomeric_smiles for item in exact.items] == ["CCO"]
+    assert [item.canonical_isomeric_smiles for item in exact.items] == [_explicit_h_smiles("CCO")]
     assert exact.items[0].molecular_weight == pytest.approx(46.069)
     assert exact.items[0].hba_count == 1
     assert exact.items[0].hbd_count == 1
@@ -374,7 +381,9 @@ def test_formula_prefilter_exact_smiles_and_substructure_counts(
             offset=0,
         )
     )
-    assert [item.canonical_isomeric_smiles for item in descriptor_filtered.items] == ["c1ccccc1"]
+    assert [item.canonical_isomeric_smiles for item in descriptor_filtered.items] == [
+        _explicit_h_smiles("c1ccccc1")
+    ]
     assert descriptor_filtered.items[0].ring_count == 1
     assert descriptor_filtered.items[0].scaffold_smiles == "c1ccccc1"
 
@@ -389,7 +398,10 @@ def test_formula_prefilter_exact_smiles_and_substructure_counts(
         )
     )
     assert nearest.page.total == 2
-    assert [item.canonical_isomeric_smiles for item in nearest.items] == ["CCO", "COC"]
+    assert [item.canonical_isomeric_smiles for item in nearest.items] == [
+        _explicit_h_smiles("CCO"),
+        _explicit_h_smiles("COC"),
+    ]
     assert nearest.items[0].similarity_score == pytest.approx(1.0)
     assert all(item.morgan_bfp_schema_version == "morgan-bfp-r2-v1" for item in nearest.items)
 
@@ -416,8 +428,12 @@ def test_formula_prefilter_exact_smiles_and_substructure_counts(
             offset=0,
         )
     )
-    assert [item.canonical_isomeric_smiles for item in tanimoto_threshold.items] == ["CCO"]
-    assert [item.canonical_isomeric_smiles for item in dice_threshold.items] == ["CCO"]
+    assert [item.canonical_isomeric_smiles for item in tanimoto_threshold.items] == [
+        _explicit_h_smiles("CCO")
+    ]
+    assert [item.canonical_isomeric_smiles for item in dice_threshold.items] == [
+        _explicit_h_smiles("CCO")
+    ]
     assert tanimoto_threshold.items[0].similarity_score == pytest.approx(1.0)
     assert dice_threshold.items[0].similarity_score == pytest.approx(1.0)
 
@@ -432,7 +448,9 @@ def test_formula_prefilter_exact_smiles_and_substructure_counts(
             offset=0,
         )
     )
-    assert [item.canonical_isomeric_smiles for item in counted.items] == ["c1ccccc1"]
+    assert [item.canonical_isomeric_smiles for item in counted.items] == [
+        _explicit_h_smiles("c1ccccc1")
+    ]
     assert counted.items[0].substructure_match_count == 6
 
 
@@ -601,7 +619,10 @@ async def test_topology_search_rest_endpoint_uses_formula_join(
     assert response.status_code == 200
     payload = response.json()
     assert payload["page"] == {"total": 2, "limit": 10, "offset": 0}
-    assert {item["canonical_isomeric_smiles"] for item in payload["items"]} == {"CCO", "COC"}
+    assert {item["canonical_isomeric_smiles"] for item in payload["items"]} == {
+        _explicit_h_smiles("CCO"),
+        _explicit_h_smiles("COC"),
+    }
 
 
 @pytest.mark.asyncio
@@ -626,7 +647,7 @@ async def test_topology_similarity_rest_endpoint_returns_ranked_scores(
     assert response.status_code == 200
     payload = response.json()
     assert payload["page"] == {"total": 1, "limit": 10, "offset": 0}
-    assert payload["items"][0]["canonical_isomeric_smiles"] == "CCO"
+    assert payload["items"][0]["canonical_isomeric_smiles"] == _explicit_h_smiles("CCO")
     assert payload["items"][0]["similarity_score"] == pytest.approx(1.0)
 
 
@@ -676,7 +697,7 @@ async def test_nexusx_generated_topology_search_rest_and_graphql(
     assert rest_response.status_code == 200
     rest_payload = rest_response.json()
     assert rest_payload["page"] == {"total": 1, "limit": 10, "offset": 0}
-    assert rest_payload["items"][0]["canonical_isomeric_smiles"] == "CCO"
+    assert rest_payload["items"][0]["canonical_isomeric_smiles"] == _explicit_h_smiles("CCO")
     assert rest_payload["items"][0]["similarity_score"] == pytest.approx(1.0)
 
     assert graphql_response.status_code == 200
@@ -685,5 +706,8 @@ async def test_nexusx_generated_topology_search_rest_and_graphql(
     graphql_result = graphql_payload["data"]["MolecularTopologyQueryService"]["search_topologies"]
     assert graphql_result["page"] == {"total": 1, "limit": 10, "offset": 0}
     assert graphql_result["items"] == [
-        {"canonical_isomeric_smiles": "CCO", "similarity_score": pytest.approx(1.0)}
+        {
+            "canonical_isomeric_smiles": _explicit_h_smiles("CCO"),
+            "similarity_score": pytest.approx(1.0),
+        }
     ]

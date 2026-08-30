@@ -12,7 +12,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPSHandler, OpenerDirector, ProxyHandler, Request, build_opener
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 CADDY_CONFIGURATION = REPOSITORY_ROOT / "infra/caddy/Caddyfile"
@@ -20,7 +20,7 @@ UPSTREAM_ADDRESS = ("127.0.0.1", 18000)
 UPSTREAM_LISTEN_ADDRESS = ("0.0.0.0", UPSTREAM_ADDRESS[1])
 HTTP_ADDRESS = ("127.0.0.1", 28080)
 HTTPS_ADDRESS = ("127.0.0.1", 28443)
-EDGE_HOST = "localhost"
+EDGE_HOST = HTTPS_ADDRESS[0]
 STREAM_DELAY_SECONDS = 0.75
 
 
@@ -58,8 +58,13 @@ def _headers() -> dict[str, str]:
     return {"Host": "localhost"}
 
 
-def _wait_for_edge(process: subprocess.Popen[str]) -> None:
+def _local_https_opener() -> OpenerDirector:
     context = ssl._create_unverified_context()
+    return build_opener(ProxyHandler({}), HTTPSHandler(context=context))
+
+
+def _wait_for_edge(process: subprocess.Popen[str]) -> None:
+    opener = _local_https_opener()
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         if process.poll() is not None:
@@ -70,7 +75,7 @@ def _wait_for_edge(process: subprocess.Popen[str]) -> None:
                 f"https://{EDGE_HOST}:{HTTPS_ADDRESS[1]}/health/live",
                 headers=_headers(),
             )
-            with urlopen(request, context=context, timeout=0.5) as response:
+            with opener.open(request, timeout=0.5) as response:
                 response.read()
             return
         except (OSError, HTTPError):
@@ -88,13 +93,13 @@ def _wait_for_edge(process: subprocess.Popen[str]) -> None:
 
 
 def _request(path: str) -> tuple[int, bytes, dict[str, str]]:
-    context = ssl._create_unverified_context()
+    opener = _local_https_opener()
     request = Request(
         f"https://{EDGE_HOST}:{HTTPS_ADDRESS[1]}{path}",
         headers=_headers(),
     )
     try:
-        with urlopen(request, context=context, timeout=3) as response:
+        with opener.open(request, timeout=3) as response:
             return response.status, response.read(), dict(response.headers.items())
     except HTTPError as error:
         return error.code, error.read(), dict(error.headers.items())
@@ -208,6 +213,8 @@ def _caddy_command(
         "docker",
         "run",
         "--rm",
+        "--user",
+        f"{os.getuid()}:{os.getgid()}",
         "-p",
         f"127.0.0.1:{HTTP_ADDRESS[1]}:{HTTP_ADDRESS[1]}",
         "-p",

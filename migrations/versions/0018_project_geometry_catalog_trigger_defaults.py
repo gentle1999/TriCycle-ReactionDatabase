@@ -8,7 +8,6 @@ summary refresh can run.
 
 from alembic import op
 
-
 revision: str = "0018_catalog_trigger_defaults"
 down_revision: str | None = "0017_reactant_sort_key"
 branch_labels: str | None = None
@@ -21,10 +20,7 @@ def upgrade() -> None:
         "has_imaginary_frequency",
         "has_thermodynamic_property",
     ):
-        op.execute(
-            f"ALTER TABLE project_geometry_catalog "
-            f"ALTER COLUMN {column} SET DEFAULT false"
-        )
+        op.execute(f"ALTER TABLE project_geometry_catalog ALTER COLUMN {column} SET DEFAULT false")
 
 
 def downgrade() -> None:
@@ -33,7 +29,4 @@ def downgrade() -> None:
         "has_imaginary_frequency",
         "has_frequency_data",
     ):
-        op.execute(
-            f"ALTER TABLE project_geometry_catalog "
-            f"ALTER COLUMN {column} DROP DEFAULT"
-        )
+        op.execute(f"ALTER TABLE project_geometry_catalog ALTER COLUMN {column} DROP DEFAULT")

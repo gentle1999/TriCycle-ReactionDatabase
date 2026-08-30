@@ -165,14 +165,11 @@ async def test_mixed_raw_batch_persists_independently_and_failed_reparse_preserv
         if "selectparse_revision.idfromparse_revision" in compact:
             individual_revision_id_reads.append(statement)
         if (
-            (
-                "from artifact_ingestion" in normalized
-                and "left outer join artifact_file" in normalized
-            )
-            or (
-                "from transition_state_inference" in normalized
-                and "artifact_ingestion_id in" in normalized
-            )
+            "from artifact_ingestion" in normalized
+            and "left outer join artifact_file" in normalized
+        ) or (
+            "from transition_state_inference" in normalized
+            and "artifact_ingestion_id in" in normalized
         ):
             completed_result_queries.append(statement)
 
@@ -262,8 +259,7 @@ async def test_mixed_raw_batch_persists_independently_and_failed_reparse_preserv
                 assert invalid_retry.items[0].succeeded is False
                 assert invalid_retry.items[0].result is not None
                 assert (
-                    invalid_retry.items[0].result.ingestion_status
-                    is ArtifactIngestionStatus.FAILED
+                    invalid_retry.items[0].result.ingestion_status is ArtifactIngestionStatus.FAILED
                 )
                 # One ingestion/artifact preload, then one ingestion/artifact
                 # result read and one inference result read cover every item.
@@ -284,9 +280,7 @@ async def test_mixed_raw_batch_persists_independently_and_failed_reparse_preserv
                     "total_ms",
                 }
                 assert expected_timing_phases <= batch.timings_ms.keys()
-                assert all(
-                    batch.timings_ms[phase] >= 0 for phase in expected_timing_phases
-                )
+                assert all(batch.timings_ms[phase] >= 0 for phase in expected_timing_phases)
                 assert not individual_ingestion_reads
                 assert not individual_revision_id_reads
                 assert len(parse_revision_selects) == 2
@@ -476,6 +470,7 @@ async def test_batch_prepare_sql_round_trips_do_not_scale_with_new_file_count(
         )
         monkeypatch.setattr(uploads, "session_factory", isolated_factory)
         try:
+
             async def capture_prepare(file_count: int) -> list[str]:
                 marker = str(uuid4()).encode()
                 statements: list[str] = []

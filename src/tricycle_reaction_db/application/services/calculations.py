@@ -110,7 +110,7 @@ def _dto_values(record: Any, *, exclude: set[str] | None = None) -> dict[str, An
 
     values = record.__dict__
     if not exclude:
-        return values.copy()
+        return cast(dict[str, Any], values.copy())
     return {key: value for key, value in values.items() if key not in exclude}
 
 
@@ -295,7 +295,9 @@ def persist_parse_revision(
 
     artifact_file_id = _require_id(artifact_file, label="ArtifactFile")
     if _fast_insert_enabled(session) and not force_new_revision:
-        new_revision = _new_entity(session, ParseRevision,
+        new_revision = _new_entity(
+            session,
+            ParseRevision,
             artifact_file=artifact_file,
             revision_number=1,
             **_dto_values(record),
@@ -362,7 +364,9 @@ def persist_parse_revision(
         .order_by(col(ParseRevision.revision_number).desc())
     ).first()
 
-    revision = _new_entity(session, ParseRevision,
+    revision = _new_entity(
+        session,
+        ParseRevision,
         artifact_file=artifact_file,
         revision_number=(latest_revision.revision_number + 1 if latest_revision is not None else 1),
         reparse_of_id=(
@@ -407,7 +411,9 @@ def persist_calculation_segment(
         _assert_record_matches(segment, record, label="CalculationSegment")
         return segment
 
-    segment = _new_entity(session, CalculationSegment,
+    segment = _new_entity(
+        session,
+        CalculationSegment,
         parse_revision=parse_revision,
         protocol=protocol,
         **_dto_values(record),
@@ -454,7 +460,9 @@ def persist_calculation_frame(
         raise ValueError("observed coordinates must match the Geometry atom count")
 
     if _fast_insert_enabled(session):
-        new_frame = _new_entity(session, CalculationFrame,
+        new_frame = _new_entity(
+            session,
+            CalculationFrame,
             segment=segment,
             geometry=geometry,
             topology_derivation=topology_derivation,
@@ -496,7 +504,9 @@ def persist_calculation_frame(
     if file_frame is not None:
         raise ValueError("file_frame_index is already assigned to a different segment frame")
 
-    frame = _new_entity(session, CalculationFrame,
+    frame = _new_entity(
+        session,
+        CalculationFrame,
         segment=segment,
         geometry=geometry,
         topology_derivation=topology_derivation,
@@ -647,12 +657,13 @@ def _validated_array_copy(
 ) -> npt.NDArray[np.generic]:
     cached_payload = cached_numpy_array_payload(record.data)
     cached_summary = cached_numpy_array_summary(record.data)
+    data: npt.NDArray[np.generic]
     if cached_payload is not None:
         # MolOP export records already carry a frozen, payload-backed array. Keep
         # that object instead of copying tens or hundreds of megabytes again.
         data = record.data
     else:
-        data: npt.NDArray[np.generic] = np.array(
+        data = np.array(
             record.data,
             copy=True,
             order="A",
@@ -752,9 +763,7 @@ def persist_thermochemistry_result(
     if record.source_schema_version != segment.parse_revision.export_schema_version:
         raise ValueError("thermochemistry source schema must match its ParseRevision export schema")
     if _fast_insert_enabled(session):
-        new_result = _new_entity(
-            session, ThermochemistryResult, frame=frame, **_dto_values(record)
-        )
+        new_result = _new_entity(session, ThermochemistryResult, frame=frame, **_dto_values(record))
         _flush_new_entity(session, new_result, label="ThermochemistryResult")
         return new_result
     _acquire_identity_locks(session, ("thermochemistry_result", frame_id))
@@ -790,7 +799,7 @@ def _persist_frame_result[FrameResultT](
     if _fast_insert_enabled(session):
         new_result = _new_entity(session, model, frame=frame, **_dto_values(record))
         _flush_new_entity(session, new_result, label=label)
-        return cast(FrameResultT, new_result)
+        return new_result
     _acquire_identity_locks(session, (label, frame_id))
     result = session.exec(select(model).where(model_with_columns.frame_id == frame_id)).first()
     if result is not None:
@@ -798,7 +807,7 @@ def _persist_frame_result[FrameResultT](
         return result
     result = _new_entity(session, model, frame=frame, **_dto_values(record))
     _flush_new_entity(session, result, label=label)
-    return cast(FrameResultT, result)
+    return result
 
 
 def persist_molecular_orbital_result(
@@ -875,9 +884,7 @@ def persist_nmr_shielding_tensor(
     if record.atom_index >= result.frame.geometry.atom_count:
         raise ValueError("NMR shielding atom index exceeds the source Geometry atom count")
     if _fast_insert_enabled(session):
-        new_tensor = _new_entity(
-            session, NMRShieldingTensor, result=result, **_dto_values(record)
-        )
+        new_tensor = _new_entity(session, NMRShieldingTensor, result=result, **_dto_values(record))
         _flush_new_entity(session, new_tensor, label="NMRShieldingTensor")
         return new_tensor
     _acquire_identity_locks(session, ("NMRShieldingTensor", result_id, record.atom_index))
@@ -924,9 +931,7 @@ def persist_electronic_state_set(
 ) -> ElectronicStateSet:
     frame_id = _require_id(frame, label="CalculationFrame")
     if _fast_insert_enabled(session):
-        new_state_set = _new_entity(
-            session, ElectronicStateSet, frame=frame, **_dto_values(record)
-        )
+        new_state_set = _new_entity(session, ElectronicStateSet, frame=frame, **_dto_values(record))
         _flush_new_entity(session, new_state_set, label="ElectronicStateSet")
         return new_state_set
     _acquire_identity_locks(session, ("ElectronicStateSet", frame_id, record.kind.value))

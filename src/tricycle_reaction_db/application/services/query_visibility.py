@@ -113,7 +113,11 @@ async def query_visibility_scope(
             permission,
         )
         requested_project_permitted = project_id in accessible_project_ids
-    project_ids = frozenset({project_id}) if requested_project_permitted else frozenset()
+    project_ids: frozenset[UUID] = (
+        frozenset({project_id})
+        if requested_project_permitted and project_id is not None
+        else frozenset()
+    )
     return QueryVisibilityScope(
         principal=principal,
         project_ids=project_ids,

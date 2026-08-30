@@ -336,12 +336,12 @@ def _preload_molecular_topologies(
         )
 
     if formula_hashes:
-        for formula in session.exec(
+        for existing_formula in session.exec(
             select(MolecularFormula).where(
                 col(MolecularFormula.composition_hash).in_(formula_hashes)
             )
         ).all():
-            context.formulas_by_hash[formula.composition_hash] = formula
+            context.formulas_by_hash[existing_formula.composition_hash] = existing_formula
     for record in pending.values():
         composition_hash = record.formula.composition_hash
         formula = context.formulas_by_hash.get(composition_hash)
@@ -357,7 +357,7 @@ def _preload_molecular_topologies(
         context.formulas_by_hash[composition_hash] = formula
 
     if topology_identity_keys:
-        for topology in session.exec(
+        for existing_topology in session.exec(
             select(MolecularTopology).where(
                 col(MolecularTopology.identity_schema_version).in_(
                     {schema_version for schema_version, _ in topology_identity_keys}
@@ -368,8 +368,8 @@ def _preload_molecular_topologies(
             )
         ).all():
             context.topologies_by_identity[
-                (topology.identity_schema_version, topology.graph_hash)
-            ] = topology
+                (existing_topology.identity_schema_version, existing_topology.graph_hash)
+            ] = existing_topology
     for record in pending.values():
         identity_key = (
             record.topology.identity_schema_version,
@@ -876,15 +876,15 @@ def preload_molecular_geometry_context(
         )
     ).all()
     context.exact_geometry_keys_loaded.update(keys)
-    for geometry in rows:
+    for exact_geometry in rows:
         key = (
-            geometry.topology_id,
-            geometry.canonicalization_version,
-            geometry.geometry_hash,
-            geometry.charge,
-            geometry.multiplicity,
+            exact_geometry.topology_id,
+            exact_geometry.canonicalization_version,
+            exact_geometry.geometry_hash,
+            exact_geometry.charge,
+            exact_geometry.multiplicity,
         )
-        context.geometries_by_hash[key] = geometry
+        context.geometries_by_hash[key] = exact_geometry
 
     # For non-exact hashes, evaluate the existing PostgreSQL equivalence
     # function in bounded set-based queries. A file batch may contain many
@@ -972,7 +972,9 @@ def preload_molecular_geometry_context(
         matching_geometries = session.exec(
             select(Geometry).where(geometry_columns.id.in_(all_matching_ids))
         ).all()
-        geometries_by_id = {geometry.id: geometry for geometry in matching_geometries}
+        geometries_by_id = {
+            matching_geometry.id: matching_geometry for matching_geometry in matching_geometries
+        }
         for _input_key, key in key_by_input.items():
             geometry_ids = context.equivalent_geometry_candidates[key]
             if len(geometry_ids) == 1:

@@ -248,9 +248,7 @@ def parse_revision_record_from_molop(
         source_format=source_format,
         source_encoding=file_payload.get("source_encoding") or "utf-8",
         source_content_sha256=(
-            artifact_sha256
-            if artifact_sha256 is not None
-            else file_payload.get("artifact_sha256")
+            artifact_sha256 if artifact_sha256 is not None else file_payload.get("artifact_sha256")
         ),
         source_size_bytes=(
             artifact_size_bytes

@@ -202,21 +202,26 @@ async def test_upload_batch_persistence_failure_recovers_pending_ingestion(
                 raise RuntimeError("persistence failed")
 
             monkeypatch.setattr(uploads, "_run_molop_file_pipeline", fake_parse)
-            monkeypatch.setattr(uploads, "_run_persist_parsed_artifact", fail_persist)
+            monkeypatch.setattr(uploads, "_persist_parsed_artifact", fail_persist)
 
-            with pytest.raises(RuntimeError, match="persistence failed"):
-                await uploads.ArtifactUploadService.upload_batch(
-                    files=[
-                        uploads.ArtifactUploadPayload(
-                            "production-recovery.log",
-                            "text/plain",
-                            content,
-                        )
-                    ],
-                    artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
-                    project_id=SYSTEM_PROJECT_ID,
-                    user_id=DEVELOPMENT_USER_ID,
-                )
+            result = await uploads.ArtifactUploadService.upload_batch(
+                files=[
+                    uploads.ArtifactUploadPayload(
+                        "production-recovery.log",
+                        "text/plain",
+                        content,
+                    )
+                ],
+                artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+                project_id=SYSTEM_PROJECT_ID,
+                user_id=DEVELOPMENT_USER_ID,
+            )
+
+            assert result.succeeded_count == 0
+            assert result.failed_count == 1
+            assert result.items[0].succeeded is False
+            assert result.items[0].error_code == "molop_parse_failed"
+            assert result.items[0].error_message == "persistence failed"
 
             async with factory() as session:
                 recovered_artifact = await session.get(ArtifactFile, artifact.id)
@@ -225,7 +230,7 @@ async def test_upload_batch_persistence_failure_recovers_pending_ingestion(
                 assert recovered_artifact.storage_status is StorageStatus.PENDING
                 assert recovered_ingestion is not None
                 assert recovered_ingestion.status is ArtifactIngestionStatus.FAILED
-                assert recovered_ingestion.error_code == "artifact_batch_failed"
+                assert recovered_ingestion.error_code == "molop_parse_failed"
         finally:
             await transaction.rollback()
 

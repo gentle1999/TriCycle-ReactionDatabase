@@ -16,6 +16,7 @@ from tricycle_reaction_db.application.dtos import (
     LogicalReactionParticipantRecord,
     LogicalReactionRecord,
     MappedReactionRecord,
+    NormalizedTopologyRecord,
 )
 from tricycle_reaction_db.application.query_cost import enforce_structure_input_budget
 from tricycle_reaction_db.application.services._persistence import _require_id
@@ -75,7 +76,7 @@ def _resolve_components(
     *,
     topology_context: GeometryPersistenceContext | None = None,
     include_creation_metadata: bool = True,
-    precomputed_topology_records: tuple[object, ...] | None = None,
+    precomputed_topology_records: tuple[NormalizedTopologyRecord, ...] | None = None,
 ) -> tuple[list[_ResolvedComponent], int]:
     components: list[_ResolvedComponent] = []
     topologies_created = 0
@@ -103,10 +104,7 @@ def _resolve_components(
                     # exported reaction_topology_records helper) do not carry
                     # endpoint provenance. Their template order is the only
                     # available mapping evidence.
-                    template_maps = [
-                        atom.GetAtomMapNum()
-                        for atom in template.GetAtoms()  # type: ignore[no-untyped-call]
-                    ]
+                    template_maps = [atom.GetAtomMapNum() for atom in template.GetAtoms()]
                     topology_atom_map_numbers = template_maps if any(template_maps) else []
             else:
                 normalized, source_to_topology = normalize_topology_with_mapping(
@@ -119,10 +117,7 @@ def _resolve_components(
                         "template_index": template_index,
                     },
                 )
-                template_atom_maps = [
-                    atom.GetAtomMapNum()
-                    for atom in template.GetAtoms()  # type: ignore[no-untyped-call]
-                ]
+                template_atom_maps = [atom.GetAtomMapNum() for atom in template.GetAtoms()]
                 if any(template_atom_maps):
                     topology_atom_map_numbers = [0] * normalized.topology.atom_count
                     for source_index, topology_index in enumerate(source_to_topology):
@@ -168,7 +163,7 @@ def _resolve_components(
 
 def reaction_topology_records(
     definition: rdChemReactions.ChemicalReaction,
-) -> list[object]:
+) -> list[NormalizedTopologyRecord]:
     """Build the exact topology records used by reaction component resolution."""
     return [
         normalize_topology(
@@ -259,7 +254,7 @@ def _create_reaction(
     topology_context: GeometryPersistenceContext | None = None,
     include_creation_metadata: bool = True,
     reconciliation_cache: ReconciliationBatchCache | None = None,
-    precomputed_topology_records: tuple[object, ...] | None = None,
+    precomputed_topology_records: tuple[NormalizedTopologyRecord, ...] | None = None,
 ) -> CreateReactionResult:
     definition = _reaction_from_representation(command.reaction)
     components, topologies_created = _resolve_components(

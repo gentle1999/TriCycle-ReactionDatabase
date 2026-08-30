@@ -8,6 +8,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import Response, StreamingResponse
 from nexusx import DefineSubset, ErDiagram, ErManager  # type: ignore[import-untyped]
+from pydantic import BaseModel, ConfigDict
 
 from tricycle_reaction_db.api.authentication import get_optional_principal
 from tricycle_reaction_db.application.dtos import (
@@ -73,6 +74,17 @@ OptionalPrincipal = Annotated[
     AuthenticatedPrincipal | None,
     Depends(get_optional_principal),
 ]
+
+
+class ReactionThermodynamicAnalyticsQuery(BaseModel):
+    """The logical-reaction filters shared by statistics and CSV export."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: UUID | None = None
+    filter_expression: str | None = None
+    has_activation_gibbs_free_energy: bool | None = None
+    has_reaction_gibbs_free_energy: bool | None = None
 
 
 class MolecularFormulaCoreDTO(DefineSubset):  # type: ignore[misc]
@@ -379,6 +391,24 @@ async def get_mapped_reaction_thermodynamic_statistics(
     return await ReactionThermodynamicAnalyticsService.statistics(project_id=project_id)
 
 
+@router.post(
+    "/mapped-reactions/thermodynamics/statistics",
+    response_model=MappedReactionThermodynamicStatistics,
+)
+async def query_mapped_reaction_thermodynamic_statistics(
+    query: ReactionThermodynamicAnalyticsQuery,
+) -> MappedReactionThermodynamicStatistics:
+    try:
+        return await ReactionThermodynamicAnalyticsService.statistics(
+            project_id=query.project_id,
+            filter_expression=query.filter_expression,
+            has_activation_gibbs_free_energy=query.has_activation_gibbs_free_energy,
+            has_reaction_gibbs_free_energy=query.has_reaction_gibbs_free_energy,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
 @router.get(
     "/mapped-reactions/thermodynamics/export.csv",
     response_class=StreamingResponse,
@@ -387,6 +417,33 @@ async def export_mapped_reaction_thermodynamics(
     project_id: UUID | None = None,
 ) -> StreamingResponse:
     stream = await ReactionThermodynamicAnalyticsService.export_csv(project_id=project_id)
+    return StreamingResponse(
+        stream,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Cache-Control": "private, no-store",
+            "Content-Disposition": ('attachment; filename="mapped-reaction-thermodynamics.csv"'),
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.post(
+    "/mapped-reactions/thermodynamics/export.csv",
+    response_class=StreamingResponse,
+)
+async def export_filtered_mapped_reaction_thermodynamics(
+    query: ReactionThermodynamicAnalyticsQuery,
+) -> StreamingResponse:
+    try:
+        stream = await ReactionThermodynamicAnalyticsService.export_csv(
+            project_id=query.project_id,
+            filter_expression=query.filter_expression,
+            has_activation_gibbs_free_energy=query.has_activation_gibbs_free_energy,
+            has_reaction_gibbs_free_energy=query.has_reaction_gibbs_free_energy,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     return StreamingResponse(
         stream,
         media_type="text/csv; charset=utf-8",

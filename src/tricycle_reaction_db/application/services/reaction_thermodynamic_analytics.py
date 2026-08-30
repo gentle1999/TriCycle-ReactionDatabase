@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlmodel import col
 
 from tricycle_reaction_db.application.dtos import (
@@ -21,11 +21,17 @@ from tricycle_reaction_db.application.dtos import (
 from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics import (
     format_composite_level_of_theory,
 )
+from tricycle_reaction_db.application.services.queries import (
+    _enforce_candidate_limit,
+    logical_reaction_filter_expression_predicate,
+)
 from tricycle_reaction_db.application.services.query_visibility import (
+    logical_reaction_id_is_visible,
     mapped_reaction_id_is_visible,
     query_visibility_scope,
 )
 from tricycle_reaction_db.db.models import (
+    LogicalReaction,
     MappedReaction,
     MappedReactionThermodynamicProfile,
 )
@@ -54,8 +60,67 @@ _PROFILE_COLUMNS = (
 )
 
 
-def _profile_predicate(scope: Any) -> Any:
-    return mapped_reaction_id_is_visible(scope, col(MappedReaction.id))
+async def _profile_predicate(
+    session: Any,
+    scope: Any,
+    *,
+    filter_expression: str | None = None,
+    has_activation_gibbs_free_energy: bool | None = None,
+    has_reaction_gibbs_free_energy: bool | None = None,
+) -> Any:
+    mapped_visibility = mapped_reaction_id_is_visible(scope, col(MappedReaction.id))
+    if (
+        filter_expression is None
+        and not has_activation_gibbs_free_energy
+        and not has_reaction_gibbs_free_energy
+    ):
+        return mapped_visibility
+
+    logical_predicates: list[Any] = [logical_reaction_id_is_visible(scope, col(LogicalReaction.id))]
+    structure_predicates: list[Any] = []
+    if filter_expression is not None:
+        logical_predicates.append(
+            logical_reaction_filter_expression_predicate(
+                filter_expression,
+                scope,
+                structure_predicates,
+            )
+        )
+    for structure_predicate in structure_predicates:
+        await _enforce_candidate_limit(
+            select(col(MappedReaction.id)).where(
+                mapped_visibility,
+                structure_predicate,
+            ),
+            label="reaction structure query",
+            session=session,
+        )
+
+    if has_activation_gibbs_free_energy or has_reaction_gibbs_free_energy:
+        matching_mapped_ids = select(col(MappedReaction.logical_reaction_id)).where(
+            mapped_visibility
+        )
+        if has_activation_gibbs_free_energy:
+            matching_mapped_ids = matching_mapped_ids.where(
+                or_(
+                    col(MappedReaction.minimum_activation_gibbs_free_energy_kcal_mol).is_not(None),
+                    col(MappedReaction.maximum_activation_gibbs_free_energy_kcal_mol).is_not(None),
+                )
+            )
+        if has_reaction_gibbs_free_energy:
+            matching_mapped_ids = matching_mapped_ids.where(
+                or_(
+                    col(MappedReaction.minimum_reaction_gibbs_free_energy_kcal_mol).is_not(None),
+                    col(MappedReaction.maximum_reaction_gibbs_free_energy_kcal_mol).is_not(None),
+                )
+            )
+        logical_predicates.append(col(LogicalReaction.id).in_(matching_mapped_ids))
+
+    matching_logical_ids = select(col(LogicalReaction.id)).where(*logical_predicates)
+    return and_(
+        mapped_visibility,
+        col(MappedReaction.logical_reaction_id).in_(matching_logical_ids),
+    )
 
 
 def _level_label(electronic_level: list[Any], thermochemistry_level: list[Any]) -> str:
@@ -129,17 +194,27 @@ class ReactionThermodynamicAnalyticsService:
     """Build read-only aggregates without bypassing artifact-rooted visibility."""
 
     @staticmethod
-    async def statistics(project_id: UUID | None = None) -> MappedReactionThermodynamicStatistics:
+    async def statistics(
+        project_id: UUID | None = None,
+        *,
+        filter_expression: str | None = None,
+        has_activation_gibbs_free_energy: bool | None = None,
+        has_reaction_gibbs_free_energy: bool | None = None,
+    ) -> MappedReactionThermodynamicStatistics:
         scope = await query_visibility_scope(project_id=project_id)
-        predicate = _profile_predicate(scope)
         profile = MappedReactionThermodynamicProfile
         async with session_factory() as session:
+            predicate = await _profile_predicate(
+                session,
+                scope,
+                filter_expression=filter_expression,
+                has_activation_gibbs_free_energy=has_activation_gibbs_free_energy,
+                has_reaction_gibbs_free_energy=has_reaction_gibbs_free_energy,
+            )
             mapped_count = int(
                 (
                     await session.execute(
-                        select(func.count())
-                        .select_from(MappedReaction)
-                        .where(mapped_reaction_id_is_visible(scope, col(MappedReaction.id)))
+                        select(func.count()).select_from(MappedReaction).where(predicate)
                     )
                 ).scalar_one()
             )
@@ -268,14 +343,28 @@ class ReactionThermodynamicAnalyticsService:
         )
 
     @staticmethod
-    async def export_csv(project_id: UUID | None = None) -> AsyncIterator[str]:
+    async def export_csv(
+        project_id: UUID | None = None,
+        *,
+        filter_expression: str | None = None,
+        has_activation_gibbs_free_energy: bool | None = None,
+        has_reaction_gibbs_free_energy: bool | None = None,
+    ) -> AsyncIterator[str]:
         """Capture request visibility before response body streaming begins."""
 
         scope = await query_visibility_scope(project_id=project_id)
-        return ReactionThermodynamicAnalyticsService._export_csv_rows(scope)
+        async with session_factory() as session:
+            predicate = await _profile_predicate(
+                session,
+                scope,
+                filter_expression=filter_expression,
+                has_activation_gibbs_free_energy=has_activation_gibbs_free_energy,
+                has_reaction_gibbs_free_energy=has_reaction_gibbs_free_energy,
+            )
+        return ReactionThermodynamicAnalyticsService._export_csv_rows(predicate)
 
     @staticmethod
-    async def _export_csv_rows(scope: Any) -> AsyncIterator[str]:
+    async def _export_csv_rows(predicate: Any) -> AsyncIterator[str]:
         """Stream one CSV row for every visible materialized profile."""
 
         profile = MappedReactionThermodynamicProfile
@@ -299,7 +388,7 @@ class ReactionThermodynamicAnalyticsService:
             )
             .select_from(profile)
             .join(MappedReaction, col(MappedReaction.id) == col(profile.mapped_reaction_id))
-            .where(_profile_predicate(scope))
+            .where(predicate)
             .order_by(col(MappedReaction.id), col(profile.id))
         )
 

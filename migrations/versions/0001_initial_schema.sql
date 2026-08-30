@@ -254,7 +254,7 @@ CREATE TABLE public.artifact_ingestion (
     error_code character varying(128),
     error_message text,
     parser_metadata jsonb NOT NULL,
-    CONSTRAINT artifact_ingestion_status CHECK (((status)::text = ANY ((ARRAY['pending'::character varying, 'succeeded'::character varying, 'partial'::character varying, 'filtered'::character varying, 'failed'::character varying])::text[]))),
+    CONSTRAINT artifact_ingestion_status CHECK (((status)::text = ANY ((ARRAY['pending'::character varying, 'succeeded'::character varying, 'partial'::character varying, 'failed'::character varying])::text[]))),
     CONSTRAINT ck_artifact_ingestion_source_frames_nonnegative CHECK (((source_frame_count IS NULL) OR (source_frame_count >= 0))),
     CONSTRAINT ck_artifact_ingestion_terminal_timestamp CHECK ((((status)::text = 'pending'::text) OR (completed_at IS NOT NULL))),
     CONSTRAINT ck_artifact_ingestion_timestamps_ordered CHECK (((completed_at IS NULL) OR (started_at IS NULL) OR (completed_at >= started_at))),
@@ -2770,12 +2770,6 @@ CREATE INDEX ix_calculation_frame_frequency_counts ON public.calculation_frame U
 
 CREATE INDEX ix_calculation_frame_geometry_id ON public.calculation_frame USING btree (geometry_id);
 
--- Name: ix_calculation_frame_geometry_revision; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX ix_calculation_frame_geometry_revision ON public.calculation_frame USING btree (geometry_id, parse_revision_id) INCLUDE (id, frequency_count, negative_frequency_count);
-
-
 --
 -- Name: ix_calculation_frame_parse_revision_id; Type: INDEX; Schema: public; Owner: -
 --
@@ -2887,17 +2881,6 @@ CREATE INDEX ix_external_identity_user_id ON public.external_identity USING btre
 
 CREATE INDEX ix_geometry_topology_id ON public.geometry USING btree (topology_id);
 
--- Name: ix_geometry_match_candidates; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX ix_geometry_match_candidates ON public.geometry USING btree (topology_id, canonicalization_version, charge, multiplicity);
-
--- Name: ix_geometry_created_id; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX ix_geometry_created_id ON public.geometry USING btree (created_at, id);
-
-
 --
 -- Name: ix_logical_reaction_cycloaddition_pattern; Type: INDEX; Schema: public; Owner: -
 --
@@ -2938,17 +2921,6 @@ CREATE INDEX ix_logical_reaction_reaction_class ON public.logical_reaction USING
 --
 
 CREATE INDEX ix_logical_reaction_reaction_hash ON public.logical_reaction USING btree (reaction_hash);
-
--- Name: ix_logical_reaction_created_id; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX ix_logical_reaction_created_id ON public.logical_reaction USING btree (created_at, id);
-
--- Name: ix_logical_reaction_reaction_key; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX ix_logical_reaction_reaction_key ON public.logical_reaction USING btree (reaction_key);
-
 
 --
 -- Name: ix_manifest_artifact_binding_artifact_file_id; Type: INDEX; Schema: public; Owner: -

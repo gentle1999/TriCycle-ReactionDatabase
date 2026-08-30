@@ -64,7 +64,7 @@ export interface ReactionQueryExpressionCondition {
 
 export interface ReactionQueryExpression {
   operator: ReactionQueryLogicalOperator;
-  conditions: ReactionQueryExpressionCondition[];
+  conditions: Array<ReactionQueryExpressionCondition | ReactionQueryExpression>;
 }
 
 export interface ReactionQueryCondition {
@@ -105,4 +105,50 @@ export const reactionQueryFieldOptions: ReactionQueryFieldOption[] = [
 
 export function reactionQueryFieldOption(field: ReactionQueryField): ReactionQueryFieldOption {
   return reactionQueryFieldOptions.find((option) => option.value === field) ?? reactionQueryFieldOptions[0];
+}
+
+/** Convert flat and advanced controls into one expression without changing OR-group semantics. */
+export function reactionFilterExpression(filters: ReactionQueryFilters): ReactionQueryExpression | undefined {
+  const conditions: Array<ReactionQueryExpressionCondition | ReactionQueryExpression> = [];
+  if (filters.filterExpression) conditions.push(filters.filterExpression);
+
+  const add = (
+    field: ReactionQueryField,
+    value: string | number | boolean | undefined,
+  ): void => {
+    if (value !== undefined && value !== "") conditions.push({ field, value });
+  };
+  add("topology_id", filters.topologyId);
+  add("reaction_key", filters.reactionKey);
+  add("label", filters.label);
+  add("reaction_hash", filters.reactionHash);
+  add("reaction_class", filters.reactionClass);
+  add("rxn_smarts", filters.reactionSmarts);
+  add("reactant_mol_block", filters.reactantMolBlock);
+  add("product_mol_block", filters.productMolBlock);
+  add(
+    "minimum_activation_gibbs_free_energy_kcal_mol",
+    filters.minimumActivationGibbsFreeEnergyKcalMol,
+  );
+  add(
+    "maximum_activation_gibbs_free_energy_kcal_mol",
+    filters.maximumActivationGibbsFreeEnergyKcalMol,
+  );
+  add(
+    "minimum_reaction_gibbs_free_energy_kcal_mol",
+    filters.minimumReactionGibbsFreeEnergyKcalMol,
+  );
+  add(
+    "maximum_reaction_gibbs_free_energy_kcal_mol",
+    filters.maximumReactionGibbsFreeEnergyKcalMol,
+  );
+  add("reactant_product_changed", filters.reactantProductChanged);
+  add("created_after", filters.createdAfter);
+  add("created_before", filters.createdBefore);
+
+  if (!conditions.length) return undefined;
+  if (conditions.length === 1 && filters.filterExpression === conditions[0]) {
+    return filters.filterExpression;
+  }
+  return { operator: "and", conditions };
 }

@@ -82,9 +82,7 @@ def main() -> None:
     results: list[tuple[float, int]] = []
     context = multiprocessing.get_context("spawn")
     with ProcessPoolExecutor(max_workers=args.workers, mp_context=context) as pool:
-        futures = [
-            pool.submit(function, str(path), args.capture_source_evidence) for path in paths
-        ]
+        futures = [pool.submit(function, str(path), args.capture_source_evidence) for path in paths]
         for future in as_completed(futures):
             results.append(future.result())
     elapsed = time.perf_counter() - started

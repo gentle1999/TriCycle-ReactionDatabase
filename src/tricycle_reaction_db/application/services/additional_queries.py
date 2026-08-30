@@ -825,7 +825,7 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
             if maximum_atom_count is not None:
                 topology_predicates.append(col(MolecularTopology.atom_count) <= maximum_atom_count)
         if uses_catalog_summary and not predicates and not topology_predicates:
-            count_statement = select(ProjectGeometryCatalogCount.geometry_count).where(
+            count_statement = select(cast(Any, ProjectGeometryCatalogCount.geometry_count)).where(
                 col(ProjectGeometryCatalogCount.project_id) == scope.requested_project_id
             )
         elif uses_catalog_summary:
@@ -890,11 +890,11 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                 has_imaginary_frequency.label("has_imaginary_frequency"),
             )
             .options(
-                defer(Geometry.mol),
-                defer(Geometry.internal_coordinate_distances_angstrom),
-                defer(Geometry.internal_coordinate_angles_degrees),
-                defer(Geometry.internal_coordinate_dihedrals_degrees),
-                defer(MolecularTopology.mol),
+                defer(cast(Any, Geometry.mol)),
+                defer(cast(Any, Geometry.internal_coordinate_distances_angstrom)),
+                defer(cast(Any, Geometry.internal_coordinate_angles_degrees)),
+                defer(cast(Any, Geometry.internal_coordinate_dihedrals_degrees)),
+                defer(cast(Any, MolecularTopology.mol)),
             )
             .join(MolecularTopology, col(Geometry.topology_id) == col(MolecularTopology.id))
         )
@@ -969,7 +969,7 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                     thermodynamic_statement = filtered_statement.where(
                         col(Geometry.id).in_(page_ids)
                     ).order_by(*catalogue_order_by)
-                    rows = (await session.execute(thermodynamic_statement)).all()
+                    rows = list((await session.execute(thermodynamic_statement)).all())
                     remaining = limit - len(rows)
                     if remaining:
                         page_ids = non_thermodynamic_catalog.limit(remaining)
@@ -984,7 +984,7 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                     non_thermodynamic_statement = filtered_statement.where(
                         col(Geometry.id).in_(page_ids)
                     ).order_by(*catalogue_order_by)
-                    rows = (await session.execute(non_thermodynamic_statement)).all()
+                    rows = list((await session.execute(non_thermodynamic_statement)).all())
             elif fast_catalogue_page:
                 thermodynamic_geometry_ids = geometry_ids_with_thermodynamic_property(
                     calculation_frame_is_visible(scope, col(CalculationFrame.parse_revision_id))
@@ -1005,9 +1005,13 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                     ~col(Geometry.id).in_(thermodynamic_geometry_ids)
                 ).order_by(*catalogue_order_by)
                 if offset < thermodynamic_total:
-                    rows = (
-                        await session.execute(thermodynamic_statement.offset(offset).limit(limit))
-                    ).all()
+                    rows = list(
+                        (
+                            await session.execute(
+                                thermodynamic_statement.offset(offset).limit(limit)
+                            )
+                        ).all()
+                    )
                     remaining = limit - len(rows)
                     if remaining:
                         rows.extend(
@@ -1016,13 +1020,15 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                             ).all()
                         )
                 else:
-                    rows = (
-                        await session.execute(
-                            non_thermodynamic_statement.offset(offset - thermodynamic_total).limit(
-                                limit
+                    rows = list(
+                        (
+                            await session.execute(
+                                non_thermodynamic_statement.offset(
+                                    offset - thermodynamic_total
+                                ).limit(limit)
                             )
-                        )
-                    ).all()
+                        ).all()
+                    )
             elif (
                 uses_catalog_summary
                 and sort_by in {"created_at", "calculation_count"}
@@ -1059,30 +1065,34 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                     .offset(offset)
                     .limit(limit)
                 )
-                rows = (
-                    await session.execute(
-                        filtered_statement.where(col(Geometry.id).in_(page_ids)).order_by(
-                            page_order,
-                            page_id_order,
+                rows = list(
+                    (
+                        await session.execute(
+                            filtered_statement.where(col(Geometry.id).in_(page_ids)).order_by(
+                                page_order,
+                                page_id_order,
+                            )
                         )
-                    )
-                ).all()
+                    ).all()
+                )
             elif sort_by == "default":
                 thermodynamic_sort = (
                     col(ProjectGeometryCatalog.has_thermodynamic_property)
                     if uses_catalog_summary
                     else geometry_has_thermodynamic_property_predicate(col(Geometry.id))
                 )
-                rows = (
-                    await session.execute(
-                        filtered_statement.order_by(
-                            desc(thermodynamic_sort),
-                            *catalogue_order_by,
+                rows = list(
+                    (
+                        await session.execute(
+                            filtered_statement.order_by(
+                                desc(thermodynamic_sort),
+                                *catalogue_order_by,
+                            )
+                            .offset(offset)
+                            .limit(limit)
                         )
-                        .offset(offset)
-                        .limit(limit)
-                    )
-                ).all()
+                    ).all()
+                )
             else:
                 geometry_sort_fields = {
                     "created_at": (
@@ -1099,16 +1109,18 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                     if sort_direction == "asc"
                     else sort_expression.desc().nulls_last()
                 )
-                rows = (
-                    await session.execute(
-                        filtered_statement.order_by(
-                            ordered_sort,
-                            col(Geometry.id),
+                rows = list(
+                    (
+                        await session.execute(
+                            filtered_statement.order_by(
+                                ordered_sort,
+                                col(Geometry.id),
+                            )
+                            .offset(offset)
+                            .limit(limit)
                         )
-                        .offset(offset)
-                        .limit(limit)
-                    )
-                ).all()
+                    ).all()
+                )
             page_geometry_ids = [
                 _required_uuid(geometry.id, "Geometry") for geometry, _, _, _, _ in rows
             ]

@@ -10,12 +10,8 @@ depends_on: str | None = None
 
 def upgrade() -> None:
     op.execute("ALTER TABLE logical_reaction DROP CONSTRAINT IF EXISTS reaction_class")
-    op.execute(
-        "ALTER TABLE logical_reaction ALTER COLUMN reaction_class DROP DEFAULT"
-    )
-    op.execute(
-        "ALTER TABLE logical_reaction ALTER COLUMN reaction_class DROP NOT NULL"
-    )
+    op.execute("ALTER TABLE logical_reaction ALTER COLUMN reaction_class DROP DEFAULT")
+    op.execute("ALTER TABLE logical_reaction ALTER COLUMN reaction_class DROP NOT NULL")
 
 
 def downgrade() -> None:
@@ -35,9 +31,7 @@ def downgrade() -> None:
     op.execute(
         "ALTER TABLE logical_reaction ALTER COLUMN reaction_class SET DEFAULT 'cycloaddition'"
     )
-    op.execute(
-        "ALTER TABLE logical_reaction ALTER COLUMN reaction_class SET NOT NULL"
-    )
+    op.execute("ALTER TABLE logical_reaction ALTER COLUMN reaction_class SET NOT NULL")
     op.execute(
         """
         ALTER TABLE logical_reaction

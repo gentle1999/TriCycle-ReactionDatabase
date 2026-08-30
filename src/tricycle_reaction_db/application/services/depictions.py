@@ -108,7 +108,10 @@ def draw_geometry_xyz(
     total_charge = (
         charge
         if charge is not None
-        else sum(atom.GetFormalCharge() for atom in molecule.GetAtoms())
+        else sum(
+            atom.GetFormalCharge()
+            for atom in molecule.GetAtoms()  # type: ignore[no-untyped-call]
+        )
     )
     total_spin = (multiplicity - 1) / 2 if multiplicity is not None else None
     total_spin_text = (
@@ -121,7 +124,9 @@ def draw_geometry_xyz(
             atom.GetSymbol(),
             conformer.GetAtomPosition(atom_index),
         )
-        for atom_index, atom in enumerate(molecule.GetAtoms())
+        for atom_index, atom in enumerate(
+            molecule.GetAtoms()  # type: ignore[no-untyped-call]
+        )
     ]
     lines = [
         str(molecule.GetNumAtoms()),

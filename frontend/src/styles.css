@@ -5640,6 +5640,76 @@ table.data-table {
   gap: 7px;
 }
 
+.analytics-filters {
+  padding: 14px 0 8px;
+  border-bottom: 1px solid var(--line-strong);
+}
+
+.analytics-filter-form {
+  display: grid;
+  grid-template-columns: minmax(260px, 440px) auto auto 36px;
+  align-items: center;
+  gap: 8px;
+}
+
+.analytics-filter-form .search-field.is-wide {
+  width: 100%;
+}
+
+.analytics-filter-form .command-button {
+  min-width: 112px;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.analytics-filter-options {
+  min-height: 46px;
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  padding-top: 9px;
+}
+
+.analytics-filter-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--ink-soft);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.analytics-filter-toggle input {
+  accent-color: var(--teal);
+}
+
+.analytics-change-filter {
+  grid-template-columns: auto 128px;
+  align-items: center;
+  margin-left: auto;
+}
+
+.analytics-active-filter-count {
+  padding-left: 14px;
+  color: var(--teal);
+  border-left: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.analytics-query-status {
+  min-height: 20px;
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.analytics-query-status > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .analytics-notice {
   margin: 18px 0 0;
 }
@@ -6419,6 +6489,19 @@ table.data-table {
 }
 
 @media (max-width: 900px) {
+  .analytics-filter-form {
+    grid-template-columns: minmax(220px, 1fr) auto auto 36px;
+  }
+
+  .analytics-filter-options {
+    flex-wrap: wrap;
+    gap: 12px 18px;
+  }
+
+  .analytics-change-filter {
+    margin-left: 0;
+  }
+
   .analytics-kpis {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     padding: 12px 0;
@@ -6454,6 +6537,35 @@ table.data-table {
 
   .analytics-heading .command-button {
     width: 100%;
+  }
+
+  .analytics-filter-form {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 36px;
+  }
+
+  .analytics-filter-form .search-field {
+    grid-column: 1 / -1;
+  }
+
+  .analytics-filter-form .command-button {
+    min-width: 0;
+    padding-right: 8px;
+    padding-left: 8px;
+  }
+
+  .analytics-filter-options {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .analytics-change-filter {
+    width: 100%;
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .analytics-active-filter-count {
+    padding-left: 0;
+    border-left: 0;
   }
 
   .analytics-panel-heading {

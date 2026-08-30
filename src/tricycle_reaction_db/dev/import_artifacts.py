@@ -407,10 +407,12 @@ async def import_files(
             candidate = batch[index]
             fingerprint = fingerprints[candidate]
             filtered = (
-                item.result is not None
-                and item.result.ingestion_status is ArtifactIngestionStatus.FILTERED
-            ) or item.error_code == "no_calculation_frames" or (
-                item.result is not None and item.result.source_frame_count == 0
+                (
+                    item.result is not None
+                    and item.result.ingestion_status is ArtifactIngestionStatus.FILTERED
+                )
+                or item.error_code == "no_calculation_frames"
+                or (item.result is not None and item.result.source_frame_count == 0)
             )
             status = "filtered" if filtered else "succeeded" if item.succeeded else "failed"
             state.append(
@@ -504,10 +506,12 @@ async def import_files(
             fingerprint = fingerprints[candidate]
             artifact_id = item.result.artifact_id if item.result is not None else None
             filtered = (
-                item.result is not None
-                and item.result.ingestion_status is ArtifactIngestionStatus.FILTERED
-            ) or item.error_code == "no_calculation_frames" or (
-                item.result is not None and item.result.source_frame_count == 0
+                (
+                    item.result is not None
+                    and item.result.ingestion_status is ArtifactIngestionStatus.FILTERED
+                )
+                or item.error_code == "no_calculation_frames"
+                or (item.result is not None and item.result.source_frame_count == 0)
             )
             if filtered:
                 batch_summary = batch_summary.add(ImportSummary(filtered=1))

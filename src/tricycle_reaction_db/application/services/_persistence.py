@@ -55,9 +55,7 @@ _FAST_INSERT_SAFE_LOCK_NAMES = frozenset(
 # reflection is comparatively expensive at this scale, so keep the scalar
 # relationship foreign-key bindings by mapped class and only inspect each
 # mapper once per process.
-_FAST_RELATIONSHIP_BINDINGS: dict[
-    type[Any], tuple[tuple[str, str, str], ...]
-] = {}
+_FAST_RELATIONSHIP_BINDINGS: dict[type[Any], tuple[tuple[str, str, str], ...]] = {}
 _FAST_RELATIONSHIP_KEYS: dict[type[Any], frozenset[str]] = {}
 _FAST_RELATIONSHIPS: dict[type[Any], dict[str, Any]] = {}
 _FAST_MAPPERS: dict[type[Any], Any] = {}
@@ -110,9 +108,7 @@ def _acquire_identity_locks(session: Session, *keys: tuple[object, ...]) -> None
     uncached_lock_ids = [lock_id for lock_id in lock_ids if lock_id not in lock_cache]
     if not uncached_lock_ids:
         return
-    lock_stats["uncached_ids"] = int(lock_stats.get("uncached_ids", 0)) + len(
-        uncached_lock_ids
-    )
+    lock_stats["uncached_ids"] = int(lock_stats.get("uncached_ids", 0)) + len(uncached_lock_ids)
     # PostgreSQL acquires the sorted lock set in one statement. This preserves
     # deterministic deadlock ordering while avoiding one network round trip per
     # identity in a prepared upload batch.
@@ -130,7 +126,11 @@ def _fast_insert_enabled(session: Session) -> bool:
     return bool(session.info.get("tricycle_fast_insert", False))
 
 
-def _new_entity(session: Session, entity_type: type[Any], **values: Any) -> Any:
+def _new_entity[EntityT](
+    session: Session,
+    entity_type: type[EntityT],
+    **values: Any,
+) -> EntityT:
     """Construct a validated table entity without repeating Pydantic parsing.
 
     Fast batch records already passed through their DTO validators. SQLModel's
@@ -145,12 +145,10 @@ def _new_entity(session: Session, entity_type: type[Any], **values: Any) -> Any:
     if mapper is None:
         mapper = cast(Any, sa_inspect(entity_type)).mapper
         _FAST_MAPPERS[entity_type] = mapper
-    entity = mapper.class_manager.new_instance()
+    entity = cast(EntityT, mapper.class_manager.new_instance())
     relationships = _FAST_RELATIONSHIPS.get(entity_type)
     if relationships is None:
-        relationships = {
-            relationship.key: relationship for relationship in mapper.relationships
-        }
+        relationships = {relationship.key: relationship for relationship in mapper.relationships}
         _FAST_RELATIONSHIPS[entity_type] = relationships
         _FAST_RELATIONSHIP_KEYS[entity_type] = frozenset(relationships)
     relationship_keys = _FAST_RELATIONSHIP_KEYS[entity_type]
@@ -294,8 +292,7 @@ def _copy_compatible(columns: tuple[Any, ...]) -> bool:
     """Return whether COPY can preserve every SQLAlchemy bind expression."""
 
     return all(
-        type(column.type).__name__ not in {"RdkitMol", "RdkitReaction"}
-        for column in columns
+        type(column.type).__name__ not in {"RdkitMol", "RdkitReaction"} for column in columns
     )
 
 
@@ -325,8 +322,15 @@ def _bulk_insert_pending_entities(session: Session) -> None:
     for entity in pending:
         state = sa_inspect(entity)
         state_name = (
-            "transient" if state.transient else "pending" if state.pending else
-            "persistent" if state.persistent else "detached" if state.detached else "other"
+            "transient"
+            if state.transient
+            else "pending"
+            if state.pending
+            else "persistent"
+            if state.persistent
+            else "detached"
+            if state.detached
+            else "other"
         )
         state_counts[state_name] = int(state_counts.get(state_name, 0)) + 1
         # A relationship cascade or a nested inference savepoint may have
@@ -351,10 +355,7 @@ def _bulk_insert_pending_entities(session: Session) -> None:
     # Relationship foreign keys are already copied to scalar columns by
     # ``_prepare_new_entity``. A stable parent-before-child order is enough for
     # these revision-local rows and avoids relying on SQLAlchemy's private UoW.
-    dependencies: dict[type[Any], set[type[Any]]] = {
-        entity_type: set()
-        for entity_type in grouped
-    }
+    dependencies: dict[type[Any], set[type[Any]]] = {entity_type: set() for entity_type in grouped}
     grouped_by_table = {
         cast(Any, sa_inspect(entity_type)).mapper.local_table: entity_type
         for entity_type in grouped
@@ -388,11 +389,7 @@ def _bulk_insert_pending_entities(session: Session) -> None:
     for entity_type in ordered:
         prepare_started = perf_counter()
         mapper = cast(Any, sa_inspect(entity_type)).mapper
-        column_attrs = {
-            column: attr.key
-            for attr in mapper.column_attrs
-            for column in attr.columns
-        }
+        column_attrs = {column: attr.key for attr in mapper.column_attrs for column in attr.columns}
         columns = tuple(
             column
             for column in mapper.local_table.columns
@@ -425,12 +422,9 @@ def _bulk_insert_pending_entities(session: Session) -> None:
             if use_copy and _copy_compatible(columns):
                 dialect = session.get_bind().dialect
                 bind_rows: list[tuple[Any, ...]] = []
-                signature_columns = tuple(
-                    column for column in columns if column.key in rows[0]
-                )
+                signature_columns = tuple(column for column in columns if column.key in rows[0])
                 processors = tuple(
-                    column.type._cached_bind_processor(dialect)
-                    for column in signature_columns
+                    column.type._cached_bind_processor(dialect) for column in signature_columns
                 )
                 for row in rows:
                     bind_rows.append(
@@ -445,9 +439,7 @@ def _bulk_insert_pending_entities(session: Session) -> None:
                     )
                 preparer = dialect.identifier_preparer
                 table_sql = preparer.format_table(mapper.local_table)
-                column_sql = ", ".join(
-                    preparer.quote(column.key) for column in signature_columns
-                )
+                column_sql = ", ".join(preparer.quote(column.key) for column in signature_columns)
                 copy_sql = f"COPY {table_sql} ({column_sql}) FROM STDIN"
                 driver_connection = session.connection().connection.driver_connection
                 await_only(_copy_rows_to_postgresql(driver_connection, copy_sql, bind_rows))

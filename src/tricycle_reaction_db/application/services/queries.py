@@ -37,7 +37,7 @@ from rdkit.Chem import rdChemReactions
 from sqlalchemy import Boolean, Text, and_, case, func, literal, not_, or_, select
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.dialects.postgresql import ARRAY, aggregate_order_by, array
-from sqlalchemy.orm import defer, load_only, selectinload
+from sqlalchemy.orm import defer, joinedload, load_only
 from sqlmodel import col
 from sqlmodel import select as sqlmodel_select
 
@@ -527,6 +527,26 @@ def _logical_reaction_query_expression_predicate(
     return predicate
 
 
+def logical_reaction_filter_expression_predicate(
+    filter_expression: str,
+    scope: Any,
+    structure_predicates: list[Any],
+) -> Any:
+    """Parse one public filter expression with the logical-reaction query rules."""
+
+    if len(filter_expression) > get_settings().structure_query_max_characters:
+        raise ValueError("filter_expression exceeds the configured character budget")
+    try:
+        expression = json.loads(filter_expression)
+    except json.JSONDecodeError as error:
+        raise ValueError("filter_expression must contain valid JSON") from error
+    return _logical_reaction_query_expression_predicate(
+        expression,
+        scope,
+        structure_predicates,
+    )
+
+
 async def _enforce_candidate_limit(
     statement: Any,
     *,
@@ -823,36 +843,42 @@ def _frame_select(*, lightweight: bool = False) -> Any:
         )
     )
     if lightweight:
+        frame_orm = cast(Any, CalculationFrame)
+        segment_orm = cast(Any, CalculationSegment)
+        revision_orm = cast(Any, ParseRevision)
+        artifact_orm = cast(Any, ArtifactFile)
+        geometry_orm = cast(Any, Geometry)
+        topology_orm = cast(Any, MolecularTopology)
         statement = statement.options(
             load_only(
-                CalculationFrame.id,
-                CalculationFrame.parse_revision_id,
-                CalculationFrame.segment_id,
-                CalculationFrame.frame_index,
-                CalculationFrame.file_frame_index,
-                CalculationFrame.frame_role,
-                CalculationFrame.geometry_id,
-                CalculationFrame.topology_derivation_id,
-                CalculationFrame.charge,
-                CalculationFrame.multiplicity,
-                CalculationFrame.coordinate_decimal_places,
-                CalculationFrame.scf_status,
-                CalculationFrame.optimization_status,
-                CalculationFrame.selected_energy_hartree,
-                CalculationFrame.selected_energy_kind,
-                CalculationFrame.frequency_count,
-                CalculationFrame.negative_frequency_count,
-                CalculationFrame.running_time_seconds,
+                frame_orm.id,
+                frame_orm.parse_revision_id,
+                frame_orm.segment_id,
+                frame_orm.frame_index,
+                frame_orm.file_frame_index,
+                frame_orm.frame_role,
+                frame_orm.geometry_id,
+                frame_orm.topology_derivation_id,
+                frame_orm.charge,
+                frame_orm.multiplicity,
+                frame_orm.coordinate_decimal_places,
+                frame_orm.scf_status,
+                frame_orm.optimization_status,
+                frame_orm.selected_energy_hartree,
+                frame_orm.selected_energy_kind,
+                frame_orm.frequency_count,
+                frame_orm.negative_frequency_count,
+                frame_orm.running_time_seconds,
             ),
             load_only(
-                CalculationSegment.id,
-                CalculationSegment.segment_index,
-                CalculationSegment.protocol_id,
+                segment_orm.id,
+                segment_orm.segment_index,
+                segment_orm.protocol_id,
             ),
-            load_only(ParseRevision.id, ParseRevision.artifact_file_id),
-            load_only(ArtifactFile.id, ArtifactFile.original_filename),
-            load_only(Geometry.id, Geometry.topology_id),
-            load_only(MolecularTopology.id, MolecularTopology.canonical_isomeric_smiles),
+            load_only(revision_orm.id, revision_orm.artifact_file_id),
+            load_only(artifact_orm.id, artifact_orm.original_filename),
+            load_only(geometry_orm.id, geometry_orm.topology_id),
+            load_only(topology_orm.id, topology_orm.canonical_isomeric_smiles),
         )
     return statement
 
@@ -952,7 +978,7 @@ class ArtifactQueryService(UseCaseService):  # type: ignore[misc]
 
         count_statement = sqlmodel_select(func.count()).select_from(ArtifactFile)
         statement = sqlmodel_select(ArtifactFile).options(
-            selectinload(cast(Any, ArtifactFile.ingestion))
+            joinedload(cast(Any, ArtifactFile.ingestion))
         )
         active_criterion = col(ArtifactFile.storage_status) != StorageStatus.RETIRED
         count_statement = count_statement.where(active_criterion)
@@ -1031,7 +1057,7 @@ class ArtifactQueryService(UseCaseService):  # type: ignore[misc]
             artifact = (
                 await session.exec(
                     sqlmodel_select(ArtifactFile)
-                    .options(selectinload(cast(Any, ArtifactFile.ingestion)))
+                    .options(joinedload(cast(Any, ArtifactFile.ingestion)))
                     .where(
                         col(ArtifactFile.id) == artifact_id,
                         scope.artifact_predicate(),
@@ -1136,7 +1162,10 @@ class MolecularTopologyQueryService(UseCaseService):  # type: ignore[misc]
             .add_columns(
                 col(MolecularTopology.morgan_bfp).is_not(None).label("morgan_bfp_available")
             )
-            .options(defer(MolecularTopology.mol), defer(MolecularTopology.morgan_bfp))
+            .options(
+                defer(cast(Any, MolecularTopology.mol)),
+                defer(cast(Any, MolecularTopology.morgan_bfp)),
+            )
             .join(
                 MolecularFormula,
                 col(MolecularTopology.formula_id) == col(MolecularFormula.id),
@@ -1152,7 +1181,7 @@ class MolecularTopologyQueryService(UseCaseService):  # type: ignore[misc]
         )
         async with session_factory() as session:
             total = int((await session.exec(count_statement)).one())
-            rows = (await session.exec(statement)).all()
+            rows = (await session.execute(statement)).all()
         return MolecularTopologySearchPage(
             items=[
                 MolecularTopologySearchResult(
@@ -1486,7 +1515,10 @@ class MolecularTopologyQueryService(UseCaseService):  # type: ignore[misc]
                 scaffold.label("scaffold_smiles"),
                 col(MolecularTopology.morgan_bfp).is_not(None).label("morgan_bfp_available"),
             )
-            .options(defer(MolecularTopology.mol), defer(MolecularTopology.morgan_bfp))
+            .options(
+                defer(cast(Any, MolecularTopology.mol)),
+                defer(cast(Any, MolecularTopology.morgan_bfp)),
+            )
             .join(
                 MolecularFormula,
                 col(MolecularTopology.formula_id) == col(MolecularFormula.id),
@@ -1705,15 +1737,9 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             )
             predicates.append(col(LogicalReaction.id).in_(mapped_structure_ids))
         if filter_expression is not None:
-            if len(filter_expression) > settings.structure_query_max_characters:
-                raise ValueError("filter_expression exceeds the configured character budget")
-            try:
-                expression = json.loads(filter_expression)
-            except json.JSONDecodeError as error:
-                raise ValueError("filter_expression must contain valid JSON") from error
             predicates.append(
-                _logical_reaction_query_expression_predicate(
-                    expression,
+                logical_reaction_filter_expression_predicate(
+                    filter_expression,
                     scope,
                     reaction_structure_predicates,
                 )
@@ -2017,23 +2043,28 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             ).scalar_one_or_none()
             if reaction is None:
                 return None
-            participant_rows = (
-                await session.execute(
-                    select(LogicalReactionParticipant, MolecularTopology)
-                    .options(defer(MolecularTopology.mol))
-                    .join(
-                        MolecularTopology,
-                        col(LogicalReactionParticipant.topology_id) == col(MolecularTopology.id),
+            participant_rows = [
+                (participant, topology)
+                for participant, topology in (
+                    await session.execute(
+                        select(LogicalReactionParticipant, MolecularTopology)
+                        .options(defer(cast(Any, MolecularTopology.mol)))
+                        .join(
+                            MolecularTopology,
+                            col(LogicalReactionParticipant.topology_id)
+                            == col(MolecularTopology.id),
+                        )
+                        .where(
+                            col(LogicalReactionParticipant.logical_reaction_id)
+                            == logical_reaction_id
+                        )
+                        .order_by(
+                            col(LogicalReactionParticipant.side),
+                            col(LogicalReactionParticipant.participant_index),
+                        )
                     )
-                    .where(
-                        col(LogicalReactionParticipant.logical_reaction_id) == logical_reaction_id
-                    )
-                    .order_by(
-                        col(LogicalReactionParticipant.side),
-                        col(LogicalReactionParticipant.participant_index),
-                    )
-                )
-            ).all()
+                ).all()
+            ]
             paths = (
                 (
                     await session.execute(

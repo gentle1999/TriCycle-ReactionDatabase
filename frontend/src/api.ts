@@ -38,7 +38,11 @@ import type {
   UploadBatchStatus,
 } from "./types";
 import type { GeometryQueryFilters, GeometrySort } from "./geometryQuery";
-import type { ReactionQueryFilters, ReactionSort } from "./reactionQuery";
+import {
+  reactionFilterExpression,
+  type ReactionQueryFilters,
+  type ReactionSort,
+} from "./reactionQuery";
 import type { ArtifactSort } from "./artifactQuery";
 
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
@@ -138,9 +142,15 @@ async function requestJson<T>(path: string, body: unknown, signal?: AbortSignal)
   return (await response.json()) as T;
 }
 
-async function requestBlob(path: string, signal?: AbortSignal): Promise<Blob> {
+async function requestBlobJson(path: string, body: unknown, signal?: AbortSignal): Promise<Blob> {
   const response = await fetch(apiUrl(path), {
-    headers: { accept: "text/csv" },
+    method: "POST",
+    headers: {
+      accept: "text/csv",
+      "content-type": "application/json",
+      ...csrfHeaders(),
+    },
+    body: JSON.stringify(body),
     credentials: "include",
     signal,
   });
@@ -155,6 +165,16 @@ async function requestBlob(path: string, signal?: AbortSignal): Promise<Blob> {
     throw new ApiError(response.status, detail);
   }
   return response.blob();
+}
+
+function reactionAnalyticsPayload(options: ReactionQueryFilters): Record<string, unknown> {
+  const filterExpression = reactionFilterExpression(options);
+  return {
+    project_id: options.projectId ?? null,
+    filter_expression: filterExpression ? JSON.stringify(filterExpression) : null,
+    has_activation_gibbs_free_energy: options.hasActivationGibbsFreeEnergy ?? null,
+    has_reaction_gibbs_free_energy: options.hasReactionGibbsFreeEnergy ?? null,
+  };
 }
 
 async function requestMutation<T>(
@@ -487,6 +507,7 @@ export const api = {
     const limit = options.limit ?? 50;
     const offset = options.offset ?? 0;
     if (options.filterExpression) {
+      const filterExpression = reactionFilterExpression(options);
       return requestJson<Page<LogicalReactionSummary>>(
         "/api/logical_reaction_query_service/list_logical_reactions",
         {
@@ -505,10 +526,10 @@ export const api = {
           maximum_reaction_gibbs_free_energy_kcal_mol: null,
           has_activation_gibbs_free_energy: options.hasActivationGibbsFreeEnergy ?? null,
           has_reaction_gibbs_free_energy: options.hasReactionGibbsFreeEnergy ?? null,
-          reactant_product_changed: options.reactantProductChanged ?? null,
+          reactant_product_changed: null,
           created_after: null,
           created_before: null,
-          filter_expression: JSON.stringify(options.filterExpression),
+          filter_expression: JSON.stringify(filterExpression),
           sort_by: options.sortBy ?? "default",
           sort_direction: options.sortDirection ?? "asc",
           limit,
@@ -545,14 +566,16 @@ export const api = {
       `/api/mapped-reactions/${encodeURIComponent(id)}/thermodynamics?${new URLSearchParams(options.projectId ? { project_id: options.projectId } : {})}`,
       signal,
     ),
-  mappedReactionThermodynamicStatistics: (options: { projectId?: string } = {}, signal?: AbortSignal) =>
-    request<MappedReactionThermodynamicStatistics>(
-      `/api/mapped-reactions/thermodynamics/statistics?${new URLSearchParams(options.projectId ? { project_id: options.projectId } : {})}`,
+  mappedReactionThermodynamicStatistics: (options: ReactionQueryFilters = {}, signal?: AbortSignal) =>
+    requestJson<MappedReactionThermodynamicStatistics>(
+      "/api/mapped-reactions/thermodynamics/statistics",
+      reactionAnalyticsPayload(options),
       signal,
     ),
-  mappedReactionThermodynamicExport: (options: { projectId?: string } = {}, signal?: AbortSignal) =>
-    requestBlob(
-      `/api/mapped-reactions/thermodynamics/export.csv?${new URLSearchParams(options.projectId ? { project_id: options.projectId } : {})}`,
+  mappedReactionThermodynamicExport: (options: ReactionQueryFilters = {}, signal?: AbortSignal) =>
+    requestBlobJson(
+      "/api/mapped-reactions/thermodynamics/export.csv",
+      reactionAnalyticsPayload(options),
       signal,
     ),
   reaction: (id: string, options: { projectId?: string } = {}, signal?: AbortSignal) =>

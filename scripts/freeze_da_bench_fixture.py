@@ -40,15 +40,29 @@ METADATA_FILES = {
 }
 
 LOG_EXPECTATIONS = {
-    "ene": (5, 6, 2, "C2H4", "C=C", 0),
-    "diene": (7, 15, 2, "C6H6O2S", "c1scc2c1OCCO2", 0),
-    "transition_state": (23, 21, 3, "C8H10O2S", "C=C.c1scc2c1OCCO2", 1),
+    "ene": (5, 6, 2, "C2H4", "[H][C]([H])=[C]([H])[H]", 0),
+    "diene": (
+        7,
+        15,
+        2,
+        "C6H6O2S",
+        "[H][c]1[s][c]([H])[c]2[c]1[O][C]([H])([H])[C]([H])([H])[O]2",
+        0,
+    ),
+    "transition_state": (
+        23,
+        21,
+        3,
+        "C8H10O2S",
+        "[H][C]([H])=[C]([H])[H].[H][c]1[s][c]([H])[c]2[c]1[O][C]([H])([H])[C]([H])([H])[O]2",
+        1,
+    ),
     "product": (
         10,
         21,
         2,
         "C8H10O2S",
-        "C1COC2=C(O1)[C@@H]1CC[C@H]2S1",
+        "[H][C]1([H])[O][C]2=[C]([O][C]1([H])[H])[C@@]1([H])[S][C@]2([H])[C]([H])([H])[C]1([H])[H]",
         0,
     ),
 }

@@ -152,9 +152,7 @@ def _revision_record_hash(
     chem_file: Any,
     records: list[MolOPFrameRecords],
 ) -> str:
-    artifact_sha256 = (
-        artifact.content_sha256 if isinstance(artifact, ArtifactFile) else artifact
-    )
+    artifact_sha256 = artifact.content_sha256 if isinstance(artifact, ArtifactFile) else artifact
     return _json_sha256(
         {
             "artifact_sha256": artifact_sha256,
@@ -384,8 +382,7 @@ def persist_molop_calculation_artifact(
                 diagnostics.append(
                     _frame_failure_diagnostic(
                         file_frame_index=int(
-                            getattr(frame, "file_frame_index", fallback_index)
-                            or fallback_index
+                            getattr(frame, "file_frame_index", fallback_index) or fallback_index
                         ),
                         segment_index=int(getattr(frame, "segment_index", 0) or 0),
                         error=error,
@@ -403,9 +400,7 @@ def persist_molop_calculation_artifact(
     # one transaction. A shared SQLAlchemy Session cannot be forked safely;
     # client-side IDs and deferred flushes provide multi-row batching without
     # weakening rollback or idempotency guarantees.
-    effective_fast_insert = fast_insert or (
-        parallel_frame_persistence and not force_new_revision
-    )
+    effective_fast_insert = fast_insert or (parallel_frame_persistence and not force_new_revision)
     previous_fast_insert = session.info.get("tricycle_fast_insert", False)
     previous_autoflush = session.autoflush
     session.info["tricycle_fast_insert"] = effective_fast_insert
@@ -422,9 +417,7 @@ def persist_molop_calculation_artifact(
                 # MolOP's source spans and identity describe the decoded
                 # stream for compressed uploads.  Only uncompressed inputs
                 # can use ArtifactFile's byte identity directly.
-                artifact_sha256=(
-                    artifact.content_sha256 if source_compression is None else None
-                ),
+                artifact_sha256=(artifact.content_sha256 if source_compression is None else None),
                 artifact_size_bytes=(artifact.size_bytes if source_compression is None else None),
             ),
             force_new_revision=force_new_revision,
@@ -436,9 +429,7 @@ def persist_molop_calculation_artifact(
             preload_snapshot = _snapshot_geometry_context(active_geometry_context)
             pending_snapshot = list(session.info.get("_fast_pending_entities", ()))
             try:
-                preload_scope = (
-                    nullcontext() if effective_fast_insert else session.begin_nested()
-                )
+                preload_scope = nullcontext() if effective_fast_insert else session.begin_nested()
                 with preload_scope:
                     preload_molecular_geometry_context(
                         session,
@@ -550,9 +541,7 @@ def persist_molop_calculation_artifact(
                     # parents.  Its pending queue is therefore the frame
                     # isolation boundary.  The regular path uses a real
                     # savepoint because each child is flushed immediately.
-                    frame_scope = (
-                        nullcontext() if effective_fast_insert else session.begin_nested()
-                    )
+                    frame_scope = nullcontext() if effective_fast_insert else session.begin_nested()
                     with frame_scope:
                         if file_frame_index is None or record.frame.frame_index is None:
                             raise ValueError("MolOP frame is missing stable source indices")
@@ -653,12 +642,9 @@ def persist_molop_calculation_artifact(
                         segment.segment_index,
                         exc_info=True,
                     )
-            if (
-                segment_failed
-                or (
-                    segment_record.source_frame_count is not None
-                    and len(segment_frames) != segment_record.source_frame_count
-                )
+            if segment_failed or (
+                segment_record.source_frame_count is not None
+                and len(segment_frames) != segment_record.source_frame_count
             ):
                 segment.parse_completeness = ParseCompleteness.PARTIAL
                 segment.parse_diagnostics = segment_diagnostics
@@ -680,12 +666,16 @@ def persist_molop_calculation_artifact(
         if not defer_reconciliation:
             reconcile_molop_geometry_context(session, active_geometry_context)
 
-        partial_parse = bool(diagnostics) or any(
-            segment.parse_completeness is ParseCompleteness.PARTIAL
-            for segment in persisted_segments
-        ) or any(
-            record.frame.parse_completeness is ParseCompleteness.PARTIAL
-            for record in frame_records
+        partial_parse = (
+            bool(diagnostics)
+            or any(
+                segment.parse_completeness is ParseCompleteness.PARTIAL
+                for segment in persisted_segments
+            )
+            or any(
+                record.frame.parse_completeness is ParseCompleteness.PARTIAL
+                for record in frame_records
+            )
         )
         if partial_parse:
             revision.parse_completeness = ParseCompleteness.PARTIAL
@@ -696,7 +686,8 @@ def persist_molop_calculation_artifact(
             session,
             revision,
             ParseRevisionCompletionRecord(
-                record_sha256=record_sha256 or _revision_record_hash(
+                record_sha256=record_sha256
+                or _revision_record_hash(
                     artifact,
                     chem_file,
                     frame_records,

@@ -25,7 +25,7 @@ def test_topology_search_query_accepts_exact_topology_id() -> None:
 def test_topology_search_query_normalizes_exact_smiles_to_display_identity() -> None:
     query = MolecularTopologySearchQuery(exact_smiles="OCC")
 
-    assert query.exact_smiles == "CCO"
+    assert query.exact_smiles == "[H][O][C]([H])([H])[C]([H])([H])[H]"
 
 
 def test_topology_search_query_accepts_sketcher_mol_block() -> None:
@@ -45,7 +45,7 @@ def test_topology_search_query_accepts_versioned_similarity_options() -> None:
         minimum_similarity=0.8,
     )
 
-    assert query.similarity_smiles == "CCO"
+    assert query.similarity_smiles == "[H][O][C]([H])([H])[C]([H])([H])[H]"
     assert query.similarity_metric == "dice"
     assert query.minimum_similarity == 0.8
 

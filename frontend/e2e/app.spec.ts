@@ -281,6 +281,8 @@ test("thermodynamic statistics render charts and export the current project", as
   const scatterReactionId = mappedPayload.items[0]?.id;
   if (!scatterReactionId) throw new Error("当前测试数据中没有映射反应");
   const runtimeErrors: string[] = [];
+  const statisticsQueries: Array<Record<string, unknown>> = [];
+  const exportQueries: Array<Record<string, unknown>> = [];
   page.on("pageerror", (error) => runtimeErrors.push(error.message));
   page.on("console", (message) => {
     if (message.type() === "error") runtimeErrors.push(message.text());
@@ -315,7 +317,10 @@ test("thermodynamic statistics render charts and export the current project", as
     });
   });
   await page.route("**/api/mapped-reactions/thermodynamics/statistics*", async (route) => {
-    expect(new URL(route.request().url()).searchParams.get("project_id")).toBe(projectId);
+    expect(route.request().method()).toBe("POST");
+    const query = route.request().postDataJSON() as Record<string, unknown>;
+    statisticsQueries.push(query);
+    expect(query.project_id).toBe(projectId);
     await route.fulfill({
       contentType: "application/json",
       body: JSON.stringify({
@@ -354,7 +359,10 @@ test("thermodynamic statistics render charts and export the current project", as
     });
   });
   await page.route("**/api/mapped-reactions/thermodynamics/export.csv*", async (route) => {
-    expect(new URL(route.request().url()).searchParams.get("project_id")).toBe(projectId);
+    expect(route.request().method()).toBe("POST");
+    const query = route.request().postDataJSON() as Record<string, unknown>;
+    exportQueries.push(query);
+    expect(query.project_id).toBe(projectId);
     await route.fulfill({
       contentType: "text/csv; charset=utf-8",
       headers: { "Content-Disposition": "attachment; filename=mapped-reaction-thermodynamics.csv" },
@@ -369,6 +377,9 @@ test("thermodynamic statistics render charts and export the current project", as
   await expect(page.locator(".analytics-chart canvas")).toHaveCount(5);
   await expect.poll(() => analyticsCanvasesHaveDrawing(page)).toBe(true);
   await expect(page.locator(".analytics-kpis")).toContainText("72");
+  await expect(page.getByRole("button", { name: "高级查询" })).toBeVisible();
+  await page.getByRole("checkbox", { name: "仅显示含有活化自由能的反应路径" }).check();
+  await expect.poll(() => statisticsQueries.at(-1)?.has_activation_gibbs_free_energy).toBe(true);
 
   const scatterCanvas = page.locator(".analytics-scatter-chart canvas");
   const firstPoint = await scatterCanvas.evaluate((element) => {
@@ -408,10 +419,13 @@ test("thermodynamic statistics render charts and export the current project", as
   await expect(page).toHaveURL(`/mapped-reactions/${scatterReactionId}?project_id=${projectId}`);
   await page.goBack();
   await expect(page.getByRole("heading", { name: "反应路径分布统计" })).toBeVisible();
+  await page.getByRole("checkbox", { name: "仅显示含有活化自由能的反应路径" }).check();
+  await expect.poll(() => statisticsQueries.at(-1)?.has_activation_gibbs_free_energy).toBe(true);
 
   const download = page.waitForEvent("download");
-  await page.getByRole("button", { name: "导出热力学 CSV" }).click();
+  await page.getByRole("button", { name: "导出筛选结果 CSV" }).click();
   expect((await download).suggestedFilename()).toBe("mapped-reaction-thermodynamics-default.csv");
+  expect(exportQueries.at(-1)?.has_activation_gibbs_free_energy).toBe(true);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await page.screenshot({ path: testInfo.outputPath("desktop-thermodynamic-statistics.png"), fullPage: true });
 

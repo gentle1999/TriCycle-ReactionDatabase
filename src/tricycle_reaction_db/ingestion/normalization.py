@@ -47,15 +47,52 @@ def _digest(value: object) -> str:
     return sha256(_canonical_json(value)).hexdigest()
 
 
-def _clear_rdkit_properties(mol: Chem.Mol) -> None:
+_STEREOCHEMISTRY_PROPERTIES = frozenset(
+    {
+        "__computedProps",
+        "_CIPCode",
+        "_CIPRank",
+        "_ChiralityPossible",
+        "_StereochemDone",
+        "_MolFileBondStereo",
+        "_MolFileBondCfg",
+    }
+)
+
+
+def _is_stereochemistry_property(prop_name: str) -> bool:
+    """Return whether an RDKit property is part of stereo assignment state."""
+
+    return prop_name in _STEREOCHEMISTRY_PROPERTIES or prop_name.startswith("_CIP")
+
+
+def _clear_rdkit_properties(
+    mol: Chem.Mol,
+    *,
+    preserve_stereochemistry: bool = False,
+) -> None:
+    """Drop parser metadata while optionally retaining MolGR stereo caches.
+
+    MolGR has already restored stereochemistry from the QM coordinates before
+    this boundary.  Clearing RDKit's computed CIP properties forces an
+    expensive and potentially different second assignment later, so trusted
+    MolGR graphs retain those properties verbatim.
+    """
+
     for prop_name in list(mol.GetPropNames(includePrivate=True, includeComputed=True)):
+        if preserve_stereochemistry and _is_stereochemistry_property(prop_name):
+            continue
         mol.ClearProp(prop_name)
     for atom in mol.GetAtoms():  # type: ignore[no-untyped-call]
         atom.SetAtomMapNum(0)
         for prop_name in list(atom.GetPropNames(includePrivate=True, includeComputed=True)):
+            if preserve_stereochemistry and _is_stereochemistry_property(prop_name):
+                continue
             atom.ClearProp(prop_name)
     for bond in mol.GetBonds():  # type: ignore[no-untyped-call]
         for prop_name in list(bond.GetPropNames(includePrivate=True, includeComputed=True)):
+            if preserve_stereochemistry and _is_stereochemistry_property(prop_name):
+                continue
             bond.ClearProp(prop_name)
 
 
@@ -80,9 +117,9 @@ def _restore_unpaired_electron_state(
     if len(state) != mol.GetNumAtoms():
         raise ValueError("unpaired-electron state does not match atom count")
     for atom, (count, is_metal_assignment) in zip(
-        mol.GetAtoms(),
+        mol.GetAtoms(),  # type: ignore[no-untyped-call]
         state,
-        strict=True,  # type: ignore[no-untyped-call]
+        strict=True,
     ):
         if is_metal_assignment:
             atom.SetNumRadicalElectrons(0)
@@ -102,11 +139,15 @@ def _canonical_topology(
     *,
     sanitize: bool = True,
     preserve_source_order: bool = False,
+    preserve_stereochemistry: bool = False,
 ) -> tuple[Chem.Mol, list[int], TopologySanitizationStatus, str | None]:
     source_topology = Chem.Mol(mol)
     source_topology.RemoveAllConformers()
     unpaired_electron_state = _capture_unpaired_electron_state(source_topology)
-    _clear_rdkit_properties(source_topology)
+    _clear_rdkit_properties(
+        source_topology,
+        preserve_stereochemistry=preserve_stereochemistry,
+    )
     atom_count = source_topology.GetNumAtoms()
     if atom_count == 0:
         raise ValueError("molecular topology must contain at least one atom")
@@ -125,9 +166,10 @@ def _canonical_topology(
         )
     elif not sanitize:
         # MolGR owns this graph and its source atom order. Do not run any
-        # RDKit chemical repair, stereochemistry assignment, or canonical atom
-        # ranking here: those operations are post-processing on an already
-        # reconstructed QM topology and can change coordinate correspondence.
+        # RDKit chemical repair or canonical atom ranking here. Clearing
+        # transient properties above preserves MolGR's computed stereo caches,
+        # so isomeric serialization keeps its E/Z and tetrahedral assignments
+        # without repeating the post-processing pass.
         _initialize_ring_info(topology)
         canonical_order = list(range(atom_count))
         sanitization_status = TopologySanitizationStatus.SANITIZED
@@ -177,7 +219,13 @@ def _canonical_topology(
     for topology_index, source_index in enumerate(canonical_order):
         source_to_topology[source_index] = topology_index
 
-    canonical = Chem.RenumberAtoms(topology, canonical_order)
+    # MolGR and other trusted source-order graphs already use the coordinate
+    # atom order.  Avoid an identity RenumberAtoms call: RDKit rebuilds the
+    # molecule there and drops computed stereo properties such as _CIPRank.
+    if canonical_order == list(range(atom_count)):
+        canonical = topology
+    else:
+        canonical = Chem.RenumberAtoms(topology, canonical_order)
     canonical.RemoveAllConformers()
     _initialize_ring_info(canonical)
     return canonical, source_to_topology, sanitization_status, sanitization_error
@@ -277,10 +325,11 @@ def _normalized_topology_records(
     suspicious_fallback = (reconstruction_metadata or {}).get(
         "molgr_status"
     ) == "suspicious_fallback"
-    trusted_molgr_graph = (
+    preserve_stereochemistry = (
         reconstruction_method.startswith("molgr/")
         or (reconstruction_metadata or {}).get("topology_source_trusted") is True
-    ) and not suspicious_fallback
+    )
+    trusted_molgr_graph = (preserve_stereochemistry) and not suspicious_fallback
     (
         topology_mol,
         source_to_topology,
@@ -290,6 +339,7 @@ def _normalized_topology_records(
         mol,
         sanitize=not trusted_molgr_graph,
         preserve_source_order=suspicious_fallback,
+        preserve_stereochemistry=preserve_stereochemistry,
     )
     composition, hill_formula = _formula_components(topology_mol)
     composition_hash = _digest(
@@ -456,11 +506,16 @@ def normalize_topology_with_mapping(
 def _ordered_geometry_mol(
     mol: Chem.Mol,
     coordinates: npt.NDArray[np.float64],
+    *,
+    preserve_stereochemistry: bool = False,
 ) -> Chem.Mol:
     geometry_mol = Chem.Mol(mol)
     geometry_mol.RemoveAllConformers()
     unpaired_electron_state = _capture_unpaired_electron_state(geometry_mol)
-    _clear_rdkit_properties(geometry_mol)
+    _clear_rdkit_properties(
+        geometry_mol,
+        preserve_stereochemistry=preserve_stereochemistry,
+    )
     _restore_unpaired_electron_state(geometry_mol, unpaired_electron_state)
     conformer = Chem.Conformer(geometry_mol.GetNumAtoms())
     conformer.SetId(0)
@@ -547,6 +602,10 @@ def normalize_molecule(
         mol=_ordered_geometry_mol(
             topology.mol,
             geometry_coordinates,
+            preserve_stereochemistry=(
+                reconstruction_method.startswith("molgr/")
+                or (reconstruction_metadata or {}).get("topology_source_trusted") is True
+            ),
         ),
         internal_coordinates=internal_coordinates,
         internal_coordinate_hash=internal_hash,

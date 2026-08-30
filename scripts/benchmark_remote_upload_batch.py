@@ -110,9 +110,7 @@ class _ProcessTreeMonitor:
         now = perf_counter()
         table = _process_table()
         process_ids = _process_tree(table, self.root_pid)
-        current_ticks = {
-            pid: table[pid].cpu_ticks for pid in process_ids if pid in table
-        }
+        current_ticks = {pid: table[pid].cpu_ticks for pid in process_ids if pid in table}
         previous_ticks = self._previous_ticks
         delta_ticks = sum(
             max(0, ticks - previous_ticks[pid])
@@ -566,10 +564,10 @@ async def _run_batch(
 
     if result is None:
         raise RuntimeError("upload_batch did not return a result")
-    inference_status_counts = Counter()
-    inference_error_counts = Counter()
+    inference_status_counts: Counter[str] = Counter()
+    inference_error_counts: Counter[str] = Counter()
     inference_error_messages: dict[str, str] = {}
-    upload_error_counts = Counter()
+    upload_error_counts: Counter[str] = Counter()
     upload_error_messages: dict[str, str] = {}
     for item in result.items:
         if not item.succeeded and item.error_code:
@@ -731,7 +729,11 @@ async def _run(arguments: argparse.Namespace) -> dict[str, object]:
 
 
 def main() -> None:
-    monitor = None if os.getenv("TRICYCLE_BENCHMARK_DISABLE_PROCESS_MONITOR") == "1" else _ProcessTreeMonitor(os.getpid())
+    monitor = (
+        None
+        if os.getenv("TRICYCLE_BENCHMARK_DISABLE_PROCESS_MONITOR") == "1"
+        else _ProcessTreeMonitor(os.getpid())
+    )
     if monitor is not None:
         monitor.start()
     payload: dict[str, object] | None = None

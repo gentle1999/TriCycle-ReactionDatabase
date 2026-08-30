@@ -321,7 +321,7 @@ def test_node_geometry_identity_uses_geometry_not_display_coordinate_index(
                 )
             monkeypatch.setattr(
                 reactions_module,
-                "require_geometry_thermodynamic_property",
+                "require_geometry_reaction_endpoint_eligibility",
                 lambda _session, _geometry: None,
             )
             for coordinate_index, geometry in enumerate((first.geometry, second.geometry)):

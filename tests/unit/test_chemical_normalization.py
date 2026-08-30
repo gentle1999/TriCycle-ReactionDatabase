@@ -251,6 +251,71 @@ def test_trusted_ts_endpoint_normalization_does_not_sanitize(monkeypatch) -> Non
     assert sorted(source_to_topology) == list(range(molecule.GetNumAtoms()))
 
 
+def test_trusted_molgr_normalization_preserves_e_z_stereochemistry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trans_source = Chem.AddHs(Chem.MolFromSmiles("F/C=C/F"))
+    cis_source = Chem.AddHs(Chem.MolFromSmiles("F/C=C\\F"))
+    chiral_source = Chem.AddHs(Chem.MolFromSmiles("C[C@H](O)F"))
+    Chem.AssignStereochemistry(chiral_source, cleanIt=True, force=True)
+    assert chiral_source.GetAtomWithIdx(1).HasProp("_CIPRank")
+    assert chiral_source.GetAtomWithIdx(1).GetProp("_CIPCode") == "R"
+
+    def forbidden_sanitize(*_: object, **__: object) -> object:
+        raise AssertionError("trusted MolGR graphs must not be sanitized")
+
+    def forbidden_stereo_assignment(*_: object, **__: object) -> object:
+        raise AssertionError("trusted MolGR graphs must not rebuild stereochemistry")
+
+    monkeypatch.setattr(Chem, "SanitizeMol", forbidden_sanitize)
+    monkeypatch.setattr(Chem, "AssignStereochemistry", forbidden_stereo_assignment)
+
+    normalized = []
+    for molecule in (trans_source, cis_source):
+        record, source_to_topology = normalize_topology_with_mapping(
+            molecule,
+            add_hydrogens=False,
+            reconstruction_method="molgr/cpp",
+            reconstruction_version="0.1.8",
+        )
+        normalized.append(record)
+        assert source_to_topology == list(range(molecule.GetNumAtoms()))
+
+    trans, cis = normalized
+    assert trans.topology.canonical_isomeric_smiles is not None
+    assert cis.topology.canonical_isomeric_smiles is not None
+    assert "/" in trans.topology.canonical_isomeric_smiles
+    assert "\\" in cis.topology.canonical_isomeric_smiles
+    assert trans.topology.graph_hash != cis.topology.graph_hash
+    assert trans.topology.stereo_status is StereoStatus.ASSIGNED
+    assert cis.topology.stereo_status is StereoStatus.ASSIGNED
+
+    chiral_record, _ = normalize_topology_with_mapping(
+        chiral_source,
+        add_hydrogens=False,
+        reconstruction_method="molgr/cpp",
+        reconstruction_version="0.1.8",
+    )
+    chiral_atom = chiral_record.topology.mol.GetAtomWithIdx(1)
+    assert chiral_atom.HasProp("_CIPRank")
+    assert chiral_atom.GetProp("_CIPCode") == "R"
+
+    # NormalizedMoleculeRecord validation independently checks the topology and
+    # geometry serialization and may assign stereo on its temporary copies.
+    monkeypatch.undo()
+    full_record = normalize_molecule(
+        chiral_source,
+        _coordinates(chiral_source.GetNumAtoms()),
+        charge=0,
+        multiplicity=1,
+        reconstruction_method="molgr/cpp",
+        reconstruction_version="0.1.8",
+    )
+    geometry_atom = full_record.geometry.mol.GetAtomWithIdx(1)
+    assert geometry_atom.HasProp("_CIPRank")
+    assert geometry_atom.GetProp("_CIPCode") == "R"
+
+
 def test_graph_only_normalization_adds_implicit_hydrogens_without_geometry() -> None:
     implicit = Chem.MolFromSmiles("C=C")
     explicit = Chem.AddHs(Chem.Mol(implicit))

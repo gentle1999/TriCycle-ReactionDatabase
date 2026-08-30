@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy import and_
@@ -131,12 +131,14 @@ def resolve_endpoint_node(
             if node.role is role
         ]
     else:
-        role_matches = session.exec(
-            select(MappedReactionNode).where(
-                MappedReactionNode.mapped_reaction_id == mapped_reaction_id,
-                MappedReactionNode.role == role,
-            )
-        ).all()
+        role_matches = list(
+            session.exec(
+                select(MappedReactionNode).where(
+                    MappedReactionNode.mapped_reaction_id == mapped_reaction_id,
+                    MappedReactionNode.role == role,
+                )
+            ).all()
+        )
     if len(role_matches) == 1:
         return role_matches[0]
 
@@ -559,7 +561,7 @@ def preload_reconciliation_context(
         return
     participant_rows = session.exec(
         select(MappedReactionParticipant, LogicalReactionParticipant.topology_id)
-        .options(selectinload(MappedReactionParticipant.logical_reaction_participant))
+        .options(selectinload(cast(Any, MappedReactionParticipant.logical_reaction_participant)))
         .join(LogicalReactionParticipant)
         .where(col(LogicalReactionParticipant.topology_id).in_(topology_ids))
     ).all()
@@ -590,7 +592,7 @@ def preload_reconciliation_context(
 
     nodes = session.exec(
         select(MappedReactionNode)
-        .options(selectinload(MappedReactionNode.mapped_reaction))
+        .options(selectinload(cast(Any, MappedReactionNode.mapped_reaction)))
         .where(col(MappedReactionNode.mapped_reaction_id).in_(reaction_ids))
     ).all()
     nodes_by_reaction: dict[UUID, list[MappedReactionNode]] = {
@@ -710,12 +712,14 @@ def _resolve_transition_state_node(
             if node.role is MappedReactionNodeRole.TRANSITION_STATE
         ]
     else:
-        role_matches = session.exec(
-            select(MappedReactionNode).where(
-                MappedReactionNode.mapped_reaction_id == mapped_reaction_id,
-                MappedReactionNode.role == MappedReactionNodeRole.TRANSITION_STATE,
-            )
-        ).all()
+        role_matches = list(
+            session.exec(
+                select(MappedReactionNode).where(
+                    MappedReactionNode.mapped_reaction_id == mapped_reaction_id,
+                    MappedReactionNode.role == MappedReactionNodeRole.TRANSITION_STATE,
+                )
+            ).all()
+        )
     if len(role_matches) == 1:
         return role_matches[0]
     if cache is not None and mapped_reaction_id in cache.loaded_reaction_nodes:
@@ -817,9 +821,7 @@ def ensure_transition_state_path(
 
     mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
     if cache is not None and mapped_reaction_id in cache.transition_state_paths_ready:
-        transition_state_node = cache.nodes_by_key.get(
-            (mapped_reaction_id, "transition-state")
-        )
+        transition_state_node = cache.nodes_by_key.get((mapped_reaction_id, "transition-state"))
         if transition_state_node is not None:
             return transition_state_node
 
