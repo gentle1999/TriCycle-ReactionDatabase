@@ -379,6 +379,126 @@ def _stereo_status(mol: Chem.Mol) -> StereoStatus:
     return StereoStatus.ASSIGNED
 
 
+_DOUBLE_BOND_E_Z_STEREO = frozenset({Chem.BondStereo.STEREOE, Chem.BondStereo.STEREOZ})
+_SERIALIZED_DOUBLE_BOND_STEREO = frozenset(
+    {
+        Chem.BondStereo.STEREOCIS,
+        Chem.BondStereo.STEREOTRANS,
+        Chem.BondStereo.STEREOE,
+        Chem.BondStereo.STEREOZ,
+    }
+)
+
+
+def _has_serialized_e_z_marker(smiles: str | None) -> bool:
+    return smiles is not None and ("/" in smiles or "\\" in smiles)
+
+
+def _serialized_e_z_stereo(mol: Chem.Mol) -> dict[frozenset[int], Chem.BondStereo]:
+    """Return SMILES-round-tripped E/Z assignments keyed by atom identities."""
+
+    projected = Chem.Mol(mol)
+    for atom_index, atom in enumerate(projected.GetAtoms(), start=1):  # type: ignore[no-untyped-call]
+        # Temporary labels let us compare the same graph edges after canonical
+        # SMILES changes the atom and bond ordering.
+        atom.SetAtomMapNum(atom_index)
+    smiles = _graph_smiles(projected, all_hydrogens_explicit=True)
+    if not _has_serialized_e_z_marker(smiles):
+        return {}
+    try:
+        serialized = Chem.MolFromSmiles(smiles, sanitize=False)
+        if serialized is None:
+            return {}
+        Chem.SetBondStereoFromDirections(serialized)
+        result: dict[frozenset[int], Chem.BondStereo] = {}
+        for bond in serialized.GetBonds():  # type: ignore[no-untyped-call]
+            stereo = bond.GetStereo()
+            if stereo not in _SERIALIZED_DOUBLE_BOND_STEREO:
+                continue
+            result[
+                frozenset(
+                    (
+                        serialized.GetAtomWithIdx(bond.GetBeginAtomIdx()).GetAtomMapNum(),
+                        serialized.GetAtomWithIdx(bond.GetEndAtomIdx()).GetAtomMapNum(),
+                    )
+                )
+            ] = stereo
+        return result
+    except Exception:
+        return {}
+
+
+def ensure_serializable_double_bond_stereochemistry(mol: Chem.Mol) -> Chem.Mol:
+    """Preserve MolGR-assigned E/Z state in an explicit-H SMILES projection.
+
+    MolGR 0.1.8 can assign ``STEREOE``/``STEREOZ`` and its stereo-atom pair
+    without the adjacent RDKit bond-direction flags required by the SMILES
+    writer.  This function uses the same Cartesian conformer only to recover
+    those missing writer flags. It never sanitizes, changes atom/bond identity,
+    or reassigns the MolGR E/Z designation.
+    """
+
+    repaired = Chem.Mol(mol)
+    stereo_bonds = [
+        bond
+        for bond in repaired.GetBonds()  # type: ignore[no-untyped-call]
+        if bond.GetStereo() in _DOUBLE_BOND_E_Z_STEREO
+    ]
+    serialized_stereo = _serialized_e_z_stereo(repaired)
+    if not stereo_bonds or len(serialized_stereo) == len(stereo_bonds):
+        return repaired
+    if repaired.GetNumConformers() != 1:
+        raise ValueError(
+            "MolGR assigned E/Z stereochemistry without a serializable SMILES projection"
+        )
+    reference = Chem.MolFromMolBlock(
+        Chem.MolToMolBlock(repaired),
+        sanitize=False,
+        removeHs=False,
+        strictParsing=True,
+    )
+    if reference is None or reference.GetNumAtoms() != repaired.GetNumAtoms():
+        raise ValueError("could not recover MolGR E/Z SMILES direction metadata")
+    for bond in stereo_bonds:
+        stereo_atoms = list(bond.GetStereoAtoms())
+        if len(stereo_atoms) != 2:
+            raise ValueError("MolGR assigned E/Z stereochemistry without two stereo atoms")
+        for atom_index, stereo_atom_index in zip(
+            (bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()),
+            stereo_atoms,
+            strict=True,
+        ):
+            source_bond = repaired.GetBondBetweenAtoms(atom_index, stereo_atom_index)
+            if source_bond is None:
+                raise ValueError("MolGR E/Z stereo atoms are not adjacent to their double bond")
+            reference_bond = reference.GetBondWithIdx(source_bond.GetIdx())
+            direction = reference_bond.GetBondDir()
+            if direction == Chem.BondDir.NONE:
+                raise ValueError("could not recover MolGR E/Z SMILES direction metadata")
+            source_bond.SetBondDir(direction)
+    serialized_stereo = _serialized_e_z_stereo(repaired)
+    if len(serialized_stereo) != len(stereo_bonds):
+        raise ValueError(
+            "MolGR E/Z stereochemistry is not fully representable in explicit-H SMILES "
+            f"({len(serialized_stereo)}/{len(stereo_bonds)} double bonds serialized)"
+        )
+    return repaired
+
+
+def _preserved_stereo_status(mol: Chem.Mol) -> StereoStatus:
+    """Report only stereochemistry already assigned by a trusted graph source."""
+
+    if any(
+        atom.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
+        for atom in mol.GetAtoms()  # type: ignore[no-untyped-call]
+    ) or any(
+        bond.GetStereo() != Chem.BondStereo.STEREONONE
+        for bond in mol.GetBonds()  # type: ignore[no-untyped-call]
+    ):
+        return StereoStatus.ASSIGNED
+    return StereoStatus.UNKNOWN
+
+
 def _normalized_topology_records(
     mol: Chem.Mol,
     *,
@@ -394,13 +514,22 @@ def _normalized_topology_records(
         or (reconstruction_metadata or {}).get("topology_source_trusted") is True
     )
     trusted_molgr_graph = (preserve_stereochemistry) and not suspicious_fallback
+    # Every MolGR result, including a suspicious fallback, must retain a
+    # lossless E/Z SMILES projection.  ``suspicious_fallback`` only changes the
+    # sanitization policy below; it must not create a stereo-specific escape
+    # hatch that silently drops MolGR's assigned double-bond state.
+    source = (
+        ensure_serializable_double_bond_stereochemistry(mol)
+        if preserve_stereochemistry
+        else Chem.Mol(mol)
+    )
     (
         topology_mol,
         source_to_topology,
         sanitization_status,
         sanitization_error,
     ) = _canonical_topology(
-        mol,
+        source,
         sanitize=not trusted_molgr_graph,
         preserve_source_order=suspicious_fallback,
         preserve_stereochemistry=preserve_stereochemistry,
@@ -487,9 +616,13 @@ def _normalized_topology_records(
         radical_electron_count=radical_electron_count,
         fragment_count=len(Chem.GetMolFrags(topology_mol)),
         stereo_status=(
-            _stereo_status(topology_mol)
-            if sanitization_status is TopologySanitizationStatus.SANITIZED
-            else StereoStatus.UNKNOWN
+            _preserved_stereo_status(topology_mol)
+            if trusted_molgr_graph
+            else (
+                _stereo_status(topology_mol)
+                if sanitization_status is TopologySanitizationStatus.SANITIZED
+                else StereoStatus.UNKNOWN
+            )
         ),
         sanitization_status=sanitization_status,
         sanitization_error=sanitization_error,
@@ -499,6 +632,15 @@ def _normalized_topology_records(
         "topology_sanitization_status": sanitization_status.value,
         "topology_sanitization_error": sanitization_error,
     }
+    source_atom_map_numbers = derivation_metadata.get("source_atom_map_numbers")
+    if isinstance(source_atom_map_numbers, list):
+        topology_atom_count = topology_mol.GetNumAtoms()
+        if len(source_atom_map_numbers) != topology_atom_count:
+            raise ValueError("source atom-map numbers do not match topology atom count")
+        topology_atom_map_numbers = [0] * topology_atom_count
+        for source_index, topology_index in enumerate(source_to_topology):
+            topology_atom_map_numbers[topology_index] = int(source_atom_map_numbers[source_index])
+        derivation_metadata["topology_atom_map_numbers"] = topology_atom_map_numbers
     topology_derivation = MolecularTopologyDerivationRecord(
         reconstruction_method=reconstruction_method,
         reconstruction_version=reconstruction_version,
@@ -558,15 +700,15 @@ def normalize_topology_with_mapping(
     MolOP source frame.
     """
 
-    source = Chem.Mol(mol)
     suspicious_fallback = (reconstruction_metadata or {}).get(
         "molgr_status"
     ) == "suspicious_fallback"
-    unpaired_electron_state = _capture_unpaired_electron_state(source)
     trusted_source_graph = (
         reconstruction_method.startswith("molgr/")
         or (reconstruction_metadata or {}).get("topology_source_trusted") is True
     )
+    source = Chem.Mol(mol)
+    unpaired_electron_state = _capture_unpaired_electron_state(source)
     if not suspicious_fallback and not trusted_source_graph:
         Chem.SanitizeMol(source)
     _restore_unpaired_electron_state(source, unpaired_electron_state)
@@ -713,6 +855,7 @@ __all__ = [
     "GEOMETRY_CANONICALIZATION_VERSION",
     "TOPOLOGY_IDENTITY_VERSION",
     "TOPOLOGY_DERIVATION_VERSION",
+    "ensure_serializable_double_bond_stereochemistry",
     "normalize_molecule",
     "normalize_topology",
     "normalize_topology_with_mapping",

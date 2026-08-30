@@ -3,6 +3,7 @@ import pytest
 from molgr.utils.converter import METAL_UNPAIRED_ELECTRONS_PROP
 from pydantic import ValidationError
 from rdkit import Chem
+from rdkit.Chem import rdDepictor
 
 from tricycle_reaction_db.application.dtos import (
     GeometryRecord,
@@ -11,6 +12,7 @@ from tricycle_reaction_db.application.dtos import (
 )
 from tricycle_reaction_db.domain.enums import StereoStatus, TopologySanitizationStatus
 from tricycle_reaction_db.ingestion.normalization import (
+    ensure_serializable_double_bond_stereochemistry,
     normalize_molecule,
     normalize_topology,
     normalize_topology_with_mapping,
@@ -250,6 +252,34 @@ def test_unsanitizable_fallback_initializes_ring_info_for_postgresql_rdkit() -> 
     assert Chem.Mol(record.geometry.mol.ToBinary()).GetRingInfo().NumRings() == 1
 
 
+def test_suspicious_molgr_fallback_still_validates_e_z_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = Chem.AddHs(Chem.MolFromSmiles("F/C=C/F"))
+    rdDepictor.Compute2DCoords(source)
+    for bond in source.GetBonds():
+        bond.SetBondDir(Chem.BondDir.NONE)
+
+    def forbidden_sanitize(*_: object, **__: object) -> object:
+        raise AssertionError("suspicious MolGR fallback must not be sanitized")
+
+    monkeypatch.setattr(Chem, "SanitizeMol", forbidden_sanitize)
+    record = normalize_topology(
+        source,
+        add_hydrogens=False,
+        reconstruction_method="molgr/openbabel-fallback",
+        reconstruction_version="0.1.8",
+        reconstruction_metadata={"molgr_status": "suspicious_fallback"},
+    )
+
+    double_bond = next(
+        bond
+        for bond in record.topology.mol.GetBonds()
+        if bond.GetStereo() in (Chem.BondStereo.STEREOE, Chem.BondStereo.STEREOZ)
+    )
+    assert double_bond.GetStereo() is Chem.BondStereo.STEREOE
+
+
 def test_molgr_normalization_trusts_input_graph_without_sanitizing(monkeypatch) -> None:
     molecule = _unsanitizable_ring_molecule()
     for atom in molecule.GetAtoms():
@@ -298,6 +328,73 @@ def test_trusted_ts_endpoint_normalization_does_not_sanitize(monkeypatch) -> Non
     assert sorted(source_to_topology) == list(range(molecule.GetNumAtoms()))
 
 
+def test_trusted_molgr_e_z_stereo_gets_serializable_direction_metadata() -> None:
+    assigned = Chem.MolFromSmiles("F/C=C/F")
+    assert assigned is not None
+    rdDepictor.Compute2DCoords(assigned)
+    incomplete = Chem.MolFromMolBlock(
+        Chem.MolToMolBlock(assigned),
+        sanitize=False,
+        removeHs=False,
+        strictParsing=True,
+    )
+    assert incomplete is not None
+    assigned_double_bond = next(
+        bond
+        for bond in assigned.GetBonds()
+        if bond.GetStereo() in (Chem.BondStereo.STEREOE, Chem.BondStereo.STEREOZ)
+    )
+    incomplete_double_bond = incomplete.GetBondWithIdx(assigned_double_bond.GetIdx())
+    incomplete_double_bond.SetStereo(assigned_double_bond.GetStereo())
+    incomplete_double_bond.SetStereoAtoms(*list(assigned_double_bond.GetStereoAtoms()))
+    for bond in incomplete.GetBonds():
+        bond.SetBondDir(Chem.BondDir.NONE)
+
+    incomplete_smiles = Chem.MolToSmiles(
+        incomplete,
+        canonical=True,
+        isomericSmiles=True,
+        allHsExplicit=True,
+    )
+    assert "/" not in incomplete_smiles and "\\" not in incomplete_smiles
+
+    repaired = ensure_serializable_double_bond_stereochemistry(incomplete)
+    repaired_smiles = Chem.MolToSmiles(
+        repaired,
+        canonical=True,
+        isomericSmiles=True,
+        allHsExplicit=True,
+    )
+
+    assert "/" in repaired_smiles or "\\" in repaired_smiles
+    repaired_double_bond = repaired.GetBondWithIdx(incomplete_double_bond.GetIdx())
+    assert repaired_double_bond.GetStereo() is assigned_double_bond.GetStereo()
+    assert list(repaired_double_bond.GetStereoAtoms()) == list(
+        assigned_double_bond.GetStereoAtoms()
+    )
+
+    normalized = normalize_molecule(
+        incomplete,
+        np.asarray(incomplete.GetConformer().GetPositions(), dtype=np.float64),
+        charge=0,
+        multiplicity=1,
+        reconstruction_method="molgr/cpp",
+        reconstruction_version="0.1.8",
+    )
+    assert normalized.topology.canonical_isomeric_smiles is not None
+    assert (
+        "/" in normalized.topology.canonical_isomeric_smiles
+        or "\\" in normalized.topology.canonical_isomeric_smiles
+    )
+    geometry_smiles = Chem.MolToSmiles(
+        normalized.geometry.mol,
+        canonical=True,
+        isomericSmiles=True,
+        allHsExplicit=True,
+    )
+    assert "/" in geometry_smiles or "\\" in geometry_smiles
+
+
 def test_trusted_molgr_normalization_preserves_e_z_stereochemistry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -314,8 +411,12 @@ def test_trusted_molgr_normalization_preserves_e_z_stereochemistry(
     def forbidden_stereo_assignment(*_: object, **__: object) -> object:
         raise AssertionError("trusted MolGR graphs must not rebuild stereochemistry")
 
+    def forbidden_stereo_discovery(*_: object, **__: object) -> object:
+        raise AssertionError("trusted MolGR graphs must not rediscover stereochemistry")
+
     monkeypatch.setattr(Chem, "SanitizeMol", forbidden_sanitize)
     monkeypatch.setattr(Chem, "AssignStereochemistry", forbidden_stereo_assignment)
+    monkeypatch.setattr(Chem, "FindPotentialStereo", forbidden_stereo_discovery)
 
     normalized = []
     for molecule in (trans_source, cis_source):

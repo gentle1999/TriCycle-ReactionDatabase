@@ -25,6 +25,7 @@ from tricycle_reaction_db.ingestion.molop_calculations import (
     segment_record_from_molop,
 )
 from tricycle_reaction_db.ingestion.normalization import (
+    ensure_serializable_double_bond_stereochemistry,
     normalize_molecule,
     normalize_topology,
     normalize_topology_with_mapping,
@@ -35,6 +36,7 @@ __all__ = [
     "calculation_protocol_record",
     "configure_molecular_graph_reconstruction",
     "detect_artifact_media_type",
+    "ensure_serializable_double_bond_stereochemistry",
     "frame_records_from_molop",
     "MOLECULAR_GRAPH_RECONSTRUCTION_FAILURE_POLICY",
     "MolOPFrameRecords",

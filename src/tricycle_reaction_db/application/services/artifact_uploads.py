@@ -32,7 +32,6 @@ from molop.config import molopconfig
 from molop.io.base_models.ChemFileFrame import BaseCalcFrame
 from molop.unit import atom_ureg
 from rdkit import Chem
-from rdkit.Chem import rdChemReactions
 from sqlalchemy.orm import Session as SQLAlchemySession
 from sqlalchemy.orm import joinedload
 from sqlmodel import Session, col, select
@@ -88,10 +87,6 @@ from tricycle_reaction_db.application.services.reaction_geometry_reconciliation 
     bind_transition_state_frame,
     ensure_transition_state_path,
 )
-from tricycle_reaction_db.application.services.reactions import (
-    _canonical_mapped_reaction_smiles,
-    _reaction_from_representation,
-)
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
@@ -117,6 +112,7 @@ from tricycle_reaction_db.domain.reaction_frames import is_transition_state_fram
 from tricycle_reaction_db.ingestion import (
     MolOPFrameRecords,
     configure_molecular_graph_reconstruction,
+    ensure_serializable_double_bond_stereochemistry,
     frame_records_from_molop,
     normalize_topology,
     normalize_topology_with_mapping,
@@ -133,9 +129,10 @@ logger = logging.getLogger(__name__)
 # Pre/post-TS endpoint selection is delegated to MolOP's
 # ``BaseCalcFrame.possible_pre_post_ts``: it samples both signed sides across
 # the amplitude range below and keeps the most frequent side topology.  These
-# values mirror the MolOP defaults so the persisted inference settings always
-# describe the actual sampling grid.
-TS_PRE_POST_MIN_RATIO = 0.75
+# values are persisted with every inference so the exact sampling grid remains
+# auditable. Starting at 0.50 retains valid endpoints whose larger imaginary-
+# mode displacements would otherwise trip MolOP's steric-crowding guard.
+TS_PRE_POST_MIN_RATIO = 0.50
 TS_PRE_POST_MAX_RATIO = 1.75
 TS_PRE_POST_STEPS = 7
 PERSISTENCE_PRELOAD_BATCH_SIZE = 16
@@ -1317,22 +1314,22 @@ def _mapped_reaction_smiles(reactant: Chem.Mol, product: Chem.Mol) -> str:
         fragments = Chem.GetMolFrags(mapped, asMols=True, sanitizeFrags=False)
         sides.append(
             ".".join(
-                Chem.MolToSmiles(
-                    fragment,
-                    canonical=True,
-                    isomericSmiles=True,
-                    allHsExplicit=True,
+                sorted(
+                    Chem.MolToSmiles(
+                        fragment,
+                        canonical=True,
+                        isomericSmiles=True,
+                        allHsExplicit=True,
+                    )
+                    for fragment in fragments
                 )
-                for fragment in fragments
             )
         )
-    reaction_smiles = f"{sides[0]}>>{sides[1]}"
-    reaction = rdChemReactions.ReactionFromSmarts(reaction_smiles, useSmiles=True)
-    if reaction is None:
-        raise ValueError("MolOP TS endpoints did not produce a valid reaction")
-    # Fragment order is not stable enough for persist_mapped_reaction's
-    # canonical serialization check, so canonicalize the complete reaction.
-    return _canonical_mapped_reaction_smiles(reaction)
+    # Fragment order is not stable across MolOP endpoint reconstruction. Each
+    # fragment is canonicalized and sorted above, so the mapped reaction is
+    # stable without round-tripping a metal-rich graph through RDKit reaction
+    # templates before persistence validates it.
+    return f"{sides[0]}>>{sides[1]}"
 
 
 def _signed_ts_endpoints(
@@ -1434,6 +1431,8 @@ def _infer_ts_frame(frame: BaseCalcFrame[Any], fallback_index: int) -> _Inferenc
                 error_code="ts_topology_untrusted",
                 error_message=("MolGR returned a suspicious fallback topology for a TS endpoint"),
             )
+        negative_endpoint = ensure_serializable_double_bond_stereochemistry(negative_endpoint)
+        positive_endpoint = ensure_serializable_double_bond_stereochemistry(positive_endpoint)
         reactant, product = sorted(
             (negative_endpoint, positive_endpoint),
             key=lambda endpoint: len(Chem.GetMolFrags(endpoint)),
@@ -2030,6 +2029,38 @@ def _parse_calculation_output(payload: bytes, filename: str) -> _ParsedArtifact:
             chem_file,
             source_compression=source_compression,
         )
+
+
+def infer_transition_states_from_calculation_output(
+    payload: bytes,
+    filename: str,
+) -> tuple[_Inference, ...]:
+    """Re-evaluate TS endpoints without rebuilding unrelated frame topologies.
+
+    Offline endpoint maintenance already has immutable CalculationFrame rows;
+    it needs only the source-order coordinates, vibrations, and MolGR graphs
+    of the two displaced endpoints. Reconstructing every optimization frame
+    again would add cost without contributing evidence to the re-inference.
+    """
+
+    configure_molecular_graph_reconstruction()
+    decoded_payload, _source_compression = _parser_payload(payload, filename)
+    with tempfile.NamedTemporaryFile(suffix=_safe_parser_suffix(filename)) as temporary:
+        temporary.write(decoded_payload)
+        temporary.flush()
+        chem_file = AutoFileParser(
+            temporary.name,
+            parser_detection="auto",
+            capture_source_evidence=True,
+            release_file_content=True,
+        )
+        inferred: list[_Inference] = []
+        for fallback_index, frame in enumerate(chem_file):
+            if isinstance(frame, BaseCalcFrame):
+                inference = _infer_ts_frame(frame, fallback_index)
+                if inference is not None:
+                    inferred.append(inference)
+        return tuple(inferred)
 
 
 def _prepare_calculation_parser_path(
@@ -2889,6 +2920,17 @@ def _resolve_and_bind_transition_state_reaction(
         else None
     )
     if cached_reaction_ids is None:
+        if topology_context is not None:
+            precomputed_topology_records = topology_context.inferred_reaction_topology_records.get(
+                inferred.reaction_smiles
+            )
+        else:
+            # The endpoint fragments are authoritative MolGR graphs. Reusing
+            # their records here avoids sanitizing RDKit reaction templates,
+            # which can mutate electronic state and cannot safely inspect some
+            # multicoordinate metal structures.
+            records = _inference_topology_records(inferred)
+            precomputed_topology_records = tuple(records[2:])
         reaction_result = create_reaction_in_session(
             session,
             CreateReactionCommand(
@@ -2903,11 +2945,7 @@ def _resolve_and_bind_transition_state_reaction(
             ),
             topology_context=topology_context,
             include_creation_metadata=topology_context is None,
-            precomputed_topology_records=(
-                topology_context.inferred_reaction_topology_records.get(inferred.reaction_smiles)
-                if topology_context is not None
-                else None
-            ),
+            precomputed_topology_records=precomputed_topology_records,
             reconciliation_cache=(
                 topology_context.reconciliation_cache if topology_context is not None else None
             ),
@@ -4008,10 +4046,9 @@ def _inference_topology_records(
 ) -> list[Any]:
     """Build endpoint and participant identities without sanitizing MolGR graphs.
 
-    RDKit's reaction parser is useful for atom-map/template ordering, but its
-    sanitized templates can erase radical annotations.  The participant
-    records therefore come from the corresponding source-order MolGR
-    fragments, matched only by their explicit atom-map sets.
+    Participant records come directly from the source-order MolGR endpoint
+    fragments.  This keeps radical, charge, and stereo annotations under the
+    same normalization/serialization validation as every other MolGR graph.
     """
 
     records: list[Any] = []
@@ -4025,56 +4062,48 @@ def _inference_topology_records(
         )
         records.append(record)
     if reaction_records is None:
-        with suppress(Exception):
-            definition = _reaction_from_representation(inferred.reaction_smiles)
-            endpoints = sorted(
-                (inferred.negative_endpoint, inferred.positive_endpoint),
-                key=lambda endpoint: len(Chem.GetMolFrags(endpoint)),
-                reverse=True,
-            )
-            fragments_by_map_set: dict[frozenset[int], Chem.Mol] = {}
-            for endpoint in endpoints:
-                source = Chem.Mol(endpoint)
-                source.RemoveAllConformers()
-                for atom_index, atom in enumerate(
-                    source.GetAtoms()  # type: ignore[no-untyped-call]
-                ):
-                    atom.SetAtomMapNum(atom_index + 1)
-                for fragment in Chem.GetMolFrags(source, asMols=True, sanitizeFrags=False):
-                    fragment_maps = frozenset(atom.GetAtomMapNum() for atom in fragment.GetAtoms())
-                    fragments_by_map_set[fragment_maps] = fragment
-            participant_records: list[Any] = []
-            for side, templates in (
-                ("reactant", definition.GetReactants()),
-                ("product", definition.GetProducts()),
+        endpoints = sorted(
+            (inferred.negative_endpoint, inferred.positive_endpoint),
+            key=lambda endpoint: len(Chem.GetMolFrags(endpoint)),
+            reverse=True,
+        )
+        participant_records: list[Any] = []
+        for side, endpoint in zip(("reactant", "product"), endpoints, strict=True):
+            source = Chem.Mol(endpoint)
+            source.RemoveAllConformers()
+            for atom_index, atom in enumerate(
+                source.GetAtoms()  # type: ignore[no-untyped-call]
             ):
-                for template_index, template in enumerate(templates):
-                    template_maps = frozenset(atom.GetAtomMapNum() for atom in template.GetAtoms())
-                    fragment = fragments_by_map_set.get(template_maps)
-                    if fragment is None:
-                        raise ValueError(
-                            "MolOP endpoint fragment maps do not match reaction templates"
-                        )
-                    participant_records.append(
-                        normalize_topology(
-                            fragment,
-                            add_hydrogens=False,
-                            reconstruction_method="molgr/possible_pre_post_ts",
-                            reconstruction_version=MOLOP_VERSION,
-                            reconstruction_metadata={
-                                "coordinate_frame": "calculation_frame.observed_coordinates",
-                                "topology_source_trusted": True,
-                                "source_fragment": True,
-                                "source_atom_map_numbers": [
-                                    atom.GetAtomMapNum()
-                                    for atom in fragment.GetAtoms()  # type: ignore[no-untyped-call]
-                                ],
-                                "side": side,
-                                "template_index": template_index,
-                            },
-                        )
+                atom.SetAtomMapNum(atom_index + 1)
+            fragments = sorted(
+                Chem.GetMolFrags(source, asMols=True, sanitizeFrags=False),
+                key=lambda fragment: Chem.MolToSmiles(
+                    fragment,
+                    canonical=True,
+                    isomericSmiles=True,
+                    allHsExplicit=True,
+                ),
+            )
+            for template_index, fragment in enumerate(fragments):
+                participant_records.append(
+                    normalize_topology(
+                        fragment,
+                        add_hydrogens=False,
+                        reconstruction_method="molgr/possible_pre_post_ts",
+                        reconstruction_version=MOLOP_VERSION,
+                        reconstruction_metadata={
+                            "coordinate_frame": "calculation_frame.observed_coordinates",
+                            "topology_source_trusted": True,
+                            "source_fragment": True,
+                            "source_atom_map_numbers": [
+                                atom.GetAtomMapNum() for atom in fragment.GetAtoms()
+                            ],
+                            "side": side,
+                            "template_index": template_index,
+                        },
                     )
-            reaction_records = tuple(participant_records)
+                )
+        reaction_records = tuple(participant_records)
     if reaction_records:
         records.extend(reaction_records)
     return records

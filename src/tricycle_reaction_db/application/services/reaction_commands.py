@@ -5,7 +5,6 @@ from hashlib import sha256
 from typing import cast
 
 from nexusx import UseCaseService, mutation  # type: ignore[import-untyped]
-from rdkit import Chem
 from rdkit import __version__ as rdkit_version
 from rdkit.Chem import rdChemReactions
 from sqlmodel import Session, select
@@ -35,6 +34,7 @@ from tricycle_reaction_db.application.services.reaction_geometry_reconciliation 
 from tricycle_reaction_db.application.services.reactions import (
     _canonical_mapped_reaction_smiles,
     _reaction_from_representation,
+    mapped_smiles_for_topology,
     persist_logical_reaction,
     persist_logical_reaction_participant,
     persist_mapped_reaction,
@@ -64,7 +64,6 @@ from tricycle_reaction_db.ingestion.normalization import (
 class _ResolvedComponent:
     side: LogicalReactionParticipantSide
     template_index: int
-    template: Chem.Mol
     formula: MolecularFormula
     topology: MolecularTopology
     topology_atom_map_numbers: list[int]
@@ -72,7 +71,7 @@ class _ResolvedComponent:
 
 def _resolve_components(
     session: Session,
-    definition: rdChemReactions.ChemicalReaction,
+    definition: rdChemReactions.ChemicalReaction | None,
     *,
     topology_context: GeometryPersistenceContext | None = None,
     include_creation_metadata: bool = True,
@@ -80,52 +79,21 @@ def _resolve_components(
 ) -> tuple[list[_ResolvedComponent], int]:
     components: list[_ResolvedComponent] = []
     topologies_created = 0
-    component_index = 0
-    for side, templates in (
-        (LogicalReactionParticipantSide.REACTANT, definition.GetReactants()),
-        (LogicalReactionParticipantSide.PRODUCT, definition.GetProducts()),
-    ):
-        for template_index, template in enumerate(templates):
-            if precomputed_topology_records is not None:
-                try:
-                    normalized = precomputed_topology_records[component_index]
-                except IndexError as error:
-                    raise ValueError(
-                        "precomputed reaction topology record count mismatch"
-                    ) from error
-                component_index += 1
-                source_atom_maps = normalized.topology_derivation.reconstruction_metadata.get(
-                    "source_atom_map_numbers"
+    if precomputed_topology_records is not None:
+        for normalized in precomputed_topology_records:
+            metadata = normalized.topology_derivation.reconstruction_metadata
+            try:
+                side = LogicalReactionParticipantSide(str(metadata["side"]))
+                template_index = int(metadata["template_index"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    "precomputed reaction topology requires side and template_index metadata"
+                ) from error
+            topology_atom_maps = metadata.get("topology_atom_map_numbers")
+            if not isinstance(topology_atom_maps, list):
+                raise ValueError(
+                    "precomputed mapped reaction topology requires topology atom-map numbers"
                 )
-                if isinstance(source_atom_maps, list):
-                    topology_atom_map_numbers = [int(number) for number in source_atom_maps]
-                else:
-                    # Generic precomputed records (for example callers of the
-                    # exported reaction_topology_records helper) do not carry
-                    # endpoint provenance. Their template order is the only
-                    # available mapping evidence.
-                    template_maps = [atom.GetAtomMapNum() for atom in template.GetAtoms()]
-                    topology_atom_map_numbers = template_maps if any(template_maps) else []
-            else:
-                normalized, source_to_topology = normalize_topology_with_mapping(
-                    template,
-                    add_hydrogens=True,
-                    reconstruction_method="rdkit/reaction-representation",
-                    reconstruction_version=rdkit_version,
-                    reconstruction_metadata={
-                        "side": side.value,
-                        "template_index": template_index,
-                    },
-                )
-                template_atom_maps = [atom.GetAtomMapNum() for atom in template.GetAtoms()]
-                if any(template_atom_maps):
-                    topology_atom_map_numbers = [0] * normalized.topology.atom_count
-                    for source_index, topology_index in enumerate(source_to_topology):
-                        if source_index >= len(template_atom_maps):
-                            break
-                        topology_atom_map_numbers[topology_index] = template_atom_maps[source_index]
-                else:
-                    topology_atom_map_numbers = []
             existing = (
                 session.exec(
                     select(MolecularTopology).where(
@@ -148,16 +116,69 @@ def _resolve_components(
                 _ResolvedComponent(
                     side=side,
                     template_index=template_index,
-                    template=template,
+                    formula=persisted.formula,
+                    topology=persisted.topology,
+                    topology_atom_map_numbers=[int(number) for number in topology_atom_maps],
+                )
+            )
+        component_keys = [(component.side, component.template_index) for component in components]
+        if len(set(component_keys)) != len(component_keys):
+            raise ValueError("precomputed reaction topology component keys must be unique")
+        return components, topologies_created
+
+    if definition is None:
+        raise ValueError("reaction definition is required without precomputed topologies")
+    for side, templates in (
+        (LogicalReactionParticipantSide.REACTANT, definition.GetReactants()),
+        (LogicalReactionParticipantSide.PRODUCT, definition.GetProducts()),
+    ):
+        for template_index, template in enumerate(templates):
+            normalized, source_to_topology = normalize_topology_with_mapping(
+                template,
+                add_hydrogens=True,
+                reconstruction_method="rdkit/reaction-representation",
+                reconstruction_version=rdkit_version,
+                reconstruction_metadata={
+                    "side": side.value,
+                    "template_index": template_index,
+                },
+            )
+            template_atom_maps = [atom.GetAtomMapNum() for atom in template.GetAtoms()]
+            if any(template_atom_maps):
+                topology_atom_map_numbers = [0] * normalized.topology.atom_count
+                for source_index, topology_index in enumerate(source_to_topology):
+                    if source_index >= len(template_atom_maps):
+                        break
+                    topology_atom_map_numbers[topology_index] = template_atom_maps[source_index]
+            else:
+                topology_atom_map_numbers = []
+            existing = (
+                session.exec(
+                    select(MolecularTopology).where(
+                        MolecularTopology.identity_schema_version
+                        == normalized.topology.identity_schema_version,
+                        MolecularTopology.graph_hash == normalized.topology.graph_hash,
+                    )
+                ).first()
+                if include_creation_metadata
+                else None
+            )
+            persisted = persist_molecular_topology(
+                session,
+                normalized,
+                context=topology_context,
+            )
+            if include_creation_metadata and existing is None:
+                topologies_created += 1
+            components.append(
+                _ResolvedComponent(
+                    side=side,
+                    template_index=template_index,
                     formula=persisted.formula,
                     topology=persisted.topology,
                     topology_atom_map_numbers=topology_atom_map_numbers,
                 )
             )
-    if precomputed_topology_records is not None and component_index != len(
-        precomputed_topology_records
-    ):
-        raise ValueError("precomputed reaction topology record count mismatch")
     return components, topologies_created
 
 
@@ -192,16 +213,10 @@ def _has_complete_mapping(components: list[_ResolvedComponent]) -> bool:
         for component in components:
             if component.side is not side:
                 continue
-            template_maps = [
-                atom.GetAtomMapNum()
-                for atom in component.template.GetAtoms()  # type: ignore[no-untyped-call]
-            ]
+            template_maps = component.topology_atom_map_numbers
             side_maps.extend(template_maps)
             any_mapping = any_mapping or any(template_maps)
-            if (
-                any(template_maps)
-                and component.template.GetNumAtoms() != component.topology.atom_count
-            ):
+            if any(template_maps) and len(template_maps) != component.topology.atom_count:
                 raise ValueError(
                     "mapped reaction components must explicitly contain every topology atom"
                 )
@@ -256,7 +271,11 @@ def _create_reaction(
     reconciliation_cache: ReconciliationBatchCache | None = None,
     precomputed_topology_records: tuple[NormalizedTopologyRecord, ...] | None = None,
 ) -> CreateReactionResult:
-    definition = _reaction_from_representation(command.reaction)
+    definition = (
+        None
+        if precomputed_topology_records is not None
+        else _reaction_from_representation(command.reaction)
+    )
     components, topologies_created = _resolve_components(
         session,
         definition,
@@ -312,7 +331,33 @@ def _create_reaction(
             mapped_reaction_created=False,
         )
 
-    canonical_smiles = _canonical_mapped_reaction_smiles(definition)
+    precomputed_mapped_smiles_by_template = None
+    if precomputed_topology_records is not None:
+        precomputed_mapped_smiles_by_template = {
+            (component.side, component.template_index): mapped_smiles_for_topology(
+                component.topology,
+                component.topology_atom_map_numbers,
+            )
+            for component in components
+        }
+        canonical_sides: dict[LogicalReactionParticipantSide, list[tuple[int, str]]] = {
+            LogicalReactionParticipantSide.REACTANT: [],
+            LogicalReactionParticipantSide.PRODUCT: [],
+        }
+        for component_key, mapped_smiles in precomputed_mapped_smiles_by_template.items():
+            side, template_index = component_key
+            canonical_sides[side].append((template_index, mapped_smiles))
+        reactants = ".".join(
+            smiles for _, smiles in sorted(canonical_sides[LogicalReactionParticipantSide.REACTANT])
+        )
+        products = ".".join(
+            smiles for _, smiles in sorted(canonical_sides[LogicalReactionParticipantSide.PRODUCT])
+        )
+        canonical_smiles = f"{reactants}>>{products}"
+    else:
+        if definition is None:  # pragma: no cover - guarded above
+            raise AssertionError("reaction definition was not initialized")
+        canonical_smiles = _canonical_mapped_reaction_smiles(definition)
     mapping_hash = sha256(canonical_smiles.encode("utf-8")).hexdigest()
     existing_mapped = (
         session.exec(
@@ -345,6 +390,7 @@ def _create_reaction(
             )
             for component in components
         },
+        precomputed_mapped_smiles_by_template=precomputed_mapped_smiles_by_template,
     )
     reactant_node = resolve_endpoint_node(
         session,

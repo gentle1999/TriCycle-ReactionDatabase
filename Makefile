@@ -3,6 +3,7 @@
 	format lint type test test-db test-storage test-redis test-infra audit vendor-audit check \
 	db-up db-down storage-up storage-down auth-up auth-down infra-up infra-down migrate import-artifacts \
 	backfill-thermodynamics reconcile-reaction-geometries bootstrap-development bootstrap-production seed-da-bench serve serve-nexusx storage-gc auth-session-cleanup \
+	reinfer-transition-state-endpoints \
 	benchmark-upload-resources benchmark-remote-upload-resources capture-query-plan-evidence probe-shared-rate-limit probe-upload-limit \
 	validate-da-bench-fixture validate-restore deployment-smoke validate-deployment-acceptance \
 	stack-build stack-up stack-down stack-logs
@@ -202,6 +203,12 @@ bootstrap-production:
 
 backfill-thermodynamics:
 	uv run python scripts/backfill_mapped_reaction_thermodynamics.py
+
+reinfer-transition-state-endpoints:
+	uv run python scripts/backfill_transition_state_endpoints.py --replace --reinfer-all \
+		$(if $(TS_REINFER_LIMIT),--limit "$(TS_REINFER_LIMIT)",) \
+		$(if $(TS_REINFER_INFERENCE_ID),--inference-id "$(TS_REINFER_INFERENCE_ID)",) \
+		$(if $(TS_REINFER_STATEMENT_TIMEOUT_MS),--statement-timeout-ms "$(TS_REINFER_STATEMENT_TIMEOUT_MS)",)
 
 reconcile-reaction-geometries:
 	uv run tricycle-reconcile-reaction-geometries \

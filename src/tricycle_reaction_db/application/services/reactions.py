@@ -103,6 +103,48 @@ def _canonical_mapped_reaction_smiles(
 ) -> str:
     """Canonicalize mapped reactions while avoiding unstable metal stereo tags."""
 
+    all_templates = (
+        definition.GetReactants(),
+        definition.GetAgents(),
+        definition.GetProducts(),
+    )
+    # RDKit's ChemicalReaction template copy can segfault for some
+    # multicoordinate metal graphs. Individual template serialization is both
+    # deterministic and sufficient for the mapped reaction identity there.
+    if any(
+        _is_metal_atomic_number(atom.GetAtomicNum())
+        for templates in all_templates
+        for template in templates
+        for atom in template.GetAtoms()
+    ):
+        metal_chiral_tags: list[tuple[Chem.Atom, Chem.ChiralType]] = []
+        try:
+            for templates in all_templates:
+                for template in templates:
+                    for atom in template.GetAtoms():
+                        if _is_metal_atomic_number(atom.GetAtomicNum()):
+                            metal_chiral_tags.append((atom, atom.GetChiralTag()))
+                            atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
+            serialized_sides = [
+                ".".join(
+                    sorted(
+                        Chem.MolToSmiles(
+                            template,
+                            canonical=True,
+                            isomericSmiles=True,
+                            allHsExplicit=True,
+                        )
+                        for template in templates
+                    )
+                )
+                for templates in all_templates
+            ]
+        finally:
+            for atom, chiral_tag in metal_chiral_tags:
+                atom.SetChiralTag(chiral_tag)
+        reactants, agents, products = serialized_sides
+        return f"{reactants}>{agents}>{products}" if agents else f"{reactants}>>{products}"
+
     stable = rdChemReactions.ChemicalReaction()
     for templates, add_template in (
         (definition.GetReactants(), stable.AddReactantTemplate),
@@ -171,19 +213,20 @@ def _reaction_graph_smiles(definition: rdChemReactions.ChemicalReaction) -> str:
 _mapped_reaction_from_smiles = _reaction_from_representation
 
 
-@lru_cache(maxsize=1024)
-def _logical_map_numbers_for_reaction(reaction_representation: str) -> frozenset[int]:
-    """Cache the immutable atom-map projection used by mapping validation."""
+def _logical_map_numbers_for_reaction(mapped_reaction: MappedReaction) -> frozenset[int]:
+    """Read map numbers from persisted participants without reparsing the reaction.
 
-    reaction_definition = _reaction_from_representation(reaction_representation)
+    MolGR-derived reactions may contain multicoordinate metals that are valid in
+    the trusted source graph but unsafe for RDKit ``ChemicalReaction`` traversal.
+    Participant rows are already the authoritative mapping projection, so a
+    second reaction parse here is both unnecessary and crash-prone.
+    """
+
     return frozenset(
-        atom.GetAtomMapNum()
-        for templates in (
-            reaction_definition.GetReactants(),
-            reaction_definition.GetProducts(),
-        )
-        for molecule in templates
-        for atom in molecule.GetAtoms()
+        atom_map
+        for participant in mapped_reaction.participants
+        for atom_map in participant.atom_map_numbers
+        if atom_map > 0
     )
 
 
@@ -603,10 +646,90 @@ def persist_mapped_reaction(
     | None = None,
     topology_ids_by_template: Mapping[tuple[LogicalReactionParticipantSide, int], object]
     | None = None,
+    precomputed_mapped_smiles_by_template: Mapping[tuple[LogicalReactionParticipantSide, int], str]
+    | None = None,
 ) -> MappedReaction:
     """Insert or reuse one explicit mapped reaction under a logical reaction."""
 
     reaction_id = _require_id(reaction, label="LogicalReaction")
+    if precomputed_mapped_smiles_by_template is not None:
+        if source_atom_maps_by_template is None or topology_ids_by_template is None:
+            raise ValueError(
+                "precomputed mapped reaction participants require topology and atom-map bindings"
+            )
+        component_keys = set(precomputed_mapped_smiles_by_template)
+        if component_keys != set(source_atom_maps_by_template) or component_keys != set(
+            topology_ids_by_template
+        ):
+            raise ValueError("precomputed mapped reaction participant keys must match")
+        canonical_sides: dict[LogicalReactionParticipantSide, list[tuple[int, str]]] = {
+            LogicalReactionParticipantSide.REACTANT: [],
+            LogicalReactionParticipantSide.PRODUCT: [],
+        }
+        for (side, template_index), mapped_smiles in precomputed_mapped_smiles_by_template.items():
+            canonical_sides[side].append((template_index, mapped_smiles))
+        reactants = ".".join(
+            smiles for _, smiles in sorted(canonical_sides[LogicalReactionParticipantSide.REACTANT])
+        )
+        products = ".".join(
+            smiles for _, smiles in sorted(canonical_sides[LogicalReactionParticipantSide.PRODUCT])
+        )
+        canonical_smiles = f"{reactants}>>{products}"
+        expected_hash = sha256(canonical_smiles.encode("utf-8")).hexdigest()
+        if record.mapped_reaction_smiles != canonical_smiles:
+            raise ValueError(
+                "precomputed mapped_reaction_smiles must match its trusted topology components"
+            )
+        if record.mapping_hash != expected_hash:
+            raise ValueError("mapping_hash does not match mapped_reaction_smiles")
+
+        _acquire_identity_locks(
+            session,
+            ("mapped_reaction", reaction_id, record.mapping_hash),
+        )
+        mapped_reaction = session.exec(
+            select(MappedReaction).where(
+                MappedReaction.logical_reaction_id == reaction_id,
+                MappedReaction.mapping_hash == record.mapping_hash,
+            )
+        ).first()
+        if mapped_reaction is None:
+            mapped_reaction = _new_entity(
+                session,
+                MappedReaction,
+                logical_reaction=reaction,
+                **record.model_dump(),
+            )
+            _flush_new_entity(session, mapped_reaction, label="MappedReaction")
+
+        participants_by_key = {
+            (participant.side, participant.participant_index): participant
+            for participant in reaction.participants
+        }
+        if component_keys != set(participants_by_key):
+            raise ValueError(
+                "precomputed mapped reaction components must match logical participants"
+            )
+        for component_key in sorted(
+            component_keys,
+            key=lambda item: (item[0].value, item[1]),
+        ):
+            participant = participants_by_key[component_key]
+            expected_topology_id = topology_ids_by_template[component_key]
+            if participant.topology_id != expected_topology_id:
+                raise ValueError(
+                    "precomputed mapped reaction component resolved to a different topology"
+                )
+            persist_mapped_reaction_participant(
+                session,
+                mapped_reaction,
+                participant,
+                template_index=component_key[1],
+                atom_map_numbers=list(source_atom_maps_by_template[component_key]),
+                mapped_smiles=precomputed_mapped_smiles_by_template[component_key],
+            )
+        return mapped_reaction
+
     definition = _reaction_from_representation(record.mapped_reaction_smiles)
     canonical_smiles = _canonical_mapped_reaction_smiles(definition)
     expected_hash = sha256(canonical_smiles.encode("utf-8")).hexdigest()
@@ -1041,7 +1164,7 @@ def persist_mapped_reaction_node_geometry_mapping(
     )
     if record.mapped_smiles != expected_smiles:
         raise ValueError("mapped_smiles does not match the converted coordinate mapping")
-    logical_map_numbers = _logical_map_numbers_for_reaction(mapped_reaction.mapped_reaction_smiles)
+    logical_map_numbers = _logical_map_numbers_for_reaction(mapped_reaction)
     if not set(record.geometry_atom_map_numbers).issubset(logical_map_numbers):
         raise ValueError("coordinate mapping contains atom maps absent from the logical path")
     participant = node_geometry.mapped_reaction_participant

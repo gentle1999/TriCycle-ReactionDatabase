@@ -194,7 +194,7 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
             assert (
                 inference.inference_settings["endpoint_selection"] == "molop.possible_pre_post_ts"
             )
-            assert inference.inference_settings["sampling_min_ratio"] == 0.75
+            assert inference.inference_settings["sampling_min_ratio"] == 0.5
             assert inference.inference_settings["sampling_max_ratio"] == 1.75
             assert inference.inference_settings["sampling_steps"] == 7
             assert inference.logical_reaction_id is not None
