@@ -23,7 +23,7 @@ than private object internals or a source checkout commit.
   parser-status facts where present.
 - TS role evidence and positive/negative imaginary-mode endpoint candidates.
 
-MolOP `0.2.11` may collect frame-role/source-locator evidence without implicitly
+MolOP `0.2.12` may collect frame-role/source-locator evidence without implicitly
 reconstructing graphs. Evidence collection remains enabled. MolGR is responsible
 for graph reconstruction; the database treats a trusted MolGR graph as
 authoritative and does not apply extra chemical repair, atom canonicalization,

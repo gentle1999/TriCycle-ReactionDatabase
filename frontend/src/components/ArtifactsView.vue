@@ -5,7 +5,7 @@ import { RouterLink, useRoute } from "vue-router";
 
 import { api, artifactDownloadUrl } from "@/api";
 import { emptyArtifactFilters, type ArtifactFilterValues, type ArtifactSort, type ArtifactSortBy } from "@/artifactQuery";
-import { formatBytes, labelFor, shortId, statusTone } from "@/format";
+import { formatBytes, formatDurationSeconds, labelFor, shortId, statusTone } from "@/format";
 import { withoutAccessState } from "@/routeAccessState";
 import type { ArtifactSummary, CalculationFrameSummary, CurrentUser, PageInfo } from "@/types";
 import ArtifactIngestionStatus from "./ArtifactIngestionStatus.vue";
@@ -190,7 +190,7 @@ watch(
         </div>
         <div class="catalog-header-actions">
           <div class="catalog-sort-controls" aria-label="原始文件排序">
-            <label><span>排序</span><select :value="sort.sortBy" aria-label="原始文件排序字段" @change="updateSortBy"><option value="created_at">创建时间</option><option value="original_filename">文件名</option><option value="size_bytes">文件大小</option><option value="artifact_kind">文件类型</option><option value="storage_status">存储状态</option></select></label>
+            <label><span>排序</span><select :value="sort.sortBy" aria-label="原始文件排序字段" @change="updateSortBy"><option value="created_at">创建时间</option><option value="original_filename">文件名</option><option value="size_bytes">文件大小</option><option value="running_time_seconds">文件总耗时</option><option value="artifact_kind">文件类型</option><option value="storage_status">存储状态</option></select></label>
             <label><span>顺序</span><select :value="sort.sortDirection" aria-label="原始文件排序方向" @change="updateSortDirection"><option value="asc">升序</option><option value="desc">降序</option></select></label>
           </div>
           <PaginationControls :page="page" label="原始文件分页（顶部）" @previous="emit('previousPage')" @next="emit('nextPage')" @jump="emit('jumpPage', $event)" />
@@ -216,6 +216,7 @@ watch(
             <th>类型</th>
             <th>可见性</th>
             <th>大小</th>
+            <th>文件总耗时</th>
             <th>存储状态</th>
             <th>解析状态</th>
             <th>SHA-256</th>
@@ -225,10 +226,10 @@ watch(
         </thead>
         <tbody>
           <tr v-if="loading && !artifacts.length">
-            <td colspan="9"><div class="table-loading">正在加载原始文件</div></td>
+            <td colspan="10"><div class="table-loading">正在加载原始文件</div></td>
           </tr>
           <tr v-else-if="!artifacts.length">
-            <td colspan="9"><div class="compact-empty">没有匹配的原始文件</div></td>
+            <td colspan="10"><div class="compact-empty">没有匹配的原始文件</div></td>
           </tr>
           <template v-for="artifact in artifacts" v-else :key="artifact.id">
           <tr class="artifact-row" :class="{ 'is-expanded': artifact.id === expandedArtifactId }" @click="emit('toggleFrames', artifact.id)">
@@ -250,6 +251,7 @@ watch(
               </span>
             </td>
             <td class="number-cell">{{ formatBytes(artifact.size_bytes) }}</td>
+            <td class="number-cell">{{ formatDurationSeconds(artifact.running_time_seconds) }}</td>
             <td><span class="status-dot" :class="statusTone(artifact.storage_status)">{{ labelFor(artifact.storage_status) }}</span></td>
             <td>
               <ArtifactIngestionStatus :status="artifact.ingestion_status" :error-message="artifact.ingestion_error_message" />
@@ -290,7 +292,7 @@ watch(
             </td>
           </tr>
           <tr v-if="artifact.id === expandedArtifactId" class="artifact-frames-row">
-            <td colspan="9">
+            <td colspan="10">
               <div class="artifact-frames-panel">
                 <div class="artifact-frames-content">
                   <section class="artifact-frame-list-pane">

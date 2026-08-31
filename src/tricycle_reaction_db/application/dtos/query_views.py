@@ -37,6 +37,7 @@ class ArtifactSummary(QueryView):
     ingestion_status: str | None = None
     source_frame_count: int | None = None
     transition_state_frame_count: int | None = None
+    running_time_seconds: float | None = None
     ingestion_error_code: str | None = None
     ingestion_error_message: str | None = None
 

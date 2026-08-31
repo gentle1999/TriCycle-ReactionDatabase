@@ -35,22 +35,9 @@ const previewQuery = useQuery({
   enabled: computed(() => artifact.value?.storage_status === "available"),
   staleTime: 60_000,
 });
-const parseRevisionsQuery = useQuery({
-  queryKey: computed(() => ["artifact-detail-parse-revisions", artifactId.value]),
-  queryFn: ({ signal }) => api.parseRevisions({ artifactFileId: artifactId.value ?? "", limit: 200 }, signal),
-  enabled: computed(() => artifact.value !== null),
-  staleTime: 60_000,
-});
 const effectiveMediaType = computed(
   () => previewQuery.data.value?.media_type ?? artifact.value?.media_type ?? "application/octet-stream",
 );
-const latestParseRevision = computed(() => {
-  const revisions = parseRevisionsQuery.data.value?.items ?? [];
-  return revisions.reduce<typeof revisions[number] | null>(
-    (latest, revision) => latest === null || revision.revision_number > latest.revision_number ? revision : latest,
-    null,
-  );
-});
 
 async function loadArtifactFrames(signal: AbortSignal): Promise<Page<CalculationFrameSummary>> {
   const firstPage = await api.frames({
@@ -86,7 +73,6 @@ watch(
   () => artifact.value?.ingestion_status,
   (status, previousStatus) => {
     if (previousStatus === "pending" && status !== "pending") void framesQuery.refetch();
-    if (previousStatus === "pending" && status !== "pending") void parseRevisionsQuery.refetch();
   },
 );
 
@@ -145,7 +131,7 @@ const frameError = computed(() => frameQuery.error.value instanceof Error ? fram
           <div><dt>可见性</dt><dd>{{ artifact.visibility === "public" ? "公开" : "项目内" }}</dd></div>
           <div><dt>存储状态</dt><dd><span class="status-dot" :class="statusTone(artifact.storage_status)">{{ labelFor(artifact.storage_status) }}</span></dd></div>
           <div><dt>解析状态</dt><dd><ArtifactIngestionStatus :status="artifact.ingestion_status" :error-message="artifact.ingestion_error_message" /></dd></div>
-          <div><dt title="MolOP 报告的文件级计算用时">文件级计算用时</dt><dd>{{ formatDurationSeconds(latestParseRevision?.running_time_seconds) }}</dd></div>
+          <div><dt title="MolOP 报告的文件级计算用时">文件总耗时</dt><dd>{{ formatDurationSeconds(artifact.running_time_seconds) }}</dd></div>
           <div><dt>计算帧</dt><dd>{{ artifact.source_frame_count ?? "—" }}</dd></div>
           <div><dt>过渡态帧</dt><dd>{{ artifact.transition_state_frame_count ?? "—" }}</dd></div>
           <div><dt>SHA-256</dt><dd><code :title="artifact.content_sha256">{{ shortId(artifact.content_sha256) }}</code></dd></div>

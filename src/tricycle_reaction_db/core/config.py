@@ -77,7 +77,7 @@ class Settings(BaseSettings):
     read_rate_limit_requests: int = Field(default=10_000, ge=1, le=1_000_000)
     upload_rate_limit_requests: int = Field(default=1_000, ge=1, le=1_000_000)
     upload_max_concurrency: int = Field(default=8, ge=1, le=128)
-    # MolOP 0.2.11 collects frame roles and source locators without implicitly
+    # MolOP 0.2.12 collects frame roles and source locators without implicitly
     # reconstructing molecular graphs. Keep evidence enabled so optimization
     # frames retain their initial/intermediate/terminal role during ingestion.
     # Deployments may still disable it explicitly for legacy fast-ingestion

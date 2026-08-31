@@ -14,7 +14,7 @@ dependencies = [
     "httpx>=0.28,<1",
     "molalchemy==0.0.7",
     "molgr>=0.1.8",
-    "molop>=0.2.11",
+    "molop>=0.2.12",
     "nexusx==6.1.2",
     "numpy>=2.2,<3",
     "psycopg[binary,pool]>=3.2,<4",

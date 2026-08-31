@@ -12,9 +12,6 @@ from sqlalchemy import delete, text
 from sqlmodel import col, select
 
 from tricycle_reaction_db.application.services.artifact_uploads import (
-    TS_PRE_POST_MAX_RATIO,
-    TS_PRE_POST_MIN_RATIO,
-    TS_PRE_POST_STEPS,
     _FailedInference,
     _parse_calculation_output,
     _persist_transition_state_endpoints,
@@ -121,13 +118,10 @@ def _remove_unreferenced_reaction(
 
 
 def _reinference_settings(inferred: _SuccessfulInference | _FailedInference) -> dict[str, Any]:
-    """Record the single sampling policy used for an endpoint re-inference."""
+    """Record the MolOP endpoint policy used for an endpoint re-inference."""
 
     settings: dict[str, Any] = {
         "endpoint_selection": "molop.possible_pre_post_ts",
-        "sampling_min_ratio": TS_PRE_POST_MIN_RATIO,
-        "sampling_max_ratio": TS_PRE_POST_MAX_RATIO,
-        "sampling_steps": TS_PRE_POST_STEPS,
     }
     if isinstance(inferred, _SuccessfulInference):
         settings.update(
@@ -493,10 +487,9 @@ def _backfill(
                         inference_settings = {
                             **inference.inference_settings,
                             "endpoint_selection": "molop.possible_pre_post_ts",
-                            "sampling_min_ratio": TS_PRE_POST_MIN_RATIO,
-                            "sampling_max_ratio": TS_PRE_POST_MAX_RATIO,
-                            "sampling_steps": TS_PRE_POST_STEPS,
                         }
+                        for key in ("sampling_min_ratio", "sampling_max_ratio", "sampling_steps"):
+                            inference_settings.pop(key, None)
                         inference_settings.pop("ratio_attempts", None)
                         inference_settings.pop("steps", None)
                         inference_settings.pop("endpoint_backfill", None)
@@ -524,14 +517,13 @@ def _backfill(
                         inference.inference_settings = {
                             **inference.inference_settings,
                             "endpoint_selection": "molop.possible_pre_post_ts",
-                            "sampling_min_ratio": TS_PRE_POST_MIN_RATIO,
-                            "sampling_max_ratio": TS_PRE_POST_MAX_RATIO,
-                            "sampling_steps": TS_PRE_POST_STEPS,
                             "endpoint_backfill": {
                                 "status": "unavailable",
                                 "reason": "source_reparse_mismatch",
                             },
                         }
+                        for key in ("sampling_min_ratio", "sampling_max_ratio", "sampling_steps"):
+                            inference.inference_settings.pop(key, None)
                         session.add(inference)
                 result.unavailable += 1
                 print(f"unavailable inference={inference.id}: {error}")

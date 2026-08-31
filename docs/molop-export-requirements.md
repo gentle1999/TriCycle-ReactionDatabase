@@ -5,7 +5,7 @@
 > 状态：MolOP 契约已实现，数据库 schema 已对齐
 > 契约版本：`molop-calculation-export-v1`
 > 使用方：Example Chemistry Database（部署显示名可由环境变量覆盖）
-> 最低兼容基线：PyPI `molop>=0.2.11`、`molgr>=0.1.8`
+> 最低兼容基线：PyPI `molop>=0.2.12`、`molgr>=0.1.8`
 > 复核日期：2026-08-09
 
 ## 1. 目标
@@ -141,7 +141,7 @@ end_line
 | `MOLREQ-014` | status 必须按真实证据作用域输出 | segment termination 不伪装成逐 frame termination 事实 |
 | `MOLREQ-015` | span 必须在 locator 拆分原文时产生 | 不得通过重复 frame 文本反向搜索位置 |
 | `MOLREQ-016` | 正式导入默认设置 `capture_source_evidence=True`；可显式关闭 | 开启时必须保留 artifact identity、segment evidence、frame span 和 MolOP frame role；关闭时保留 artifact SHA-256、解析器 provenance/configuration、帧顺序与诊断，但不能提供证据派生的 frame role，源跨度/块哈希为 `NULL` |
-| `MOLREQ-017` | 证据收集、角色判定与图重建彼此独立 | MolOP `0.2.11` 的 evidence collection 不再隐式重建分子图；导入保持 evidence enabled，由 MolGR 在归一化阶段重建图。文件级 worker、候选窗口与完成结果持久化微批独立控制；审计/重解析路径保持严格幂等写入。 |
+| `MOLREQ-017` | 证据收集、角色判定与图重建彼此独立 | MolOP `0.2.12` 的 evidence collection 不再隐式重建分子图；导入保持 evidence enabled，由 MolGR 在归一化阶段重建图。文件级 worker、候选窗口与完成结果持久化微批独立控制；审计/重解析路径保持严格幂等写入。 |
 
 segment 的 `protocol` 必须是通用 `model_chemistry` 的纯 mapping 投影，
 `task_requests` 必须是通用 `QMTaskRequest` 的纯 mapping 列表。不得泄漏
@@ -292,7 +292,7 @@ MolOP 当前已实现：
 
 数据库接入状态：
 
-1. 依赖要求为 PyPI MolOP `>=0.2.11` 与 MolGR `>=0.1.8`。Gaussian 进程内导入直接消费 MolOP
+1. 依赖要求为 PyPI MolOP `>=0.2.12` 与 MolGR `>=0.1.8`。Gaussian 进程内导入直接消费 MolOP
    公共模型的 `model_dump(mode="python", exclude_none=False)` payload，不重复实现
    locator、状态判断、拓扑重建或模型校验。数据库侧只做字段裁剪、Quantity 单位归一化、
    ndarray sidecar 摘要/转换和数据库 identity 绑定。可信 MolGR 图只重建 ring info；数据库不再

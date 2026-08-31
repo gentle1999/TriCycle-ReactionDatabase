@@ -885,7 +885,11 @@ def _frame_select(*, lightweight: bool = False) -> Any:
     return statement
 
 
-def _artifact_summary(artifact: ArtifactFile) -> ArtifactSummary:
+def _artifact_summary(
+    artifact: ArtifactFile,
+    *,
+    running_time_seconds: float | None = None,
+) -> ArtifactSummary:
     ingestion = artifact.ingestion
     return ArtifactSummary(
         id=_required_uuid(artifact.id, "ArtifactFile"),
@@ -905,6 +909,7 @@ def _artifact_summary(artifact: ArtifactFile) -> ArtifactSummary:
         transition_state_frame_count=(
             ingestion.transition_state_frame_count if ingestion is not None else None
         ),
+        running_time_seconds=running_time_seconds,
         ingestion_error_code=ingestion.error_code if ingestion is not None else None,
         ingestion_error_message=ingestion.error_message if ingestion is not None else None,
     )
@@ -962,24 +967,37 @@ class ArtifactQueryService(UseCaseService):  # type: ignore[misc]
     ) -> ArtifactPage:
         """List artifact catalogue entries without exposing RustFS credentials."""
 
+        latest_running_time = (
+            select(col(ParseRevision.running_time_seconds))
+            .where(col(ParseRevision.artifact_file_id) == col(ArtifactFile.id))
+            .order_by(
+                col(ParseRevision.revision_number).desc(),
+                col(ParseRevision.id).desc(),
+            )
+            .limit(1)
+            .correlate(ArtifactFile)
+            .scalar_subquery()
+            .label("running_time_seconds")
+        )
         artifact_sort_fields = {
             "created_at": col(ArtifactFile.created_at),
             "original_filename": col(ArtifactFile.original_filename),
             "size_bytes": col(ArtifactFile.size_bytes),
             "artifact_kind": col(ArtifactFile.artifact_kind),
             "storage_status": col(ArtifactFile.storage_status),
+            "running_time_seconds": latest_running_time,
         }
         sort_expression = artifact_sort_fields.get(sort_by)
         if sort_expression is None:
             raise ValueError(
                 "sort_by must be created_at, original_filename, size_bytes, artifact_kind, "
-                "or storage_status"
+                "storage_status, or running_time_seconds"
             )
         if cursor is not None and (sort_by != "created_at" or sort_direction != "desc"):
             raise ValueError("cursor pagination only supports created_at descending order")
 
         count_statement = sqlmodel_select(func.count()).select_from(ArtifactFile)
-        statement = sqlmodel_select(ArtifactFile).options(
+        statement = sqlmodel_select(ArtifactFile, latest_running_time).options(
             joinedload(cast(Any, ArtifactFile.ingestion))
         )
         active_criterion = col(ArtifactFile.storage_status) != StorageStatus.RETIRED
@@ -1045,20 +1063,37 @@ class ArtifactQueryService(UseCaseService):  # type: ignore[misc]
             total = -1 if cursor_mode else int((await session.exec(count_statement)).one())
             rows = (await session.exec(statement)).all()
         has_more = len(rows) > limit
-        artifacts = rows[:limit]
-        next_cursor = _encode_artifact_cursor(artifacts[-1]) if has_more and artifacts else None
+        artifact_rows = rows[:limit]
+        next_cursor = (
+            _encode_artifact_cursor(artifact_rows[-1][0]) if has_more and artifact_rows else None
+        )
         return ArtifactPage(
-            items=[_artifact_summary(artifact) for artifact in artifacts],
+            items=[
+                _artifact_summary(artifact, running_time_seconds=running_time_seconds)
+                for artifact, running_time_seconds in artifact_rows
+            ],
             page=PageInfo(total=total, limit=limit, offset=offset, next_cursor=next_cursor),
         )
 
     @query  # type: ignore[untyped-decorator]
     async def get_artifact(cls, artifact_id: UUID) -> ArtifactSummary | None:
         scope = await query_visibility_scope(ProjectPermission.ARTIFACT_READ)
+        latest_running_time = (
+            select(col(ParseRevision.running_time_seconds))
+            .where(col(ParseRevision.artifact_file_id) == col(ArtifactFile.id))
+            .order_by(
+                col(ParseRevision.revision_number).desc(),
+                col(ParseRevision.id).desc(),
+            )
+            .limit(1)
+            .correlate(ArtifactFile)
+            .scalar_subquery()
+            .label("running_time_seconds")
+        )
         async with session_factory() as session:
-            artifact = (
+            row = (
                 await session.exec(
-                    sqlmodel_select(ArtifactFile)
+                    sqlmodel_select(ArtifactFile, latest_running_time)
                     .options(joinedload(cast(Any, ArtifactFile.ingestion)))
                     .where(
                         col(ArtifactFile.id) == artifact_id,
@@ -1066,9 +1101,10 @@ class ArtifactQueryService(UseCaseService):  # type: ignore[misc]
                     )
                 )
             ).first()
-        if artifact is None:
+        if row is None:
             return None
-        return _artifact_summary(artifact)
+        artifact, running_time_seconds = row
+        return _artifact_summary(artifact, running_time_seconds=running_time_seconds)
 
 
 def molecular_formula_range_predicates(

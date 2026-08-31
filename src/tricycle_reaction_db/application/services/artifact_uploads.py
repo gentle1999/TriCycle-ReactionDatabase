@@ -126,15 +126,6 @@ from tricycle_reaction_db.storage.rustfs import (
 
 MOLOP_VERSION = version("molop")
 logger = logging.getLogger(__name__)
-# Pre/post-TS endpoint selection is delegated to MolOP's
-# ``BaseCalcFrame.possible_pre_post_ts``: it samples both signed sides across
-# the amplitude range below and keeps the most frequent side topology.  These
-# values are persisted with every inference so the exact sampling grid remains
-# auditable. Starting at 0.50 retains valid endpoints whose larger imaginary-
-# mode displacements would otherwise trip MolOP's steric-crowding guard.
-TS_PRE_POST_MIN_RATIO = 0.50
-TS_PRE_POST_MAX_RATIO = 1.75
-TS_PRE_POST_STEPS = 7
 PERSISTENCE_PRELOAD_BATCH_SIZE = 16
 # MolGR reconstruction is CPU-heavy and each frame crosses a process boundary.
 # Larger chunks amortize pickle/future overhead while retaining enough tasks to
@@ -662,7 +653,7 @@ def _file_worker_submission_slots() -> asyncio.Semaphore:
 def _fast_molop_ingestion_enabled() -> bool:
     """Return whether deferred MolGR work and batched frame writes are enabled.
 
-    MolOP 0.2.11 source evidence is collected during parsing without forcing
+    MolOP 0.2.12 source evidence is collected during parsing without forcing
     topology reconstruction, so evidence capture does not disable this path.
     """
 
@@ -1367,20 +1358,13 @@ def _signed_ts_endpoints(
 ) -> tuple[Chem.Mol, Chem.Mol, float, float]:
     """Return MolOP's inferred pre/post-TS endpoints with signed displacements.
 
-    Endpoint *selection* is MolOP's ``possible_pre_post_ts``: it samples each
-    signed side across ``TS_PRE_POST_MIN_RATIO..MAX_RATIO`` and keeps the most
-    frequent side topology, so crowding cannot silently drop one side.  The
-    project only *measures* the selected endpoints' actual displacement along
-    the imaginary mode to restore the signed direction/ratio used by the
-    persisted endpoint rows; it does not choose or rank the endpoints itself.
+    Endpoint selection and sampling policy are delegated to MolOP's
+    ``possible_pre_post_ts`` defaults. The project only measures the selected
+    endpoints' actual displacement along the imaginary mode to restore the
+    signed direction/ratio used by the persisted endpoint rows.
     """
 
-    reactant, product = frame.possible_pre_post_ts(
-        show_3D=True,
-        min_ratio=TS_PRE_POST_MIN_RATIO,
-        max_ratio=TS_PRE_POST_MAX_RATIO,
-        steps=TS_PRE_POST_STEPS,
-    )
+    reactant, product = frame.possible_pre_post_ts(show_3D=True)
     if frame.vibrations is None:
         raise ValueError("TS frame has no vibration mode")
     center = np.asarray(frame.coords.to(atom_ureg.angstrom).magnitude, dtype=np.float64)
@@ -3064,9 +3048,6 @@ def _persist_successful_inference(
         "inference_method": "molop/possible_pre_post_ts",
         "inference_settings": {
             "endpoint_selection": "molop.possible_pre_post_ts",
-            "sampling_min_ratio": TS_PRE_POST_MIN_RATIO,
-            "sampling_max_ratio": TS_PRE_POST_MAX_RATIO,
-            "sampling_steps": TS_PRE_POST_STEPS,
             "side_topology": "most frequent side topology per signed side",
             "reaction_side_semantics": "fragment-rich endpoint first",
             "direction_semantics": (
@@ -3122,9 +3103,6 @@ def _add_failed_inference(
         "inference_method": "molop/possible_pre_post_ts",
         "inference_settings": {
             "endpoint_selection": "molop.possible_pre_post_ts",
-            "sampling_min_ratio": TS_PRE_POST_MIN_RATIO,
-            "sampling_max_ratio": TS_PRE_POST_MAX_RATIO,
-            "sampling_steps": TS_PRE_POST_STEPS,
         },
         "error_code": error_code,
         "error_message": (

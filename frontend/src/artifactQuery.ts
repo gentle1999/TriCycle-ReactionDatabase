@@ -11,7 +11,8 @@ export type ArtifactSortBy =
   | "original_filename"
   | "size_bytes"
   | "artifact_kind"
-  | "storage_status";
+  | "storage_status"
+  | "running_time_seconds";
 
 export interface ArtifactSort {
   sortBy: ArtifactSortBy;

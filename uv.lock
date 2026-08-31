@@ -876,7 +876,7 @@ wheels = [
 
 [[package]]
 name = "molop"
-version = "0.2.11"
+version = "0.2.12"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -893,9 +893,9 @@ dependencies = [
     { name = "tabulate" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/79/fc/f23baa08aeaef583588c80729dc41201c0bce5b959b49caeb82ecf411020/molop-0.2.11.tar.gz", hash = "sha256:c6a9df46fe5bd8b88638c1c5f50677c8f068698e753a0b22ea6b7e4835212e3d", size = 297404, upload-time = "2026-08-25T09:04:14.158Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/af/d8/ba8d94f62767a1107a3f39258fde27cf8e2270555674d20731b78782151d/molop-0.2.12.tar.gz", hash = "sha256:2f9801fa2f15c4f585b35c38e7d0beb22e9f4e051f0b66958c425733349089e0", size = 298704, upload-time = "2026-08-31T14:31:17.545Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/27/08/0feee7bb0d8a598c2e6f99d344147252120008fff0634b1aa415f4a747ea/molop-0.2.11-py3-none-any.whl", hash = "sha256:e0dead278600b8b3eec411050635520ca36ae9053117583771ab4a83aca2d851", size = 367393, upload-time = "2026-08-25T09:04:12.894Z" },
+    { url = "https://files.pythonhosted.org/packages/bf/c9/6181fb32c93dea1682c724161e43f19b86e5a2b4b8d6c135169489fc52a0/molop-0.2.12-py3-none-any.whl", hash = "sha256:0560e26eb0068fb48e04a5d80c0f0aef4a964a41ab162c0a5dcdeaa746e7238c", size = 368744, upload-time = "2026-08-31T14:31:16.014Z" },
 ]
 
 [[package]]
@@ -1795,7 +1795,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "molalchemy", specifier = "==0.0.7" },
     { name = "molgr", specifier = ">=0.1.8" },
-    { name = "molop", specifier = ">=0.2.11" },
+    { name = "molop", specifier = ">=0.2.12" },
     { name = "nexusx", specifier = "==6.1.2" },
     { name = "numpy", specifier = ">=2.2,<3" },
     { name = "prometheus-client", specifier = ">=0.24,<1" },

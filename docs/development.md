@@ -626,7 +626,7 @@ payload hash 和 metadata。
 
 ## 依赖约束
 
-MolOP `>=0.2.11` 与 MolGR `>=0.1.8` 直接从官方 PyPI 安装；`pyproject.toml` 声明最低
+MolOP `>=0.2.12` 与 MolGR `>=0.1.8` 直接从官方 PyPI 安装；`pyproject.toml` 声明最低
 兼容版本，`uv.lock` 记录当前解析版本。项目不再使用内网 Git source 或
 `override-dependencies`。
 

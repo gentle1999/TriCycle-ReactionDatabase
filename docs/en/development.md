@@ -164,7 +164,7 @@ file are persisted and a no-frame file becomes `filtered`, not successful.
 
 ## Dependency Upgrades
 
-MolOP `>=0.2.11` and MolGR `>=0.1.8` are installed from PyPI. After changing
+MolOP `>=0.2.12` and MolGR `>=0.1.8` are installed from PyPI. After changing
 MolOP, MolGR, OpenBabel, or RDKit, run:
 
 ```bash

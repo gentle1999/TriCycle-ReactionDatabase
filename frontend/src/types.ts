@@ -461,6 +461,7 @@ export interface ArtifactSummary {
   ingestion_status: "pending" | "succeeded" | "partial" | "filtered" | "failed" | null;
   source_frame_count: number | null;
   transition_state_frame_count: number | null;
+  running_time_seconds: number | null;
   ingestion_error_code: string | null;
   ingestion_error_message: string | null;
 }
