@@ -472,6 +472,24 @@ def test_trusted_molgr_normalization_preserves_e_z_stereochemistry(
     assert full_record.geometry.mol.GetIntProp("_StereochemDone") == 1
 
 
+def test_trusted_normalization_preserves_enhanced_stereo_groups() -> None:
+    source = Chem.MolFromSmiles("F[C@H](Cl)[C@H](Br)I |&1:1,3|")
+    assert source is not None
+    assert len(source.GetStereoGroups()) == 1
+
+    record = normalize_topology(
+        source,
+        add_hydrogens=False,
+        reconstruction_method="molgr/cpp",
+        reconstruction_version="0.1.8",
+    )
+
+    groups = record.topology.mol.GetStereoGroups()
+    assert len(groups) == 1
+    assert groups[0].GetGroupType() is Chem.StereoGroupType.STEREO_AND
+    assert len(groups[0].GetAtoms()) == 2
+
+
 def test_trusted_molgr_projection_is_stable_across_source_atom_order() -> None:
     source = Chem.AddHs(Chem.MolFromSmiles("F/C=C(/[C@H](Cl)Br)I"))
     Chem.AssignStereochemistry(source, cleanIt=True, force=True)

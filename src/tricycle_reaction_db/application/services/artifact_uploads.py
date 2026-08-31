@@ -1311,7 +1311,13 @@ def _mapped_reaction_smiles(reactant: Chem.Mol, product: Chem.Mol) -> str:
             atom.SetAtomMapNum(atom_index + 1)
         # MolGR owns the endpoint graph.  Sanitizing fragments here can erase
         # radical/electronic annotations before topology persistence.
-        fragments = Chem.GetMolFrags(mapped, asMols=True, sanitizeFrags=False)
+        fragments = tuple(
+            ensure_serializable_double_bond_stereochemistry(
+                fragment,
+                preserve_atom_maps=True,
+            )
+            for fragment in Chem.GetMolFrags(mapped, asMols=True, sanitizeFrags=False)
+        )
         sides.append(
             ".".join(
                 sorted(
@@ -1330,6 +1336,29 @@ def _mapped_reaction_smiles(reactant: Chem.Mol, product: Chem.Mol) -> str:
     # stable without round-tripping a metal-rich graph through RDKit reaction
     # templates before persistence validates it.
     return f"{sides[0]}>>{sides[1]}"
+
+
+def _infer_endpoint_stereochemistry_from_3d(endpoint: Chem.Mol) -> Chem.Mol:
+    """Infer an endpoint's stereochemistry from its displaced 3D geometry.
+
+    MolOP reconstructs a displaced endpoint from coordinates, so the endpoint
+    itself is the authority for the pre/post-TS stereochemistry.  Re-running
+    RDKit's 3D assignment here also covers cases where MolGR reconstructed the
+    connectivity but did not retain its E/Z tags.  Bond directions are then
+    regenerated so the assigned state survives explicit-H isomeric SMILES.
+    """
+
+    if endpoint.GetNumConformers() != 1 or not endpoint.GetConformer().Is3D():
+        raise ValueError("MolOP TS endpoint has no single 3D conformer for stereo inference")
+    inferred = Chem.Mol(endpoint)
+    # Displaced endpoints may carry stale direction flags from a previous
+    # graph reconstruction.  Clear them before assigning from the endpoint's
+    # coordinates, then derive fresh writer directions from the new E/Z tags.
+    for bond in inferred.GetBonds():  # type: ignore[no-untyped-call]
+        bond.SetBondDir(Chem.BondDir.NONE)
+    Chem.AssignStereochemistryFrom3D(inferred, confId=-1, replaceExistingTags=True)
+    Chem.SetDoubleBondNeighborDirections(inferred)
+    return inferred
 
 
 def _signed_ts_endpoints(
@@ -1383,6 +1412,8 @@ def _signed_ts_endpoints(
         raise ValueError(
             "MolOP pre/post-TS endpoints do not bracket the TS center on the imaginary mode"
         )
+    reactant = _infer_endpoint_stereochemistry_from_3d(reactant)
+    product = _infer_endpoint_stereochemistry_from_3d(product)
     return reactant, product, abs(negative_ratio), positive_ratio
 
 
@@ -4082,7 +4113,17 @@ def _inference_topology_records(
             ):
                 atom.SetAtomMapNum(atom_index + 1)
             fragments = sorted(
-                Chem.GetMolFrags(source, asMols=True, sanitizeFrags=False),
+                (
+                    ensure_serializable_double_bond_stereochemistry(
+                        fragment,
+                        preserve_atom_maps=True,
+                    )
+                    for fragment in Chem.GetMolFrags(
+                        source,
+                        asMols=True,
+                        sanitizeFrags=False,
+                    )
+                ),
                 key=lambda fragment: Chem.MolToSmiles(
                     fragment,
                     canonical=True,

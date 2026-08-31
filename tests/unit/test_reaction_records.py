@@ -16,6 +16,7 @@ from tricycle_reaction_db.application.services.reactions import (
     _canonical_mapped_reaction_smiles,
     _mapped_reaction_from_smiles,
     _mapping_assignment_for_topology,
+    mapped_smiles_for_topology,
 )
 from tricycle_reaction_db.domain.enums import (
     ArtifactResolutionStatus,
@@ -224,6 +225,107 @@ def test_mapping_assignment_preserves_global_maps_for_endpoint_fragments() -> No
 
     assert atom_maps == [7, 8]
     assert mapped_smiles == "[CH2:7]=[CH2:8]"
+
+
+@pytest.mark.parametrize(
+    ("source_smiles", "expected_stereo"),
+    [
+        ("C/C=C/C", Chem.BondStereo.STEREOE),
+        ("C/C=C\\C", Chem.BondStereo.STEREOZ),
+    ],
+)
+def test_mapped_smiles_restores_ez_after_database_round_trip(
+    source_smiles: str,
+    expected_stereo: Chem.BondStereo,
+) -> None:
+    """Mapped SMILES retain assigned E/Z when RDKit dropped BondDir flags."""
+
+    molecule = Chem.AddHs(Chem.MolFromSmiles(source_smiles))
+    for bond in molecule.GetBonds():
+        bond.SetBondDir(Chem.BondDir.NONE)
+    topology = SimpleNamespace(atom_count=molecule.GetNumAtoms(), mol=molecule)
+
+    mapped_smiles = mapped_smiles_for_topology(
+        topology,
+        list(range(1, molecule.GetNumAtoms() + 1)),
+    )
+    reparsed = Chem.MolFromSmiles(mapped_smiles)
+    assert reparsed is not None
+    double_bond = next(
+        bond for bond in reparsed.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE
+    )
+    assert double_bond.GetStereo() == expected_stereo
+    assert "/" in mapped_smiles or "\\" in mapped_smiles
+
+
+def test_mapped_smiles_uses_persisted_projection_for_complex_ez_after_round_trip() -> None:
+    source = Chem.AddHs(Chem.MolFromSmiles("F/C=C(/[C@H](Cl)Br)I"))
+    canonical_projection = Chem.MolToSmiles(
+        source,
+        canonical=True,
+        isomericSmiles=True,
+        allHsExplicit=True,
+    )
+    stored = Chem.Mol(source.ToBinary())
+    for bond in stored.GetBonds():
+        bond.SetBondDir(Chem.BondDir.NONE)
+    topology = SimpleNamespace(
+        atom_count=stored.GetNumAtoms(),
+        mol=stored,
+        canonical_isomeric_smiles=canonical_projection,
+    )
+
+    mapped_smiles = mapped_smiles_for_topology(
+        topology,
+        list(range(1, stored.GetNumAtoms() + 1)),
+    )
+    reparsed = Chem.MolFromSmiles(mapped_smiles)
+    assert reparsed is not None
+    double_bond = next(
+        bond for bond in reparsed.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE
+    )
+
+    assert double_bond.GetStereo() == Chem.BondStereo.STEREOZ
+    assert "/" in mapped_smiles or "\\" in mapped_smiles
+
+
+@pytest.mark.parametrize(
+    ("source_smiles", "expected_chiral_tag"),
+    [
+        ("C[C@H](F)Cl", Chem.ChiralType.CHI_TETRAHEDRAL_CCW),
+        ("C[C@@H](F)Cl", Chem.ChiralType.CHI_TETRAHEDRAL_CW),
+        ("Cl[Pt@SP1](Cl)([NH3])[NH3]", Chem.ChiralType.CHI_SQUAREPLANAR),
+        ("F[P@TB1](Cl)(Br)(I)N", Chem.ChiralType.CHI_TRIGONALBIPYRAMIDAL),
+        ("N[Co@OH1](N)(N)(N)(N)N", Chem.ChiralType.CHI_OCTAHEDRAL),
+    ],
+)
+def test_mapped_smiles_preserves_atom_stereo_after_database_round_trip(
+    source_smiles: str,
+    expected_chiral_tag: Chem.ChiralType,
+) -> None:
+    """Mapped SMILES retain tetrahedral and supported non-tetrahedral tags."""
+
+    molecule = Chem.MolFromSmiles(source_smiles)
+    assert molecule is not None
+    # Simulate the PostgreSQL RDKit object boundary.  The test deliberately
+    # does not call AssignStereochemistry after loading the molecule.
+    molecule = Chem.Mol(molecule.ToBinary())
+    topology = SimpleNamespace(atom_count=molecule.GetNumAtoms(), mol=molecule)
+
+    mapped_smiles = mapped_smiles_for_topology(
+        topology,
+        list(range(1, molecule.GetNumAtoms() + 1)),
+    )
+    reparsed = Chem.MolFromSmiles(mapped_smiles)
+    assert reparsed is not None
+    chiral_tags = [
+        atom.GetChiralTag()
+        for atom in reparsed.GetAtoms()
+        if atom.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
+    ]
+
+    assert chiral_tags == [expected_chiral_tag]
+    assert "@" in mapped_smiles
 
 
 def test_mapping_assignment_preserves_molop_source_atom_order() -> None:

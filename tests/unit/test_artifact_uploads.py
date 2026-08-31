@@ -10,7 +10,7 @@ from molgr.config import CONFIG as molgr_config
 from molop import molopconfig
 from molop.io.base_models import Molecule as molop_molecule_module
 from rdkit import Chem
-from rdkit.Chem import rdChemReactions, rdDepictor
+from rdkit.Chem import AllChem, rdChemReactions, rdDepictor
 
 from tricycle_reaction_db.application.dtos import ArtifactUploadResult
 from tricycle_reaction_db.application.services import artifact_uploads as upload_module
@@ -553,9 +553,9 @@ def test_inferred_endpoint_repairs_stereo_before_fragment_extraction(
     repair_inputs: list[tuple[int, int]] = []
     repair_stereo = upload_module.ensure_serializable_double_bond_stereochemistry
 
-    def record_repair_input(molecule: Chem.Mol) -> Chem.Mol:
+    def record_repair_input(molecule: Chem.Mol, **kwargs: object) -> Chem.Mol:
         repair_inputs.append((len(Chem.GetMolFrags(molecule)), molecule.GetNumConformers()))
-        return repair_stereo(molecule)
+        return repair_stereo(molecule, **kwargs)
 
     monkeypatch.setattr(
         upload_module,
@@ -577,7 +577,8 @@ def test_inferred_endpoint_repairs_stereo_before_fragment_extraction(
     )
     records = upload_module._inference_topology_records(inferred)
 
-    assert repair_inputs == [(2, 1), (2, 1)]
+    assert repair_inputs[:2] == [(2, 1), (2, 1)]
+    assert repair_inputs[2:] == [(1, 0)] * 4
     endpoint_smiles = [record.topology.canonical_isomeric_smiles for record in records[:2]]
     participant_smiles = [
         record.topology.canonical_isomeric_smiles
@@ -590,6 +591,50 @@ def test_inferred_endpoint_repairs_stereo_before_fragment_extraction(
         for smiles in endpoint_smiles + participant_smiles
         if smiles is not None
     )
+
+
+def test_mapped_endpoint_reaction_repairs_ez_after_fragment_extraction() -> None:
+    endpoint = Chem.AddHs(Chem.MolFromSmiles("C/C=C/C.[Na+]"))
+    for bond in endpoint.GetBonds():
+        bond.SetBondDir(Chem.BondDir.NONE)
+
+    reaction_smiles = upload_module._mapped_reaction_smiles(endpoint, Chem.Mol(endpoint))
+    reactants, products = reaction_smiles.split(">>")
+
+    assert "/" in reactants or "\\" in reactants
+    assert "/" in products or "\\" in products
+    for side in (reactants, products):
+        parsed = Chem.MolFromSmiles(side)
+        assert parsed is not None
+        double_bond = next(
+            bond for bond in parsed.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE
+        )
+        assert double_bond.GetStereo() == Chem.BondStereo.STEREOE
+
+
+def test_ts_endpoint_stereo_is_inferred_from_endpoint_3d_coordinates() -> None:
+    endpoint = Chem.AddHs(Chem.MolFromSmiles("FC=CF"))
+    assert AllChem.EmbedMolecule(endpoint, randomSeed=7) == 0
+    for bond in endpoint.GetBonds():
+        bond.SetStereo(Chem.BondStereo.STEREONONE)
+        bond.SetBondDir(Chem.BondDir.NONE)
+
+    inferred = upload_module._infer_endpoint_stereochemistry_from_3d(endpoint)
+    double_bond = next(
+        bond for bond in inferred.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE
+    )
+    serialized = Chem.MolToSmiles(
+        inferred,
+        canonical=True,
+        isomericSmiles=True,
+        allHsExplicit=True,
+    )
+
+    assert double_bond.GetStereo() in {
+        Chem.BondStereo.STEREOE,
+        Chem.BondStereo.STEREOZ,
+    }
+    assert "/" in serialized or "\\" in serialized
 
 
 def test_gzip_parser_payload_keeps_logical_source_identity_separate() -> None:

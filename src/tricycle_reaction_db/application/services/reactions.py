@@ -56,6 +56,9 @@ from tricycle_reaction_db.domain.enums import (
     StorageStatus,
     WorkflowManifestStatus,
 )
+from tricycle_reaction_db.ingestion.normalization import (
+    ensure_serializable_double_bond_stereochemistry,
+)
 
 ParticipantIdentity = tuple[LogicalReactionParticipantSide, MolecularTopology, int]
 
@@ -117,31 +120,36 @@ def _canonical_mapped_reaction_smiles(
         for template in templates
         for atom in template.GetAtoms()
     ):
-        metal_chiral_tags: list[tuple[Chem.Atom, Chem.ChiralType]] = []
-        try:
-            for templates in all_templates:
-                for template in templates:
-                    for atom in template.GetAtoms():
-                        if _is_metal_atomic_number(atom.GetAtomicNum()):
-                            metal_chiral_tags.append((atom, atom.GetChiralTag()))
-                            atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
-            serialized_sides = [
-                ".".join(
-                    sorted(
-                        Chem.MolToSmiles(
-                            template,
-                            canonical=True,
-                            isomericSmiles=True,
-                            allHsExplicit=True,
-                        )
-                        for template in templates
+        serialized_sides = []
+        for templates in all_templates:
+            serialized_templates = []
+            for template in templates:
+                template_maps = [atom.GetAtomMapNum() for atom in template.GetAtoms()]
+                normalized = ensure_serializable_double_bond_stereochemistry(
+                    template,
+                    preserve_atom_maps=bool(
+                        template_maps
+                        and all(number > 0 for number in template_maps)
+                        and len(set(template_maps)) == len(template_maps)
+                    ),
+                )
+                # RDKit's ChemicalReaction template copy can segfault for some
+                # multicoordinate metal graphs.  Preserve every supported
+                # non-metal/ bond stereo annotation, while retaining the
+                # existing policy of omitting unstable metal-center tags from
+                # the reaction-level identity.
+                for atom in normalized.GetAtoms():
+                    if _is_metal_atomic_number(atom.GetAtomicNum()):
+                        atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
+                serialized_templates.append(
+                    Chem.MolToSmiles(
+                        normalized,
+                        canonical=True,
+                        isomericSmiles=True,
+                        allHsExplicit=True,
                     )
                 )
-                for templates in all_templates
-            ]
-        finally:
-            for atom, chiral_tag in metal_chiral_tags:
-                atom.SetChiralTag(chiral_tag)
+            serialized_sides.append(".".join(sorted(serialized_templates)))
         reactants, agents, products = serialized_sides
         return f"{reactants}>{agents}>{products}" if agents else f"{reactants}>>{products}"
 
@@ -153,6 +161,15 @@ def _canonical_mapped_reaction_smiles(
     ):
         for template in templates:
             normalized = Chem.Mol(template)
+            template_maps = [atom.GetAtomMapNum() for atom in normalized.GetAtoms()]
+            normalized = ensure_serializable_double_bond_stereochemistry(
+                normalized,
+                preserve_atom_maps=bool(
+                    template_maps
+                    and all(number > 0 for number in template_maps)
+                    and len(set(template_maps)) == len(template_maps)
+                ),
+            )
             # RDKit's unsupported metal stereo annotations are not stable across
             # a parse/serialize round trip. Supported non-metal stereo stays.
             for atom in normalized.GetAtoms():  # type: ignore[no-untyped-call]
@@ -271,6 +288,15 @@ def mapped_smiles_for_topology(
     mapped = Chem.Mol(topology.mol)
     for atom, map_number in zip(mapped.GetAtoms(), atom_maps, strict=True):  # type: ignore[no-untyped-call]
         atom.SetAtomMapNum(map_number)
+    # PostgreSQL/RDKit preserves the BondStereo assignment but may drop the
+    # neighboring BondDir flags required by the SMILES writer. Recreate those
+    # flags on the mapped clone; checking after maps are installed is important
+    # because RDKit can choose a different canonical traversal in their presence.
+    mapped = ensure_serializable_double_bond_stereochemistry(
+        mapped,
+        reference_smiles=getattr(topology, "canonical_isomeric_smiles", None),
+        preserve_atom_maps=True,
+    )
     return Chem.MolToSmiles(
         mapped,
         canonical=True,
