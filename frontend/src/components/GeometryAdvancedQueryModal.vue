@@ -53,9 +53,10 @@ function clearConditionValidation(id: number): void {
 
 function validationInput(condition: GeometryQueryCondition): { kind: ChemistryValidationKind; value: string } | null {
   const kind = fieldKind(condition);
-  if (kind === "smiles") return { kind: "smiles", value: condition.value.trim() };
-  if (kind === "smarts") return { kind: "smarts", value: condition.value.trim() };
-  if (kind === "mol_block") return { kind: "mol_block", value: condition.value.trim() };
+  const value = String(condition.value).trim();
+  if (kind === "smiles") return { kind: "smiles", value };
+  if (kind === "smarts") return { kind: "smarts", value };
+  if (kind === "mol_block") return { kind: "mol_block", value };
   return null;
 }
 
@@ -153,7 +154,7 @@ function buildFilters(): GeometryQueryFilters | null {
   let minimumAtomCount: number | undefined;
   let maximumAtomCount: number | undefined;
   for (const condition of conditions.value) {
-    const value = condition.value.trim();
+    const value = String(condition.value).trim();
     if (!value) {
       validationError.value = `请填写“${geometryQueryFieldOption(condition.field).label}”`;
       return null;

@@ -48,6 +48,7 @@ export interface LogicalReactionSummary {
   reaction_class: string | null;
   cycloaddition_pattern: string | null;
   reaction_hash: string;
+  similarity_score: number | null;
   reactant_product_changed: boolean | null;
   created_at: string | null;
   reactant_topology_ids: string[];
@@ -83,6 +84,7 @@ export interface MappedReactionSummary {
   maximum_activation_gibbs_free_energy_kcal_mol: number | null;
   minimum_reaction_gibbs_free_energy_kcal_mol: number | null;
   maximum_reaction_gibbs_free_energy_kcal_mol: number | null;
+  similarity_score: number | null;
 }
 
 export interface LogicalReactionDetail extends LogicalReactionSummary {
@@ -131,6 +133,7 @@ export interface GeometrySummary {
   reaction_binding_count: number;
   is_transition_state: boolean;
   imaginary_frequency_status: "present" | "absent" | "unavailable";
+  similarity_score: number | null;
 }
 
 export interface GeometryDetail extends GeometrySummary {

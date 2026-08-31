@@ -660,6 +660,7 @@ def _reaction_summary(
     reaction: LogicalReaction,
     *,
     reactant_product_changed: bool | None = None,
+    similarity_score: float | None = None,
     reactant_topology_ids: list[UUID] | None = None,
     product_topology_ids: list[UUID] | None = None,
     transition_state_geometry_id: UUID | None = None,
@@ -676,6 +677,7 @@ def _reaction_summary(
         cycloaddition_pattern=reaction.cycloaddition_pattern,
         reaction_hash=reaction.reaction_hash,
         reactant_product_changed=reactant_product_changed,
+        similarity_score=similarity_score,
         created_at=reaction.created_at,
         reactant_topology_ids=reactant_topology_ids or [],
         product_topology_ids=product_topology_ids or [],
@@ -1624,6 +1626,8 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
         reaction_hash: str | None = None,
         reaction_class: ReactionClass | None = None,
         reaction_smarts: str | None = None,
+        similarity_reaction_smiles: str | None = None,
+        similarity_metric: SimilarityMetric = SimilarityMetric.tanimoto,
         reactant_mol_block: str | None = None,
         product_mol_block: str | None = None,
         minimum_activation_gibbs_free_energy_kcal_mol: float | None = None,
@@ -1656,11 +1660,13 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             ),
             "minimum_reaction_gibbs_free_energy": ("minimum_reaction_gibbs_free_energy_kcal_mol"),
         }
-        if sort_by not in {"default", *reaction_sort_fields, *energy_sort_fields}:
+        if sort_by not in {"default", "similarity", *reaction_sort_fields, *energy_sort_fields}:
             raise ValueError(
-                "sort_by must be default, created_at, reaction_key, reaction_class, "
+                "sort_by must be default, similarity, created_at, reaction_key, reaction_class, "
                 "minimum_activation_gibbs_free_energy, or minimum_reaction_gibbs_free_energy"
             )
+        if sort_by == "similarity" and similarity_reaction_smiles is None:
+            raise ValueError("similarity sorting requires similarity_reaction_smiles")
 
         settings = get_settings()
         flat_filter_values = (
@@ -1670,6 +1676,7 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             reaction_hash,
             reaction_class,
             reaction_smarts,
+            similarity_reaction_smiles,
             reactant_mol_block,
             product_mol_block,
             minimum_activation_gibbs_free_energy_kcal_mol,
@@ -1684,6 +1691,7 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             raise ValueError("filter_expression conflicts with flat logical reaction filters")
         structure_inputs = {
             "reaction_smarts": reaction_smarts,
+            "similarity_reaction_smiles": similarity_reaction_smiles,
             "reactant_mol_block": reactant_mol_block,
             "product_mol_block": product_mol_block,
         }
@@ -1736,6 +1744,46 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                 .correlate(None)
             )
             predicates.append(col(LogicalReaction.id).in_(mapped_structure_ids))
+        similarity_score_expression: Any = literal(None)
+        similarity_rank: Any | None = None
+        if similarity_reaction_smiles is not None:
+            if (
+                rdChemReactions.ReactionFromSmarts(
+                    similarity_reaction_smiles,
+                    useSmiles=True,
+                )
+                is None
+            ):
+                raise ValueError("similarity_reaction_smiles must be a valid reaction SMILES")
+            similarity_query_reaction = reaction_from_smiles(
+                cast(CString, sql_cast(similarity_reaction_smiles, CString))
+            )
+            stored_reaction_fp = cast(Any, col(MappedReaction.reaction_structural_bfp))
+            similarity_fingerprint = reaction_structural_bfp(
+                similarity_query_reaction,
+                REACTION_STRUCTURAL_BFP_RADIUS,
+            )
+            similarity_score_expression = (
+                tanimoto_sml(stored_reaction_fp, similarity_fingerprint)
+                if similarity_metric == SimilarityMetric.tanimoto
+                else dice_sml(stored_reaction_fp, similarity_fingerprint)
+            )
+            similarity_rank = (
+                select(
+                    col(MappedReaction.logical_reaction_id).label("logical_reaction_id"),
+                    func.max(similarity_score_expression).label("similarity_score"),
+                )
+                .where(
+                    mapped_reaction_id_is_visible(scope, col(MappedReaction.id)),
+                    stored_reaction_fp.is_not(None),
+                    *reaction_structure_predicates,
+                )
+                .group_by(col(MappedReaction.logical_reaction_id))
+                .subquery()
+            )
+            predicates.append(
+                col(LogicalReaction.id).in_(select(col(similarity_rank.c.logical_reaction_id)))
+            )
         if filter_expression is not None:
             predicates.append(
                 logical_reaction_filter_expression_predicate(
@@ -1839,14 +1887,28 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                     )
                 ).scalar_one()
             )
-            reaction_statement = select(LogicalReaction).where(*predicates)
-            if sort_by == "default":
+            if similarity_rank is not None and sort_by in {"default", "similarity"}:
+                reaction_statement = (
+                    select(LogicalReaction, similarity_rank.c.similarity_score)
+                    .join(
+                        similarity_rank,
+                        col(LogicalReaction.id) == similarity_rank.c.logical_reaction_id,
+                    )
+                    .where(*predicates)
+                    .order_by(
+                        similarity_rank.c.similarity_score.desc().nulls_last(),
+                        col(LogicalReaction.id),
+                    )
+                )
+            else:
+                reaction_statement = select(LogicalReaction).where(*predicates)
+            if similarity_rank is None and sort_by == "default":
                 reaction_statement = reaction_statement.order_by(
                     col(LogicalReaction.reactant_sort_key).nulls_last(),
                     col(LogicalReaction.created_at),
                     col(LogicalReaction.id),
                 )
-            elif sort_by in energy_sort_fields:
+            elif similarity_rank is None and sort_by in energy_sort_fields:
                 energy_field = energy_sort_fields[sort_by]
                 energy_sort_keys = (
                     select(
@@ -1866,16 +1928,29 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                     _ordered_sort_expression(energy_sort_keys.c.energy_sort_key, sort_direction),
                     col(LogicalReaction.id),
                 )
-            else:
+            elif similarity_rank is None:
                 reaction_statement = reaction_statement.order_by(
                     _ordered_sort_expression(reaction_sort_fields[sort_by], sort_direction),
                     col(LogicalReaction.id),
                 )
-            reactions = (
-                (await session.execute(reaction_statement.offset(offset).limit(limit)))
-                .scalars()
-                .all()
-            )
+            if similarity_rank is not None and sort_by in {"default", "similarity"}:
+                reaction_rows = (
+                    await session.execute(reaction_statement.offset(offset).limit(limit))
+                ).all()
+                reactions = [reaction for reaction, _similarity_score in reaction_rows]
+                similarity_scores_by_reaction = {
+                    _required_uuid(reaction.id, "LogicalReaction"): (
+                        float(similarity_score) if similarity_score is not None else None
+                    )
+                    for reaction, similarity_score in reaction_rows
+                }
+            else:
+                reactions = list(
+                    (await session.execute(reaction_statement.offset(offset).limit(limit)))
+                    .scalars()
+                    .all()
+                )
+                similarity_scores_by_reaction = {}
             page_reaction_ids = [
                 _required_uuid(reaction.id, "LogicalReaction") for reaction in reactions
             ]
@@ -2017,6 +2092,9 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                     maximum_reaction_gibbs_free_energy_kcal_mol=barriers_by_reaction.get(
                         _required_uuid(reaction.id, "LogicalReaction"), (None, None, None, None)
                     )[3],
+                    similarity_score=similarity_scores_by_reaction.get(
+                        _required_uuid(reaction.id, "LogicalReaction")
+                    ),
                 )
                 for reaction in reactions
             ],

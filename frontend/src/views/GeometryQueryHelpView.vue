@@ -10,19 +10,19 @@ import { RouterLink } from "vue-router";
         <RouterLink class="entity-back-link" :to="{ name: 'geometries' }"><ArrowLeft :size="15" aria-hidden="true" />返回几何构象</RouterLink>
         <span class="eyebrow">Geometry query reference</span>
         <h1 id="geometry-query-help-title">几何构象查询帮助</h1>
-        <p>快速查询适合单个拓扑 SMILES；高级查询可以组合拓扑、来源、角色和计算属性。</p>
+        <p>快速查询适合输入单个分子；结果按 Morgan/Tanimoto 相似度从高到低排序。高级查询可以组合拓扑、来源、角色和计算属性。</p>
       </div>
       <div class="query-help-mark" aria-hidden="true"><CircleHelp :size="25" /></div>
     </header>
     <section class="query-help-section">
       <header><span class="eyebrow">01 · Quick query</span><h2>拓扑 SMILES</h2></header>
-      <p>在侧栏输入分子 SMILES，例如 <code>CCO</code>。输入框右侧图标表示 RDKit 格式校验状态；构象查询只会在提交有效结构后执行。</p>
+        <p>在侧栏输入分子 SMILES，例如 <code>CCO</code>。输入框右侧图标表示 RDKit 格式校验状态；构象查询只会在提交有效结构后执行，并显示相似度分数。</p>
       <div class="query-help-example"><code>c1ccccc1</code><span>苯的拓扑 SMILES</span></div>
     </section>
     <section class="query-help-section">
       <header><span class="eyebrow">02 · Structure fields</span><h2>结构条件</h2></header>
       <div class="query-help-table-wrap"><table class="query-help-table"><thead><tr><th>字段</th><th>输入方式</th><th>匹配含义</th></tr></thead><tbody>
-        <tr><th><code>topology_smiles</code></th><td>ChemDoodle 绘图或 SMILES</td><td>按拓扑结构匹配。</td></tr>
+            <tr><th><code>topology_smiles</code></th><td>ChemDoodle 绘图或 SMILES</td><td>高级查询按拓扑结构匹配；侧栏快速输入使用相似度排序。</td></tr>
         <tr><th><code>topology_smarts</code></th><td>SMARTS 文本</td><td>按 RDKit SMARTS 子结构匹配。</td></tr>
         <tr><th><code>topology_mol_block</code></th><td>MOL Block 文本</td><td>解析 MOL Block 后按结构匹配。</td></tr>
       </tbody></table></div>

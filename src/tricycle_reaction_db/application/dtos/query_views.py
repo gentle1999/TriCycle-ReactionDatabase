@@ -127,6 +127,7 @@ class GeometrySummary(QueryView):
     reaction_binding_count: int
     is_transition_state: bool
     imaginary_frequency_status: str
+    similarity_score: float | None = None
 
 
 class GeometryPage(QueryView):
@@ -188,6 +189,7 @@ class LogicalReactionSummary(QueryView):
     reaction_class: str | None = None
     cycloaddition_pattern: str | None = None
     reaction_hash: str
+    similarity_score: float | None = None
     # True when canonical reactant/product topology multisets differ.
     reactant_product_changed: bool | None = None
     created_at: datetime | None = None

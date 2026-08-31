@@ -315,6 +315,8 @@ async def list_logical_reactions(
     reaction_hash: str | None = None,
     reaction_class: ReactionClass | None = None,
     reaction_smarts: str | None = None,
+    similarity_reaction_smiles: str | None = None,
+    similarity_metric: SimilarityMetric = SimilarityMetric.tanimoto,
     reactant_mol_block: str | None = None,
     product_mol_block: str | None = None,
     minimum_activation_gibbs_free_energy_kcal_mol: float | None = None,
@@ -339,6 +341,8 @@ async def list_logical_reactions(
                 reaction_hash=reaction_hash,
                 reaction_class=reaction_class,
                 reaction_smarts=reaction_smarts,
+                similarity_reaction_smiles=similarity_reaction_smiles,
+                similarity_metric=similarity_metric,
                 reactant_mol_block=reactant_mol_block,
                 product_mol_block=product_mol_block,
                 minimum_activation_gibbs_free_energy_kcal_mol=(

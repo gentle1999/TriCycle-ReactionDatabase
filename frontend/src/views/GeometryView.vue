@@ -23,8 +23,10 @@ const router = useRouter();
 const projectContext = useProjectContext();
 const currentProjectId = projectContext.currentProjectId;
 const offset = ref(0);
-const geometrySort = ref<GeometrySort>({ sortBy: "default", sortDirection: "asc" });
 const initialTopologySmiles = typeof route.query.topology === "string" ? route.query.topology : "";
+const geometrySort = ref<GeometrySort>(initialTopologySmiles
+  ? { sortBy: "similarity", sortDirection: "desc" }
+  : { sortBy: "default", sortDirection: "asc" });
 const quickSmilesInput = ref(initialTopologySmiles);
 const topologySmiles = ref(initialTopologySmiles);
 const selectedFrameId = ref<string | null>(null);
@@ -88,6 +90,9 @@ watch(() => route.query.topology, (value) => {
   quickSmilesInput.value = nextValue;
   topologySmiles.value = nextValue;
   advancedFilters.value = null;
+  geometrySort.value = nextValue
+    ? { sortBy: "similarity", sortDirection: "desc" }
+    : { sortBy: "default", sortDirection: "asc" };
   offset.value = 0;
 });
 
@@ -145,10 +150,15 @@ function scheduleQuickValidation(value: string): void {
   }, 320);
 }
 async function submitSearch(): Promise<void> {
+  if (quickValidationTimer !== null) window.clearTimeout(quickValidationTimer);
+  quickValidationTimer = null;
   const smiles = quickSmilesInput.value.trim();
   if (!(await validateQuickQuery(smiles))) return;
   advancedFilters.value = null;
   topologySmiles.value = smiles;
+  geometrySort.value = smiles
+    ? { sortBy: "similarity", sortDirection: "desc" }
+    : { sortBy: "default", sortDirection: "asc" };
   offset.value = 0;
   syncRouteQuery();
 }
@@ -160,6 +170,7 @@ function clearFilters(): void {
   quickValidation.value = { status: "idle", message: "" };
   advancedFilters.value = null;
   thermodynamicOnly.value = true;
+  geometrySort.value = { sortBy: "default", sortDirection: "asc" };
   quickSmilesInput.value = "";
   topologySmiles.value = "";
   offset.value = 0;
@@ -169,12 +180,14 @@ function applyAdvancedQuery(filters: GeometryQueryFilters): void {
   advancedFilters.value = filters;
   quickSmilesInput.value = "";
   topologySmiles.value = "";
+  geometrySort.value = { sortBy: "default", sortDirection: "asc" };
   offset.value = 0;
   advancedQueryOpen.value = false;
   syncRouteQuery();
 }
 function clearAdvancedQuery(): void {
   advancedFilters.value = null;
+  geometrySort.value = { sortBy: "default", sortDirection: "asc" };
   offset.value = 0;
 }
 function openGeometry(id: string): void { void router.replace({ name: "geometries", query: { ...withoutAccessState(route.query), preview_geometry: id } }); }
@@ -231,11 +244,11 @@ onBeforeUnmount(() => {
 
     <section class="geometry-results" :aria-busy="catalogQuerying">
       <header class="geometry-results-header">
-        <div><span class="eyebrow">Conformer catalog</span><h2>{{ advancedConditionCount ? "高级查询结果" : topologySmiles ? "SMILES 查询结果" : thermodynamicOnly ? "含热力学属性的几何构象" : "全部几何构象" }}</h2></div>
+        <div><span class="eyebrow">Conformer catalog</span><h2>{{ advancedConditionCount ? "高级查询结果" : topologySmiles ? "分子相似度查询结果" : thermodynamicOnly ? "含热力学属性的几何构象" : "全部几何构象" }}</h2></div>
         <div class="catalog-header-actions">
           <div class="catalog-sort-controls" aria-label="几何构象排序">
-            <label><span>排序</span><select v-model="geometrySort.sortBy" aria-label="几何构象排序字段"><option value="default">默认顺序</option><option value="created_at">创建时间</option><option value="atom_count">原子数</option><option value="calculation_count">计算帧数</option></select></label>
-            <label><span>顺序</span><select v-model="geometrySort.sortDirection" aria-label="几何构象排序方向" :disabled="geometrySort.sortBy === 'default'"><option value="asc">升序</option><option value="desc">降序</option></select></label>
+            <label><span>排序</span><select v-model="geometrySort.sortBy" aria-label="几何构象排序字段"><option value="default">默认顺序</option><option v-if="topologySmiles" value="similarity">相似度</option><option value="created_at">创建时间</option><option value="atom_count">原子数</option><option value="calculation_count">计算帧数</option></select></label>
+            <label><span>顺序</span><select v-model="geometrySort.sortDirection" aria-label="几何构象排序方向" :disabled="geometrySort.sortBy === 'default' || geometrySort.sortBy === 'similarity'"><option value="asc">升序</option><option value="desc">降序</option></select></label>
           </div>
           <PaginationControls :page="page" label="几何构象分页" @previous="previousPage" @next="nextPage" @jump="jumpPage" />
         </div>

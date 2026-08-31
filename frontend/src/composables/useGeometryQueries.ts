@@ -45,7 +45,8 @@ export function useGeometryQueries(
     const smiles = topologySmiles.value.trim();
     return {
       projectId: projectId.value ?? undefined,
-      topologySmiles: smiles || undefined,
+      similaritySmiles: smiles || undefined,
+      similarityMetric: smiles ? "tanimoto" : undefined,
       thermodynamicOnly: thermodynamicOnly.value,
     };
   });

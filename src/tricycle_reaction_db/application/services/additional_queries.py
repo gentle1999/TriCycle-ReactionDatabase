@@ -6,11 +6,11 @@ from typing import Any, cast
 from uuid import UUID
 
 from molalchemy.helpers import rdkit_col
-from molalchemy.rdkit.functions import mol_from_smiles
+from molalchemy.rdkit.functions import dice_sml, mol_from_smiles, morganbv_fp, tanimoto_sml
 from molalchemy.types import CString
 from nexusx import UseCaseService, query  # type: ignore[import-untyped]
 from rdkit import Chem
-from sqlalchemy import Text, and_, desc, func, not_, or_, select, true
+from sqlalchemy import Text, and_, desc, func, literal, not_, or_, select, true
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.orm import defer
 from sqlmodel import col
@@ -108,7 +108,12 @@ from tricycle_reaction_db.db.models import (
     TransitionStateInference,
 )
 from tricycle_reaction_db.db.session import session_factory
-from tricycle_reaction_db.domain.enums import ArtifactIngestionStatus, MappedReactionNodeRole
+from tricycle_reaction_db.domain.enums import (
+    ArtifactIngestionStatus,
+    MappedReactionNodeRole,
+    SimilarityMetric,
+)
+from tricycle_reaction_db.domain.fingerprints import MORGAN_BFP_RADIUS
 from tricycle_reaction_db.domain.precision import round_energy_hartree
 
 # NexusX's schema builder accepts constrained scalar aliases, but not a Pydantic
@@ -181,6 +186,7 @@ def _geometry_summary(
     is_transition_state: bool,
     has_frequency_data: bool,
     has_imaginary_frequency: bool,
+    similarity_score: float | None = None,
 ) -> GeometrySummary:
     imaginary_frequency_status = (
         "present" if has_imaginary_frequency else "absent" if has_frequency_data else "unavailable"
@@ -199,6 +205,7 @@ def _geometry_summary(
         reaction_binding_count=reaction_binding_count,
         is_transition_state=is_transition_state,
         imaginary_frequency_status=imaginary_frequency_status,
+        similarity_score=similarity_score,
     )
 
 
@@ -644,6 +651,8 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
         topology_smiles: str | None = None,
         topology_mol_block: str | None = None,
         topology_smarts: str | None = None,
+        similarity_smiles: str | None = None,
+        similarity_metric: SimilarityMetric = SimilarityMetric.tanimoto,
         thermodynamic_only: bool = False,
         imaginary_frequency_status: str | None = None,
         minimum_atom_count: int | None = None,
@@ -659,20 +668,24 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
             raise ValueError("sort_direction must be asc or desc")
         if sort_by not in {
             "default",
+            "similarity",
             "created_at",
             "atom_count",
             "calculation_count",
         }:
             raise ValueError(
-                "sort_by must be default, created_at, atom_count, or calculation_count"
+                "sort_by must be default, similarity, created_at, atom_count, or calculation_count"
             )
+        if sort_by == "similarity" and similarity_smiles is None:
+            raise ValueError("similarity sorting requires similarity_smiles")
         structure_inputs = {
             "topology_smiles": topology_smiles,
             "topology_mol_block": topology_mol_block,
             "topology_smarts": topology_smarts,
+            "similarity_smiles": similarity_smiles,
         }
         if sum(value is not None for value in structure_inputs.values()) > 1:
-            raise ValueError("topology_smiles, topology_mol_block, and topology_smarts conflict")
+            raise ValueError("topology structure filters and similarity_smiles conflict")
         enforce_structure_input_budget(
             structure_inputs,
             maximum_characters=get_settings().structure_query_max_characters,
@@ -689,6 +702,7 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
             topology_smiles,
             topology_mol_block,
             topology_smarts,
+            similarity_smiles,
             imaginary_frequency_status,
             minimum_atom_count,
             maximum_atom_count,
@@ -812,6 +826,35 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
             topology_predicates.append(
                 rdkit_col(MolecularTopology.mol).has_substructure(cast(str, query_expression))
             )
+        similarity_score: Any = literal(None)
+        similarity_fingerprint: Any | None = None
+        fingerprint_column: Any | None = None
+        if similarity_smiles is not None:
+            query_molecule = Chem.MolFromSmiles(similarity_smiles)
+            if query_molecule is None:
+                raise ValueError("similarity_smiles must contain a valid molecule")
+            explicit_query_smiles = Chem.MolToSmiles(
+                Chem.AddHs(query_molecule),
+                canonical=True,
+                isomericSmiles=True,
+                allHsExplicit=True,
+            )
+            similarity_query_molecule = mol_from_smiles(
+                cast(CString, sql_cast(explicit_query_smiles, CString))
+            )
+            similarity_fingerprint = morganbv_fp(
+                similarity_query_molecule,
+                MORGAN_BFP_RADIUS,
+            )
+            fingerprint_column = cast(Any, col(MolecularTopology.morgan_bfp))
+            assert similarity_fingerprint is not None
+            assert fingerprint_column is not None
+            similarity_score = (
+                tanimoto_sml(fingerprint_column, similarity_fingerprint)
+                if similarity_metric == SimilarityMetric.tanimoto
+                else dice_sml(fingerprint_column, similarity_fingerprint)
+            )
+            topology_predicates.append(fingerprint_column.is_not(None))
         _validate_range(
             minimum_atom_count,
             maximum_atom_count,
@@ -888,6 +931,7 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                 calculation_count,
                 has_frequency_data.label("has_frequency_data"),
                 has_imaginary_frequency.label("has_imaginary_frequency"),
+                similarity_score.label("similarity_score"),
             )
             .options(
                 defer(cast(Any, Geometry.mol)),
@@ -921,6 +965,7 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
             and not scope.unrestricted
             and not predicates
             and not topology_predicates
+            and similarity_fingerprint is None
         )
         async with session_factory() as session:
             total_value = (await session.execute(count_statement)).scalar_one_or_none()
@@ -1029,6 +1074,23 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                             )
                         ).all()
                     )
+            elif similarity_fingerprint is not None and sort_by in {"default", "similarity"}:
+                assert fingerprint_column is not None
+                nearest_operator = (
+                    "<%>" if similarity_metric == SimilarityMetric.tanimoto else "<#>"
+                )
+                rows = list(
+                    (
+                        await session.execute(
+                            filtered_statement.order_by(
+                                fingerprint_column.op(nearest_operator)(similarity_fingerprint),
+                                col(Geometry.id),
+                            )
+                            .offset(offset)
+                            .limit(limit)
+                        )
+                    ).all()
+                )
             elif (
                 uses_catalog_summary
                 and sort_by in {"created_at", "calculation_count"}
@@ -1122,7 +1184,7 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                     ).all()
                 )
             page_geometry_ids = [
-                _required_uuid(geometry.id, "Geometry") for geometry, _, _, _, _ in rows
+                _required_uuid(geometry.id, "Geometry") for geometry, _, _, _, _, _ in rows
             ]
             reaction_binding_counts: dict[UUID, int] = {}
             transition_state_geometry_ids: set[UUID] = set()
@@ -1188,6 +1250,7 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                     _required_uuid(geometry.id, "Geometry") in transition_state_geometry_ids,
                     bool(has_frequency_data),
                     bool(has_imaginary_frequency),
+                    float(similarity_score) if similarity_score is not None else None,
                 )
                 for (
                     geometry,
@@ -1195,6 +1258,7 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                     calculations,
                     has_frequency_data,
                     has_imaginary_frequency,
+                    similarity_score,
                 ) in rows
             ],
             page=_page(total, limit, offset),

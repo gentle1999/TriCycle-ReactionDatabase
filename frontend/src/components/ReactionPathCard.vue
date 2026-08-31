@@ -99,6 +99,7 @@ onBeforeUnmount(() => observer?.disconnect());
       </div>
       <footer class="reaction-card-footer">
         <span>{{ reactants.length }} 底物 · {{ products.length }} 产物</span>
+        <span v-if="reaction.similarity_score !== null" class="reaction-similarity">相似度 {{ (reaction.similarity_score * 100).toFixed(1) }}%</span>
         <span v-if="reaction.minimum_activation_gibbs_free_energy_kcal_mol !== null" class="reaction-barrier">
           ΔG‡ {{ reaction.minimum_activation_gibbs_free_energy_kcal_mol.toFixed(1) }}–{{ (reaction.maximum_activation_gibbs_free_energy_kcal_mol ?? reaction.minimum_activation_gibbs_free_energy_kcal_mol).toFixed(1) }} kcal/mol
         </span>

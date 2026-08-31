@@ -19,7 +19,7 @@ import { RouterLink } from "vue-router";
         </RouterLink>
         <span class="eyebrow">Reaction query reference</span>
         <h1 id="reaction-query-help-title">反应查询帮助</h1>
-        <p>快速查询适合单个结构条件；高级查询可以组合结构、元数据、能量和时间条件。</p>
+        <p>快速查询适合输入单个反应，并按反应结构相似度从高到低排序；高级查询可以组合结构、元数据、能量和时间条件。</p>
       </div>
       <div class="query-help-mark" aria-hidden="true"><CircleHelp :size="25" /></div>
     </header>
@@ -31,7 +31,7 @@ import { RouterLink } from "vue-router";
       </header>
       <p>在反应路径侧栏输入反应物和产物，用 <code>&gt;&gt;</code> 分隔，例如 <code>C=C&gt;&gt;CC</code>。后端使用 RDKit 的反应 SMARTS 解析器校验输入，因此这里也可以使用 SMARTS 原子或键条件。</p>
       <div class="query-help-example"><code>[C:1]=[C:2]>>[C:1]-[C:2]</code><span>带原子映射的反应结构模式</span></div>
-      <p class="query-help-note">当前查询是结构包含匹配：数据库中的完整反应只要包含输入的反应模板就会命中，不要求反应字符串完全相同，也不应把它当作相等比较。</p>
+        <p class="query-help-note">侧栏快速输入使用反应结构指纹进行相似度排序，并显示相似度分数；高级查询中的反应结构条件仍是结构包含匹配：数据库中的完整反应只要包含输入的反应模板就会命中，不要求反应字符串完全相同。</p>
     </section>
 
     <section class="query-help-section" aria-labelledby="query-help-rxn-title">

@@ -433,6 +433,25 @@ async function openBatch(batchId: string): Promise<void> {
     window.localStorage.setItem("tricycle.lastUploadBatch", batchId);
     await router.replace({ query: { ...route.query, project_id: batch.value.project_id, batch: batchId } });
   } catch (error) {
+    if (error instanceof ApiError && error.status === 404) {
+      // The database can be replaced independently of the browser session.
+      // A route/localStorage batch id from the previous database is therefore
+      // stale and must not prevent the upload page from being used.
+      if (window.localStorage.getItem("tricycle.lastUploadBatch") === batchId) {
+        window.localStorage.removeItem("tricycle.lastUploadBatch");
+      }
+      if (route.query.batch === batchId) {
+        const nextQuery = { ...route.query };
+        delete nextQuery.batch;
+        await router.replace({ query: nextQuery });
+      }
+      batch.value = null;
+      remoteMode.value = false;
+      remoteItems.value = [];
+      remoteTotal.value = 0;
+      queuePage.value = 0;
+      return;
+    }
     queueError.value = error instanceof Error ? error.message : "上传批次加载失败";
   } finally {
     loadingBatch.value = false;

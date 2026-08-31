@@ -811,20 +811,24 @@ test("mobile reaction workspace has no page-level overflow", async ({ page }, te
   await page.screenshot({ path: testInfo.outputPath("mobile-reaction.png"), fullPage: true });
 });
 
-test("reaction quick query submits a direct reaction SMILES", async ({ page }) => {
+test("reaction quick query ranks by reaction similarity", async ({ page }) => {
   await page.goto("/");
   const responsePromise = page.waitForResponse((response) =>
     response.url().includes("/api/logical-reactions")
     && response.request().method() === "GET"
-    && response.url().includes("reaction_smarts=C%3DC%3E%3ECC"),
+    && response.url().includes("similarity_reaction_smiles=C%3DC%3E%3ECC"),
   );
   await page.getByRole("searchbox", { name: "反应 SMILES 快速查询" }).fill("C=C>>CC");
   await page.getByRole("button", { name: "查询", exact: true }).click();
   const response = await responsePromise;
   expect(response.status()).toBe(200);
-  const payload = await response.json() as { page: { total: number } };
+  const payload = await response.json() as {
+    items: Array<{ similarity_score: number | null }>;
+    page: { total: number };
+  };
   expect(payload.page.total).toBeGreaterThan(0);
-  await expect(page.getByRole("heading", { name: "反应结构查询结果" })).toBeVisible();
+  expect(payload.items[0]?.similarity_score).not.toBeNull();
+  await expect(page.getByRole("heading", { name: "反应相似度查询结果" })).toBeVisible();
 });
 
 test("reaction query help is reachable from quick and advanced query controls", async ({ page }) => {
@@ -1210,7 +1214,7 @@ test("geometry cards preserve drawer preview and link to a standalone detail pag
   await page.screenshot({ path: testInfo.outputPath("mobile-geometry-detail.png"), fullPage: true });
 });
 
-test("geometry quick query submits only the basic SMILES filter", async ({ page }) => {
+test("geometry quick query ranks by molecular similarity", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 960 });
   await page.goto("/geometries");
   const sidebarLayout = await page.locator(".geometry-filter-sidebar").evaluate((sidebar) => {
@@ -1226,30 +1230,35 @@ test("geometry quick query submits only the basic SMILES filter", async ({ page 
   const responsePromise = page.waitForResponse((response) =>
     response.url().includes("/api/geometry_query_service/list_geometries")
     && response.request().method() === "POST"
-    && response.request().postData()?.includes('"topology_smiles":"C=C"') === true,
+    && response.request().postData()?.includes('"similarity_smiles":"C=C"') === true,
   );
   await page.getByRole("searchbox", { name: "SMILES 快速查询" }).fill("C=C");
   await page.getByRole("button", { name: "查询", exact: true }).click();
   const response = await responsePromise;
   const payload = response.request().postDataJSON() as {
-    topology_smiles?: string;
+    similarity_smiles?: string;
+    similarity_metric?: string;
+    topology_smiles?: string | null;
     topology_smarts?: string | null;
     topology_mol_block?: string | null;
     thermodynamic_only?: boolean;
     filter_expression?: string | null;
   };
   const result = await response.json() as {
-    items: Array<{ canonical_isomeric_smiles: string }>;
+    items: Array<{ canonical_isomeric_smiles: string; similarity_score: number | null }>;
     page: { total: number };
   };
   expect(response.status()).toBe(200);
-  expect(payload.topology_smiles).toBe("C=C");
+  expect(payload.similarity_smiles).toBe("C=C");
+  expect(payload.similarity_metric).toBe("tanimoto");
+  expect(payload.topology_smiles).toBeNull();
   expect(payload.topology_smarts).toBeNull();
   expect(payload.topology_mol_block).toBeNull();
   expect(payload.thermodynamic_only).toBe(true);
   expect(payload.filter_expression).toBeNull();
   expect(result.page.total).toBeGreaterThan(0);
-  await expect(page.getByRole("heading", { name: "SMILES 查询结果" })).toBeVisible();
+  expect(result.items[0]?.similarity_score).not.toBeNull();
+  await expect(page.getByRole("heading", { name: "分子相似度查询结果" })).toBeVisible();
 });
 
 test("geometry structure filters validate while editing and expose help", async ({ page }) => {
@@ -1324,6 +1333,31 @@ test("geometry advanced query builds AND, OR, and NOT expressions", async ({ pag
   expect(mobileDialogBox?.width ?? Infinity).toBeLessThanOrEqual(390);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await page.screenshot({ path: testInfo.outputPath("mobile-geometry-advanced-query.png"), fullPage: true });
+});
+
+test("geometry advanced query applies atom count conditions", async ({ page }) => {
+  await page.goto("/geometries");
+  await page.getByRole("button", { name: "高级查询", exact: true }).click();
+
+  const dialog = page.getByRole("dialog", { name: "高级查询" });
+  await dialog.locator('select[id^="advanced-query-field-"]').selectOption("minimum_atom_count");
+  await dialog.locator('input[type="number"]').fill("20");
+
+  const responsePromise = page.waitForResponse((response) =>
+    response.url().includes("/api/geometry_query_service/list_geometries")
+    && response.request().method() === "POST"
+    && Boolean((response.request().postDataJSON() as { filter_expression?: string }).filter_expression),
+  );
+  await dialog.getByRole("button", { name: "应用高级查询" }).click();
+
+  const response = await responsePromise;
+  expect(response.status()).toBe(200);
+  const payload = response.request().postDataJSON() as { filter_expression?: string };
+  const expression = JSON.parse(payload.filter_expression ?? "{}") as {
+    conditions?: Array<{ field: string; value: number }>;
+  };
+  expect(expression.conditions).toEqual([{ field: "minimum_atom_count", value: 20 }]);
+  await expect(page.getByRole("heading", { name: "高级查询结果" })).toBeVisible();
 });
 
 test("ChemDoodle editor keeps its SMILES display synchronized", async ({ page }) => {

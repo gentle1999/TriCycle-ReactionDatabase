@@ -23,6 +23,7 @@ export type ReactionQueryLogicalOperator = "and" | "or";
 
 export type ReactionSortBy =
   | "default"
+  | "similarity"
   | "created_at"
   | "reaction_key"
   | "reaction_class"
@@ -42,6 +43,8 @@ export interface ReactionQueryFilters {
   reactionHash?: string;
   reactionClass?: string;
   reactionSmarts?: string;
+  similarityReactionSmiles?: string;
+  similarityMetric?: "tanimoto" | "dice";
   reactantMolBlock?: string;
   productMolBlock?: string;
   minimumActivationGibbsFreeEnergyKcalMol?: number;

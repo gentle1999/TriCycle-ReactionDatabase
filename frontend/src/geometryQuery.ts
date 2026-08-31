@@ -17,6 +17,7 @@ export type GeometryImaginaryFrequencyStatus = "present" | "absent" | "unavailab
 
 export type GeometrySortBy =
   | "default"
+  | "similarity"
   | "created_at"
   | "atom_count"
   | "calculation_count";
@@ -37,6 +38,8 @@ export interface GeometryQueryFilters {
   topologySmiles?: string;
   topologyMolBlock?: string;
   topologySmarts?: string;
+  similaritySmiles?: string;
+  similarityMetric?: "tanimoto" | "dice";
   thermodynamicOnly?: boolean;
   imaginaryFrequencyStatus?: GeometryImaginaryFrequencyStatus;
   minimumAtomCount?: number;

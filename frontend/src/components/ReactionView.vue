@@ -40,7 +40,7 @@ const emit = defineEmits<{
   updateSort: [sort: ReactionSort];
 }>();
 
-const quickReactionInput = ref(props.queryFilters.reactionSmarts ?? "");
+const quickReactionInput = ref(props.queryFilters.similarityReactionSmiles ?? props.queryFilters.reactionSmarts ?? "");
 const hasActivationGibbsFreeEnergy = ref(props.queryFilters.hasActivationGibbsFreeEnergy ?? false);
 const hasReactionGibbsFreeEnergy = ref(props.queryFilters.hasReactionGibbsFreeEnergy ?? false);
 const reactantProductChanged = ref<boolean | null>(props.queryFilters.reactantProductChanged ?? null);
@@ -54,11 +54,12 @@ let quickValidationGeneration = 0;
 const advancedConditionCount = computed(() => props.queryFilters.filterExpression?.conditions.length ?? 0);
 const resultTitle = computed(() => {
   if (advancedConditionCount.value) return "高级查询结果";
+  if (props.queryFilters.similarityReactionSmiles) return "反应相似度查询结果";
   if (props.queryFilters.reactionSmarts) return "反应结构查询结果";
   return "反应路径";
 });
 
-watch(() => props.queryFilters.reactionSmarts, (value) => {
+watch(() => props.queryFilters.similarityReactionSmiles ?? props.queryFilters.reactionSmarts, (value) => {
   if (value !== quickReactionInput.value) quickReactionInput.value = value ?? "";
 });
 watch(() => props.queryFilters.hasActivationGibbsFreeEnergy, (value) => {
@@ -142,6 +143,8 @@ function chooseReaction(id: string): void {
 }
 
 async function applyQuickQuery(): Promise<void> {
+  if (quickValidationTimer !== null) window.clearTimeout(quickValidationTimer);
+  quickValidationTimer = null;
   const reactionSmarts = quickReactionInput.value.trim();
   if (reactionSmarts && !reactionSmarts.includes(">>")) {
     validationError.value = "请输入“反应物>>产物”格式的反应 SMILES";
@@ -152,7 +155,7 @@ async function applyQuickQuery(): Promise<void> {
     return;
   }
   validationError.value = "";
-  emit("applyFilters", { ...selectedEnergyFilters(), reactionSmarts: reactionSmarts || undefined });
+  emit("applyFilters", { ...selectedEnergyFilters(), similarityReactionSmiles: reactionSmarts || undefined });
 }
 
 function clearFilters(): void {
@@ -265,8 +268,8 @@ onBeforeUnmount(() => {
         </div>
         <div class="catalog-header-actions">
           <div class="catalog-sort-controls" aria-label="反应排序">
-            <label><span>排序</span><select :value="sort.sortBy" aria-label="反应排序字段" @change="updateSortBy"><option value="default">默认顺序</option><option value="created_at">创建时间</option><option value="reaction_key">反应键</option><option value="reaction_class">反应类型</option><option value="minimum_activation_gibbs_free_energy">最低 ΔG‡</option><option value="minimum_reaction_gibbs_free_energy">最低 ΔG</option></select></label>
-            <label><span>顺序</span><select :value="sort.sortDirection" aria-label="反应排序方向" :disabled="sort.sortBy === 'default'" @change="updateSortDirection"><option value="asc">升序</option><option value="desc">降序</option></select></label>
+            <label><span>排序</span><select :value="sort.sortBy" aria-label="反应排序字段" @change="updateSortBy"><option value="default">默认顺序</option><option v-if="queryFilters.similarityReactionSmiles" value="similarity">相似度</option><option value="created_at">创建时间</option><option value="reaction_key">反应键</option><option value="reaction_class">反应类型</option><option value="minimum_activation_gibbs_free_energy">最低 ΔG‡</option><option value="minimum_reaction_gibbs_free_energy">最低 ΔG</option></select></label>
+            <label><span>顺序</span><select :value="sort.sortDirection" aria-label="反应排序方向" :disabled="sort.sortBy === 'default' || sort.sortBy === 'similarity'" @change="updateSortDirection"><option value="asc">升序</option><option value="desc">降序</option></select></label>
           </div>
           <PaginationControls :page="page" label="反应分页（顶部）" @previous="emit('previousPage')" @next="emit('nextPage')" @jump="emit('jumpPage', $event)" />
         </div>

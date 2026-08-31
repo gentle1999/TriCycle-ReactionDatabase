@@ -179,6 +179,9 @@ function openFrame(id: string): void {
 
 function applyReactionFilters(filters: ReactionQueryFilters): void {
   reactionFilters.value = filters;
+  reactionSort.value = filters.similarityReactionSmiles
+    ? { sortBy: "similarity", sortDirection: "desc" }
+    : { sortBy: "default", sortDirection: "asc" };
   reactionOffset.value = 0;
 }
 
