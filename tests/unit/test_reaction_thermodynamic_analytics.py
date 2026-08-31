@@ -74,6 +74,10 @@ async def test_export_csv_preserves_profile_columns_and_quotes_smiles(
             ["DFT", "DFT", None, "B3LYP", "def2-SVP"],
             298.15,
             1.0,
+            10.0,
+            20.0,
+            30.0,
+            55.0,
             12.25,
             13.5,
             -2.0,
@@ -93,5 +97,9 @@ async def test_export_csv_preserves_profile_columns_and_quotes_smiles(
     assert exported[0]["mapped_reaction_id"] == str(mapped_id)
     assert exported[0]["mapped_reaction_smiles"] == rows[0][4]
     assert exported[0]["level_of_theory"] == "B3LYP/def2-SVP"
+    assert exported[0]["reactants_running_time_seconds"] == "10.0"
+    assert exported[0]["transition_state_running_time_seconds"] == "20.0"
+    assert exported[0]["products_running_time_seconds"] == "30.0"
+    assert exported[0]["total_running_time_seconds"] == "55.0"
     assert exported[0]["activation_gibbs_free_energy_kcal_mol"] == "13.5"
     assert exported[0]["reaction_gibbs_free_energy_kcal_mol"] == "-3.25"

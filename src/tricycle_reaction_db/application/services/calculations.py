@@ -333,6 +333,7 @@ def persist_parse_revision(
             "source_content_sha256",
             "source_size_bytes",
             "source_compression",
+            "running_time_seconds",
         )
         source_identity_changed = False
         for field_name in source_identity_fields:

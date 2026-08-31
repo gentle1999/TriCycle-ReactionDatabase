@@ -53,6 +53,10 @@ _PROFILE_COLUMNS = (
     "level_of_theory",
     "temperature_kelvin",
     "pressure_atm",
+    "reactants_running_time_seconds",
+    "transition_state_running_time_seconds",
+    "products_running_time_seconds",
+    "total_running_time_seconds",
     "activation_enthalpy_kcal_mol",
     "activation_gibbs_free_energy_kcal_mol",
     "reaction_enthalpy_kcal_mol",
@@ -381,6 +385,10 @@ class ReactionThermodynamicAnalyticsService:
                 col(profile.thermochemistry_level),
                 col(profile.temperature_kelvin),
                 col(profile.pressure_atm),
+                col(profile.reactants_running_time_seconds),
+                col(profile.transition_state_running_time_seconds),
+                col(profile.products_running_time_seconds),
+                col(profile.total_running_time_seconds),
                 col(profile.activation_enthalpy_kcal_mol),
                 col(profile.activation_gibbs_free_energy_kcal_mol),
                 col(profile.reaction_enthalpy_kcal_mol),
@@ -401,23 +409,51 @@ class ReactionThermodynamicAnalyticsService:
         async with session_factory() as session:
             result = await session.stream(statement)
             async for row in result:
-                (
-                    mapped_id,
-                    logical_id,
-                    mapped_key,
-                    mapped_kind,
-                    mapped_smiles,
-                    mapping_hash,
-                    policy_version,
-                    electronic_level,
-                    thermochemistry_level,
-                    temperature,
-                    pressure,
-                    activation_enthalpy,
-                    activation_gibbs,
-                    reaction_enthalpy,
-                    reaction_gibbs,
-                ) = row
+                # Keep the encoder tolerant of small test doubles and older
+                # callers that supplied the pre-runtime 15-column row shape.
+                values = tuple(row)
+                if len(values) == 15:
+                    (
+                        mapped_id,
+                        logical_id,
+                        mapped_key,
+                        mapped_kind,
+                        mapped_smiles,
+                        mapping_hash,
+                        policy_version,
+                        electronic_level,
+                        thermochemistry_level,
+                        temperature,
+                        pressure,
+                        activation_enthalpy,
+                        activation_gibbs,
+                        reaction_enthalpy,
+                        reaction_gibbs,
+                    ) = values
+                    reactants_runtime = transition_state_runtime = None
+                    products_runtime = total_runtime = None
+                else:
+                    (
+                        mapped_id,
+                        logical_id,
+                        mapped_key,
+                        mapped_kind,
+                        mapped_smiles,
+                        mapping_hash,
+                        policy_version,
+                        electronic_level,
+                        thermochemistry_level,
+                        temperature,
+                        pressure,
+                        reactants_runtime,
+                        transition_state_runtime,
+                        products_runtime,
+                        total_runtime,
+                        activation_enthalpy,
+                        activation_gibbs,
+                        reaction_enthalpy,
+                        reaction_gibbs,
+                    ) = values
                 yield encode(
                     [
                         mapped_id,
@@ -432,6 +468,10 @@ class ReactionThermodynamicAnalyticsService:
                         _level_label(list(electronic_level), list(thermochemistry_level)),
                         temperature,
                         pressure,
+                        reactants_runtime,
+                        transition_state_runtime,
+                        products_runtime,
+                        total_runtime,
                         activation_enthalpy,
                         activation_gibbs,
                         reaction_enthalpy,

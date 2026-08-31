@@ -951,12 +951,20 @@ CREATE TABLE public.mapped_reaction_thermodynamic_profile (
     products_enthalpy_hartree double precision,
     products_gibbs_free_energy_hartree double precision,
     products_entropy_cal_mol_k double precision,
+    reactants_running_time_seconds double precision,
+    transition_state_running_time_seconds double precision,
+    products_running_time_seconds double precision,
+    total_running_time_seconds double precision,
     activation_enthalpy_kcal_mol double precision GENERATED ALWAYS AS (((transition_state_enthalpy_hartree - reactants_enthalpy_hartree) * (627.5094740631)::double precision)) STORED,
     activation_gibbs_free_energy_kcal_mol double precision GENERATED ALWAYS AS (((transition_state_gibbs_free_energy_hartree - reactants_gibbs_free_energy_hartree) * (627.5094740631)::double precision)) STORED,
     activation_entropy_cal_mol_k double precision GENERATED ALWAYS AS ((transition_state_entropy_cal_mol_k - reactants_entropy_cal_mol_k)) STORED,
     reaction_enthalpy_kcal_mol double precision GENERATED ALWAYS AS (((products_enthalpy_hartree - reactants_enthalpy_hartree) * (627.5094740631)::double precision)) STORED,
     reaction_gibbs_free_energy_kcal_mol double precision GENERATED ALWAYS AS (((products_gibbs_free_energy_hartree - reactants_gibbs_free_energy_hartree) * (627.5094740631)::double precision)) STORED,
-    reaction_entropy_cal_mol_k double precision GENERATED ALWAYS AS ((products_entropy_cal_mol_k - reactants_entropy_cal_mol_k)) STORED
+    reaction_entropy_cal_mol_k double precision GENERATED ALWAYS AS ((products_entropy_cal_mol_k - reactants_entropy_cal_mol_k)) STORED,
+    CONSTRAINT ck_mapped_rxn_profile_reactants_runtime_nonnegative CHECK (((reactants_running_time_seconds IS NULL) OR (reactants_running_time_seconds >= (0)::double precision))),
+    CONSTRAINT ck_mapped_rxn_profile_ts_runtime_nonnegative CHECK (((transition_state_running_time_seconds IS NULL) OR (transition_state_running_time_seconds >= (0)::double precision))),
+    CONSTRAINT ck_mapped_rxn_profile_products_runtime_nonnegative CHECK (((products_running_time_seconds IS NULL) OR (products_running_time_seconds >= (0)::double precision))),
+    CONSTRAINT ck_mapped_rxn_profile_total_runtime_nonnegative CHECK (((total_running_time_seconds IS NULL) OR (total_running_time_seconds >= (0)::double precision)))
 );
 
 
@@ -1202,6 +1210,7 @@ CREATE TABLE public.parse_revision (
     source_content_sha256 character varying(64),
     source_size_bytes bigint,
     source_compression character varying(32),
+    running_time_seconds double precision,
     revision_number integer NOT NULL,
     reparse_of_id uuid,
     CONSTRAINT ck_parse_revision_number_positive CHECK ((revision_number >= 1)),
@@ -1211,6 +1220,7 @@ CREATE TABLE public.parse_revision (
     CONSTRAINT ck_parse_revision_record_hash_hex CHECK (((record_sha256 IS NULL) OR ((record_sha256)::text ~ '^[0-9a-f]{64}$'::text))),
     CONSTRAINT ck_parse_revision_source_hash_hex CHECK (((source_content_sha256 IS NULL) OR ((source_content_sha256)::text ~ '^[0-9a-f]{64}$'::text))),
     CONSTRAINT ck_parse_revision_source_size_nonnegative CHECK (((source_size_bytes IS NULL) OR (source_size_bytes >= 0))),
+    CONSTRAINT ck_parse_revision_running_time_nonnegative CHECK (((running_time_seconds IS NULL) OR (running_time_seconds >= (0)::double precision))),
     CONSTRAINT ck_parse_revision_succeeded_payload CHECK ((((status)::text <> 'succeeded'::text) OR ((record_sha256 IS NOT NULL) AND (completed_at IS NOT NULL)))),
     CONSTRAINT ck_parse_revision_timestamps_ordered CHECK (((completed_at IS NULL) OR (started_at IS NULL) OR (completed_at >= started_at))),
     CONSTRAINT parse_revision_parse_completeness CHECK (((parse_completeness)::text = ANY ((ARRAY['not_assessed'::character varying, 'complete'::character varying, 'partial'::character varying])::text[]))),

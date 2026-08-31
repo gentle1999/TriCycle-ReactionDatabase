@@ -5,7 +5,7 @@ import { computed, defineAsyncComponent, ref, watch } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 
 import { api } from "@/api";
-import { formatEnergy, formatNumber, labelFor, shortId } from "@/format";
+import { formatDurationSeconds, formatEnergy, formatNumber, labelFor, shortId } from "@/format";
 import { withoutAccessState } from "@/routeAccessState";
 import type {
   LogicalReactionDetail,
@@ -231,6 +231,12 @@ watch(orderedNodes, (nodes) => { activeNodeId.value = nodes[0]?.id ?? null; }, {
               <div><span>ΔS 反应</span><strong>{{ profile.reaction.entropy_cal_mol_k.toFixed(2) }}</strong><small>cal/mol/K</small></div>
             </template>
           </div>
+          <dl class="thermo-runtime-facts" aria-label="反应路径文件计算用时">
+            <div><dt>前体文件用时</dt><dd>{{ formatDurationSeconds(profile.reactants_running_time_seconds) }}</dd></div>
+            <div><dt>过渡态文件用时</dt><dd>{{ formatDurationSeconds(profile.transition_state_running_time_seconds) }}</dd></div>
+            <div><dt>后体文件用时</dt><dd>{{ formatDurationSeconds(profile.products_running_time_seconds) }}</dd></div>
+            <div><dt>文件总用时</dt><dd>{{ formatDurationSeconds(profile.total_running_time_seconds) }}</dd></div>
+          </dl>
         </article>
       </div>
     </section>
@@ -274,7 +280,7 @@ watch(orderedNodes, (nodes) => { activeNodeId.value = nodes[0]?.id ?? null; }, {
           <div class="geometry-component-list">
             <section v-for="row in selectedGeometryRows" :key="row.key" class="geometry-component-row">
               <header class="geometry-component-row-header"><div><span class="eyebrow">Component {{ row.componentIndex + 1 }}</span><h4>{{ row.participantRole ? labelFor(row.participantRole) : row.componentKey }}</h4></div><code>{{ row.componentKey }}</code></header>
-              <div class="geometry-grid"><article v-for="(geometry, geometryIndex) in row.geometries" :key="geometry.id" class="geometry-item"><header><div><strong>{{ geometry.participant_role ? labelFor(geometry.participant_role) : geometry.component_key }}</strong><span>坐标 {{ geometryIndex + 1 }}</span></div><span v-if="geometry.is_primary" class="primary-tag">主构型</span><RouterLink class="geometry-direct-link" :to="{ name: 'geometry-detail', params: { geometryId: geometry.geometry_id }, query: navigationQuery }" title="查看几何构象" :aria-label="`查看几何构象 ${geometry.geometry_id}`"><ArrowUpRight :size="15" aria-hidden="true" /></RouterLink></header><ChemDoodleGeometry3D :geometry-id="geometry.geometry_id" :project-id="projectId ?? undefined" :label="geometry.canonical_isomeric_smiles ?? undefined" :height="220" /><code class="smiles-line">{{ geometry.canonical_isomeric_smiles ?? "SMILES 不可用" }}</code><dl class="property-grid"><div><dt>电子能 / Eh</dt><dd>{{ formatEnergy(geometry.energy_view.electronic_energy_hartree) }}</dd></div><div><dt>Gibbs / Eh</dt><dd>{{ formatEnergy(geometry.energy_view.gibbs_free_energy_hartree) }}</dd></div><div><dt>熵 / cal mol⁻¹ K⁻¹</dt><dd>{{ formatNumber(geometry.energy_view.entropy_cal_mol_k, 3) }}</dd></div></dl><div class="frame-links"><div v-for="calculation in geometry.calculations" :key="calculation.id" class="frame-link-item"><button type="button" @click="emit('openFrame', calculation.id)"><span>{{ labelFor(calculation.frame_role) }}</span><code>{{ formatEnergy(calculation.selected_energy_hartree) }}</code><ChevronRight :size="15" aria-hidden="true" /></button><RouterLink :to="{ name: 'calculation-detail', params: { frameId: calculation.id }, query: navigationQuery }" title="在独立页面打开" :aria-label="`在独立页面打开计算帧 ${calculation.id}`"><ArrowUpRight :size="15" aria-hidden="true" /></RouterLink></div></div></article></div>
+              <div class="geometry-grid"><article v-for="(geometry, geometryIndex) in row.geometries" :key="geometry.id" class="geometry-item"><header><div><strong>{{ geometry.participant_role ? labelFor(geometry.participant_role) : geometry.component_key }}</strong><span>坐标 {{ geometryIndex + 1 }}</span></div><span v-if="geometry.is_primary" class="primary-tag">主构型</span><RouterLink class="geometry-direct-link" :to="{ name: 'geometry-detail', params: { geometryId: geometry.geometry_id }, query: navigationQuery }" title="查看几何构象" :aria-label="`查看几何构象 ${geometry.geometry_id}`"><ArrowUpRight :size="15" aria-hidden="true" /></RouterLink></header><ChemDoodleGeometry3D :geometry-id="geometry.geometry_id" :project-id="projectId ?? undefined" :label="geometry.canonical_isomeric_smiles ?? undefined" :height="220" /><code class="smiles-line">{{ geometry.canonical_isomeric_smiles ?? "SMILES 不可用" }}</code><dl class="property-grid"><div><dt>电子能 / Eh</dt><dd>{{ formatEnergy(geometry.energy_view.electronic_energy_hartree) }}</dd></div><div><dt>Gibbs / Eh</dt><dd>{{ formatEnergy(geometry.energy_view.gibbs_free_energy_hartree) }}</dd></div><div><dt>熵 / cal mol⁻¹ K⁻¹</dt><dd>{{ formatNumber(geometry.energy_view.entropy_cal_mol_k, 3) }}</dd></div></dl><div class="frame-links"><div v-for="calculation in geometry.calculations" :key="calculation.id" class="frame-link-item"><button type="button" @click="emit('openFrame', calculation.id)"><span>{{ labelFor(calculation.frame_role) }}</span><code>{{ formatEnergy(calculation.selected_energy_hartree) }}</code><code class="frame-link-runtime" :title="`逐帧计算用时：${formatDurationSeconds(calculation.running_time_seconds)}`">{{ formatDurationSeconds(calculation.running_time_seconds) }}</code><ChevronRight :size="15" aria-hidden="true" /></button><RouterLink :to="{ name: 'calculation-detail', params: { frameId: calculation.id }, query: navigationQuery }" title="在独立页面打开" :aria-label="`在独立页面打开计算帧 ${calculation.id}`"><ArrowUpRight :size="15" aria-hidden="true" /></RouterLink></div></div></article></div>
             </section>
           </div>
         </section>

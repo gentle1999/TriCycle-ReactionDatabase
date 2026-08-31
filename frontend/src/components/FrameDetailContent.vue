@@ -4,7 +4,7 @@ import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 
 import { api, apiUrl } from "@/api";
-import { formatBytes, formatEnergy, formatNumber, labelFor, shortId, statusTone } from "@/format";
+import { formatBytes, formatDurationSeconds, formatEnergy, formatNumber, labelFor, shortId, statusTone } from "@/format";
 import { withoutAccessState } from "@/routeAccessState";
 import type { CalculationFrameDetail, ScientificArrayPreview } from "@/types";
 
@@ -264,6 +264,7 @@ onBeforeUnmount(() => previewController?.abort());
       <div><dt>角色</dt><dd>{{ labelFor(frame.frame_role) }}</dd></div>
       <div><dt>电荷 / 多重度</dt><dd>{{ frame.charge }} / {{ frame.multiplicity }}</dd></div>
       <div><dt>能量 / Eh</dt><dd>{{ formatEnergy(frame.selected_energy_hartree) }}</dd></div>
+      <div><dt title="该计算帧记录的运行时间">逐帧计算用时</dt><dd>{{ formatDurationSeconds(frame.running_time_seconds) }}</dd></div>
       <div><dt>负频数</dt><dd>{{ frame.negative_frequency_count ?? "—" }}</dd></div>
     </dl>
 

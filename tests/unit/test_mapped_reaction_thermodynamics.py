@@ -10,6 +10,9 @@ from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics im
     build_mapped_reaction_thermodynamics,
     format_composite_level_of_theory,
 )
+from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics_persistence import (
+    _runtime_for_geometry_ids,
+)
 
 
 def _candidate(
@@ -395,3 +398,24 @@ def test_mapped_reaction_thermodynamics_ignores_candidates_outside_participant()
 
     assert len(result.profiles) == 1
     assert result.profiles[0].reactants.topologies[0].geometry_id == (expected_reactant.geometry_id)
+
+
+def test_profile_runtime_deduplicates_files_and_uses_latest_revision() -> None:
+    shared_file = uuid4()
+    second_file = uuid4()
+    first_geometry = uuid4()
+    second_geometry = uuid4()
+    runtimes = {
+        first_geometry: {
+            shared_file: (1, 120.0),
+            second_file: (1, 30.0),
+        },
+        second_geometry: {
+            shared_file: (2, 125.0),
+        },
+    }
+
+    assert _runtime_for_geometry_ids(
+        {first_geometry, second_geometry},
+        runtimes,
+    ) == pytest.approx(155.0)

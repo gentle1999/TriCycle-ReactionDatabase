@@ -468,6 +468,7 @@ erDiagram
         string source_content_sha256 "nullable"
         bigint source_size_bytes "nullable"
         string source_compression "nullable"
+        float running_time_seconds "nullable"
         boolean source_complete "nullable"
         enum parse_completeness
         jsonb parse_diagnostics

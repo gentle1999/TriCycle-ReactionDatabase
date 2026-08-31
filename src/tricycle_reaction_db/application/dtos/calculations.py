@@ -151,6 +151,7 @@ class ParseRevisionRecord(BaseModel):
     source_content_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     source_size_bytes: int | None = Field(default=None, ge=0)
     source_compression: str | None = Field(default=None, min_length=1, max_length=32)
+    running_time_seconds: float | None = Field(default=None, ge=0)
     source_complete: bool | None = None
     parse_completeness: ParseCompleteness = ParseCompleteness.NOT_ASSESSED
     parse_diagnostics: list[dict[str, Any]] = Field(default_factory=list)

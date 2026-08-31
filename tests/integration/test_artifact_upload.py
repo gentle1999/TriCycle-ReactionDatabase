@@ -175,6 +175,9 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
                 .order_by(col(ParseRevision.created_at).desc())
             ).first()
             assert revision is not None
+            assert revision.running_time_seconds == pytest.approx(
+                float(parsed.chem_file.running_time.to("second").magnitude)
+            )
             frame_count = session.exec(
                 select(func.count())
                 .select_from(CalculationFrame)
@@ -186,6 +189,10 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
                 )
             ).one()
             assert frame_count == parsed.source_frame_count == 23
+            frame_runtime_sum = sum(
+                record.frame.running_time_seconds or 0.0 for record in parsed.frame_records
+            )
+            assert revision.running_time_seconds != pytest.approx(frame_runtime_sum)
             assert ingestion.status is ArtifactIngestionStatus.SUCCEEDED
             assert ingestion.transition_state_frame_count == 1
             assert inference.status is TransitionStateInferenceStatus.SUCCEEDED

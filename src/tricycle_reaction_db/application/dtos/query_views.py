@@ -374,6 +374,7 @@ class ParseRevisionSummary(QueryView):
     parse_completeness: str
     status: str
     record_sha256: str | None = None
+    running_time_seconds: float | None = None
     error_code: str | None = None
     error_message: str | None = None
     started_at: datetime | None = None
@@ -1003,6 +1004,12 @@ class MappedReactionThermodynamicsProfile(QueryView):
     products: ThermodynamicStateView | None = None
     activation: ThermodynamicDifferenceView | None = None
     reaction: ThermodynamicDifferenceView | None = None
+    # Runtime is summed from distinct source files for each state.  It is
+    # intentionally separate from the per-frame running_time_seconds field.
+    reactants_running_time_seconds: float | None = None
+    transition_state_running_time_seconds: float | None = None
+    products_running_time_seconds: float | None = None
+    total_running_time_seconds: float | None = None
 
 
 class MappedReactionThermodynamics(QueryView):

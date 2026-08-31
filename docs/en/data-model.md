@@ -81,6 +81,11 @@ frame remains an artifact, but is `filtered`, not `succeeded`. Visible
 and `failed`. Explicit reparse appends a new revision and preserves a previous
 successful result.
 
+`ParseRevision.running_time_seconds` stores the file-level calculation runtime
+reported by MolOP. `CalculationFrame.running_time_seconds` stores per-frame
+runtime; the file-level value has different semantics and must not be replaced
+by a sum of frame runtimes.
+
 Local import is a streaming candidate queue. `IMPORT_PIPELINE_WINDOW_FILES`
 sets the prefetched candidate pool, `TRICYCLE_MOLOP_BATCH_N_JOBS` sets concurrent
 file workers, and `IMPORT_COMMIT_BATCH_FILES` only sets the completed-result
@@ -130,6 +135,12 @@ authoritative graph or geometry identity. `GeometryEnergyView` and reaction
 thermodynamic profiles are versioned derived read models that select a source
 Frame/Protocol and report `selected`, `missing`, or `ambiguous`; they never
 rewrite original observations.
+
+Each mapped-reaction thermodynamic profile also stores file-level runtimes for
+reactants, transition state, products, and the full path. Values are summed
+over distinct `ArtifactFile` ids referenced by the selected calculation frames;
+the full-path value uses the union across the three states. The CSV export
+contains these four runtime columns. Per-frame runtime sums are not used.
 
 ## Storage and Deletion
 

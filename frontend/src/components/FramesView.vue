@@ -2,7 +2,7 @@
 import { ChevronRight, Search } from "@lucide/vue";
 import { computed, ref } from "vue";
 
-import { formatEnergy, labelFor, statusTone } from "@/format";
+import { formatDurationSeconds, formatEnergy, labelFor, statusTone } from "@/format";
 import type { CalculationFrameSummary } from "@/types";
 
 const props = defineProps<{
@@ -63,6 +63,7 @@ const filteredFrames = computed(() => {
             <th>角色</th>
             <th>分子拓扑</th>
             <th>能量 / Hartree</th>
+            <th>逐帧用时</th>
             <th>SCF</th>
             <th>优化</th>
             <th><span class="sr-only">详情</span></th>
@@ -70,10 +71,10 @@ const filteredFrames = computed(() => {
         </thead>
         <tbody>
           <tr v-if="loading && !frames.length">
-            <td colspan="7"><div class="table-loading">正在加载计算帧</div></td>
+            <td colspan="8"><div class="table-loading">正在加载计算帧</div></td>
           </tr>
           <tr v-else-if="!filteredFrames.length">
-            <td colspan="7"><div class="compact-empty">没有匹配的计算帧</div></td>
+            <td colspan="8"><div class="compact-empty">没有匹配的计算帧</div></td>
           </tr>
           <tr
             v-for="frame in filteredFrames"
@@ -91,6 +92,7 @@ const filteredFrames = computed(() => {
             <td><span class="role-pill">{{ labelFor(frame.frame_role) }}</span></td>
             <td><code>{{ frame.canonical_isomeric_smiles ?? "SMILES 不可用" }}</code></td>
             <td class="number-cell">{{ formatEnergy(frame.selected_energy_hartree) }}</td>
+            <td class="number-cell">{{ formatDurationSeconds(frame.running_time_seconds) }}</td>
             <td><span class="status-dot" :class="statusTone(frame.scf_status)">{{ labelFor(frame.scf_status) }}</span></td>
             <td><span class="status-dot" :class="statusTone(frame.optimization_status)">{{ labelFor(frame.optimization_status) }}</span></td>
             <td><ChevronRight :size="16" aria-hidden="true" /></td>

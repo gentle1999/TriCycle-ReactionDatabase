@@ -92,6 +92,38 @@ export function formatBytes(value: number | null | undefined): string {
   return `${formatted} ${units[unit]}`;
 }
 
+/** Format a non-negative runtime without implying that frame times sum to it. */
+export function formatDurationSeconds(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return i18n.global.t("common.none");
+  }
+  const seconds = Math.max(0, value);
+  const parts: string[] = [];
+  let remainder = seconds;
+
+  if (remainder >= 86_400) {
+    const days = Math.floor(remainder / 86_400);
+    parts.push(`${days} d`);
+    remainder -= days * 86_400;
+  }
+  if (remainder >= 3_600) {
+    const hours = Math.floor(remainder / 3_600);
+    parts.push(`${hours} h`);
+    remainder -= hours * 3_600;
+  }
+  if (remainder >= 60) {
+    const minutes = Math.floor(remainder / 60);
+    parts.push(`${minutes} m`);
+    remainder -= minutes * 60;
+  }
+
+  if (remainder > 0 || parts.length === 0) {
+    const digits = Number.isInteger(remainder) ? 0 : remainder < 10 ? 2 : 1;
+    parts.push(`${formatNumber(remainder, digits)} s`);
+  }
+  return parts.join(" ");
+}
+
 export function shortId(value: string | null | undefined): string {
   return value ? `${value.slice(0, 8)}…${value.slice(-4)}` : i18n.global.t("common.none");
 }

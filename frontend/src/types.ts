@@ -198,6 +198,10 @@ export interface MappedReactionThermodynamicsProfile {
   products: { enthalpy_hartree: number; gibbs_free_energy_hartree: number; entropy_cal_mol_k: number } | null;
   activation: ThermodynamicDifference | null;
   reaction: ThermodynamicDifference | null;
+  reactants_running_time_seconds: number | null;
+  transition_state_running_time_seconds: number | null;
+  products_running_time_seconds: number | null;
+  total_running_time_seconds: number | null;
 }
 
 export interface MappedReactionThermodynamics {
@@ -459,6 +463,31 @@ export interface ArtifactSummary {
   transition_state_frame_count: number | null;
   ingestion_error_code: string | null;
   ingestion_error_message: string | null;
+}
+
+export interface ParseRevisionSummary {
+  id: string;
+  artifact_file_id: string;
+  revision_number: number;
+  reparse_of_id: string | null;
+  export_schema_version: string;
+  parser_name: string;
+  parser_version: string;
+  molop_version: string;
+  source_format: string;
+  parse_completeness: string;
+  status: string;
+  record_sha256: string | null;
+  running_time_seconds: number | null;
+  error_code: string | null;
+  error_message: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export interface ParseRevisionPage {
+  items: ParseRevisionSummary[];
+  page: PageInfo;
 }
 
 export interface CurrentUser {

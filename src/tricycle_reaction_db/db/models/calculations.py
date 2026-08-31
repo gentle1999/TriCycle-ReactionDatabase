@@ -101,6 +101,10 @@ class ParseRevision(SQLModel, table=True):
             name="ck_parse_revision_timestamps_ordered",
         ),
         CheckConstraint(
+            "running_time_seconds IS NULL OR running_time_seconds >= 0",
+            name="ck_parse_revision_running_time_nonnegative",
+        ),
+        CheckConstraint(
             "status <> 'succeeded' OR (record_sha256 IS NOT NULL AND completed_at IS NOT NULL)",
             name="ck_parse_revision_succeeded_payload",
         ),
@@ -159,6 +163,9 @@ class ParseRevision(SQLModel, table=True):
     source_content_sha256: str | None = Field(default=None, max_length=64)
     source_size_bytes: int | None = Field(default=None, sa_type=BigInteger)
     source_compression: str | None = Field(default=None, max_length=32)
+    # Runtime reported by the quantum-chemistry file as a file-level fact.
+    # Frame-level ``running_time_seconds`` remains the per-frame counterpart.
+    running_time_seconds: float | None = Field(default=None, sa_type=Float)
     source_complete: bool | None = Field(default=None)
     parse_completeness: ParseCompleteness = Field(
         default=ParseCompleteness.NOT_ASSESSED,

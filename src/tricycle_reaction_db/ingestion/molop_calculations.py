@@ -256,6 +256,7 @@ def parse_revision_record_from_molop(
             else file_payload.get("artifact_size_bytes")
         ),
         source_compression=source_compression,
+        running_time_seconds=_quantity(file_payload.get("running_time"), "second"),
         source_complete=file_payload.get("source_complete"),
         parse_completeness=ParseCompleteness(
             _enum_value(file_payload.get("parse_completeness") or ParseCompleteness.NOT_ASSESSED)

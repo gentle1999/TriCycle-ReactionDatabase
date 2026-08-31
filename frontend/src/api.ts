@@ -22,6 +22,7 @@ import type {
   AuditEventView,
   ReactionEnergyProfile,
   MappedReactionThermodynamics,
+  ParseRevisionPage,
   ProjectInvitationCreateResult,
   ProjectInvitationView,
   ProjectMemberView,
@@ -642,6 +643,24 @@ export const api = {
         minimum_imaginary_frequency_cm1: options.minimumImaginaryFrequencyCm1 ?? null,
         maximum_imaginary_frequency_cm1: options.maximumImaginaryFrequencyCm1 ?? null,
         reactant_product_changed: options.reactantProductChanged ?? null,
+        limit: options.limit ?? 50,
+        offset: options.offset ?? 0,
+      },
+      signal,
+    ),
+  parseRevisions: (options: {
+    artifactFileId?: string;
+    status?: string;
+    sourceFormat?: string;
+    limit?: number;
+    offset?: number;
+  } = {}, signal?: AbortSignal) =>
+    requestJson<ParseRevisionPage>(
+      "/api/parse_revision_query_service/list_parse_revisions",
+      {
+        artifact_file_id: options.artifactFileId ?? null,
+        status: options.status ?? null,
+        source_format: options.sourceFormat ?? null,
         limit: options.limit ?? 50,
         offset: options.offset ?? 0,
       },

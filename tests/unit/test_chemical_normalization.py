@@ -395,6 +395,69 @@ def test_trusted_molgr_e_z_stereo_gets_serializable_direction_metadata() -> None
     assert "/" in geometry_smiles or "\\" in geometry_smiles
 
 
+@pytest.mark.parametrize(
+    ("source_smiles", "expected_stereo"),
+    [
+        ("C/C=C/C", Chem.BondStereo.STEREOE),
+        ("C/C=C\\C", Chem.BondStereo.STEREOZ),
+    ],
+)
+def test_stale_double_bond_direction_cannot_flip_serialized_e_z(
+    source_smiles: str,
+    expected_stereo: Chem.BondStereo,
+) -> None:
+    molecule = Chem.AddHs(Chem.MolFromSmiles(source_smiles))
+    directional_bond = next(
+        bond for bond in molecule.GetBonds() if bond.GetBondDir() != Chem.BondDir.NONE
+    )
+    directional_bond.SetBondDir(
+        Chem.BondDir.ENDDOWNRIGHT
+        if directional_bond.GetBondDir() == Chem.BondDir.ENDUPRIGHT
+        else Chem.BondDir.ENDUPRIGHT
+    )
+
+    repaired = ensure_serializable_double_bond_stereochemistry(molecule)
+    serialized = Chem.MolToSmiles(
+        repaired,
+        canonical=True,
+        isomericSmiles=True,
+        allHsExplicit=True,
+    )
+    reparsed = Chem.MolFromSmiles(serialized)
+    assert reparsed is not None
+    double_bond = next(
+        bond for bond in reparsed.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE
+    )
+    assert double_bond.GetStereo() == expected_stereo
+
+
+def test_substituted_double_bond_clears_provisional_neighbor_directions() -> None:
+    molecule = Chem.AddHs(Chem.MolFromSmiles("C/C(Cl)=C(Br)/C"))
+    double_bond = next(
+        bond for bond in molecule.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE
+    )
+    # Use a non-CIP stereo-atom pair to force the direction constraint solver
+    # after SetDoubleBondNeighborDirections has populated provisional flags.
+    double_bond.SetStereoAtoms(0, 4)
+    double_bond.SetStereo(Chem.BondStereo.STEREOE)
+    for bond in molecule.GetBonds():
+        bond.SetBondDir(Chem.BondDir.NONE)
+
+    repaired = ensure_serializable_double_bond_stereochemistry(molecule)
+    serialized = Chem.MolToSmiles(
+        repaired,
+        canonical=True,
+        isomericSmiles=True,
+        allHsExplicit=True,
+    )
+    reparsed = Chem.MolFromSmiles(serialized)
+    assert reparsed is not None
+    reparsed_double_bond = next(
+        bond for bond in reparsed.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE
+    )
+    assert reparsed_double_bond.GetStereo() == Chem.BondStereo.STEREOE
+
+
 def test_trusted_molgr_normalization_preserves_e_z_stereochemistry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -456,16 +456,15 @@ def _serialized_double_bond_keys_match(
     serialized: dict[frozenset[int], Chem.BondStereo],
     expected: dict[frozenset[int], Chem.BondStereo],
 ) -> bool:
-    """Check that every assigned double bond was emitted with stereo syntax.
+    """Check that every assigned double bond retains its E/Z designation.
 
-    E/Z is relative to a double bond's chosen stereo-atom pair.  RDKit may
-    choose a different equivalent pair after canonicalization (especially in
-    conjugated rings), so comparing only the enum can report a false flip even
-    when the physical stereochemistry is unchanged.  The topology's assigned
-    value remains authoritative; this check is only for serialization coverage.
+    The atom-map key identifies the double bond independently of canonical
+    traversal. The value must also match: a stale or contradictory BondDir can
+    otherwise make the SMILES writer emit the opposite E/Z state while the
+    source molecule still reports its original BondStereo value.
     """
 
-    return set(serialized) == set(expected)
+    return serialized == expected
 
 
 def _restore_double_bond_directions_from_smiles_reference(
@@ -520,6 +519,13 @@ def _solve_double_bond_direction_constraints(
 ) -> bool:
     """Set writer directions while respecting bonds shared by two E/Z bonds."""
 
+    # ``SetDoubleBondNeighborDirections`` may have assigned directions to more
+    # than the selected stereo-atom pair on a substituted alkene. Clear those
+    # provisional flags before applying the solved constraint set; otherwise
+    # RDKit can suppress the SMILES stereo marker or emit a contradictory one.
+    for bond in mol.GetBonds():
+        bond.SetBondDir(Chem.BondDir.NONE)
+
     constraints: list[tuple[int, int, int]] = []
     for bond in stereo_bonds:
         stereo_atoms = list(bond.GetStereoAtoms())
@@ -558,9 +564,7 @@ def _solve_double_bond_direction_constraints(
     for first_bond_index, second_bond_index, parity in constraints:
         if first_bond_index not in directions:
             directions[first_bond_index] = (
-                directions[second_bond_index] ^ parity
-                if second_bond_index in directions
-                else 0
+                directions[second_bond_index] ^ parity if second_bond_index in directions else 0
             )
         expected_second = directions[first_bond_index] ^ parity
         if second_bond_index in directions and directions[second_bond_index] != expected_second:

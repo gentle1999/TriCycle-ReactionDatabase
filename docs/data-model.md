@@ -63,6 +63,10 @@ application upload service；CLI 只把本地路径作为字节来源。上传�
 `pending`、`succeeded`、`partial`、`filtered` 或 `failed`，前端据此区分正在解析、部分成功、
 无计算帧与真正失败。显式 reparse 创建新的 revision，不覆盖已有成功结果。
 
+`ParseRevision.running_time_seconds` 保存 MolOP 报告的文件级计算用时；
+`CalculationFrame.running_time_seconds` 保存逐帧用时。两者语义不同，文件级用时不能用逐帧用时
+求和替代。
+
 本地导入是流式候选队列：`IMPORT_PIPELINE_WINDOW_FILES` 决定预取候选池，
 `TRICYCLE_MOLOP_BATCH_N_JOBS` 决定同时运行的文件 worker，
 `IMPORT_COMMIT_BATCH_FILES` 只决定已完成结果的持久化/checkpoint 微批。候选池应大于 worker
@@ -101,6 +105,11 @@ application upload service；CLI 只把本地路径作为字节来源。上传�
 RDKit binary Mol、reaction 和 fingerprint 是查询投影，不替代权威 graph/geometry identity。
 `GeometryEnergyView` 与反应热力学 profile 是版本化派生读模型，选择来源 Frame/Protocol 并
 标记 `selected`、`missing` 或 `ambiguous`；不会改写原始计算结果。
+
+每个 `MappedReaction` 热力学 profile 还记录前体、过渡态、后体和全路径文件级计算用时。
+这些值按 profile 实际涉及的计算帧所属 `ArtifactFile` 去重后，将各文件对应最新解析 revision
+的 `ParseRevision.running_time_seconds` 相加；全路径总用时对三部分的文件并集再次去重。反应路径
+CSV 导出包含这四列，不能用逐帧用时之和替代。
 
 ## 存储与删除
 

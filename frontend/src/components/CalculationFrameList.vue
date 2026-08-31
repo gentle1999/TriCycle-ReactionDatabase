@@ -4,7 +4,7 @@ import { computed } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 
 import { UiStatusBadge } from "@/components/ui";
-import { formatEnergy, labelFor } from "@/format";
+import { formatDurationSeconds, formatEnergy, labelFor } from "@/format";
 import { withoutAccessState } from "@/routeAccessState";
 import type { CalculationFrameSummary } from "@/types";
 
@@ -36,6 +36,7 @@ const navigationQuery = computed(() => withoutAccessState(route.query));
         <span class="frame-list-main"><strong>{{ labelFor(frame.frame_role) }}</strong><small>segment {{ frame.segment_index + 1 }} · frame {{ frame.frame_index + 1 }}</small></span>
         <span class="frame-list-energy">{{ formatEnergy(frame.selected_energy_hartree) }}</span>
         <UiStatusBadge :status="frame.optimization_status" />
+        <span class="frame-list-runtime" :title="`逐帧计算用时：${formatDurationSeconds(frame.running_time_seconds)}`">{{ formatDurationSeconds(frame.running_time_seconds) }}</span>
         <Eye :size="15" aria-hidden="true" />
       </button>
       <RouterLink class="frame-list-direct-link" :to="{ name: 'calculation-detail', params: { frameId: frame.id }, query: navigationQuery }" title="在独立页面打开" :aria-label="`在独立页面打开计算帧 ${frame.id}`"><ArrowUpRight :size="15" aria-hidden="true" /></RouterLink>

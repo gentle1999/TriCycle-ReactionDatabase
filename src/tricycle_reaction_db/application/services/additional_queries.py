@@ -445,6 +445,7 @@ def _parse_revision_summary(revision: ParseRevision) -> ParseRevisionSummary:
         parse_completeness=_enum_value(revision.parse_completeness),
         status=_enum_value(revision.status),
         record_sha256=revision.record_sha256,
+        running_time_seconds=revision.running_time_seconds,
         error_code=revision.error_code,
         error_message=revision.error_message,
         started_at=revision.started_at,
@@ -2038,6 +2039,10 @@ class ReactionEnergyQueryService(UseCaseService):  # type: ignore[misc]
                     and row.reaction_entropy_cal_mol_k is not None
                     else None
                 ),
+                reactants_running_time_seconds=row.reactants_running_time_seconds,
+                transition_state_running_time_seconds=row.transition_state_running_time_seconds,
+                products_running_time_seconds=row.products_running_time_seconds,
+                total_running_time_seconds=row.total_running_time_seconds,
             )
             for row in rows
         ]

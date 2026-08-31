@@ -489,6 +489,23 @@ class MappedReactionThermodynamicProfile(SQLModel, table=True):
             "mapped_reaction_id",
             "activation_gibbs_free_energy_kcal_mol",
         ),
+        CheckConstraint(
+            "reactants_running_time_seconds IS NULL OR reactants_running_time_seconds >= 0",
+            name="ck_mapped_rxn_profile_reactants_runtime_nonnegative",
+        ),
+        CheckConstraint(
+            "transition_state_running_time_seconds IS NULL OR "
+            "transition_state_running_time_seconds >= 0",
+            name="ck_mapped_rxn_profile_ts_runtime_nonnegative",
+        ),
+        CheckConstraint(
+            "products_running_time_seconds IS NULL OR products_running_time_seconds >= 0",
+            name="ck_mapped_rxn_profile_products_runtime_nonnegative",
+        ),
+        CheckConstraint(
+            "total_running_time_seconds IS NULL OR total_running_time_seconds >= 0",
+            name="ck_mapped_rxn_profile_total_runtime_nonnegative",
+        ),
     )
 
     id: UUID | None = uuid_primary_key_field()
@@ -516,6 +533,11 @@ class MappedReactionThermodynamicProfile(SQLModel, table=True):
     products_enthalpy_hartree: float | None = Field(default=None)
     products_gibbs_free_energy_hartree: float | None = Field(default=None)
     products_entropy_cal_mol_k: float | None = Field(default=None)
+    # Distinct source-file runtimes for each state and their global union.
+    reactants_running_time_seconds: float | None = Field(default=None)
+    transition_state_running_time_seconds: float | None = Field(default=None)
+    products_running_time_seconds: float | None = Field(default=None)
+    total_running_time_seconds: float | None = Field(default=None)
     activation_enthalpy_kcal_mol: float | None = Field(
         default=None,
         sa_column=Column(

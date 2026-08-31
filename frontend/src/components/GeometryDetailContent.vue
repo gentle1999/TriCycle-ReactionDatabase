@@ -4,7 +4,7 @@ import { computed } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 
 import { apiUrl } from "@/api";
-import { formatEnergy, formatNumber, shortId } from "@/format";
+import { formatDurationSeconds, formatEnergy, formatNumber, shortId } from "@/format";
 import { withoutAccessState } from "@/routeAccessState";
 import type { GeometryDetail } from "@/types";
 
@@ -97,8 +97,11 @@ function geometryDownloadUrl(format: "sdf" | "xyz"): string {
       <div class="frame-list">
         <div v-for="item in geometry.frames" :key="item.id" class="frame-list-item">
           <button class="frame-list-row" type="button" @click="emit('openFrame', item.id)">
+            <span class="frame-list-index">{{ String(item.file_frame_index + 1).padStart(2, "0") }}</span>
             <span class="frame-list-main"><strong>{{ item.original_filename }}</strong><small>frame {{ item.file_frame_index + 1 }} · {{ item.frame_role }}</small></span>
-            <span class="frame-list-energy">{{ formatEnergy(item.selected_energy_hartree) }}</span><ChevronRight :size="15" aria-hidden="true" />
+            <span class="frame-list-energy">{{ formatEnergy(item.selected_energy_hartree) }}</span>
+            <span class="frame-list-runtime" :title="`逐帧计算用时：${formatDurationSeconds(item.running_time_seconds)}`">{{ formatDurationSeconds(item.running_time_seconds) }}</span>
+            <ChevronRight :size="15" aria-hidden="true" />
           </button>
           <RouterLink class="frame-list-direct-link" :to="{ name: 'calculation-detail', params: { frameId: item.id }, query: navigationQuery }" title="在独立页面打开" :aria-label="`在独立页面打开计算帧 ${item.id}`"><ArrowUpRight :size="15" aria-hidden="true" /></RouterLink>
         </div>

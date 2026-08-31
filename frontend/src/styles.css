@@ -4133,6 +4133,39 @@ table.data-table {
 .thermo-metrics small { color: var(--ink-soft); font-size: 10px; }
 .thermo-metrics strong { font-family: var(--mono); font-size: 18px; }
 
+.thermo-runtime-facts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 10px 0 0;
+  border-top: 1px solid var(--line);
+  border-left: 1px solid var(--line);
+}
+
+.thermo-runtime-facts > div {
+  min-width: 0;
+  padding: 8px 10px;
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.thermo-runtime-facts dt,
+.thermo-runtime-facts dd {
+  margin: 0;
+}
+
+.thermo-runtime-facts dt {
+  color: var(--ink-soft);
+  font-size: 9px;
+}
+
+.thermo-runtime-facts dd {
+  margin-top: 4px;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
 .reaction-potential-energy {
   margin-top: 30px;
   padding-top: 18px;
@@ -5374,14 +5407,16 @@ table.data-table {
 .geometry-frame-section > header > span { color: var(--ink-soft); font-family: var(--mono); font-size: 10px; }
 
 .frame-list { display: grid; gap: 1px; }
-.frame-list-row { min-width: 0; display: grid; grid-template-columns: 32px minmax(0, 1fr) auto auto 15px; align-items: center; gap: 9px; width: 100%; padding: 9px 10px; color: inherit; background: var(--surface); border: 0; border-bottom: 1px solid var(--line); text-align: left; cursor: pointer; }
+.frame-list-row { min-width: 0; display: grid; grid-template-columns: 32px minmax(0, 1fr) auto auto auto 15px; align-items: center; gap: 9px; width: 100%; padding: 9px 10px; color: inherit; background: var(--surface); border: 0; border-bottom: 1px solid var(--line); text-align: left; cursor: pointer; }
 .frame-list-row:hover { background: var(--surface-muted); }
+.geometry-frame-section .frame-list-row { grid-template-columns: 32px minmax(0, 1fr) auto auto 15px; }
 .frame-list-index { color: var(--red); font-family: var(--mono); font-size: 10px; }
 .frame-list-main { min-width: 0; display: grid; gap: 3px; }
 .frame-list-main strong,.frame-list-main small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .frame-list-main strong { font-size: 11px; }
 .frame-list-main small { color: var(--ink-soft); font-size: 9px; }
 .frame-list-energy { color: var(--ink-soft); font-family: var(--mono); font-size: 10px; white-space: nowrap; }
+.frame-list-runtime { color: var(--ink-soft); font-family: var(--mono); font-size: 10px; white-space: nowrap; }
 .frame-list-state { display: flex; align-items: center; gap: 7px; padding: 18px 10px; color: var(--ink-soft); font-size: 10px; }
 .frame-list-state.is-error { color: var(--danger); }
 .artifact-row { cursor: pointer; }
@@ -5518,6 +5553,9 @@ table.data-table {
   .thermo-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .thermo-metrics > div:nth-child(odd) { border-left: 0; }
   .thermo-metrics > div:nth-child(n + 3) { border-top: 1px solid var(--line); }
+  .thermo-runtime-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .thermo-runtime-facts > div:nth-child(odd) { border-left: 0; }
+  .thermo-runtime-facts > div:nth-child(n + 3) { border-top: 1px solid var(--line); }
   .thermo-profile-header { align-items: start; flex-direction: column; gap: 6px; }
   .reaction-potential-energy-header { align-items: start; flex-direction: column; gap: 6px; }
   .reaction-potential-energy-context { max-width: 100%; text-align: left; }
@@ -5558,7 +5596,8 @@ table.data-table {
   .geometry-detail-drawer { top: 60px; width: 100vw; padding-right: 16px; padding-left: 16px; }
   .geometry-detail-drawer .drawer-header { margin-right: -16px; margin-left: -16px; padding-right: 16px; padding-left: 16px; }
   .artifact-frames-panel { width: calc(100vw - 28px); padding-left: 12px; }
-  .frame-list-row { grid-template-columns: 24px minmax(0, 1fr) auto 15px; }
+  .frame-list-row { grid-template-columns: 24px minmax(0, 1fr) auto auto 15px; }
+  .geometry-frame-section .frame-list-row { grid-template-columns: 24px minmax(0, 1fr) auto auto 15px; }
   .frame-list-row .status-dot { display: none; }
   .frame-movie-controls { gap: 4px; padding-right: 7px; padding-left: 7px; }
   .frame-movie-controls .icon-button { width: 28px; height: 28px; }
