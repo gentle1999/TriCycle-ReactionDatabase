@@ -6,12 +6,14 @@ import asyncio
 import copy
 import gzip
 import io
+import json
 import logging
 import multiprocessing
 import os
 import tempfile
 import threading
 import zlib
+from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, MutableMapping
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import asynccontextmanager, suppress
@@ -111,9 +113,11 @@ from tricycle_reaction_db.domain.enums import (
 from tricycle_reaction_db.domain.reaction_frames import is_transition_state_frame_eligible
 from tricycle_reaction_db.ingestion import (
     MolOPFrameRecords,
+    StereoProjectionError,
     configure_molecular_graph_reconstruction,
     ensure_serializable_double_bond_stereochemistry,
     frame_records_from_molop,
+    infer_molgr_stereochemistry_from_3d,
     normalize_topology,
     normalize_topology_with_mapping,
 )
@@ -185,6 +189,7 @@ class _FailedInference:
     imaginary_frequency_cm1: float
     error_code: str
     error_message: str
+    error_metadata: dict[str, Any] | None = None
 
 
 _Inference = _SuccessfulInference | _FailedInference
@@ -217,6 +222,8 @@ class _ProcessedFrame:
     topology_reconstruction_status: str | None
     error_code: str | None = None
     error_message: str | None = None
+    error_type: str | None = None
+    error_metadata: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -438,21 +445,68 @@ def _frame_failure_diagnostic(
     error: Exception,
     stage: str,
     segment_index: int | None = None,
+    error_code: str | None = None,
+    error_type: str | None = None,
+    error_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    code = {
-        "conversion": "frame_parse_failed",
-        "inference": "ts_inference_failed",
-    }.get(stage, "frame_processing_failed")
+    explicit_code = getattr(error, "error_code", None)
+    code = error_code or (
+        explicit_code
+        if isinstance(explicit_code, str) and explicit_code
+        else {
+            "conversion": "frame_conversion_failed",
+            "inference": "ts_inference_failed",
+            "persistence": "frame_persistence_failed",
+        }.get(stage, "frame_processing_failed")
+    )
+    if error_metadata is None:
+        evidence = getattr(error, "evidence", None)
+        if callable(evidence):
+            candidate = evidence()
+            if isinstance(candidate, dict):
+                error_metadata = candidate
     diagnostic = {
         "code": code,
         "stage": stage,
         "file_frame_index": file_frame_index,
-        "error_type": type(error).__name__,
+        "error_type": error_type or type(error).__name__,
         "message": str(error) or type(error).__name__,
     }
     if segment_index is not None:
         diagnostic["segment_index"] = segment_index
+    if error_metadata:
+        diagnostic["metadata"] = error_metadata
     return diagnostic
+
+
+def _parse_failure_metadata(
+    error: Exception,
+    *,
+    parsed: _ParsedArtifact | None = None,
+) -> dict[str, Any]:
+    """Build a compact, queryable file-level failure summary."""
+
+    metadata: dict[str, Any] = {}
+    evidence = getattr(error, "evidence", None)
+    if callable(evidence):
+        candidate = evidence()
+        if isinstance(candidate, dict):
+            metadata.update(candidate)
+    if parsed is not None:
+        diagnostics = list(parsed.parse_diagnostics)
+        counts = Counter(str(item.get("code", "unknown")) for item in diagnostics)
+        metadata.update(
+            {
+                "source_frame_count": parsed.source_frame_count,
+                "persisted_frame_count": 0,
+                "diagnostic_counts": dict(sorted(counts.items())),
+                "diagnostic_samples": diagnostics[:8],
+            }
+        )
+    metadata.setdefault("failure_stage", "artifact_processing")
+    metadata.setdefault("error_type", type(error).__name__)
+    metadata.setdefault("message", str(error) or type(error).__name__)
+    return metadata
 
 
 def _frame_records_from_chem_file(
@@ -1297,18 +1351,34 @@ def _mapped_reaction_smiles(reactant: Chem.Mol, product: Chem.Mol) -> str:
     sides: list[str] = []
     for endpoint in (reactant, product):
         mapped = Chem.Mol(endpoint)
-        mapped.RemoveAllConformers()
+        # The endpoint has already been assigned from its 3D conformer by
+        # ``_infer_endpoint_stereochemistry_from_3d``. This function is only a
+        # one-way projection of that frozen graph; it must never infer stereo
+        # again or let a SMILES traversal become a new source of truth.
+        for prop_name in ("_smilesAtomOutputOrder", "_smilesBondOutputOrder"):
+            if mapped.HasProp(prop_name):
+                mapped.ClearProp(prop_name)
         for atom_index, atom in enumerate(mapped.GetAtoms()):  # type: ignore[no-untyped-call]
             atom.SetAtomMapNum(atom_index + 1)
         # MolGR owns the endpoint graph.  Sanitizing fragments here can erase
-        # radical/electronic annotations before topology persistence.
-        fragments = tuple(
-            ensure_serializable_double_bond_stereochemistry(
+        # radical/electronic annotations before topology persistence. Keep the
+        # endpoint's one trusted conformer through fragment extraction: RDKit
+        # may retain BondStereo/BondDir values whose local atom order is no
+        # longer sufficient to reconstruct the physical E/Z state after a
+        # disconnected fragment is isolated.
+        fragments = Chem.GetMolFrags(mapped, asMols=True, sanitizeFrags=False)
+        serialized_fragments: list[Chem.Mol] = []
+        for fragment in fragments:
+            # Split while the endpoint conformer is still available, then
+            # discard it only after the projection has completed. A failure is
+            # propagated as an explicit inference failure; emitting a
+            # non-isomeric reaction would silently lose trusted 3D stereo.
+            repaired = ensure_serializable_double_bond_stereochemistry(
                 fragment,
                 preserve_atom_maps=True,
             )
-            for fragment in Chem.GetMolFrags(mapped, asMols=True, sanitizeFrags=False)
-        )
+            repaired.RemoveAllConformers()
+            serialized_fragments.append(repaired)
         sides.append(
             ".".join(
                 sorted(
@@ -1318,7 +1388,7 @@ def _mapped_reaction_smiles(reactant: Chem.Mol, product: Chem.Mol) -> str:
                         isomericSmiles=True,
                         allHsExplicit=True,
                     )
-                    for fragment in fragments
+                    for fragment in serialized_fragments
                 )
             )
         )
@@ -1333,23 +1403,12 @@ def _infer_endpoint_stereochemistry_from_3d(endpoint: Chem.Mol) -> Chem.Mol:
     """Infer an endpoint's stereochemistry from its displaced 3D geometry.
 
     MolOP reconstructs a displaced endpoint from coordinates, so the endpoint
-    itself is the authority for the pre/post-TS stereochemistry.  Re-running
-    RDKit's 3D assignment here also covers cases where MolGR reconstructed the
-    connectivity but did not retain its E/Z tags.  Bond directions are then
-    regenerated so the assigned state survives explicit-H isomeric SMILES.
+    itself is the authority for the pre/post-TS stereochemistry. The returned
+    clone is frozen for downstream projections; writer-facing direction repair
+    is deliberately performed by a separate serialization-only helper.
     """
 
-    if endpoint.GetNumConformers() != 1 or not endpoint.GetConformer().Is3D():
-        raise ValueError("MolOP TS endpoint has no single 3D conformer for stereo inference")
-    inferred = Chem.Mol(endpoint)
-    # Displaced endpoints may carry stale direction flags from a previous
-    # graph reconstruction.  Clear them before assigning from the endpoint's
-    # coordinates, then derive fresh writer directions from the new E/Z tags.
-    for bond in inferred.GetBonds():  # type: ignore[no-untyped-call]
-        bond.SetBondDir(Chem.BondDir.NONE)
-    Chem.AssignStereochemistryFrom3D(inferred, confId=-1, replaceExistingTags=True)
-    Chem.SetDoubleBondNeighborDirections(inferred)
-    return inferred
+    return infer_molgr_stereochemistry_from_3d(endpoint)
 
 
 def _signed_ts_endpoints(
@@ -1446,8 +1505,6 @@ def _infer_ts_frame(frame: BaseCalcFrame[Any], fallback_index: int) -> _Inferenc
                 error_code="ts_topology_untrusted",
                 error_message=("MolGR returned a suspicious fallback topology for a TS endpoint"),
             )
-        negative_endpoint = ensure_serializable_double_bond_stereochemistry(negative_endpoint)
-        positive_endpoint = ensure_serializable_double_bond_stereochemistry(positive_endpoint)
         reactant, product = sorted(
             (negative_endpoint, positive_endpoint),
             key=lambda endpoint: len(Chem.GetMolFrags(endpoint)),
@@ -1473,12 +1530,20 @@ def _infer_ts_frame(frame: BaseCalcFrame[Any], fallback_index: int) -> _Inferenc
             multiplicity=int(frame.multiplicity),
         )
     except Exception as error:
+        error_code = getattr(error, "error_code", "ts_endpoint_inference_failed")
+        error_metadata = None
+        evidence = getattr(error, "evidence", None)
+        if callable(evidence):
+            candidate = evidence()
+            if isinstance(candidate, dict):
+                error_metadata = candidate
         return _FailedInference(
             file_frame_index=file_frame_index,
             imaginary_mode_index=imaginary_mode_index,
             imaginary_frequency_cm1=frequency_cm1,
-            error_code="ts_endpoint_inference_failed",
+            error_code=error_code,
             error_message=str(error) or type(error).__name__,
+            error_metadata=error_metadata,
         )
 
 
@@ -1510,8 +1575,10 @@ def _process_frame_without_configuration(
             record=None,
             inference=None,
             topology_reconstruction_status=getattr(frame, "topology_reconstruction_status", None),
-            error_code="frame_conversion_failed",
+            error_code=getattr(error, "error_code", "frame_conversion_failed"),
             error_message=str(error) or type(error).__name__,
+            error_type=type(error).__name__,
+            error_metadata=(error.evidence() if isinstance(error, StereoProjectionError) else None),
         )
     try:
         inference = _infer_ts_frame(frame, fallback_index)
@@ -1523,8 +1590,10 @@ def _process_frame_without_configuration(
             record=record,
             inference=None,
             topology_reconstruction_status=frame.topology_reconstruction_status,
-            error_code="ts_inference_failed",
+            error_code=getattr(error, "error_code", "ts_inference_failed"),
             error_message=str(error) or type(error).__name__,
+            error_type=type(error).__name__,
+            error_metadata=(error.evidence() if isinstance(error, StereoProjectionError) else None),
         )
     return _ProcessedFrame(
         file_frame_index=file_frame_index,
@@ -1717,8 +1786,12 @@ def _materialize_parsed_artifacts(
                         record=None,
                         inference=None,
                         topology_reconstruction_status=None,
-                        error_code="frame_conversion_failed",
+                        error_code=getattr(error, "error_code", "frame_conversion_failed"),
                         error_message=str(error) or type(error).__name__,
+                        error_type=type(error).__name__,
+                        error_metadata=(
+                            error.evidence() if isinstance(error, StereoProjectionError) else None
+                        ),
                     )
                 )
         status_by_index = {
@@ -1750,6 +1823,9 @@ def _materialize_parsed_artifacts(
                 segment_index=int(
                     getattr(frames_by_index.get(item.file_frame_index), "segment_index", 0) or 0
                 ),
+                error_code=item.error_code,
+                error_type=item.error_type,
+                error_metadata=item.error_metadata,
             )
             for item in processed
             if item.error_code is not None
@@ -1832,8 +1908,12 @@ async def _process_parsed_artifact_frames(
                 record=None,
                 inference=None,
                 topology_reconstruction_status=None,
-                error_code="frame_conversion_failed",
+                error_code=getattr(result, "error_code", "frame_conversion_failed"),
                 error_message=str(result) or type(result).__name__,
+                error_type=type(result).__name__,
+                error_metadata=(
+                    result.evidence() if isinstance(result, StereoProjectionError) else None
+                ),
             )
             for frame, fallback_index in chunk
         )
@@ -1864,6 +1944,9 @@ async def _process_parsed_artifact_frames(
             segment_index=int(
                 getattr(frames_by_index.get(item.file_frame_index), "segment_index", 0) or 0
             ),
+            error_code=item.error_code,
+            error_type=item.error_type,
+            error_metadata=item.error_metadata,
         )
         for item in processed
         if item.error_code is not None
@@ -3103,6 +3186,11 @@ def _add_failed_inference(
         "inference_method": "molop/possible_pre_post_ts",
         "inference_settings": {
             "endpoint_selection": "molop.possible_pre_post_ts",
+            **(
+                {"failure": inferred.error_metadata}
+                if isinstance(inferred, _FailedInference) and inferred.error_metadata is not None
+                else {}
+            ),
         },
         "error_code": error_code,
         "error_message": (
@@ -3125,6 +3213,8 @@ def _persist_one_new_inference(
     *,
     topology_context: GeometryPersistenceContext | None,
 ) -> None:
+    context_snapshot = _snapshot_inference_context(topology_context)
+    pending_snapshot = list(session.info.get("_fast_pending_entities", ()))
     try:
         with session.begin_nested():
             _persist_successful_inference(
@@ -3138,6 +3228,15 @@ def _persist_one_new_inference(
                 defer_flush=False,
             )
     except Exception as error:
+        # The nested transaction rolls back database rows, but it cannot roll
+        # back Python-side reconciliation indexes.  Restore both before the
+        # failed inference is recorded so the next task cannot reuse a binding
+        # that never committed.
+        _restore_inference_context(topology_context, context_snapshot)
+        if pending_snapshot:
+            session.info["_fast_pending_entities"] = pending_snapshot
+        else:
+            session.info.pop("_fast_pending_entities", None)
         _add_failed_inference(
             session,
             deferred=task.deferred,
@@ -3157,9 +3256,11 @@ _INFERENCE_CONTEXT_MUTABLE_FIELDS = (
     "equivalent_geometry_by_key",
     "equivalent_geometry_candidates",
     "equivalent_geometry_keys_loaded",
+    "in_memory_geometries_by_identity",
     "geometries_to_reconcile",
     "reaction_participants_by_topology",
     "mapped_reactions_by_id",
+    "mapped_reactions_to_reconcile",
     "inferred_reaction_ids_by_smiles",
     "inferred_reaction_topology_records",
 )
@@ -3179,18 +3280,35 @@ _RECONCILIATION_CACHE_MUTABLE_FIELDS = (
 )
 
 
+def _copy_inference_snapshot_value(value: object) -> object:
+    """Copy mutable containers while retaining ORM identity holders."""
+
+    if isinstance(value, dict):
+        return {key: _copy_inference_snapshot_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_inference_snapshot_value(item) for item in value]
+    if isinstance(value, set):
+        return set(value)
+    if isinstance(value, tuple):
+        return tuple(_copy_inference_snapshot_value(item) for item in value)
+    return value
+
+
 def _snapshot_inference_context(
     topology_context: GeometryPersistenceContext | None,
 ) -> tuple[dict[str, object], dict[str, object] | None, int] | None:
     if topology_context is None:
         return None
     context_state = {
-        name: copy.copy(getattr(topology_context, name))
+        name: _copy_inference_snapshot_value(getattr(topology_context, name))
         for name in _INFERENCE_CONTEXT_MUTABLE_FIELDS
     }
     cache = topology_context.reconciliation_cache
     cache_state = (
-        {name: copy.copy(getattr(cache, name)) for name in _RECONCILIATION_CACHE_MUTABLE_FIELDS}
+        {
+            name: _copy_inference_snapshot_value(getattr(cache, name))
+            for name in _RECONCILIATION_CACHE_MUTABLE_FIELDS
+        }
         if isinstance(cache, ReconciliationBatchCache)
         else None
     )
@@ -3558,6 +3676,7 @@ def _mark_ingestion_failed(
     ingestion: ArtifactIngestion | None = None,
     source_frame_count: int | None = None,
     transition_state_frame_count: int | None = None,
+    error_metadata: dict[str, Any] | None = None,
 ) -> None:
     ingestion = ingestion or session.get(ArtifactIngestion, ingestion_id)
     if ingestion is None:
@@ -3569,6 +3688,17 @@ def _mark_ingestion_failed(
         ingestion.parser_metadata = {
             **ingestion.parser_metadata,
             "qc_rejection": error.evidence(),
+        }
+    if error_metadata is None:
+        evidence = getattr(error, "evidence", None)
+        if callable(evidence):
+            candidate = evidence()
+            if isinstance(candidate, dict):
+                error_metadata = candidate
+    if error_metadata:
+        ingestion.parser_metadata = {
+            **ingestion.parser_metadata,
+            "failure": error_metadata,
         }
     ingestion.error_code = error_code
     ingestion.error_message = str(error) or type(error).__name__
@@ -3644,6 +3774,11 @@ def _result(
             calculation_frame_id=row.calculation_frame_id,
             error_code=row.error_code,
             error_message=row.error_message,
+            error_metadata_json=(
+                json.dumps(row.inference_settings.get("failure"), sort_keys=True)
+                if isinstance(row.inference_settings.get("failure"), dict)
+                else None
+            ),
         )
         for row in rows
     ]
@@ -3742,6 +3877,11 @@ def _batch_results(
                 calculation_frame_id=row.calculation_frame_id,
                 error_code=row.error_code,
                 error_message=row.error_message,
+                error_metadata_json=(
+                    json.dumps(row.inference_settings.get("failure"), sort_keys=True)
+                    if isinstance(row.inference_settings.get("failure"), dict)
+                    else None
+                ),
             )
             for row in rows
         ]
@@ -3809,6 +3949,7 @@ def _run_mark_ingestion_failed(
     ingestion: ArtifactIngestion | None = None,
     source_frame_count: int | None = None,
     transition_state_frame_count: int | None = None,
+    error_metadata: dict[str, Any] | None = None,
 ) -> None:
     _mark_ingestion_failed(
         cast(Session, session),
@@ -3819,6 +3960,7 @@ def _run_mark_ingestion_failed(
         ingestion=ingestion,
         source_frame_count=source_frame_count,
         transition_state_frame_count=transition_state_frame_count,
+        error_metadata=error_metadata,
     )
 
 
@@ -4060,12 +4202,11 @@ def _inference_topology_records(
     same normalization/serialization validation as every other MolGR graph.
     """
 
-    # Repair writer direction metadata while the endpoint still has its single
-    # displaced conformer.  Fragment extraction below intentionally removes
-    # conformers, so doing this after ``RemoveAllConformers`` would make a
-    # valid MolGR E/Z assignment impossible to serialize.
-    negative_endpoint = ensure_serializable_double_bond_stereochemistry(inferred.negative_endpoint)
-    positive_endpoint = ensure_serializable_double_bond_stereochemistry(inferred.positive_endpoint)
+    # The endpoints already contain the coordinate-authoritative stereo
+    # snapshot. Topology normalization consumes that snapshot; it does not
+    # perform a second coordinate inference here.
+    negative_endpoint = inferred.negative_endpoint
+    positive_endpoint = inferred.positive_endpoint
     records: list[Any] = []
     for endpoint, direction in (
         (negative_endpoint, TransitionStateEndpointDirection.NEGATIVE),
@@ -4085,23 +4226,36 @@ def _inference_topology_records(
         participant_records: list[Any] = []
         for side, endpoint in zip(("reactant", "product"), endpoints, strict=True):
             source = Chem.Mol(endpoint)
-            source.RemoveAllConformers()
             for atom_index, atom in enumerate(
                 source.GetAtoms()  # type: ignore[no-untyped-call]
             ):
                 atom.SetAtomMapNum(atom_index + 1)
-            fragments = sorted(
-                (
-                    ensure_serializable_double_bond_stereochemistry(
+            # Split before discarding the endpoint conformer. Each fragment
+            # must see the same coordinate evidence used by the complete
+            # endpoint when its E/Z writer metadata is repaired.
+            fragments = Chem.GetMolFrags(
+                source,
+                asMols=True,
+                sanitizeFrags=False,
+            )
+            serializable_fragments: list[Chem.Mol] = []
+            for fragment in fragments:
+                try:
+                    repaired = ensure_serializable_double_bond_stereochemistry(
                         fragment,
                         preserve_atom_maps=True,
                     )
-                    for fragment in Chem.GetMolFrags(
-                        source,
-                        asMols=True,
-                        sanitizeFrags=False,
-                    )
-                ),
+                    # Keep the fragment conformer through normalize_topology.
+                    # Its canonical atom-order projection also needs the
+                    # coordinate-authoritative stereo state; removing it here
+                    # would reintroduce the same local BondStereo/BondDir
+                    # ambiguity one stage later.
+                    serializable_fragments.append(repaired)
+                except StereoProjectionError:
+                    fragment.RemoveAllConformers()
+                    serializable_fragments.append(fragment)
+            serializable_fragments = sorted(
+                serializable_fragments,
                 key=lambda fragment: Chem.MolToSmiles(
                     fragment,
                     canonical=True,
@@ -4109,7 +4263,7 @@ def _inference_topology_records(
                     allHsExplicit=True,
                 ),
             )
-            for template_index, fragment in enumerate(fragments):
+            for template_index, fragment in enumerate(serializable_fragments):
                 participant_records.append(
                     normalize_topology(
                         fragment,
@@ -4121,7 +4275,8 @@ def _inference_topology_records(
                             "topology_source_trusted": True,
                             "source_fragment": True,
                             "source_atom_map_numbers": [
-                                atom.GetAtomMapNum() for atom in fragment.GetAtoms()
+                                atom.GetAtomMapNum()
+                                for atom in fragment.GetAtoms()  # type: ignore[no-untyped-call]
                             ],
                             "side": side,
                             "template_index": template_index,
@@ -4352,6 +4507,7 @@ class ArtifactUploadService:
                         error=parse_error,
                         error_code=getattr(parse_error, "error_code", "molop_parse_failed"),
                         completed_at=datetime.now(UTC),
+                        error_metadata=_parse_failure_metadata(parse_error),
                     )
                 )
                 await session.commit()
@@ -4392,8 +4548,18 @@ class ArtifactUploadService:
                         cast(Session, sync_session),
                         ingestion_id=ingestion_id,
                         error=persistence_error,
-                        error_code="calculation_persistence_failed",
+                        error_code=getattr(
+                            persistence_error,
+                            "error_code",
+                            "calculation_persistence_failed",
+                        ),
                         completed_at=datetime.now(UTC),
+                        source_frame_count=parsed.source_frame_count,
+                        transition_state_frame_count=len(parsed.inferences),
+                        error_metadata=_parse_failure_metadata(
+                            persistence_error,
+                            parsed=parsed,
+                        ),
                     )
                 )
                 await session.commit()
@@ -4462,6 +4628,7 @@ class ArtifactUploadService:
                             error=parse_error,
                             error_code=getattr(parse_error, "error_code", "molop_reparse_failed"),
                             completed_at=datetime.now(UTC),
+                            error_metadata=_parse_failure_metadata(parse_error),
                         )
                     )
                     await session.commit()
@@ -4502,8 +4669,18 @@ class ArtifactUploadService:
                             cast(Session, sync_session),
                             ingestion_id=ingestion_id,
                             error=persistence_error,
-                            error_code="calculation_reparse_persistence_failed",
+                            error_code=getattr(
+                                persistence_error,
+                                "error_code",
+                                "calculation_reparse_persistence_failed",
+                            ),
                             completed_at=datetime.now(UTC),
+                            source_frame_count=parsed.source_frame_count,
+                            transition_state_frame_count=len(parsed.inferences),
+                            error_metadata=_parse_failure_metadata(
+                                persistence_error,
+                                parsed=parsed,
+                            ),
                         )
                     )
                     await session.commit()
@@ -4545,6 +4722,12 @@ class ArtifactUploadService:
                 ),
                 error_message=(
                     inference.error_message if isinstance(inference, _FailedInference) else None
+                ),
+                error_metadata_json=(
+                    json.dumps(inference.error_metadata, sort_keys=True)
+                    if isinstance(inference, _FailedInference)
+                    and inference.error_metadata is not None
+                    else None
                 ),
             )
             for inference in parsed.inferences
@@ -5057,6 +5240,8 @@ class ArtifactUploadService:
         # PostgreSQL transaction open for the lifetime of the upload batch.
         persistence_pipeline_started = perf_counter()
         parse_errors_by_index: dict[int, Exception] = {}
+        parse_failure_metadata_by_index: dict[int, dict[str, Any]] = {}
+        parse_source_counts_by_index: dict[int, tuple[int, int]] = {}
         persisted_revisions_by_index: dict[int, tuple[UUID, bool]] = {}
         completion_by_ingestion_id: dict[UUID, _IngestionCompletion] = {}
         pending_preload: list[tuple[int, _ParsedArtifact]] = []
@@ -5212,6 +5397,13 @@ class ArtifactUploadService:
                             )
                         except Exception as error:
                             parse_errors_by_index[original_index] = error
+                            parse_failure_metadata_by_index[original_index] = (
+                                _parse_failure_metadata(error, parsed=parsed)
+                            )
+                            parse_source_counts_by_index[original_index] = (
+                                parsed.source_frame_count,
+                                len(parsed.inferences),
+                            )
                             continue
                         persist_write_elapsed_ms += (perf_counter() - write_started) * 1000
                         persisted_revisions_by_index[original_index] = (
@@ -5271,9 +5463,26 @@ class ArtifactUploadService:
                             ),
                             completed_at=datetime.now(UTC),
                             ingestion=ingestion,
-                            source_frame_count=(0 if original_index in no_frame_indices else None),
+                            source_frame_count=(
+                                0
+                                if original_index in no_frame_indices
+                                else parse_source_counts_by_index.get(
+                                    original_index,
+                                    (None, None),
+                                )[0]
+                            ),
                             transition_state_frame_count=(
-                                0 if original_index in no_frame_indices else None
+                                0
+                                if original_index in no_frame_indices
+                                else parse_source_counts_by_index.get(
+                                    original_index,
+                                    (None, None),
+                                )[1]
+                            ),
+                            error_metadata=(
+                                None
+                                if original_index in no_frame_indices
+                                else parse_failure_metadata_by_index.get(original_index)
                             ),
                         )
                     )

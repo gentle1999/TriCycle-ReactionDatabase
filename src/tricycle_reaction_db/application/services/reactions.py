@@ -53,6 +53,7 @@ from tricycle_reaction_db.domain.enums import (
     ArtifactResolutionStatus,
     LogicalReactionParticipantSide,
     MappedReactionNodeRole,
+    StereoStatus,
     StorageStatus,
     WorkflowManifestStatus,
 )
@@ -138,7 +139,7 @@ def _canonical_mapped_reaction_smiles(
                 # non-metal/ bond stereo annotation, while retaining the
                 # existing policy of omitting unstable metal-center tags from
                 # the reaction-level identity.
-                for atom in normalized.GetAtoms():
+                for atom in normalized.GetAtoms():  # type: ignore[no-untyped-call]
                     if _is_metal_atomic_number(atom.GetAtomicNum()):
                         atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
                 serialized_templates.append(
@@ -161,7 +162,10 @@ def _canonical_mapped_reaction_smiles(
     ):
         for template in templates:
             normalized = Chem.Mol(template)
-            template_maps = [atom.GetAtomMapNum() for atom in normalized.GetAtoms()]
+            template_maps = [
+                atom.GetAtomMapNum()
+                for atom in normalized.GetAtoms()  # type: ignore[no-untyped-call]
+            ]
             normalized = ensure_serializable_double_bond_stereochemistry(
                 normalized,
                 preserve_atom_maps=bool(
@@ -290,17 +294,20 @@ def mapped_smiles_for_topology(
         atom.SetAtomMapNum(map_number)
     # PostgreSQL/RDKit preserves the BondStereo assignment but may drop the
     # neighboring BondDir flags required by the SMILES writer. Recreate those
-    # flags on the mapped clone; checking after maps are installed is important
-    # because RDKit can choose a different canonical traversal in their presence.
-    mapped = ensure_serializable_double_bond_stereochemistry(
-        mapped,
-        reference_smiles=getattr(topology, "canonical_isomeric_smiles", None),
-        preserve_atom_maps=True,
-    )
+    # flags on the mapped clone when the projection is trusted. An ambiguous
+    # topology deliberately uses a connectivity-only reaction component so a
+    # stale/contradictory E/Z marker never enters the reaction identity.
+    isomeric_smiles = getattr(topology, "stereo_status", None) is not StereoStatus.AMBIGUOUS
+    if isomeric_smiles:
+        mapped = ensure_serializable_double_bond_stereochemistry(
+            mapped,
+            reference_smiles=getattr(topology, "canonical_isomeric_smiles", None),
+            preserve_atom_maps=True,
+        )
     return Chem.MolToSmiles(
         mapped,
         canonical=True,
-        isomericSmiles=True,
+        isomericSmiles=isomeric_smiles,
         allHsExplicit=True,
     )
 
@@ -1063,7 +1070,11 @@ def persist_mapped_reaction_node_geometry(
         ),
         None,
     )
-    if preloaded_bindings is None:
+    if binding is None:
+        # ``preloaded_bindings`` is an optimization, not an authority.  It
+        # can be a partial view after a node was resolved before its geometry
+        # collection was loaded, so a miss must be checked against PostgreSQL
+        # before creating a row with the same NULL-participant identity.
         binding = session.exec(identity_statement).first()
     if binding is not None:
         if (
@@ -1075,15 +1086,16 @@ def persist_mapped_reaction_node_geometry(
             _promote_mapped_reaction_node_geometry(session, binding)
         return binding
 
-    existing_components = (
-        [
-            existing
-            for existing in preloaded_bindings
-            if existing.component_key == record.component_key
-            or existing.component_index == record.component_index
-        ]
-        if preloaded_bindings is not None
-        else session.exec(
+    existing_components = [
+        existing
+        for existing in preloaded_bindings or ()
+        if existing.component_key == record.component_key
+        or existing.component_index == record.component_index
+    ]
+    # Merge the database view even when a caller supplied a preloaded list.
+    # The list may include pending fast-path rows, so retain both views.
+    existing_components.extend(
+        session.exec(
             select(MappedReactionNodeGeometry).where(
                 MappedReactionNodeGeometry.mapped_reaction_node_id == node_id,
                 (
@@ -1110,7 +1122,7 @@ def persist_mapped_reaction_node_geometry(
         ),
         None,
     )
-    if preloaded_bindings is None:
+    if binding is None:
         binding = session.exec(
             select(MappedReactionNodeGeometry).where(
                 MappedReactionNodeGeometry.mapped_reaction_node_id == node_id,

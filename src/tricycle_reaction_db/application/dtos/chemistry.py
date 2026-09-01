@@ -418,16 +418,18 @@ class NormalizedMoleculeRecord(BaseModel):
         ):
             atom.SetAtomMapNum(topology_index + 1)
         if not topology_is_untrusted:
-            Chem.AssignStereochemistry(topology_graph, cleanIt=True, force=True)
-            Chem.AssignStereochemistry(geometry_graph, cleanIt=True, force=True)
+            ambiguous_stereochemistry = self.topology.stereo_status is StereoStatus.AMBIGUOUS
+            if not ambiguous_stereochemistry:
+                Chem.AssignStereochemistry(topology_graph, cleanIt=True, force=True)
+                Chem.AssignStereochemistry(geometry_graph, cleanIt=True, force=True)
             if Chem.MolToCXSmiles(
                 topology_graph,
                 canonical=True,
-                isomericSmiles=True,
+                isomericSmiles=not ambiguous_stereochemistry,
             ) != Chem.MolToCXSmiles(
                 geometry_graph,
                 canonical=True,
-                isomericSmiles=True,
+                isomericSmiles=not ambiguous_stereochemistry,
             ):
                 raise ValueError("Geometry.mol does not match Topology in canonical atom order")
             if self.charge != self.topology.formal_charge:

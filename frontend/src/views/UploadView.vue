@@ -637,10 +637,15 @@ async function runTaskBatch(selected: QueueTask[], runId: number): Promise<void>
           return;
         }
         // The API may be configured with a smaller request window than the
-        // validated development setting. A preflight 413 for a multi-file
-        // request is therefore recoverable by recursively splitting the same
-        // reserved tasks; a singleton remains a genuine per-file failure.
-        if (error instanceof ApiError && error.status === 413 && selected.length > 1) {
+        // validated development setting. A preflight 413, or an unexpected
+        // batch-level 500 after some files have committed, is recoverable by
+        // recursively splitting the same reserved tasks; a singleton remains
+        // a genuine per-file failure.
+        if (
+          error instanceof ApiError
+          && (error.status === 413 || error.status === 500)
+          && selected.length > 1
+        ) {
           const midpoint = Math.ceil(selected.length / 2);
           for (const task of selected) {
             task.status = "queued";

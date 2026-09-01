@@ -96,7 +96,7 @@ def _exact_geometry_assignment(molecule: NormalizedMoleculeRecord) -> dict[str, 
         "observed_to_geometry_transform": molecule.observed_to_geometry_transform,
         "geometry_assignment_rmsd_angstrom": molecule.geometry_assignment_rmsd_angstrom,
         "geometry_assignment_max_abs_angstrom": molecule.geometry_assignment_max_abs_angstrom,
-        "geometry_assignment_policy_version": "geometry-internal-coordinate-match-v3",
+        "geometry_assignment_policy_version": "geometry-internal-coordinate-match-v4",
     }
 
 

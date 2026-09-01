@@ -3,7 +3,7 @@ import pytest
 from molgr.utils.converter import METAL_UNPAIRED_ELECTRONS_PROP
 from pydantic import ValidationError
 from rdkit import Chem
-from rdkit.Chem import rdDepictor
+from rdkit.Chem import AllChem, rdDepictor
 
 from tricycle_reaction_db.application.dtos import (
     GeometryRecord,
@@ -12,8 +12,11 @@ from tricycle_reaction_db.application.dtos import (
 )
 from tricycle_reaction_db.domain.enums import StereoStatus, TopologySanitizationStatus
 from tricycle_reaction_db.ingestion.normalization import (
+    _canonical_isomeric_smiles_signature,
     ensure_serializable_double_bond_stereochemistry,
+    infer_molgr_stereochemistry_from_3d,
     normalize_molecule,
+    normalize_molgr_stereochemistry,
     normalize_topology,
     normalize_topology_with_mapping,
 )
@@ -393,6 +396,174 @@ def test_trusted_molgr_e_z_stereo_gets_serializable_direction_metadata() -> None
         allHsExplicit=True,
     )
     assert "/" in geometry_smiles or "\\" in geometry_smiles
+
+
+def test_coordinate_stereo_boundary_is_separate_from_smiles_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = Chem.AddHs(Chem.MolFromSmiles("F/C=C/[C@H](Cl)Br"))
+    assert source is not None
+    assert AllChem.EmbedMolecule(source, randomSeed=17) == 0
+    source_double_bond = next(
+        bond for bond in source.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE
+    )
+    source_stereo = source_double_bond.GetStereo()
+    for bond in source.GetBonds():
+        bond.SetBondDir(Chem.BondDir.NONE)
+
+    calls: list[str] = []
+    assign_from_3d = Chem.AssignStereochemistryFrom3D
+
+    def assign_wrapper(*args: object, **kwargs: object) -> None:
+        calls.append("assign3d")
+        assign_from_3d(*args, **kwargs)
+
+    def forbidden_direction_discovery(*_: object, **__: object) -> None:
+        raise AssertionError("coordinate stereo inference must not use SMILES directions")
+
+    monkeypatch.setattr(Chem, "AssignStereochemistryFrom3D", assign_wrapper)
+    monkeypatch.setattr(Chem, "DetectBondStereochemistry", forbidden_direction_discovery)
+    monkeypatch.setattr(Chem, "SetBondStereoFromDirections", forbidden_direction_discovery)
+
+    normalized = infer_molgr_stereochemistry_from_3d(source)
+
+    assert calls == ["assign3d"]
+    assert normalized is not source
+    normalized_double_bond = normalized.GetBondWithIdx(source_double_bond.GetIdx())
+    assert normalized_double_bond.GetStereo() in {
+        Chem.BondStereo.STEREOE,
+        Chem.BondStereo.STEREOZ,
+        Chem.BondStereo.STEREONONE,
+    }
+    # The coordinate pass is allowed to replace stale graph stereo. The source
+    # object itself remains untouched and is not reused as a writer scratchpad.
+    assert source_double_bond.GetStereo() is source_stereo
+
+    normalized_again = normalize_molgr_stereochemistry(normalized)
+    assert calls == ["assign3d"]
+    assert normalized_again.GetBondWithIdx(source_double_bond.GetIdx()).GetStereo() == (
+        normalized_double_bond.GetStereo()
+    )
+
+
+def test_serialization_projection_never_reinfers_from_a_conformer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    molecule = Chem.AddHs(Chem.MolFromSmiles("F/C=C/F"))
+    assert molecule is not None
+    assert AllChem.EmbedMolecule(molecule, randomSeed=17) == 0
+    double_bond = next(
+        bond for bond in molecule.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE
+    )
+    expected_stereo = double_bond.GetStereo()
+    for bond in molecule.GetBonds():
+        bond.SetBondDir(Chem.BondDir.NONE)
+
+    def forbidden_assign(*_: object, **__: object) -> None:
+        raise AssertionError("SMILES projection must not infer stereo from coordinates")
+
+    monkeypatch.setattr(Chem, "AssignStereochemistryFrom3D", forbidden_assign)
+    repaired = ensure_serializable_double_bond_stereochemistry(molecule)
+    serialized = Chem.MolToSmiles(
+        repaired,
+        canonical=True,
+        isomericSmiles=True,
+        allHsExplicit=True,
+    )
+    parser = Chem.SmilesParserParams()
+    parser.removeHs = False
+    reparsed = Chem.MolFromSmiles(serialized, parser)
+    assert reparsed is not None
+    reparsed_double_bond = next(
+        bond for bond in reparsed.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE
+    )
+    assert reparsed_double_bond.GetStereo() is expected_stereo
+
+
+def test_trusted_e_z_projection_accepts_atom_order_equivalent_smiles() -> None:
+    # This conjugated, explicit-H graph reproduces the MolGR/RDKit boundary:
+    # the source BondStereo values are assigned, while the atom-order
+    # projection makes the local serialized E/Z map disagree with those
+    # values. The complete canonical isomeric projection is still lossless.
+    smiles = (
+        "[H][C]([H])=[C]([H])[H]."
+        "[H][O][C](=[O])/[C](=[C]([H])\\[C]([H])=[C]"
+        "(\\[C](=[O])[O][H])[C]([H])([H])[H])[C]([H])([H])[H]"
+    )
+    parser = Chem.SmilesParserParams()
+    parser.removeHs = False
+    molecule = Chem.MolFromSmiles(smiles, parser)
+    assert molecule is not None
+
+    record = normalize_molecule(
+        molecule,
+        _coordinates(molecule.GetNumAtoms()),
+        charge=0,
+        multiplicity=1,
+        reconstruction_method="molgr/cpp",
+        reconstruction_version="0.1.8",
+    )
+
+    assert record.topology.stereo_status is StereoStatus.ASSIGNED
+    assert record.topology.identity_schema_version == "topology-identity-v1"
+    assert record.geometry.mol.GetNumConformers() == 1
+    assert "stereo_projection" not in record.topology_derivation.reconstruction_metadata
+    assert "/" in (record.topology.canonical_isomeric_smiles or "") or "\\" in (
+        record.topology.canonical_isomeric_smiles or ""
+    )
+
+
+def test_symmetric_e_z_assignments_compare_by_molecular_identity() -> None:
+    # In hexa-2,4-diene, reversing the identical ends exchanges the two
+    # terminal double bonds.  [E,Z] and [Z,E] are therefore the same molecule,
+    # while [E,E] is not.
+    ez = _canonical_isomeric_smiles_signature("C/C=C/C=C\\C")
+    ze = _canonical_isomeric_smiles_signature("C/C=C\\C=C\\C")
+    ee = _canonical_isomeric_smiles_signature("C/C=C/C=C/C")
+
+    assert ez == ze
+    assert ez != ee
+
+
+def test_mapped_symmetric_topology_is_standardized_after_map_removal() -> None:
+    # This is the same failure mode as the persisted diene duplicate: the two
+    # equivalent source traversals carry different atom maps and opposite
+    # slash directions on the symmetric conjugated system.  Topology identity
+    # must be computed only after maps have been removed and the graph has been
+    # canonicalized.
+    parser = Chem.SmilesParserParams()
+    parser.removeHs = False
+    source_smiles = (
+        "[H][O][C](=[O])/[C](=[C]([H])\\[C]([H])=[C]"
+        "(\\[C](=[O])[O][H])[C]([H])([H])[H])[C]([H])([H])[H]"
+    )
+    equivalent_smiles = (
+        "[H][O][C](=[O])/[C](=[C]([H])/[C]([H])=[C]"
+        "(\\[C](=[O])[O][H])[C]([H])([H])[H])[C]([H])([H])[H]"
+    )
+
+    normalized = []
+    for offset, smiles in ((100, source_smiles), (200, equivalent_smiles)):
+        molecule = Chem.MolFromSmiles(smiles, parser)
+        assert molecule is not None
+        assert AllChem.EmbedMolecule(molecule, randomSeed=17) == 0
+        for atom_index, atom in enumerate(molecule.GetAtoms()):
+            atom.SetAtomMapNum(offset + atom_index)
+        record = normalize_topology(
+            molecule,
+            add_hydrogens=False,
+            reconstruction_method="molgr/cpp",
+            reconstruction_version="0.1.8",
+        )
+        normalized.append(record)
+
+    first, second = normalized
+    assert first.topology.canonical_isomeric_smiles == second.topology.canonical_isomeric_smiles
+    assert first.topology.graph_hash == second.topology.graph_hash
+    assert first.topology.identity_schema_version == "topology-identity-v1"
+    assert second.topology.identity_schema_version == "topology-identity-v1"
+    assert all(atom.GetAtomMapNum() == 0 for atom in first.topology.mol.GetAtoms())
+    assert all(atom.GetAtomMapNum() == 0 for atom in second.topology.mol.GetAtoms())
 
 
 @pytest.mark.parametrize(

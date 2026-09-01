@@ -205,6 +205,23 @@ def _endpoint_nodes(
     return nodes
 
 
+def _cache_node_geometry_binding(
+    cache: ReconciliationBatchCache,
+    node_id: UUID,
+    binding: MappedReactionNodeGeometry,
+) -> None:
+    """Add a binding to the positive cache without duplicating its identity."""
+
+    bindings = cache.node_geometries_by_node.setdefault(node_id, [])
+    if any(
+        existing.geometry_id == binding.geometry_id
+        and existing.mapped_reaction_participant_id == binding.mapped_reaction_participant_id
+        for existing in bindings
+    ):
+        return
+    bindings.append(binding)
+
+
 def _find_or_create_node_geometry(
     session: Session,
     *,
@@ -234,8 +251,12 @@ def _find_or_create_node_geometry(
         ),
     )
 
-    if cache is not None and node_id in cache.loaded_node_geometries:
+    bindings: list[MappedReactionNodeGeometry] | None = None
+    cache_node_geometries_loaded = False
+    existing = None
+    if cache is not None:
         bindings = cache.node_geometries_by_node.setdefault(node_id, [])
+        cache_node_geometries_loaded = node_id in cache.loaded_node_geometries
         existing = next(
             (
                 binding
@@ -245,8 +266,13 @@ def _find_or_create_node_geometry(
             ),
             None,
         )
-    else:
-        bindings = None
+
+    # The cache is allowed to be a positive fast path, but a miss is not proof
+    # that the row is absent.  A node can have been resolved before its
+    # geometry collection was hydrated, and a savepoint retry can restore only
+    # the rows that were visible at the snapshot.  Always ask PostgreSQL on a
+    # cache miss before allocating a new coordinate.
+    if existing is None:
         statement = select(MappedReactionNodeGeometry).where(
             MappedReactionNodeGeometry.mapped_reaction_node_id == node_id,
             MappedReactionNodeGeometry.geometry_id == geometry_id,
@@ -260,8 +286,24 @@ def _find_or_create_node_geometry(
                 MappedReactionNodeGeometry.mapped_reaction_participant_id == participant_id
             )
         existing = session.exec(statement).first()
+        if existing is not None and cache is not None:
+            _cache_node_geometry_binding(cache, node_id, existing)
     if existing is not None:
         return existing
+
+    if cache is not None and bindings is not None:
+        # Keep unflushed fast-path bindings from the cache, and merge the
+        # authoritative rows that are already visible in PostgreSQL.  This is
+        # needed for coordinate allocation as well as identity lookup: the
+        # cache may contain a newly created row that the database cannot see
+        # until the batch flush.
+        for persisted_binding in session.exec(
+            select(MappedReactionNodeGeometry).where(
+                MappedReactionNodeGeometry.mapped_reaction_node_id == node_id
+            )
+        ).all():
+            _cache_node_geometry_binding(cache, node_id, persisted_binding)
+        bindings = cache.node_geometries_by_node[node_id]
 
     if participant_id is not None:
         participant_bindings = (
@@ -324,8 +366,13 @@ def _find_or_create_node_geometry(
         thermodynamic_property_verified=thermodynamic_property_verified,
     )
     if cache is not None:
-        cache.node_geometries_by_node.setdefault(node_id, []).append(binding)
-        cache.loaded_node_geometries.add(node_id)
+        _cache_node_geometry_binding(cache, node_id, binding)
+        # A node loaded from PostgreSQL is complete.  A node first observed
+        # through an existing row is not: its cache contains only rows touched
+        # by this context, so do not promote that partial list to a complete
+        # cache merely because one new row was inserted.
+        if cache_node_geometries_loaded:
+            cache.loaded_node_geometries.add(node_id)
         cache.new_node_geometry_ids.add(_require_id(binding, label="MappedReactionNodeGeometry"))
     return binding
 

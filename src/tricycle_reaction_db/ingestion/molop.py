@@ -10,7 +10,10 @@ from molop.unit import atom_ureg
 from rdkit import Chem
 
 from tricycle_reaction_db.application.dtos.chemistry import NormalizedMoleculeRecord
-from tricycle_reaction_db.ingestion.normalization import normalize_molecule
+from tricycle_reaction_db.ingestion.normalization import (
+    normalize_molecule,
+    normalize_molgr_stereochemistry,
+)
 
 MOLOP_VERSION = version("molop")
 MOLGR_VERSION = version("molgr")
@@ -50,9 +53,13 @@ def configure_molecular_graph_reconstruction(*, allow_native_parallel: bool = Fa
 def normalize_molop_frame(frame: BaseCalcFrame[Any]) -> NormalizedMoleculeRecord:
     """Normalize one public MolOP frame without accessing parser-private state."""
 
-    mol = frame.rdmol
-    if not isinstance(mol, Chem.Mol):
+    rdmol = frame.rdmol
+    if not isinstance(rdmol, Chem.Mol):
         raise ValueError("MolOP frame does not provide a reconstructed RDKit molecule")
+    # MolGR returns the reconstructed graph and its Cartesian conformer, but
+    # RDKit's SMILES writer may still need neighboring BondDir metadata. Keep
+    # this as the single MolGR -> ingestion stereo boundary.
+    mol = normalize_molgr_stereochemistry(rdmol)
     coordinates = frame.coords.to(atom_ureg.angstrom).magnitude
     reconstruction_backend = frame.topology_reconstruction_backend or "unknown"
     reconstruction_status = getattr(

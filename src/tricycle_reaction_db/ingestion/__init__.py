@@ -25,8 +25,11 @@ from tricycle_reaction_db.ingestion.molop_calculations import (
     segment_record_from_molop,
 )
 from tricycle_reaction_db.ingestion.normalization import (
+    StereoProjectionError,
     ensure_serializable_double_bond_stereochemistry,
+    infer_molgr_stereochemistry_from_3d,
     normalize_molecule,
+    normalize_molgr_stereochemistry,
     normalize_topology,
     normalize_topology_with_mapping,
 )
@@ -37,6 +40,9 @@ __all__ = [
     "configure_molecular_graph_reconstruction",
     "detect_artifact_media_type",
     "ensure_serializable_double_bond_stereochemistry",
+    "infer_molgr_stereochemistry_from_3d",
+    "normalize_molgr_stereochemistry",
+    "StereoProjectionError",
     "frame_records_from_molop",
     "MOLECULAR_GRAPH_RECONSTRUCTION_FAILURE_POLICY",
     "MolOPFrameRecords",

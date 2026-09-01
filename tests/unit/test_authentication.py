@@ -30,6 +30,7 @@ from tricycle_reaction_db.application.services import (
 )
 from tricycle_reaction_db.application.services import authentication as authentication_module
 from tricycle_reaction_db.application.services.artifact_uploads import (
+    ArtifactUploadError,
     ArtifactUploadLimitError,
 )
 from tricycle_reaction_db.core.config import Settings
@@ -819,6 +820,28 @@ async def test_batch_route_preserves_service_level_limit_as_http_413(
 
     assert response.status_code == 413
     assert response.json() == {"detail": "upload batch exceeds the service byte limit"}
+
+
+@pytest.mark.asyncio
+async def test_batch_route_returns_processing_error_as_http_422(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def reject_after_route_preflight(**_: object) -> ArtifactBatchUploadResult:
+        raise ArtifactUploadError("one calculation file could not be parsed")
+
+    monkeypatch.setattr(ArtifactUploadService, "upload_batch", reject_after_route_preflight)
+    async with AsyncClient(
+        transport=ASGITransport(app=create_app()),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/artifacts/batch",
+            data={"project_id": "00000000-0000-7000-8000-000000000201"},
+            files=[("files", ("one.log", b"a", "text/plain"))],
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "one calculation file could not be parsed"}
 
 
 @pytest.mark.asyncio

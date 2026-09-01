@@ -32,6 +32,7 @@ class TransitionStateInferenceView(BaseModel):
     calculation_frame_id: UUID | None = None
     error_code: str | None = None
     error_message: str | None = None
+    error_metadata_json: str | None = None
 
 
 class ArtifactUploadResult(BaseModel):
@@ -60,6 +61,7 @@ class ArtifactValidationInferenceView(BaseModel):
     reaction_smiles: str | None = None
     error_code: str | None = None
     error_message: str | None = None
+    error_metadata_json: str | None = None
 
 
 class ArtifactValidationResult(BaseModel):

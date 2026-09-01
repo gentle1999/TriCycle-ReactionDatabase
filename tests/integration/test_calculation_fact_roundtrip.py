@@ -89,7 +89,7 @@ def _exact_geometry_assignment(molecule: NormalizedMoleculeRecord) -> dict[str, 
         "observed_to_geometry_transform": molecule.observed_to_geometry_transform,
         "geometry_assignment_rmsd_angstrom": molecule.geometry_assignment_rmsd_angstrom,
         "geometry_assignment_max_abs_angstrom": molecule.geometry_assignment_max_abs_angstrom,
-        "geometry_assignment_policy_version": "geometry-internal-coordinate-match-v3",
+        "geometry_assignment_policy_version": "geometry-internal-coordinate-match-v4",
     }
 
 
@@ -606,7 +606,7 @@ def test_postgresql_checks_reject_invalid_calculation_facts(tmp_path) -> None:
                 "geometry_assignment_max_abs_angstrom": (
                     molecule_record.geometry_assignment_max_abs_angstrom
                 ),
-                "geometry_assignment_policy_version": ("geometry-internal-coordinate-match-v3"),
+                "geometry_assignment_policy_version": ("geometry-internal-coordinate-match-v4"),
                 "program_metadata": {},
             }
             _assert_check_rejected(

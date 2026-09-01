@@ -52,7 +52,7 @@ def _frame_record(**overrides: object) -> CalculationFrameRecord:
         "observed_to_geometry_transform": np.eye(4).ravel().tolist(),
         "geometry_assignment_rmsd_angstrom": 0.0,
         "geometry_assignment_max_abs_angstrom": 0.0,
-        "geometry_assignment_policy_version": "geometry-internal-coordinate-match-v3",
+        "geometry_assignment_policy_version": "geometry-internal-coordinate-match-v4",
     }
     values.update(overrides)
     return CalculationFrameRecord.model_validate(values)

@@ -32,7 +32,16 @@ from tricycle_reaction_db.application.services import (
     persist_thermochemistry_result,
 )
 from tricycle_reaction_db.application.services import reactions as reactions_module
+from tricycle_reaction_db.application.services.molecular_geometry import (
+    GeometryPersistenceContext,
+)
+from tricycle_reaction_db.application.services.molop_artifact_ingestion import (
+    reconcile_molop_geometry_context,
+)
 from tricycle_reaction_db.application.services.reaction_commands import _create_reaction
+from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
+    ReconciliationBatchCache,
+)
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
     Geometry,
@@ -711,7 +720,7 @@ def test_later_converged_frame_links_to_preexisting_reaction(tmp_path) -> None:
                     geometry_assignment_max_abs_angstrom=(
                         normalized.geometry_assignment_max_abs_angstrom
                     ),
-                    geometry_assignment_policy_version=("geometry-internal-coordinate-match-v3"),
+                    geometry_assignment_policy_version=("geometry-internal-coordinate-match-v4"),
                 ),
             )
             assert frame.geometry_id == persisted.geometry.id
@@ -752,7 +761,7 @@ def test_later_converged_frame_links_to_preexisting_reaction(tmp_path) -> None:
                     geometry_assignment_max_abs_angstrom=(
                         normalized.geometry_assignment_max_abs_angstrom
                     ),
-                    geometry_assignment_policy_version=("geometry-internal-coordinate-match-v3"),
+                    geometry_assignment_policy_version=("geometry-internal-coordinate-match-v4"),
                     frequency_count=1,
                     negative_frequency_count=0,
                     lowest_frequency_cm1=100.0,
@@ -800,6 +809,40 @@ def test_later_converged_frame_links_to_preexisting_reaction(tmp_path) -> None:
             ).all()
             assert len(backfilled_node_geometries) == 2
             assert {binding.geometry_id for binding in backfilled_node_geometries} == {
+                persisted.geometry.id
+            }
+
+            deferred_context = GeometryPersistenceContext()
+            deferred_context.reconciliation_cache = ReconciliationBatchCache()
+            deferred = _create_reaction(
+                session,
+                CreateReactionCommand(
+                    reaction="[2H:21][3H:22]>>[2H:21][3H:22]",
+                    mapped_reaction_key="deferred-existing-geometry-backfill",
+                ),
+                defer_geometry_reconciliation=True,
+                topology_context=deferred_context,
+                reconciliation_cache=deferred_context.reconciliation_cache,
+            )
+            assert deferred.mapped_reaction_id is not None
+            assert (
+                session.exec(
+                    select(func.count())
+                    .select_from(MappedReactionNodeGeometry)
+                    .join(MappedReactionNode)
+                    .where(MappedReactionNode.mapped_reaction_id == deferred.mapped_reaction_id)
+                ).one()
+                == 0
+            )
+
+            reconcile_molop_geometry_context(session, deferred_context)
+            deferred_node_geometries = session.exec(
+                select(MappedReactionNodeGeometry)
+                .join(MappedReactionNode)
+                .where(MappedReactionNode.mapped_reaction_id == deferred.mapped_reaction_id)
+            ).all()
+            assert len(deferred_node_geometries) == 2
+            assert {binding.geometry_id for binding in deferred_node_geometries} == {
                 persisted.geometry.id
             }
 

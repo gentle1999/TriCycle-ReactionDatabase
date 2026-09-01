@@ -23,6 +23,8 @@ from tricycle_reaction_db.application.dtos import (
     UploadBatchView,
 )
 from tricycle_reaction_db.application.services.artifact_uploads import (
+    ArtifactUploadConflictError,
+    ArtifactUploadLimitError,
     ArtifactUploadPayload,
     ArtifactUploadService,
 )
@@ -797,7 +799,15 @@ class UploadBatchService:
             )
             raise
         except Exception as error:
-            await cls._finish_items(
+            # A shared persistence/preload failure must not turn a whole HTTP
+            # request into a 500 when one file is responsible.  The artifact
+            # service already isolates ordinary parser failures, but failures
+            # in a batch-level DB phase can still escape after other files have
+            # committed.  First close this attempt durably, then retry each
+            # file through the normal single-file path.  That path reopens a
+            # failed ingestion and preserves the successful files in the same
+            # client batch.
+            failed_items = await cls._finish_items(
                 batch_id,
                 outcomes=[
                     _UploadItemOutcome(
@@ -811,7 +821,74 @@ class UploadBatchService:
                 ],
                 user_id=user_id,
             )
-            raise
+            if len(pending_files) == 1:
+                # A single-file failure is an item result, not a request-level
+                # transport failure.  Returning it lets the queue UI display
+                # the durable error and retry only this file later.
+                failed_by_client_id = {item.client_file_id: item for item in failed_items}
+                return [
+                    failed_by_client_id.get(client_file_id, completed_items[client_file_id])
+                    for client_file_id in client_file_ids
+                ]
+
+            logger.exception(
+                "batch upload failed; isolating %s files for batch %s",
+                len(pending_files),
+                batch_id,
+            )
+            isolated_by_client_id: dict[UUID, UploadBatchItemView] = {}
+            for client_file_id, upload in pending_files:
+                try:
+                    isolated = await cls.upload_items(
+                        batch_id,
+                        files=[(client_file_id, upload)],
+                        user_id=user_id,
+                    )
+                except UploadBatchNotFoundError:
+                    raise
+                except (
+                    UploadBatchConflictError,
+                    ArtifactUploadConflictError,
+                    ArtifactUploadLimitError,
+                ):
+                    # These are request/preflight state errors. Retrying the
+                    # same bytes cannot repair them, and the route maps them
+                    # to their intended 409/413 response.
+                    raise
+                except Exception as isolated_error:
+                    # The singleton path should normally convert a processing
+                    # error into a failed item. Keep the outer request
+                    # non-fatal even if a second unexpected boundary escapes.
+                    logger.exception(
+                        "single-file isolation failed for batch %s file %s",
+                        batch_id,
+                        client_file_id,
+                        exc_info=True,
+                    )
+                    isolated = await cls._finish_items(
+                        batch_id,
+                        outcomes=[
+                            _UploadItemOutcome(
+                                client_file_id=client_file_id,
+                                succeeded=False,
+                                artifact_file_id=None,
+                                error_code="artifact_upload_failed",
+                                error_message=(
+                                    str(isolated_error) or type(isolated_error).__name__
+                                ),
+                            )
+                        ],
+                        user_id=user_id,
+                    )
+                if len(isolated) != 1:
+                    raise RuntimeError(
+                        "single-file isolation returned an unexpected item count"
+                    ) from error
+                isolated_by_client_id[client_file_id] = isolated[0]
+            return [
+                isolated_by_client_id.get(client_file_id, completed_items[client_file_id])
+                for client_file_id in client_file_ids
+            ]
 
         if len(result.items) != len(pending_files):
             mismatch_error = RuntimeError(

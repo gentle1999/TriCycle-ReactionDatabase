@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
 from contextlib import nullcontext, suppress
 from copy import copy
 from dataclasses import dataclass
@@ -51,6 +52,7 @@ from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics_pe
     refresh_mapped_reaction_thermodynamics,
 )
 from tricycle_reaction_db.application.services.molecular_geometry import (
+    GEOMETRY_MATCH_POLICY_VERSION,
     GeometryPersistenceContext,
     persist_molecular_geometry,
     preload_molecular_geometry_context,
@@ -60,6 +62,7 @@ from tricycle_reaction_db.application.services.reaction_geometry_reconciliation 
     preload_reconciliation_context,
     reconcilable_geometry_ids,
     reconcile_geometry_with_reactions,
+    reconcile_mapped_reaction_with_geometries,
 )
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
@@ -71,6 +74,7 @@ from tricycle_reaction_db.domain.enums import (
     ElectronicStateSetKind,
     GeometryAssignmentKind,
     ParseCompleteness,
+    ParseStatus,
     ScientificArrayOwnerKind,
 )
 from tricycle_reaction_db.ingestion import (
@@ -82,6 +86,34 @@ from tricycle_reaction_db.ingestion import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class NoPersistableCalculationFramesError(RuntimeError):
+    """MolOP located frames, but every frame failed conversion or persistence."""
+
+    error_code = "calculation_frames_not_persisted"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        source_frame_count: int,
+        diagnostics: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    ) -> None:
+        self.source_frame_count = source_frame_count
+        self.diagnostics = tuple(diagnostics)
+        super().__init__(message)
+
+    def evidence(self) -> dict[str, Any]:
+        counts = Counter(str(item.get("code", "unknown")) for item in self.diagnostics)
+        return {
+            "failure_stage": "frame_processing",
+            "source_frame_count": self.source_frame_count,
+            "persisted_frame_count": 0,
+            "failed_frame_count": len(self.diagnostics),
+            "diagnostic_counts": dict(sorted(counts.items())),
+            "diagnostic_samples": list(self.diagnostics[:8]),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,9 +137,11 @@ _GEOMETRY_CONTEXT_FIELDS = (
     "equivalent_geometry_by_key",
     "equivalent_geometry_candidates",
     "equivalent_geometry_keys_loaded",
+    "in_memory_geometries_by_identity",
     "geometries_to_reconcile",
     "reaction_participants_by_topology",
     "mapped_reactions_by_id",
+    "mapped_reactions_to_reconcile",
 )
 
 
@@ -132,13 +166,26 @@ def _frame_failure_diagnostic(
     error: Exception,
     stage: str,
 ) -> dict[str, Any]:
+    explicit_code = getattr(error, "error_code", None)
+    code = (
+        explicit_code
+        if isinstance(explicit_code, str) and explicit_code
+        else {
+            "conversion": "frame_conversion_failed",
+            "inference": "ts_inference_failed",
+            "persistence": "frame_persistence_failed",
+        }.get(stage, "frame_processing_failed")
+    )
+    evidence = getattr(error, "evidence", None)
+    metadata = evidence() if callable(evidence) else None
     return {
-        "code": "frame_persistence_failed" if stage == "persistence" else "frame_parse_failed",
+        "code": code,
         "stage": stage,
         "segment_index": segment_index,
         "file_frame_index": file_frame_index,
         "error_type": type(error).__name__,
         "message": str(error) or type(error).__name__,
+        **({"metadata": metadata} if isinstance(metadata, dict) else {}),
     }
 
 
@@ -392,9 +439,7 @@ def persist_molop_calculation_artifact(
     else:
         frame_records = list(records)
     failed_frame_count = sum(
-        item.get("code")
-        in {"frame_parse_failed", "frame_persistence_failed", "ts_inference_failed"}
-        for item in diagnostics
+        item.get("stage") in {"conversion", "persistence", "inference"} for item in diagnostics
     )
     # Parallel frame persistence here means batched, revision-local writes in
     # one transaction. A shared SQLAlchemy Session cannot be forked safely;
@@ -577,7 +622,7 @@ def persist_molop_calculation_artifact(
                                         molecule.coordinate_max_abs_angstrom
                                     ),
                                     "geometry_assignment_policy_version": (
-                                        "geometry-internal-coordinate-match-v3"
+                                        GEOMETRY_MATCH_POLICY_VERSION
                                     ),
                                 }
                             )
@@ -653,8 +698,32 @@ def persist_molop_calculation_artifact(
                 segment.parse_diagnostics = segment_diagnostics
                 session.add(segment)
 
+        # A stereo projection warning does not make the frame unpersistable,
+        # but it is still a file-level quality diagnostic. Surface it on the
+        # revision/ingestion summary as well as on the individual frame.
+        for record in frame_records:
+            for diagnostic in record.frame.parse_diagnostics:
+                if (
+                    diagnostic.get("code") == "stereo_projection_failed"
+                    and diagnostic not in diagnostics
+                ):
+                    diagnostics.append(diagnostic)
+
         if not frames_by_file_index:
-            raise ValueError("no calculation frames could be persisted from the source")
+            failure = NoPersistableCalculationFramesError(
+                "no calculation frames could be persisted from the source",
+                source_frame_count=len(chem_file),
+                diagnostics=diagnostics,
+            )
+            revision.parse_completeness = ParseCompleteness.PARTIAL
+            revision.parse_diagnostics = [*revision.parse_diagnostics, *diagnostics]
+            revision.status = ParseStatus.FAILED
+            revision.error_code = failure.error_code
+            revision.error_message = str(failure)
+            revision.error_metadata = failure.evidence()
+            revision.completed_at = completed_at
+            session.add(revision)
+            raise failure
 
         # Batch ingestion can keep revision-local rows pending across files.
         # The shared context owns their identities, and the final reconciliation
@@ -758,6 +827,21 @@ def reconcile_molop_geometry_context(
                     mapped_reactions_by_id=context.mapped_reactions_by_id,
                     cache=reconciliation_cache,
                 )
+        # A mapped reaction may have been created after its endpoint Geometry
+        # rows were persisted by an earlier ingestion microbatch. The normal
+        # Geometry pass cannot discover that ordering, so explicitly perform
+        # the reverse lookup for every reaction registered during this batch.
+        for mapped_reaction in context.mapped_reactions_to_reconcile.values():
+            mapped_reaction_id = mapped_reaction.id
+            if mapped_reaction_id is None:
+                continue
+            reconcile_mapped_reaction_with_geometries(
+                session,
+                mapped_reaction,
+                refresh_thermodynamics=False,
+                cache=reconciliation_cache,
+            )
+            reconciliation_cache.affected_reactions_by_id[mapped_reaction_id] = mapped_reaction
         _attach_pending_entities(session)
         session.flush()
         for mapped_reaction in reconciliation_cache.affected_reactions_by_id.values():

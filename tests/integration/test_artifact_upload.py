@@ -22,6 +22,7 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
 )
 from tricycle_reaction_db.application.services.reaction_commands import _create_reaction
 from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
+    ReconciliationBatchCache,
     bind_transition_state_frame,
 )
 from tricycle_reaction_db.application.services.reactions import (
@@ -234,6 +235,26 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
                 binding for binding in ts_geometries if binding.geometry_id == ts_frame.geometry_id
             )
             assert len(inferred_geometry.mapping_bindings) == 1
+
+            # Simulate the historical partial cache: the node is marked loaded
+            # but the requested Geometry is absent from its in-memory list.
+            # The binding must be recovered from PostgreSQL and reused.
+            assert ts_node.id is not None
+            mapped_reaction = session.get(MappedReaction, inference.mapped_reaction_id)
+            assert mapped_reaction is not None
+            partial_cache = ReconciliationBatchCache()
+            partial_cache.node_geometries_by_node[ts_node.id] = [
+                binding for binding in ts_geometries if binding.geometry_id != ts_frame.geometry_id
+            ]
+            partial_cache.loaded_node_geometries.add(ts_node.id)
+            reused_from_partial_cache = bind_transition_state_frame(
+                session,
+                mapped_reaction=mapped_reaction,
+                calculation_frame=ts_frame,
+                cache=partial_cache,
+            )
+            assert reused_from_partial_cache.id == inferred_geometry.id
+
             mapping = inferred_geometry.mapping_bindings[0]
             expected_map_set = list(range(1, ts_frame.geometry.atom_count + 1))
             frame_source_to_geometry = list(ts_frame.observed_to_geometry_atom_indices)

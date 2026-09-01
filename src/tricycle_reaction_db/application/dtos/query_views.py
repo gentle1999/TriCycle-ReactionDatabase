@@ -332,6 +332,7 @@ class ArtifactIngestionSummary(QueryView):
     transition_state_frame_count: int | None = None
     error_code: str | None = None
     error_message: str | None = None
+    parser_metadata_json: str = "{}"
     started_at: datetime | None = None
     completed_at: datetime | None = None
 
@@ -355,6 +356,7 @@ class TransitionStateInferenceSummary(QueryView):
     reactant_product_changed: bool | None = None
     error_code: str | None = None
     error_message: str | None = None
+    error_metadata_json: str | None = None
 
 
 class TransitionStateInferencePage(QueryView):
@@ -378,6 +380,8 @@ class ParseRevisionSummary(QueryView):
     running_time_seconds: float | None = None
     error_code: str | None = None
     error_message: str | None = None
+    error_metadata_json: str | None = None
+    parse_diagnostics_json: str = "[]"
     started_at: datetime | None = None
     completed_at: datetime | None = None
 

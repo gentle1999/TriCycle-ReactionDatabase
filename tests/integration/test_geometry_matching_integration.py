@@ -1,9 +1,6 @@
 """Database-backed tests for software-neutral Geometry reuse."""
 
 import os
-from datetime import UTC, datetime
-from hashlib import sha256
-from uuid import uuid4
 
 import numpy as np
 import pytest
@@ -11,24 +8,15 @@ from rdkit import Chem
 from sqlalchemy import create_engine, text
 from sqlmodel import Session
 
-from tricycle_reaction_db.application.services.artifact_uploads import (
-    _mark_ingestion_failed,
-)
 from tricycle_reaction_db.application.services.molecular_geometry import (
     GEOMETRY_MATCH_POLICY_VERSION,
-    GeometryAssignmentAmbiguityError,
+    GeometryPersistenceContext,
     persist_molecular_geometry,
+    preload_molecular_geometry_context,
 )
 from tricycle_reaction_db.core.config import get_settings
-from tricycle_reaction_db.db.models import ArtifactFile, ArtifactIngestion, Geometry
-from tricycle_reaction_db.domain.enums import (
-    ArtifactIngestionStatus,
-    ArtifactKind,
-    ArtifactVisibility,
-    GeometryAssignmentKind,
-    StorageStatus,
-)
-from tricycle_reaction_db.domain.identity import DEVELOPMENT_USER_ID, SYSTEM_PROJECT_ID
+from tricycle_reaction_db.db.models import Geometry
+from tricycle_reaction_db.domain.enums import GeometryAssignmentKind
 from tricycle_reaction_db.ingestion import normalize_molecule
 
 pytestmark = [
@@ -194,7 +182,74 @@ def test_printing_precision_observation_reuses_one_geometry() -> None:
                 source.geometry.internal_coordinates,
                 rotated.geometry.internal_coordinates,
             )
-            assert GEOMETRY_MATCH_POLICY_VERSION == "geometry-internal-coordinate-match-v3"
+            assert GEOMETRY_MATCH_POLICY_VERSION == "geometry-internal-coordinate-match-v4"
+    finally:
+        transaction.rollback()
+        connection.close()
+        engine.dispose()
+
+
+def test_preloaded_batch_reuses_pending_equivalent_geometry() -> None:
+    base = Chem.MolFromSmiles("[13CH3][15NH2]")
+    assert base is not None
+    molecule = Chem.AddHs(base)
+    atom_indices = np.arange(molecule.GetNumAtoms(), dtype=np.float64)
+    coordinates = np.column_stack(
+        (
+            atom_indices * 0.7,
+            np.mod(np.square(atom_indices), 5.0) * 0.3,
+            np.mod(np.power(atom_indices, 3), 7.0) * 0.2,
+        )
+    )
+    shifted = coordinates.copy()
+    shifted[2, 1] += 2e-9
+    source = normalize_molecule(
+        molecule,
+        coordinates,
+        charge=0,
+        multiplicity=1,
+        reconstruction_method="geometry-batch-dedup-test",
+        reconstruction_version="v1",
+    )
+    observation = normalize_molecule(
+        molecule,
+        shifted,
+        charge=0,
+        multiplicity=1,
+        reconstruction_method="geometry-batch-dedup-test",
+        reconstruction_version="v1",
+    )
+    assert source.geometry.geometry_hash != observation.geometry.geometry_hash
+
+    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    connection = engine.connect()
+    transaction = connection.begin()
+    try:
+        with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
+            session.info["tricycle_fast_insert"] = True
+            context = GeometryPersistenceContext()
+            preload_molecular_geometry_context(
+                session,
+                [(source, 8), (observation, 8)],
+                context=context,
+            )
+            first = persist_molecular_geometry(
+                session,
+                source,
+                coordinate_decimal_places=8,
+                context=context,
+            )
+            second = persist_molecular_geometry(
+                session,
+                observation,
+                coordinate_decimal_places=8,
+                context=context,
+            )
+
+            assert second.geometry.id == first.geometry.id
+            assert (
+                second.geometry_assignment_kind is GeometryAssignmentKind.MATCHED_EXISTING_GEOMETRY
+            )
     finally:
         transaction.rollback()
         connection.close()
@@ -243,8 +298,9 @@ def test_same_coordinates_with_different_electronic_state_are_distinct_geometrie
         engine.dispose()
 
 
-def test_ambiguous_geometry_match_is_rejected_with_persisted_versioned_qc_evidence() -> None:
+def test_ambiguous_geometry_match_selects_nearest_candidate() -> None:
     molecule = Chem.AddHs(Chem.MolFromSmiles("CO"))
+    assert molecule is not None
     atom_indices = np.arange(molecule.GetNumAtoms(), dtype=np.float64)
     coordinates = np.column_stack(
         (
@@ -261,11 +317,21 @@ def test_ambiguous_geometry_match_is_rejected_with_persisted_versioned_qc_eviden
         reconstruction_method="geometry-ambiguity-test",
         reconstruction_version="v1",
     )
-    shifted_coordinates = coordinates.copy()
-    shifted_coordinates[2, 1] += 2e-9
+    alternate_coordinates = coordinates.copy()
+    alternate_coordinates[2, 1] += 4e-7
+    alternate_record = normalize_molecule(
+        molecule,
+        alternate_coordinates,
+        charge=0,
+        multiplicity=1,
+        reconstruction_method="geometry-ambiguity-test",
+        reconstruction_version="v1",
+    )
+    observed_coordinates = coordinates.copy()
+    observed_coordinates[2, 1] += 3e-7
     observation = normalize_molecule(
         molecule,
-        shifted_coordinates,
+        observed_coordinates,
         charge=0,
         multiplicity=1,
         reconstruction_method="geometry-ambiguity-test",
@@ -283,75 +349,52 @@ def test_ambiguous_geometry_match_is_rejected_with_persisted_versioned_qc_eviden
                 coordinate_decimal_places=8,
             )
             assert authority.topology.id is not None
-            internal = np.array(source.geometry.internal_coordinates, copy=True)
+            assert source.geometry.geometry_hash != alternate_record.geometry.geometry_hash
+            assert source.geometry.geometry_hash != observation.geometry.geometry_hash
+            assert alternate_record.geometry.geometry_hash != observation.geometry.geometry_hash
+            internal = np.array(alternate_record.geometry.internal_coordinates, copy=True)
             alternate = Geometry(
                 topology_id=authority.topology.id,
                 topology=authority.topology,
-                mol=Chem.Mol(authority.geometry.mol),
+                mol=Chem.Mol(alternate_record.geometry.mol),
                 internal_coordinates=internal,
                 internal_coordinate_distances_angstrom=internal[:, 0].tolist(),
                 internal_coordinate_angles_degrees=internal[:, 1].tolist(),
                 internal_coordinate_dihedrals_degrees=internal[:, 2].tolist(),
-                internal_coordinate_hash=source.geometry.internal_coordinate_hash,
-                geometry_hash=sha256(f"ambiguous-{uuid4()}".encode()).hexdigest(),
-                canonicalization_version=source.geometry.canonicalization_version,
+                minimum_coordinate_decimal_places=6,
+                internal_coordinate_hash=alternate_record.geometry.internal_coordinate_hash,
+                geometry_hash=alternate_record.geometry.geometry_hash,
+                charge=alternate_record.geometry.charge,
+                multiplicity=alternate_record.geometry.multiplicity,
+                canonicalization_version=alternate_record.geometry.canonicalization_version,
             )
             session.add(alternate)
             session.flush()
 
-            with pytest.raises(GeometryAssignmentAmbiguityError) as caught:
-                persist_molecular_geometry(
-                    session,
-                    observation,
-                    coordinate_decimal_places=8,
-                )
-
-            error = caught.value
-            assert set(error.candidate_ids) == {authority.geometry.id, alternate.id}
-            evidence = error.evidence()
-            assert evidence["rule_id"] == "geometry.unique-coordinate-match"
-            assert evidence["policy_version"] == GEOMETRY_MATCH_POLICY_VERSION
-            assert evidence["outcome"] == "fail"
-            assert evidence["candidate_count"] == 2
-
-            digest = sha256(f"geometry-ambiguity-ingestion-{uuid4()}".encode()).hexdigest()
-            artifact = ArtifactFile(
-                project_id=SYSTEM_PROJECT_ID,
-                created_by_user_id=DEVELOPMENT_USER_ID,
-                visibility=ArtifactVisibility.PROJECT,
-                bucket="integration-test",
-                object_key=f"integration/geometry-ambiguity/{digest}",
-                content_sha256=digest,
-                size_bytes=1,
-                original_filename="ambiguous.log",
-                media_type="text/plain",
-                artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
-                storage_status=StorageStatus.AVAILABLE,
+            assert _database_internal_coordinate_match(
+                source.geometry.internal_coordinates,
+                observation.geometry.internal_coordinates,
+                candidate_decimal_places=6,
+                observed_decimal_places=6,
             )
-            session.add(artifact)
-            session.flush()
-            assert artifact.id is not None
-            ingestion = ArtifactIngestion(
-                artifact_file_id=artifact.id,
-                artifact_file=artifact,
-                parser_version="test",
-                started_at=datetime.now(UTC),
+            assert _database_internal_coordinate_match(
+                alternate_record.geometry.internal_coordinates,
+                observation.geometry.internal_coordinates,
+                candidate_decimal_places=6,
+                observed_decimal_places=6,
             )
-            session.add(ingestion)
-            session.flush()
-            assert ingestion.id is not None
-            _mark_ingestion_failed(
+
+            matched = persist_molecular_geometry(
                 session,
-                ingestion_id=ingestion.id,
-                error=error,
-                error_code="calculation_persistence_failed",
-                completed_at=datetime.now(UTC),
+                observation,
+                coordinate_decimal_places=6,
             )
-            session.flush()
-
-            assert ingestion.status is ArtifactIngestionStatus.FAILED
-            assert ingestion.error_code == "geometry_assignment_ambiguous"
-            assert ingestion.parser_metadata["qc_rejection"] == evidence
+            assert matched.geometry.id == alternate.id
+            assert (
+                matched.geometry_assignment_kind is GeometryAssignmentKind.MATCHED_EXISTING_GEOMETRY
+            )
+            assert matched.coordinate_rmsd_angstrom >= 0
+            assert matched.coordinate_max_abs_angstrom >= matched.coordinate_rmsd_angstrom
     finally:
         transaction.rollback()
         connection.close()

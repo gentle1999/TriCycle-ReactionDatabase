@@ -8,8 +8,9 @@ from rdkit import Chem
 from tricycle_reaction_db.application.services import molecular_geometry
 from tricycle_reaction_db.application.services.molecular_geometry import (
     _coordinate_alignment,
+    _nearest_geometry_candidate,
 )
-from tricycle_reaction_db.ingestion.normalization import normalize_topology
+from tricycle_reaction_db.ingestion.normalization import normalize_molecule, normalize_topology
 
 
 def _alternate_projection_record():
@@ -123,3 +124,62 @@ def test_geometry_error_removes_translation_and_proper_rotation() -> None:
     assert max_abs < 1e-12
     assert aligned == pytest.approx(reference, abs=1e-12)
     assert np.linalg.det(transform[:3, :3]) == pytest.approx(1.0)
+
+
+def test_nearest_geometry_candidate_uses_aligned_cartesian_rmsd() -> None:
+    molecule = Chem.MolFromSmiles("CO")
+    assert molecule is not None
+    molecule = Chem.AddHs(molecule)
+    atom_indices = np.arange(molecule.GetNumAtoms(), dtype=np.float64)
+    coordinates = np.column_stack(
+        (
+            atom_indices * 0.9,
+            np.mod(np.square(atom_indices), 5.0) * 0.2,
+            np.mod(np.power(atom_indices, 3), 7.0) * 0.15,
+        )
+    )
+    nearest_coordinates = coordinates.copy()
+    nearest_coordinates[2, 1] += 1e-3
+    distant_coordinates = coordinates.copy()
+    distant_coordinates[2, 1] += 2e-3
+    observation = normalize_molecule(
+        molecule,
+        coordinates,
+        charge=0,
+        multiplicity=1,
+        reconstruction_method="geometry-nearest-test",
+        reconstruction_version="v1",
+    )
+    nearest = normalize_molecule(
+        molecule,
+        nearest_coordinates,
+        charge=0,
+        multiplicity=1,
+        reconstruction_method="geometry-nearest-test",
+        reconstruction_version="v1",
+    )
+    distant = normalize_molecule(
+        molecule,
+        distant_coordinates,
+        charge=0,
+        multiplicity=1,
+        reconstruction_method="geometry-nearest-test",
+        reconstruction_version="v1",
+    )
+    nearest_candidate = SimpleNamespace(
+        id=UUID("00000000-0000-7000-8000-000000000501"),
+        mol=nearest.geometry.mol,
+    )
+    distant_candidate = SimpleNamespace(
+        id=UUID("00000000-0000-7000-8000-000000000502"),
+        mol=distant.geometry.mol,
+    )
+
+    selected, rmsd, max_abs, _transform = _nearest_geometry_candidate(
+        observation,
+        (distant_candidate, nearest_candidate),
+    )
+
+    assert selected is nearest_candidate
+    assert rmsd >= 0
+    assert max_abs >= rmsd

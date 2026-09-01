@@ -10,6 +10,7 @@ class StereoStatus(StrEnum):
     UNASSIGNED = "unassigned"
     CONFLICT = "conflict"
     UNKNOWN = "unknown"
+    AMBIGUOUS = "ambiguous"
 
 
 class TopologySanitizationStatus(StrEnum):

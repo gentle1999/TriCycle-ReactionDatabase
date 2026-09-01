@@ -408,7 +408,12 @@ def _create_reaction(
     # participants.  Defer this candidate scan until the batch barrier so the
     # query can see every participant and run once over the complete Geometry
     # context.  The endpoint nodes above are still created immediately.
-    if not defer_geometry_reconciliation:
+    if defer_geometry_reconciliation:
+        if topology_context is None:
+            raise ValueError("deferred Geometry reconciliation requires a topology context")
+        mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
+        topology_context.mapped_reactions_to_reconcile[mapped_reaction_id] = mapped_reaction
+    else:
         reconcile_mapped_reaction_with_geometries(
             session,
             mapped_reaction,

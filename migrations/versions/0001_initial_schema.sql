@@ -1061,7 +1061,7 @@ END) STORED,
     CONSTRAINT ck_molecular_topology_radical_electrons CHECK ((radical_electron_count >= 0)),
     CONSTRAINT ck_molecular_topology_sanitization_evidence CHECK (((((sanitization_status)::text = 'sanitized'::text) AND (sanitization_error IS NULL) AND (canonical_isomeric_smiles IS NOT NULL)) OR (((sanitization_status)::text = 'failed'::text) AND (sanitization_error IS NOT NULL)))),
     CONSTRAINT molecular_topology_sanitization_status CHECK (((sanitization_status)::text = ANY ((ARRAY['sanitized'::character varying, 'failed'::character varying])::text[]))),
-    CONSTRAINT molecular_topology_stereo_status CHECK (((stereo_status)::text = ANY ((ARRAY['assigned'::character varying, 'unassigned'::character varying, 'unknown'::character varying, 'conflict'::character varying])::text[])))
+    CONSTRAINT molecular_topology_stereo_status CHECK (((stereo_status)::text = ANY ((ARRAY['assigned'::character varying, 'unassigned'::character varying, 'unknown'::character varying, 'conflict'::character varying, 'ambiguous'::character varying])::text[])))
 );
 
 

@@ -4,6 +4,7 @@ import threading
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 from molgr.config import CONFIG as molgr_config
@@ -31,13 +32,20 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
     _pipeline_task_lifecycle,
     _prepare_calculation_parser_path,
     _require_batch_upload_budget,
+    _restore_inference_context,
     _run_molop_file_parser,
     _run_molop_file_pipeline,
     _run_molop_parser_with_progress,
+    _snapshot_inference_context,
     _SuccessfulInference,
 )
 from tricycle_reaction_db.application.services.authorization import AuthorizationService
+from tricycle_reaction_db.application.services.molecular_geometry import GeometryPersistenceContext
+from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
+    ReconciliationBatchCache,
+)
 from tricycle_reaction_db.core.config import Settings
+from tricycle_reaction_db.db.models import MappedReactionNodeGeometry
 from tricycle_reaction_db.domain.enums import (
     ArtifactIngestionStatus,
     ArtifactKind,
@@ -56,6 +64,41 @@ NON_TS_FIXTURE = (
     FIXTURE_ROOT / "complete_set/000000000000_000000403256/00/prod/"
     "000000000000_000000403256_00_00.prod.log.gz"
 )
+
+
+def test_inference_context_snapshot_restores_nested_reconciliation_cache_lists() -> None:
+    context = GeometryPersistenceContext()
+    cache = ReconciliationBatchCache()
+    context.reconciliation_cache = cache
+    node_id = UUID("00000000-0000-7000-8000-000000000001")
+    original_binding = MappedReactionNodeGeometry(
+        mapped_reaction_node_id=node_id,
+        geometry_id=UUID("00000000-0000-7000-8000-000000000002"),
+        component_key="transition-state",
+        component_index=0,
+        coordinate_index=0,
+        is_primary=True,
+    )
+    cache.node_geometries_by_node[node_id] = [original_binding]
+    cache.loaded_node_geometries.add(node_id)
+
+    snapshot = _snapshot_inference_context(context)
+    cache.node_geometries_by_node[node_id].append(
+        MappedReactionNodeGeometry(
+            mapped_reaction_node_id=node_id,
+            geometry_id=UUID("00000000-0000-7000-8000-000000000003"),
+            component_key="transition-state",
+            component_index=0,
+            coordinate_index=1,
+            is_primary=False,
+        )
+    )
+    cache.loaded_node_geometries.clear()
+
+    _restore_inference_context(context, snapshot)
+
+    assert cache.node_geometries_by_node[node_id] == [original_binding]
+    assert node_id in cache.loaded_node_geometries
 
 
 @pytest.fixture(autouse=True)
@@ -152,7 +195,7 @@ def test_frame_conversion_failure_keeps_other_frames(monkeypatch: pytest.MonkeyP
     assert parsed.source_frame_count == 3
     assert parsed.parse_diagnostics == (
         {
-            "code": "frame_parse_failed",
+            "code": "frame_conversion_failed",
             "stage": "conversion",
             "segment_index": 0,
             "file_frame_index": 1,
@@ -160,6 +203,23 @@ def test_frame_conversion_failure_keeps_other_frames(monkeypatch: pytest.MonkeyP
             "message": "malformed frame",
         },
     )
+
+
+def test_frame_failure_diagnostic_keeps_specific_error_code_and_evidence() -> None:
+    error = upload_module.StereoProjectionError(
+        "stereo projection is ambiguous",
+        evidence={"failure_boundary": "canonical_atom_order_projection"},
+    )
+
+    diagnostic = upload_module._frame_failure_diagnostic(
+        file_frame_index=4,
+        error=error,
+        stage="conversion",
+    )
+
+    assert diagnostic["code"] == "stereo_projection_failed"
+    assert diagnostic["error_type"] == "StereoProjectionError"
+    assert diagnostic["metadata"] == {"failure_boundary": "canonical_atom_order_projection"}
 
 
 def test_source_evidence_does_not_disable_fast_ingestion(
@@ -532,9 +592,7 @@ def test_inferred_endpoint_repairs_stereo_before_fragment_extraction(
         strictParsing=True,
     )
     assert endpoint is not None
-    for assigned_bond, endpoint_bond in zip(
-        assigned.GetBonds(), endpoint.GetBonds(), strict=True
-    ):
+    for assigned_bond, endpoint_bond in zip(assigned.GetBonds(), endpoint.GetBonds(), strict=True):
         endpoint_bond.SetStereo(assigned_bond.GetStereo())
         stereo_atoms = list(assigned_bond.GetStereoAtoms())
         if len(stereo_atoms) == 2:
@@ -577,8 +635,11 @@ def test_inferred_endpoint_repairs_stereo_before_fragment_extraction(
     )
     records = upload_module._inference_topology_records(inferred)
 
-    assert repair_inputs[:2] == [(2, 1), (2, 1)]
-    assert repair_inputs[2:] == [(1, 0)] * 4
+    # Fragments are split while the endpoint's conformer is still available;
+    # the conformer is removed only after each fragment's stereo is repaired.
+    # Complete endpoint projection is performed once by the reaction-side
+    # serializer; topology normalization consumes the frozen endpoint state.
+    assert repair_inputs == [(1, 1)] * 4
     endpoint_smiles = [record.topology.canonical_isomeric_smiles for record in records[:2]]
     participant_smiles = [
         record.topology.canonical_isomeric_smiles
@@ -591,6 +652,77 @@ def test_inferred_endpoint_repairs_stereo_before_fragment_extraction(
         for smiles in endpoint_smiles + participant_smiles
         if smiles is not None
     )
+
+
+def test_fragment_stereo_uses_endpoint_coordinates_before_conformer_removal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    endpoint = Chem.AddHs(Chem.MolFromSmiles("F/C(Cl)=C(/F)Cl.[Na+]"))
+    assert endpoint is not None
+    assert AllChem.EmbedMolecule(endpoint, randomSeed=17) == 0
+    for bond in endpoint.GetBonds():
+        bond.SetStereo(Chem.BondStereo.STEREONONE)
+        bond.SetBondDir(Chem.BondDir.NONE)
+
+    assign_from_3d = Chem.AssignStereochemistryFrom3D
+    assign_calls = 0
+
+    def assign_once(*args: object, **kwargs: object) -> None:
+        nonlocal assign_calls
+        assign_calls += 1
+        assign_from_3d(*args, **kwargs)
+
+    monkeypatch.setattr(Chem, "AssignStereochemistryFrom3D", assign_once)
+
+    inferred_endpoint = upload_module._infer_endpoint_stereochemistry_from_3d(endpoint)
+    reaction_smiles = upload_module._mapped_reaction_smiles(
+        inferred_endpoint,
+        Chem.Mol(inferred_endpoint),
+    )
+
+    for side in reaction_smiles.split(">>"):
+        parsed_fragments = [Chem.MolFromSmiles(fragment) for fragment in side.split(".")]
+        alkene = next(
+            molecule
+            for molecule in parsed_fragments
+            if molecule is not None
+            and any(bond.GetBondType() == Chem.BondType.DOUBLE for bond in molecule.GetBonds())
+        )
+        assert alkene is not None
+        double_bond = next(
+            bond for bond in alkene.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE
+        )
+        assert double_bond.GetStereo() is Chem.BondStereo.STEREOE
+
+    assert assign_calls == 1
+
+    inferred = _SuccessfulInference(
+        file_frame_index=0,
+        imaginary_mode_index=0,
+        imaginary_frequency_cm1=-100.0,
+        reaction_smiles=reaction_smiles,
+        negative_endpoint=inferred_endpoint,
+        positive_endpoint=Chem.Mol(inferred_endpoint),
+        negative_displacement_ratio=1.0,
+        positive_displacement_ratio=1.0,
+        charge=1,
+        multiplicity=1,
+    )
+    records = upload_module._inference_topology_records(inferred)
+    participant_smiles = [
+        record.topology.canonical_isomeric_smiles
+        for record in records[2:]
+        if record.topology.atom_count > 1
+    ]
+    assert len(participant_smiles) == 2
+    for smiles in participant_smiles:
+        assert smiles is not None
+        parsed = Chem.MolFromSmiles(smiles)
+        assert parsed is not None
+        double_bond = next(
+            bond for bond in parsed.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE
+        )
+        assert double_bond.GetStereo() is Chem.BondStereo.STEREOE
 
 
 def test_mapped_endpoint_reaction_repairs_ez_after_fragment_extraction() -> None:

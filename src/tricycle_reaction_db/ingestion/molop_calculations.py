@@ -928,6 +928,23 @@ def _frame_record(
             optimization_status = OptimizationStatus.NOT_CONVERGED
     elif _parse_presence(frame.get("parse_presence") or {}).get("optimization") == "not_requested":
         optimization_status = OptimizationStatus.NOT_REQUESTED
+    parse_diagnostics = _diagnostics(frame.get("parse_diagnostics") or [])
+    stereo_projection = molecule.topology_derivation.reconstruction_metadata.get(
+        "stereo_projection"
+    )
+    if isinstance(stereo_projection, dict):
+        parse_diagnostics.append(
+            {
+                "code": "stereo_projection_failed",
+                "stage": "topology_normalization",
+                "error_type": stereo_projection.get("error_type", "StereoProjectionError"),
+                "message": stereo_projection.get(
+                    "message",
+                    "trusted stereo assignment could not be projected losslessly",
+                ),
+                "metadata": stereo_projection.get("evidence", {}),
+            }
+        )
     return CalculationFrameRecord(
         frame_index=segment_frame_index,
         file_frame_index=file_frame_index,
@@ -937,7 +954,7 @@ def _frame_record(
         parse_completeness=ParseCompleteness(
             _enum_value(frame.get("parse_completeness") or ParseCompleteness.NOT_ASSESSED)
         ),
-        parse_diagnostics=_diagnostics(frame.get("parse_diagnostics") or []),
+        parse_diagnostics=parse_diagnostics,
         charge=frame["charge"],
         multiplicity=frame["multiplicity"],
         coordinate_decimal_places=frame["coordinate_decimal_places"],
@@ -948,7 +965,7 @@ def _frame_record(
         observed_to_geometry_transform=molecule.observed_to_geometry_transform,
         geometry_assignment_rmsd_angstrom=molecule.geometry_assignment_rmsd_angstrom,
         geometry_assignment_max_abs_angstrom=molecule.geometry_assignment_max_abs_angstrom,
-        geometry_assignment_policy_version="geometry-internal-coordinate-match-v3",
+        geometry_assignment_policy_version="geometry-internal-coordinate-match-v4",
         scf_status=_scf_status(frame["status"]["scf_converged"] if frame["status"] else None),
         optimization_status=optimization_status,
         electronic_total_energy_hartree=(energy.electronic_energy_hartree if energy else None),

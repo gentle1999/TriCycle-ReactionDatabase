@@ -177,6 +177,17 @@ async def upload_artifact_batch(
                 status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                 detail=str(error),
             ) from error
+        except ArtifactUploadConflictError as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+        except ArtifactUploadError as error:
+            # A calculation file can fail during parsing or persistence after
+            # the other files in this request have already been committed.
+            # Return a structured client error instead of leaking the domain
+            # exception as an opaque HTTP 500.
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=str(error),
+            ) from error
 
 
 @router.post("/validate", response_model=ArtifactValidationResult)

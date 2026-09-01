@@ -426,6 +426,7 @@ def _ingestion_summary(ingestion: ArtifactIngestion) -> ArtifactIngestionSummary
         transition_state_frame_count=ingestion.transition_state_frame_count,
         error_code=ingestion.error_code,
         error_message=ingestion.error_message,
+        parser_metadata_json=json.dumps(ingestion.parser_metadata, sort_keys=True),
         started_at=ingestion.started_at,
         completed_at=ingestion.completed_at,
     )
@@ -448,6 +449,12 @@ def _parse_revision_summary(revision: ParseRevision) -> ParseRevisionSummary:
         running_time_seconds=revision.running_time_seconds,
         error_code=revision.error_code,
         error_message=revision.error_message,
+        error_metadata_json=(
+            json.dumps(revision.error_metadata, sort_keys=True)
+            if revision.error_metadata is not None
+            else None
+        ),
+        parse_diagnostics_json=json.dumps(revision.parse_diagnostics, sort_keys=True),
         started_at=revision.started_at,
         completed_at=revision.completed_at,
     )
@@ -488,6 +495,11 @@ def _ts_summary(
         reactant_product_changed=reactant_product_changed,
         error_code=inference.error_code,
         error_message=inference.error_message,
+        error_metadata_json=(
+            json.dumps(inference.inference_settings.get("failure"), sort_keys=True)
+            if isinstance(inference.inference_settings.get("failure"), dict)
+            else None
+        ),
     )
 
 

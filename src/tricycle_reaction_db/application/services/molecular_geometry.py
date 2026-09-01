@@ -98,8 +98,21 @@ class GeometryPersistenceContext:
     equivalent_geometry_candidates: dict[tuple[UUID, str, str, int, int], tuple[UUID, ...]] = field(
         default_factory=dict
     )
+    # Keep the complete preloaded candidate rows so the closest candidate can
+    # be selected against each observation without another database roundtrip.
+    equivalent_geometry_rows_by_key: dict[tuple[UUID, str, str, int, int], tuple[Geometry, ...]] = (
+        field(default_factory=dict)
+    )
     equivalent_geometry_keys_loaded: set[tuple[UUID, str, str, int, int]] = field(
         default_factory=set
+    )
+    # Geometry rows created in the current SQLAlchemy transaction are not
+    # visible to PostgreSQL until the fast-insert queue is flushed.  Keep a
+    # small in-memory index so two near-equivalent observations in one
+    # persistence microbatch reuse the first row instead of creating a pair
+    # of hash-distinct Geometry records.
+    in_memory_geometries_by_identity: dict[tuple[UUID, str, int, int], tuple[Geometry, ...]] = (
+        field(default_factory=dict)
     )
     geometries_to_reconcile: dict[UUID, Geometry] = field(default_factory=dict)
     # Reaction participants are keyed by topology because reconciliation runs
@@ -109,6 +122,12 @@ class GeometryPersistenceContext:
         default_factory=dict
     )
     mapped_reactions_by_id: dict[UUID, MappedReaction] = field(default_factory=dict)
+    # A mapped reaction can be created after its endpoint Geometry rows were
+    # committed in an earlier ingestion microbatch. Keep those reactions in
+    # the batch context so the reconciliation barrier performs the reverse
+    # (reaction -> existing Geometry) lookup as well as the normal Geometry ->
+    # existing reaction lookup.
+    mapped_reactions_to_reconcile: dict[UUID, MappedReaction] = field(default_factory=dict)
     # TS inference commonly repeats the same mapped reaction across files. The
     # reaction identity is immutable, so reuse the first successful creation
     # result while still binding each source frame independently.
@@ -119,14 +138,14 @@ class GeometryPersistenceContext:
     reconciliation_cache: Any = None
 
 
-GEOMETRY_MATCH_POLICY_VERSION = "geometry-internal-coordinate-match-v3"
+GEOMETRY_MATCH_POLICY_VERSION = "geometry-internal-coordinate-match-v4"
 # Keep each set-based equivalence statement below the database statement
 # timeout even when one file batch contains many thousands of frame keys.
 GEOMETRY_MATCH_INPUT_BATCH_SIZE = 128
 
 
 class GeometryAssignmentAmbiguityError(ValueError):
-    """A coordinate observation matched more than one persisted Geometry."""
+    """Legacy error type retained for callers handling pre-v4 failures."""
 
     error_code = "geometry_assignment_ambiguous"
     rule_id = "geometry.unique-coordinate-match"
@@ -178,6 +197,37 @@ def _coordinate_alignment(
     return proper_rigid_alignment(observed, reference)
 
 
+def _nearest_geometry_candidate(
+    record: NormalizedMoleculeRecord,
+    candidates: Sequence[Geometry],
+) -> tuple[Geometry, float, float, tuple[float, ...]]:
+    """Choose the closest equivalent Geometry with a deterministic tie-break."""
+
+    if not candidates:
+        raise ValueError("at least one Geometry candidate is required")
+    observed_topology_coords = _topology_order_coordinates(
+        record.observed_coordinates,
+        record.observed_to_geometry_atom_indices,
+    )
+    scored: list[tuple[float, float, str, Geometry, tuple[float, ...]]] = []
+    for candidate in candidates:
+        candidate_id = _require_id(candidate, label="Geometry")
+        candidate_coordinates = np.asarray(
+            candidate.mol.GetConformer().GetPositions(),
+            dtype=np.float64,
+        )
+        rmsd, max_abs, transform = _coordinate_alignment(
+            observed_topology_coords,
+            candidate_coordinates,
+        )
+        scored.append((rmsd, max_abs, str(candidate_id), candidate, transform))
+    rmsd, max_abs, _candidate_id, geometry, transform = min(
+        scored,
+        key=lambda item: (item[0], item[1], item[2]),
+    )
+    return geometry, rmsd, max_abs, transform
+
+
 def _coordinate_error(
     observed: npt.NDArray[np.float64],
     reference: npt.NDArray[np.float64],
@@ -199,6 +249,201 @@ def _internal_coordinate_projection(
     )
 
 
+def _internal_coordinate_arrays_equivalent(
+    candidate_distances: Sequence[float],
+    candidate_angles: Sequence[float],
+    candidate_dihedrals: Sequence[float],
+    candidate_minimum_coordinate_decimal_places: int | None,
+    observed_distances: Sequence[float],
+    observed_angles: Sequence[float],
+    observed_dihedrals: Sequence[float],
+    observed_coordinate_decimal_places: int | None,
+) -> bool:
+    """Mirror the PostgreSQL geometry-equivalence predicate for pending rows."""
+
+    candidate_distance_values = np.asarray(candidate_distances, dtype=np.float64)
+    candidate_angle_values = np.asarray(candidate_angles, dtype=np.float64)
+    candidate_dihedral_values = np.asarray(candidate_dihedrals, dtype=np.float64)
+    observed_distance_values = np.asarray(observed_distances, dtype=np.float64)
+    observed_angle_values = np.asarray(observed_angles, dtype=np.float64)
+    observed_dihedral_values = np.asarray(observed_dihedrals, dtype=np.float64)
+    arrays = (
+        candidate_distance_values,
+        candidate_angle_values,
+        candidate_dihedral_values,
+        observed_distance_values,
+        observed_angle_values,
+        observed_dihedral_values,
+    )
+    if any(array.ndim != 1 for array in arrays):
+        return False
+    candidate_length = candidate_distance_values.size
+    observed_length = observed_distance_values.size
+    if (
+        candidate_length == 0
+        or candidate_length != observed_length
+        or candidate_angle_values.size != candidate_length
+        or candidate_dihedral_values.size != candidate_length
+        or observed_angle_values.size != observed_length
+        or observed_dihedral_values.size != observed_length
+        or any(not np.isfinite(array).all() for array in arrays)
+    ):
+        return False
+
+    if (
+        candidate_minimum_coordinate_decimal_places is None
+        and observed_coordinate_decimal_places is None
+    ):
+        coordinate_tolerance = 1e-6
+    else:
+        known_places = min(
+            candidate_minimum_coordinate_decimal_places
+            if candidate_minimum_coordinate_decimal_places is not None
+            else 18,
+            observed_coordinate_decimal_places
+            if observed_coordinate_decimal_places is not None
+            else 18,
+        )
+        coordinate_tolerance = max(1e-8, 1.1 * 10.0 ** (-known_places))
+    distance_tolerance = 2.2 * coordinate_tolerance
+    if np.any(np.abs(candidate_distance_values - observed_distance_values) > distance_tolerance):
+        return False
+
+    positive_distances = np.concatenate(
+        (
+            candidate_distance_values[candidate_distance_values > 1e-8],
+            observed_distance_values[observed_distance_values > 1e-8],
+        )
+    )
+    minimum_positive_distance = (
+        float(np.min(positive_distances)) if positive_distances.size else 1.0
+    )
+    length_scale = max(minimum_positive_distance, 0.1)
+    angular_tolerance = max(
+        1e-6,
+        float(np.degrees(4.0 * coordinate_tolerance / length_scale)),
+    )
+    if np.any(np.abs(candidate_angle_values - observed_angle_values) > angular_tolerance):
+        return False
+
+    candidate_is_linear = (
+        np.minimum(
+            np.abs(candidate_angle_values),
+            np.abs(180.0 - candidate_angle_values),
+        )
+        <= angular_tolerance
+    )
+    observed_is_linear = (
+        np.minimum(
+            np.abs(observed_angle_values),
+            np.abs(180.0 - observed_angle_values),
+        )
+        <= angular_tolerance
+    )
+    non_linear = ~(candidate_is_linear | observed_is_linear)
+    if np.any(non_linear):
+        dihedral_delta = candidate_dihedral_values - observed_dihedral_values
+        dihedral_delta = np.abs(dihedral_delta - 360.0 * np.floor((dihedral_delta + 180.0) / 360.0))
+        if np.any(dihedral_delta[non_linear] > angular_tolerance):
+            return False
+    return True
+
+
+def _geometry_match_identity(
+    *,
+    topology_id: UUID,
+    canonicalization_version: str,
+    charge: int,
+    multiplicity: int,
+) -> tuple[UUID, str, int, int]:
+    return topology_id, canonicalization_version, charge, multiplicity
+
+
+def _geometry_projection_from_entity(
+    geometry: Geometry,
+) -> tuple[Sequence[float], Sequence[float], Sequence[float]] | None:
+    """Read the non-deferred projection without triggering a lazy load."""
+
+    values = tuple(
+        geometry.__dict__.get(field_name)
+        for field_name in (
+            "internal_coordinate_distances_angstrom",
+            "internal_coordinate_angles_degrees",
+            "internal_coordinate_dihedrals_degrees",
+        )
+    )
+    if any(value is None for value in values):
+        return None
+    return cast(
+        tuple[Sequence[float], Sequence[float], Sequence[float]],
+        values,
+    )
+
+
+def _register_in_memory_geometry(
+    context: GeometryPersistenceContext,
+    geometry: Geometry,
+    *,
+    topology_id: UUID,
+    canonicalization_version: str,
+    charge: int,
+    multiplicity: int,
+) -> None:
+    """Make a transaction-local Geometry visible to later frame writes."""
+
+    if not isinstance(geometry.id, UUID):
+        return
+    if _geometry_projection_from_entity(geometry) is None:
+        return
+    identity = _geometry_match_identity(
+        topology_id=topology_id,
+        canonicalization_version=canonicalization_version,
+        charge=charge,
+        multiplicity=multiplicity,
+    )
+    candidates = context.in_memory_geometries_by_identity.get(identity, ())
+    if all(candidate.id != geometry.id for candidate in candidates):
+        context.in_memory_geometries_by_identity[identity] = (*candidates, geometry)
+
+
+def _find_in_memory_geometry_match(
+    context: GeometryPersistenceContext,
+    *,
+    topology_id: UUID,
+    record: NormalizedMoleculeRecord,
+    coordinate_decimal_places: int | None,
+) -> Geometry | None:
+    """Find the closest equivalent Geometry among pending transaction rows."""
+
+    identity = _geometry_match_identity(
+        topology_id=topology_id,
+        canonicalization_version=record.geometry.canonicalization_version,
+        charge=record.charge,
+        multiplicity=record.multiplicity,
+    )
+    observed_distances, observed_angles, observed_dihedrals = _internal_coordinate_projection(
+        record.geometry.internal_coordinates
+    )
+    matches: list[Geometry] = []
+    for candidate in context.in_memory_geometries_by_identity.get(identity, ()):
+        projection = _geometry_projection_from_entity(candidate)
+        if projection is None:
+            continue
+        candidate_distances, candidate_angles, candidate_dihedrals = projection
+        if _internal_coordinate_arrays_equivalent(
+            candidate_distances,
+            candidate_angles,
+            candidate_dihedrals,
+            candidate.minimum_coordinate_decimal_places,
+            observed_distances,
+            observed_angles,
+            observed_dihedrals,
+            coordinate_decimal_places,
+        ):
+            matches.append(candidate)
+    return _nearest_geometry_candidate(record, matches)[0] if matches else None
+
+
 def _find_database_geometry_match(
     session: Session,
     *,
@@ -206,13 +451,9 @@ def _find_database_geometry_match(
     record: NormalizedMoleculeRecord,
     coordinate_decimal_places: int | None,
 ) -> tuple[Geometry, list[int], float, float, tuple[float, ...]] | None:
-    """Let PostgreSQL find the unique coordinate-equivalent Geometry."""
+    """Let PostgreSQL narrow candidates, then choose the closest Geometry."""
 
     observed = record.geometry
-    observed_topology_coords = _topology_order_coordinates(
-        record.observed_coordinates,
-        record.observed_to_geometry_atom_indices,
-    )
     distances, angles, dihedrals = _internal_coordinate_projection(observed.internal_coordinates)
     matching_ids = list(
         session.exec(
@@ -234,24 +475,17 @@ def _find_database_geometry_match(
             )
         ).all()
     )
-    if len(matching_ids) > 1:
-        raise GeometryAssignmentAmbiguityError(
-            topology_id=topology.id,
-            observed_geometry_hash=record.geometry.geometry_hash,
-            candidate_ids=matching_ids,
-        )
     if not matching_ids:
         return None
-    candidate = session.get(Geometry, matching_ids[0])
-    if candidate is None:
-        raise RuntimeError("database returned a missing Geometry match")
-    candidate_coordinates = np.asarray(
-        candidate.mol.GetConformer().GetPositions(),
-        dtype=np.float64,
+    geometry_columns = cast(Any, Geometry)
+    candidates = tuple(
+        session.exec(select(Geometry).where(geometry_columns.id.in_(matching_ids))).all()
     )
-    rmsd, max_abs, transform = _coordinate_alignment(
-        observed_topology_coords,
-        candidate_coordinates,
+    if len(candidates) != len(matching_ids):
+        raise RuntimeError("database returned an incomplete Geometry candidate set")
+    candidate, rmsd, max_abs, transform = _nearest_geometry_candidate(
+        record,
+        candidates,
     )
     return (
         candidate,
@@ -643,6 +877,19 @@ def persist_molecular_geometry(
         record.charge,
         record.multiplicity,
     )
+    # Serialize tolerance-equivalence decisions for this topology/electronic
+    # state across concurrent transactions.  The database uniqueness
+    # constraint is exact, while the reuse decision is tolerance-based.
+    _acquire_identity_locks(
+        session,
+        (
+            "geometry-equivalence",
+            topology_id,
+            record.geometry.canonicalization_version,
+            record.charge,
+            record.multiplicity,
+        ),
+    )
     geometry = context.geometries_by_hash.get(geometry_key) if context is not None else None
     equivalent_match = False
     if geometry is None and (
@@ -660,15 +907,37 @@ def persist_molecular_geometry(
         if geometry is not None and context is not None:
             context.geometries_by_hash[geometry_key] = geometry
     if geometry is None and context is not None:
-        candidates = context.equivalent_geometry_candidates.get(geometry_key, ())
-        if len(candidates) > 1:
-            raise GeometryAssignmentAmbiguityError(
-                topology_id=topology.id,
-                observed_geometry_hash=record.geometry.geometry_hash,
-                candidate_ids=candidates,
-            )
         geometry = context.equivalent_geometry_by_key.get(geometry_key)
+        if geometry is None:
+            candidate_rows = context.equivalent_geometry_rows_by_key.get(geometry_key)
+            if candidate_rows is None:
+                candidate_ids = context.equivalent_geometry_candidates.get(geometry_key, ())
+                if candidate_ids:
+                    geometry_columns = cast(Any, Geometry)
+                    candidate_rows = tuple(
+                        session.exec(
+                            select(Geometry).where(geometry_columns.id.in_(candidate_ids))
+                        ).all()
+                    )
+                    if len(candidate_rows) != len(candidate_ids):
+                        raise RuntimeError("database returned an incomplete Geometry candidate set")
+                    context.equivalent_geometry_rows_by_key[geometry_key] = candidate_rows
+            if candidate_rows:
+                geometry = _nearest_geometry_candidate(record, candidate_rows)[0]
         equivalent_match = geometry is not None
+    if geometry is None and context is not None:
+        geometry = _find_in_memory_geometry_match(
+            context,
+            topology_id=topology_id,
+            record=record,
+            coordinate_decimal_places=coordinate_decimal_places,
+        )
+        equivalent_match = geometry is not None
+        if geometry is not None:
+            context.equivalent_geometry_by_key[geometry_key] = geometry
+            context.equivalent_geometry_candidates[geometry_key] = (
+                _require_id(geometry, label="Geometry"),
+            )
     assignment_kind = GeometryAssignmentKind.PARSED_EXACT
     assignment_indices: list[int] | None = list(record.observed_to_geometry_atom_indices)
     assignment_transform = tuple(record.observed_to_geometry_transform)
@@ -736,6 +1005,15 @@ def persist_molecular_geometry(
             _flush_shared_entity(session, geometry, label="Geometry", defer_if_fast=True)
     if context is not None and geometry.geometry_hash == record.geometry.geometry_hash:
         context.geometries_by_hash[geometry_key] = geometry
+    if context is not None:
+        _register_in_memory_geometry(
+            context,
+            geometry,
+            topology_id=topology_id,
+            canonicalization_version=record.geometry.canonicalization_version,
+            charge=record.charge,
+            multiplicity=record.multiplicity,
+        )
     geometry_id = _require_id(geometry, label="Geometry")
     if context is None:
         reconcile_geometry_with_reactions(session, geometry)
@@ -809,6 +1087,31 @@ def preload_molecular_geometry_context(
         records_by_key.setdefault(key, (record, coordinate_decimal_places))
     if not keys:
         return
+    # Hold these locks before taking the database snapshot below. Otherwise
+    # two concurrent upload transactions can both observe an empty candidate
+    # set and create hash-distinct but tolerance-equivalent Geometry rows.
+    _acquire_identity_locks(
+        session,
+        *sorted(
+            {
+                (
+                    "geometry-equivalence",
+                    topology_id,
+                    canonicalization_version,
+                    charge,
+                    multiplicity,
+                )
+                for (
+                    topology_id,
+                    canonicalization_version,
+                    _geometry_hash,
+                    charge,
+                    multiplicity,
+                ) in keys
+            },
+            key=str,
+        ),
+    )
     geometry_columns = cast(Any, Geometry)
     exact_inputs = (
         text(
@@ -977,10 +1280,18 @@ def preload_molecular_geometry_context(
         }
         for _input_key, key in key_by_input.items():
             geometry_ids = context.equivalent_geometry_candidates[key]
-            if len(geometry_ids) == 1:
-                geometry = geometries_by_id.get(geometry_ids[0])
-                if geometry is not None:
-                    context.equivalent_geometry_by_key[key] = geometry
+            candidate_rows = tuple(
+                geometries_by_id[geometry_id]
+                for geometry_id in geometry_ids
+                if geometry_id in geometries_by_id
+            )
+            if len(candidate_rows) != len(geometry_ids):
+                raise RuntimeError("database returned an incomplete Geometry candidate set")
+            context.equivalent_geometry_rows_by_key[key] = candidate_rows
+            if len(candidate_rows) == 1:
+                context.equivalent_geometry_by_key[key] = candidate_rows[0]
+            else:
+                context.equivalent_geometry_by_key.pop(key, None)
 
 
 __all__ = [
