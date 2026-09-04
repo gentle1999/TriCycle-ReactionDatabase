@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import and_
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session, col, select
 
@@ -38,6 +38,10 @@ from tricycle_reaction_db.application.services.reactions import (
     persist_mapped_reaction_node_geometry,
     persist_mapped_reaction_node_geometry_mapping,
 )
+from tricycle_reaction_db.core.chemistry_config import (
+    REACTION_GEOMETRY_LINK_METHOD,
+    REACTION_GEOMETRY_LINK_POLICY_VERSION,
+)
 from tricycle_reaction_db.db.models import (
     CalculationFrame,
     Geometry,
@@ -56,9 +60,6 @@ from tricycle_reaction_db.domain.enums import (
     OptimizationStatus,
 )
 from tricycle_reaction_db.domain.reaction_frames import is_transition_state_frame_eligible
-
-_MAPPING_METHOD = "topology-identity"
-_MAPPING_VERSION = "reaction-geometry-link-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,8 +410,8 @@ def _ensure_mapping(
         MappedReactionNodeGeometryMappingRecord(
             geometry_atom_map_numbers=topology_atom_maps,
             mapped_smiles=mapped_smiles,
-            mapping_method=_MAPPING_METHOD,
-            mapping_version=_MAPPING_VERSION,
+            mapping_method=REACTION_GEOMETRY_LINK_METHOD,
+            mapping_version=REACTION_GEOMETRY_LINK_POLICY_VERSION,
             verified=True,
         ),
         identity_is_new=(cache is not None and node_geometry_id in cache.new_node_geometry_ids),
@@ -457,6 +458,287 @@ def _bind_participant_geometry(
         )
         node_geometries.append(node_geometry)
     return node_geometries
+
+
+def _cache_reaction_node(
+    cache: ReconciliationBatchCache | None,
+    mapped_reaction: MappedReaction,
+    node: MappedReactionNode,
+) -> None:
+    """Register a newly resolved path node in the reconciliation cache."""
+
+    if cache is None:
+        return
+    mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
+    node_id = _require_id(node, label="MappedReactionNode")
+    current = cache.nodes_by_reaction.setdefault(mapped_reaction_id, ())
+    if all(existing.id != node_id for existing in current):
+        cache.nodes_by_reaction[mapped_reaction_id] = (*current, node)
+    cache.nodes_by_key[(mapped_reaction_id, node.node_key)] = node
+    cache.loaded_reaction_nodes.add(mapped_reaction_id)
+    cache.node_geometries_by_node.setdefault(node_id, [])
+    cache.loaded_node_geometries.add(node_id)
+
+
+def _target_node_for_source_node(
+    session: Session,
+    *,
+    source_node: MappedReactionNode,
+    target_mapped_reaction: MappedReaction,
+    cache: ReconciliationBatchCache | None,
+) -> MappedReactionNode:
+    """Resolve the target path node corresponding to one source path node.
+
+    The normal generated path uses the same ``reactants``, ``products`` and
+    ``transition-state`` keys for every mapping.  Keeping the node-key lookup
+    here also makes evidence sharing safe for a curated path with more than
+    one node of the same role: a source binding is copied to its matching
+    target node rather than to every node of that role.
+    """
+
+    target_id = _require_id(target_mapped_reaction, label="MappedReaction")
+    if cache is not None and target_id in cache.loaded_reaction_nodes:
+        existing = cache.nodes_by_key.get((target_id, source_node.node_key))
+    else:
+        existing = session.exec(
+            select(MappedReactionNode).where(
+                MappedReactionNode.mapped_reaction_id == target_id,
+                MappedReactionNode.node_key == source_node.node_key,
+            )
+        ).first()
+    if existing is not None:
+        if existing.role is not source_node.role:
+            raise ValueError("shared evidence path node has an incompatible role")
+        _cache_reaction_node(cache, target_mapped_reaction, existing)
+        return existing
+
+    if source_node.role is MappedReactionNodeRole.TRANSITION_STATE:
+        if source_node.node_key == "transition-state":
+            return ensure_transition_state_path(
+                session,
+                mapped_reaction=target_mapped_reaction,
+                cache=cache,
+            )
+        role_matches = session.exec(
+            select(MappedReactionNode).where(
+                MappedReactionNode.mapped_reaction_id == target_id,
+                MappedReactionNode.role == MappedReactionNodeRole.TRANSITION_STATE,
+            )
+        ).all()
+    else:
+        _, role, _ = _endpoint_spec(
+            LogicalReactionParticipantSide.REACTANT
+            if source_node.role is MappedReactionNodeRole.REACTANT
+            else LogicalReactionParticipantSide.PRODUCT
+        )
+        role_matches = _endpoint_nodes(
+            session,
+            target_mapped_reaction,
+            LogicalReactionParticipantSide.REACTANT
+            if role is MappedReactionNodeRole.REACTANT
+            else LogicalReactionParticipantSide.PRODUCT,
+            cache=cache,
+        )
+
+    if len(role_matches) == 1:
+        target_node = role_matches[0]
+        _cache_reaction_node(cache, target_mapped_reaction, target_node)
+        return target_node
+
+    target_node = persist_mapped_reaction_node(
+        session,
+        target_mapped_reaction,
+        MappedReactionNodeRecord(
+            node_key=source_node.node_key,
+            node_index=source_node.node_index,
+            role=source_node.role,
+        ),
+    )
+    _cache_reaction_node(cache, target_mapped_reaction, target_node)
+    return target_node
+
+
+def _concrete_participant_topology_id(
+    session: Session,
+    participant: MappedReactionParticipant,
+) -> UUID:
+    """Resolve a participant's strict topology, including legacy rows."""
+
+    if participant.concrete_topology_id is not None:
+        return participant.concrete_topology_id
+    logical_participant = session.get(
+        LogicalReactionParticipant,
+        participant.logical_reaction_participant_id,
+    )
+    if logical_participant is None:  # pragma: no cover - protected by the FK
+        raise RuntimeError("MappedReactionParticipant references a missing logical participant")
+    return logical_participant.topology_id
+
+
+def share_mapped_reaction_evidence(
+    session: Session,
+    *,
+    source_mapped_reaction: MappedReaction,
+    target_mapped_reaction: MappedReaction,
+    cache: ReconciliationBatchCache | None = None,
+    refresh_thermodynamics: bool = False,
+) -> tuple[UUID, ...]:
+    """Copy reusable source evidence to a concrete mapping instance.
+
+    A concrete mapping changes only the participant topology selected during
+    transfer.  Its transition-state geometry and every endpoint geometry whose
+    concrete topology is unchanged are therefore facts about the same physical
+    calculation and must be reused, not rediscovered from the target topology.
+    Geometry rows remain globally shared; only the mapping-specific node and
+    node-geometry bindings are created for the target reaction.
+    """
+
+    source_id = _require_id(source_mapped_reaction, label="source MappedReaction")
+    target_id = _require_id(target_mapped_reaction, label="target MappedReaction")
+    if source_id == target_id:
+        return ()
+
+    target_participants = {
+        (participant.side, participant.template_index): participant
+        for participant in session.exec(
+            select(MappedReactionParticipant).where(
+                MappedReactionParticipant.mapped_reaction_id == target_id
+            )
+        ).all()
+    }
+    source_rows = session.exec(
+        select(MappedReactionNode, MappedReactionNodeGeometry, Geometry)
+        .join(
+            MappedReactionNodeGeometry,
+            col(MappedReactionNodeGeometry.mapped_reaction_node_id) == col(MappedReactionNode.id),
+        )
+        .join(Geometry, col(MappedReactionNodeGeometry.geometry_id) == col(Geometry.id))
+        .where(MappedReactionNode.mapped_reaction_id == source_id)
+        .order_by(
+            col(MappedReactionNode.node_index),
+            col(MappedReactionNodeGeometry.component_key),
+            col(MappedReactionNodeGeometry.coordinate_index),
+        )
+    ).all()
+    source_transition_state_exists = bool(
+        session.exec(
+            select(MappedReactionNode.id).where(
+                MappedReactionNode.mapped_reaction_id == source_id,
+                MappedReactionNode.role == MappedReactionNodeRole.TRANSITION_STATE,
+            )
+        ).first()
+    )
+    if source_transition_state_exists:
+        ensure_transition_state_path(
+            session,
+            mapped_reaction=target_mapped_reaction,
+            cache=cache,
+        )
+
+    copied_geometry_ids: set[UUID] = set()
+    copied_endpoint_bindings: set[tuple[UUID, UUID, UUID]] = set()
+    for source_node, source_binding, geometry in source_rows:
+        source_participant_id = source_binding.mapped_reaction_participant_id
+        target_participant: MappedReactionParticipant | None = None
+        if source_participant_id is not None:
+            source_participant = session.get(MappedReactionParticipant, source_participant_id)
+            if source_participant is None:  # pragma: no cover - protected by the FK
+                continue
+            participant_key = (source_participant.side, source_participant.template_index)
+            target_participant = target_participants.get(participant_key)
+            if target_participant is None:
+                continue
+            if _concrete_participant_topology_id(session, source_participant) != (
+                _concrete_participant_topology_id(session, target_participant)
+            ):
+                # This is the selected concrete variant: it must be resolved
+                # against its own endpoint geometries, not copied from source.
+                continue
+            geometry_id = _require_id(geometry, label="Geometry")
+            target_participant_topology_id = _concrete_participant_topology_id(
+                session,
+                target_participant,
+            )
+            if geometry.topology_id != target_participant_topology_id:
+                continue
+            target_node = _target_node_for_source_node(
+                session,
+                source_node=source_node,
+                target_mapped_reaction=target_mapped_reaction,
+                cache=cache,
+            )
+            identity = (
+                _require_id(target_node, label="MappedReactionNode"),
+                geometry_id,
+                _require_id(target_participant, label="MappedReactionParticipant"),
+            )
+            if identity in copied_endpoint_bindings:
+                continue
+            copied_endpoint_bindings.add(identity)
+            node_geometry = _find_or_create_node_geometry(
+                session,
+                node=target_node,
+                geometry=geometry,
+                component_key=source_binding.component_key,
+                component_index=source_binding.component_index,
+                participant=target_participant,
+                prefer_primary=source_binding.is_primary,
+                cache=cache,
+                # The source binding has already passed endpoint eligibility.
+                thermodynamic_property_verified=True,
+            )
+            _ensure_mapping(
+                session,
+                node_geometry=node_geometry,
+                topology_atom_maps=list(target_participant.atom_map_numbers),
+                mapped_smiles=target_participant.mapped_smiles,
+                cache=cache,
+            )
+            copied_geometry_ids.add(geometry_id)
+            continue
+
+        if source_node.role is not MappedReactionNodeRole.TRANSITION_STATE:
+            continue
+        target_node = _target_node_for_source_node(
+            session,
+            source_node=source_node,
+            target_mapped_reaction=target_mapped_reaction,
+            cache=cache,
+        )
+        node_geometry = _find_or_create_node_geometry(
+            session,
+            node=target_node,
+            geometry=geometry,
+            component_key=source_binding.component_key,
+            component_index=source_binding.component_index,
+            participant=None,
+            prefer_primary=source_binding.is_primary,
+            cache=cache,
+            # The source TS binding already passed thermodynamic eligibility.
+            thermodynamic_property_verified=True,
+        )
+        source_mapping = session.exec(
+            select(MappedReactionNodeGeometryMapping).where(
+                MappedReactionNodeGeometryMapping.mapped_reaction_node_geometry_id
+                == _require_id(source_binding, label="source MappedReactionNodeGeometry")
+            )
+        ).first()
+        if source_mapping is not None:
+            _ensure_mapping(
+                session,
+                node_geometry=node_geometry,
+                topology_atom_maps=list(source_mapping.geometry_atom_map_numbers),
+                mapped_smiles=source_mapping.mapped_smiles,
+                cache=cache,
+            )
+        geometry_id = _require_id(geometry, label="Geometry")
+        copied_geometry_ids.add(geometry_id)
+
+    if cache is not None:
+        cache.affected_reactions_by_id[target_id] = target_mapped_reaction
+    elif refresh_thermodynamics:
+        refresh_mapped_reaction_thermodynamics(session, target_mapped_reaction)
+    return tuple(sorted(copied_geometry_ids, key=str))
 
 
 def _geometry_has_converged_optimization_frame(
@@ -522,7 +804,16 @@ def reconcile_geometry_with_reactions(
                 session.exec(
                     select(MappedReactionParticipant)
                     .join(LogicalReactionParticipant)
-                    .where(LogicalReactionParticipant.topology_id == geometry.topology_id)
+                    .where(
+                        or_(
+                            col(MappedReactionParticipant.concrete_topology_id)
+                            == geometry.topology_id,
+                            and_(
+                                col(MappedReactionParticipant.concrete_topology_id).is_(None),
+                                col(LogicalReactionParticipant.topology_id) == geometry.topology_id,
+                            ),
+                        )
+                    )
                 ).all()
             )
             participants_by_topology[geometry.topology_id] = participants
@@ -531,7 +822,15 @@ def reconcile_geometry_with_reactions(
             session.exec(
                 select(MappedReactionParticipant)
                 .join(LogicalReactionParticipant)
-                .where(LogicalReactionParticipant.topology_id == geometry.topology_id)
+                .where(
+                    or_(
+                        col(MappedReactionParticipant.concrete_topology_id) == geometry.topology_id,
+                        and_(
+                            col(MappedReactionParticipant.concrete_topology_id).is_(None),
+                            col(LogicalReactionParticipant.topology_id) == geometry.topology_id,
+                        ),
+                    )
+                )
             ).all()
         )
     node_geometries: list[MappedReactionNodeGeometry] = []
@@ -607,15 +906,28 @@ def preload_reconciliation_context(
     if not topology_ids:
         return
     participant_rows = session.exec(
-        select(MappedReactionParticipant, LogicalReactionParticipant.topology_id)
+        select(
+            MappedReactionParticipant,
+            MappedReactionParticipant.concrete_topology_id,
+            LogicalReactionParticipant.topology_id,
+        )
         .options(selectinload(cast(Any, MappedReactionParticipant.logical_reaction_participant)))
         .join(LogicalReactionParticipant)
-        .where(col(LogicalReactionParticipant.topology_id).in_(topology_ids))
+        .where(
+            or_(
+                col(MappedReactionParticipant.concrete_topology_id).in_(topology_ids),
+                and_(
+                    col(MappedReactionParticipant.concrete_topology_id).is_(None),
+                    col(LogicalReactionParticipant.topology_id).in_(topology_ids),
+                ),
+            )
+        )
     ).all()
     for topology_id in topology_ids:
         participants_by_topology[topology_id] = ()
     reaction_ids: set[UUID] = set()
-    for participant, topology_id in participant_rows:
+    for participant, concrete_topology_id, logical_topology_id in participant_rows:
+        topology_id = concrete_topology_id or logical_topology_id
         if not isinstance(topology_id, UUID):
             continue
         participants_by_topology[topology_id] = (
@@ -707,7 +1019,11 @@ def reconcile_mapped_reaction_with_geometries(
     ).all()
     node_geometries: list[MappedReactionNodeGeometry] = []
     for participant in participants:
-        topology_id = participant.logical_reaction_participant.topology_id
+        topology_id = participant.concrete_topology_id
+        if topology_id is None:
+            # Rows inserted before the concrete-topology split are retained by
+            # the migration and are still readable until their next rewrite.
+            topology_id = participant.logical_reaction_participant.topology_id
         geometries = session.exec(
             select(Geometry).where(
                 Geometry.topology_id == topology_id,
@@ -947,6 +1263,21 @@ def bind_transition_state_frame(
     mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
     if cache is not None:
         cache.affected_reactions_by_id[mapped_reaction_id] = mapped_reaction
+    sibling_reactions = session.exec(
+        select(MappedReaction).where(
+            MappedReaction.logical_reaction_id == mapped_reaction.logical_reaction_id,
+            MappedReaction.id != mapped_reaction_id,
+        )
+    ).all()
+    for sibling_reaction in sibling_reactions:
+        share_mapped_reaction_evidence(
+            session,
+            source_mapped_reaction=mapped_reaction,
+            target_mapped_reaction=sibling_reaction,
+            cache=cache,
+        )
+        if cache is None and refresh_thermodynamics:
+            refresh_mapped_reaction_thermodynamics(session, sibling_reaction)
     if refresh_thermodynamics:
         refresh_mapped_reaction_thermodynamics(session, mapped_reaction)
         if cache is not None:
@@ -964,4 +1295,5 @@ __all__ = [
     "preload_reconciliation_context",
     "reconcile_mapped_reaction_with_geometries",
     "resolve_endpoint_node",
+    "share_mapped_reaction_evidence",
 ]

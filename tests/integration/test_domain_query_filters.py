@@ -694,6 +694,41 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         assert logical_page.page.total == 1
         assert [item.id for item in logical_page.items] == [logical_reaction.id]
         assert logical_page.items[0].reactant_product_changed is False
+        logical_min_mapped_page = asyncio.run(
+            LogicalReactionQueryService.list_logical_reactions(
+                reaction_hash=logical_reaction.reaction_hash,
+                minimum_mapped_reaction_count=1,
+                limit=1,
+                offset=0,
+            )
+        )
+        assert logical_min_mapped_page.page.total == 1
+        assert [item.id for item in logical_min_mapped_page.items] == [logical_reaction.id]
+        logical_zero_mapped_page = asyncio.run(
+            LogicalReactionQueryService.list_logical_reactions(
+                reaction_hash=logical_reaction.reaction_hash,
+                maximum_mapped_reaction_count=0,
+                limit=1,
+                offset=0,
+            )
+        )
+        assert logical_zero_mapped_page.page.total == 0
+        logical_count_expression_page = asyncio.run(
+            LogicalReactionQueryService.list_logical_reactions(
+                filter_expression=json.dumps(
+                    {
+                        "operator": "and",
+                        "conditions": [
+                            {"field": "reaction_hash", "value": logical_reaction.reaction_hash},
+                            {"field": "minimum_mapped_reaction_count", "value": 1},
+                        ],
+                    }
+                ),
+                limit=1,
+                offset=0,
+            )
+        )
+        assert logical_count_expression_page.page.total == 1
         logical_changed_page = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
                 reaction_hash=logical_reaction.reaction_hash,

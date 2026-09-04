@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ArrowUpRight, ChevronDown, CircleHelp, Download, Eye, Globe2, ListFilter, LoaderCircle, LockKeyhole, RotateCcw, Search, Trash2, UploadCloud, X } from "@lucide/vue";
+import { ArrowDown, ArrowDownUp, ArrowUp, ArrowUpRight, ChevronDown, CircleHelp, Download, Eye, Globe2, ListFilter, LoaderCircle, LockKeyhole, RotateCcw, Search, Trash2, UploadCloud, X } from "@lucide/vue";
 import { computed, ref, watch } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 
@@ -108,17 +108,21 @@ function applyAdvancedFilters(filters: ArtifactFilterValues): void {
 }
 
 function updateSortBy(event: Event): void {
-  emit("updateSort", {
-    sortBy: (event.target as HTMLSelectElement).value as ArtifactSortBy,
-    sortDirection: props.sort.sortDirection,
-  });
+  const sortBy = (event.currentTarget as HTMLButtonElement).dataset.sortBy as ArtifactSortBy;
+  const sortDirection = props.sort.sortBy === sortBy
+    ? props.sort.sortDirection === "asc" ? "desc" : "asc"
+    : "asc";
+  emit("updateSort", { sortBy, sortDirection });
 }
 
-function updateSortDirection(event: Event): void {
-  emit("updateSort", {
-    sortBy: props.sort.sortBy,
-    sortDirection: (event.target as HTMLSelectElement).value as ArtifactSort["sortDirection"],
-  });
+function sortAriaValue(sortBy: ArtifactSortBy): "ascending" | "descending" | undefined {
+  if (props.sort.sortBy !== sortBy) return undefined;
+  return props.sort.sortDirection === "asc" ? "ascending" : "descending";
+}
+
+function sortButtonLabel(sortBy: ArtifactSortBy, label: string): string {
+  if (props.sort.sortBy !== sortBy) return `按${label}排序`;
+  return `${label}，当前${props.sort.sortDirection === "asc" ? "升序" : "降序"}，点击切换`;
 }
 
 function canDeleteArtifact(artifact: ArtifactSummary): boolean {
@@ -180,6 +184,11 @@ watch(
         <button class="icon-button" type="button" title="清除文件筛选" aria-label="清除文件筛选" @click="clearFilters"><X :size="14" aria-hidden="true" /></button>
       </div>
       <div class="filter-result-count"><strong>{{ total >= 0 ? total : artifacts.length }}</strong><span>{{ total >= 0 ? "个匹配文件" : "个本页文件" }}</span></div>
+      <div class="artifact-upload-toolbar">
+        <RouterLink v-if="canUpload" class="command-button" :to="{ name: 'uploads', query: { ...navigationQuery, project_id: selectedProjectId } }">
+          <UploadCloud :size="16" aria-hidden="true" />批量上传
+        </RouterLink>
+      </div>
     </aside>
 
     <section class="artifact-results" aria-labelledby="artifact-results-title" :aria-busy="querying">
@@ -189,20 +198,11 @@ watch(
           <h2 id="artifact-results-title">文件目录</h2>
         </div>
         <div class="catalog-header-actions">
-          <div class="catalog-sort-controls" aria-label="原始文件排序">
-            <label><span>排序</span><select :value="sort.sortBy" aria-label="原始文件排序字段" @change="updateSortBy"><option value="created_at">创建时间</option><option value="original_filename">文件名</option><option value="size_bytes">文件大小</option><option value="running_time_seconds">文件总耗时</option><option value="artifact_kind">文件类型</option><option value="storage_status">存储状态</option></select></label>
-            <label><span>顺序</span><select :value="sort.sortDirection" aria-label="原始文件排序方向" @change="updateSortDirection"><option value="asc">升序</option><option value="desc">降序</option></select></label>
-          </div>
           <PaginationControls :page="page" label="原始文件分页（顶部）" @previous="emit('previousPage')" @next="emit('nextPage')" @jump="emit('jumpPage', $event)" />
         </div>
       </header>
       <div class="catalog-query-status-slot" aria-live="polite">
         <div v-if="querying" class="catalog-query-status" role="status"><LoaderCircle class="is-spinning" :size="16" aria-hidden="true" /><span>{{ artifacts.length ? "正在查询，当前显示上次结果" : "正在查询筛选结果" }}</span></div>
-      </div>
-      <div class="artifact-upload-toolbar">
-        <RouterLink v-if="canUpload" class="command-button" :to="{ name: 'uploads', query: { ...navigationQuery, project_id: selectedProjectId } }">
-          <UploadCloud :size="16" aria-hidden="true" />批量上传
-        </RouterLink>
       </div>
 
     <p v-if="deleteError" class="inline-error" role="alert">{{ deleteError }}</p>
@@ -212,24 +212,67 @@ watch(
       <table class="data-table artifacts-table">
         <thead>
           <tr>
-            <th>文件</th>
-            <th>类型</th>
+            <th scope="col" :aria-sort="sortAriaValue('original_filename')">
+              <button class="data-table-sort-button" type="button" :data-sort-by="'original_filename'" :aria-label="sortButtonLabel('original_filename', '文件名')" @click="updateSortBy">
+                <span>文件</span>
+                <ArrowUp v-if="sort.sortBy === 'original_filename' && sort.sortDirection === 'asc'" :size="13" aria-hidden="true" />
+                <ArrowDown v-else-if="sort.sortBy === 'original_filename'" :size="13" aria-hidden="true" />
+                <ArrowDownUp v-else :size="13" aria-hidden="true" />
+              </button>
+            </th>
+            <th scope="col" :aria-sort="sortAriaValue('artifact_kind')">
+              <button class="data-table-sort-button" type="button" :data-sort-by="'artifact_kind'" :aria-label="sortButtonLabel('artifact_kind', '文件类型')" @click="updateSortBy">
+                <span>类型</span>
+                <ArrowUp v-if="sort.sortBy === 'artifact_kind' && sort.sortDirection === 'asc'" :size="13" aria-hidden="true" />
+                <ArrowDown v-else-if="sort.sortBy === 'artifact_kind'" :size="13" aria-hidden="true" />
+                <ArrowDownUp v-else :size="13" aria-hidden="true" />
+              </button>
+            </th>
             <th>可见性</th>
-            <th>大小</th>
-            <th>文件总耗时</th>
-            <th>存储状态</th>
+            <th scope="col" :aria-sort="sortAriaValue('size_bytes')">
+              <button class="data-table-sort-button" type="button" :data-sort-by="'size_bytes'" :aria-label="sortButtonLabel('size_bytes', '文件大小')" @click="updateSortBy">
+                <span>大小</span>
+                <ArrowUp v-if="sort.sortBy === 'size_bytes' && sort.sortDirection === 'asc'" :size="13" aria-hidden="true" />
+                <ArrowDown v-else-if="sort.sortBy === 'size_bytes'" :size="13" aria-hidden="true" />
+                <ArrowDownUp v-else :size="13" aria-hidden="true" />
+              </button>
+            </th>
+            <th scope="col" :aria-sort="sortAriaValue('running_time_seconds')">
+              <button class="data-table-sort-button" type="button" :data-sort-by="'running_time_seconds'" :aria-label="sortButtonLabel('running_time_seconds', '文件总耗时')" @click="updateSortBy">
+                <span>文件总耗时</span>
+                <ArrowUp v-if="sort.sortBy === 'running_time_seconds' && sort.sortDirection === 'asc'" :size="13" aria-hidden="true" />
+                <ArrowDown v-else-if="sort.sortBy === 'running_time_seconds'" :size="13" aria-hidden="true" />
+                <ArrowDownUp v-else :size="13" aria-hidden="true" />
+              </button>
+            </th>
+            <th scope="col" :aria-sort="sortAriaValue('storage_status')">
+              <button class="data-table-sort-button" type="button" :data-sort-by="'storage_status'" :aria-label="sortButtonLabel('storage_status', '存储状态')" @click="updateSortBy">
+                <span>存储状态</span>
+                <ArrowUp v-if="sort.sortBy === 'storage_status' && sort.sortDirection === 'asc'" :size="13" aria-hidden="true" />
+                <ArrowDown v-else-if="sort.sortBy === 'storage_status'" :size="13" aria-hidden="true" />
+                <ArrowDownUp v-else :size="13" aria-hidden="true" />
+              </button>
+            </th>
             <th>解析状态</th>
             <th>SHA-256</th>
+            <th scope="col" :aria-sort="sortAriaValue('created_at')">
+              <button class="data-table-sort-button" type="button" :data-sort-by="'created_at'" :aria-label="sortButtonLabel('created_at', '创建时间')" @click="updateSortBy">
+                <span>创建时间</span>
+                <ArrowUp v-if="sort.sortBy === 'created_at' && sort.sortDirection === 'asc'" :size="13" aria-hidden="true" />
+                <ArrowDown v-else-if="sort.sortBy === 'created_at'" :size="13" aria-hidden="true" />
+                <ArrowDownUp v-else :size="13" aria-hidden="true" />
+              </button>
+            </th>
             <th>验证时间</th>
             <th><span class="sr-only">文件操作</span></th>
           </tr>
         </thead>
         <tbody>
           <tr v-if="loading && !artifacts.length">
-            <td colspan="10"><div class="table-loading">正在加载原始文件</div></td>
+            <td colspan="11"><div class="table-loading">正在加载原始文件</div></td>
           </tr>
           <tr v-else-if="!artifacts.length">
-            <td colspan="10"><div class="compact-empty">没有匹配的原始文件</div></td>
+            <td colspan="11"><div class="compact-empty">没有匹配的原始文件</div></td>
           </tr>
           <template v-for="artifact in artifacts" v-else :key="artifact.id">
           <tr class="artifact-row" :class="{ 'is-expanded': artifact.id === expandedArtifactId }" @click="emit('toggleFrames', artifact.id)">
@@ -257,6 +300,7 @@ watch(
               <ArtifactIngestionStatus :status="artifact.ingestion_status" :error-message="artifact.ingestion_error_message" />
             </td>
             <td><code :title="artifact.content_sha256">{{ shortId(artifact.content_sha256) }}</code></td>
+            <td>{{ artifact.created_at ? new Date(artifact.created_at).toLocaleString("zh-CN") : "—" }}</td>
             <td>{{ artifact.storage_verified_at ? new Date(artifact.storage_verified_at).toLocaleString("zh-CN") : "—" }}</td>
             <td>
               <div class="table-actions">
@@ -292,7 +336,7 @@ watch(
             </td>
           </tr>
           <tr v-if="artifact.id === expandedArtifactId" class="artifact-frames-row">
-            <td colspan="10">
+            <td colspan="11">
               <div class="artifact-frames-panel">
                 <div class="artifact-frames-content">
                   <section class="artifact-frame-list-pane">

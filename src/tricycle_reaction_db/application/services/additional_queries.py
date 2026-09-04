@@ -85,6 +85,7 @@ from tricycle_reaction_db.application.services.reaction_geometry_policy import (
     geometry_ids_with_thermodynamic_property,
 )
 from tricycle_reaction_db.core.config import get_settings
+from tricycle_reaction_db.core.units import hartree_per_particle_to_kcal_per_mol
 from tricycle_reaction_db.db.models import (
     ArtifactIngestion,
     CalculationFrame,
@@ -120,7 +121,6 @@ from tricycle_reaction_db.domain.precision import round_energy_hartree
 # input model. Keep pagination definitions local to this module for registration.
 QueryLimit = PageLimit
 QueryOffset = PageOffset
-HARTREE_TO_KCAL_MOL = 627.5094740631
 REACTION_ENERGY_KINDS = frozenset(
     {
         "electronic_energy_hartree",
@@ -1906,7 +1906,7 @@ class ReactionEnergyQueryService(UseCaseService):  # type: ignore[misc]
         def difference(left: float | None, right: float | None) -> float | None:
             if left is None or right is None:
                 return None
-            return round((left - right) * HARTREE_TO_KCAL_MOL, 6)
+            return round(hartree_per_particle_to_kcal_per_mol(left - right), 6)
 
         return ReactionEnergyProfile(
             mapped_reaction_id=mapped_reaction_id,

@@ -48,6 +48,7 @@ export interface LogicalReactionSummary {
   reaction_class: string | null;
   cycloaddition_pattern: string | null;
   reaction_hash: string;
+  mapped_reaction_count: number;
   similarity_score: number | null;
   reactant_product_changed: boolean | null;
   created_at: string | null;
@@ -294,6 +295,7 @@ export interface MappedReactionDetail extends MappedReactionSummary {
     side: string;
     template_index: number;
     topology_id: string;
+    logical_topology_id: string;
     atom_map_numbers: number[];
     mapped_smiles: string;
   }>;
@@ -449,6 +451,7 @@ export interface ArtifactSummary {
   id: string;
   project_id: string;
   created_by_user_id: string;
+  created_at?: string | null;
   visibility: "public" | "project";
   original_filename: string;
   content_sha256: string;

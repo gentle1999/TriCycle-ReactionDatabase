@@ -102,7 +102,13 @@ def _missing_binding_candidate() -> Any:
         )
         .join(
             Geometry,
-            col(Geometry.topology_id) == col(LogicalReactionParticipant.topology_id),
+            or_(
+                col(Geometry.topology_id) == col(MappedReactionParticipant.concrete_topology_id),
+                and_(
+                    col(MappedReactionParticipant.concrete_topology_id).is_(None),
+                    col(Geometry.topology_id) == col(LogicalReactionParticipant.topology_id),
+                ),
+            ),
         )
         .join(
             MappedReactionNode,

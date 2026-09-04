@@ -79,6 +79,9 @@ def test_database_topology_reuses_identity_with_an_alternate_projection(monkeypa
         def first(self):
             return self.value
 
+        def all(self):
+            return self.value
+
     class Session:
         def __init__(self):
             self.results = iter(
@@ -86,8 +89,10 @@ def test_database_topology_reuses_identity_with_an_alternate_projection(monkeypa
                     Result(formula),
                     Result(topology),
                     Result(SimpleNamespace(**record.topology_derivation.model_dump())),
+                    Result([]),
                 ]
             )
+            self.info = {}
 
         def exec(self, _statement):
             return next(self.results)

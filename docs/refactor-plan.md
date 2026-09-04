@@ -469,3 +469,261 @@ authorization-code/PKCE、SMTP STARTTLS 邀请、PostgreSQL/RustFS/Redis 私有 
 切换、目标数据规模 query-plan、生产对象版本恢复、告警触发/恢复和实测 RTO/RPO，仍必须
 在目标多主机环境按 `deployment-acceptance-v1` 记录并通过 validator；当前默认 PostgreSQL
 容器仍使用 `tricycle` 凭据，示例配置的 `example_user` 不能用于默认 query-plan capture。
+
+## 9. 2026-09-02 反应拓扑解耦重构方向（已固化）
+
+本节冻结后续反应拓扑重构的领域方向。它优先于当前 `create_reaction` 中由同一
+topology 同时创建 `LogicalReactionParticipant` 和 `MappedReactionParticipant` 的实现方式。
+本节先确认目标语义；本轮实现状态见 9.8，后续验收仍按本节的领域不变量执行。
+
+### 9.1 核心语义
+
+采用“严格具体层 → 抽象逻辑层 → 具体成员双向归属”的模型：
+
+1. 严格 concrete topology、Geometry 和完整 atom-mapped reaction 是事实源，不被
+   logical projection 覆盖或重写。
+2. LogicalReaction 是抽象反应类别和检索入口，不要求在创建时枚举全部具体前体。
+3. MappedReaction 是带完整 atom mapping 的具体反应实例；同一个 LogicalReaction 可以
+   包含多个具体构型的 MappedReaction。
+4. 抽象组分与具体拓扑使用分子图包含/匹配关系，不使用具体 topology hash 相等作为
+   唯一关系条件。
+5. 前体/后体只是 endpoint 顺序约定。可翻转立体规则必须对偶地检查两侧和可用的 TS
+   证据，并通过 atom map 将可翻转中心的屏蔽范围传播到对应的另一侧。
+6. 仅有具体分子拓扑而没有完整 reaction mapping 时，只建立具体拓扑归属，不伪造
+   MappedReaction。
+
+### 9.2 目标关系
+
+`LogicalReactionParticipant` 保存抽象 topology；`MappedReactionParticipant` 保存严格
+concrete topology。二者不得再复用同一个 topology 语义：
+
+```text
+LogicalReaction
+  └─ LogicalReactionParticipant
+       └─ LogicalParticipantConcreteTopology
+            └─ concrete_topology_id
+
+MappedReaction
+  └─ MappedReactionParticipant
+       ├─ logical_reaction_participant_id
+       └─ concrete_topology_id
+
+Geometry.topology_id == MappedReactionParticipant.concrete_topology_id
+```
+
+分子拓扑自身的立体抽象关系先独立建成有向 DAG，再被逻辑反应参与者复用。关系表的
+边保存为 `specific_topology → general_topology`，只在某个抽象级别被实际需要时物化；
+不预先展开理论上的全部立体特征子集。从逻辑节点枚举具体成员时反向沿
+`general_topology → specific_topology` 遍历。边表示已验证的严格抽象关系，可以按规则
+要求跨越未物化的中间级别。一个分子有两个独立立体中心时，已物化的分支可形成：
+
+```text
+      两中心具体拓扑
+       /          \
+  仅中心 A       仅中心 B
+       \          /
+        无明确中心
+```
+
+这不是单一 `parent_id` 链：同一具体拓扑可以有多个抽象分支，多个具体分支也可以汇聚
+到同一个更一般拓扑。边带有 abstraction policy version，遍历只使用相同 policy 的边，
+并在写入服务层拒绝回边造成的环。DAG 是已入库拓扑的关系索引，不是理论构型生成器；
+新 concrete topology 或新 logical participant 建立时必须补建对应关系，查询过程不隐式
+写入未请求的节点。
+
+拓扑上的 `is_stereo_abstraction_upstream` 是“允许作为抽象上游”的显式能力标记，不能
+从 `stereo_status=unknown/unassigned/ambiguous` 推断。只有 TS inversion 规则实际产生的
+不明确立体投影才设置该标记；普通解析失败、缺少立体信息或其他非 TS 拓扑不能成为上游
+候选。每次创建或复用拓扑都尝试检索同元素组成、同电荷且带该标记的严格图匹配；没有
+匹配时有效上游退化为自身，但不写入自环，以保持 DAG 合法。
+
+新增的 `LogicalParticipantConcreteTopology`（名称可在实现时确定）是独立的具体成员
+关系，至少记录：
+
+- logical participant 和 concrete topology 的唯一组合；
+- concrete-to-logical 的原子/键匹配结果或可重算的匹配依据；
+- projection/match policy version；
+- 匹配状态和必要的审计元数据。
+
+`MappedReactionParticipant` 可以直接保存 `concrete_topology_id`，也可以进一步外键到
+上述成员关系，但每个 mapped participant 必须能证明其 concrete topology 属于对应的
+logical participant。
+
+`MappedReactionNode` 继续表示 mapped reaction 的路径状态。由于一个 reactant/product
+node 可以包含多个组分，不在 node 上强行放单一 topology；具体 topology 通过
+`MappedReactionParticipant` 和 node geometry binding 关联。TS Geometry 可以被多个
+MappedReaction 的 TS node 分别绑定，但每个 mapped reaction 保留自己的 node 和 mapping
+binding。
+
+### 9.3 严格具体反应与逻辑反应的建立
+
+严格阶段先保存能够从 source geometry、TS 或已有 mapping 可靠得到的具体信息：
+
+```text
+strict endpoint topology
+  → concrete MolecularTopology
+  → strict mapped reaction draft
+  → exact isomeric mapped SMILES / mapping_hash
+```
+
+TS endpoint 是严格具体构型的证据来源之一，但不是所有可能 concrete precursor 的枚举器。
+若不同 precursor 经过同一个可翻转 N 的 TS/后体而在 endpoint 中收敛，不能要求 TS
+endpoint 反推出这些 precursor；它们应通过后续 concrete topology 反向检索加入。
+
+逻辑投影只对严格 mapped reaction 的副本执行，不修改 concrete topology：
+
+```text
+在 reactant/product/TS 中匹配 inversion-labile SMARTS
+  → 收集 labile atom map
+  → 沿 atom map 对偶传播到另一侧
+  → 清除这些中心及其依赖的严格 stereo annotation
+  → 保留所有非规则覆盖的立体信息
+  → 生成 logical topology
+```
+
+当前首条规则的 SMARTS 是 `[N;X3;v3;+0]`。规则必须是可扩展、可版本化的 registry，
+并明确匹配 SMARTS、适用条件、需要清除的 atom/bond stereo 以及 policy version。不得因为原子是 N
+就全局清除该分子所有立体信息，也不得用全局 `useChirality=False` 替代选择性匹配。
+
+### 9.4 LogicalReaction 的双向检索
+
+抽象 participant 建立后，执行抽象到具体的反向枚举：
+
+```text
+abstract participant
+  → 元素组成/电荷/原子数等候选过滤
+  → logical topology 作为 query
+  → concrete topology 作为 target
+  → 立体感知的图包含匹配
+  → 建立 concrete membership
+```
+
+具体 diene 后续单独录入时，执行相反方向：
+
+```text
+new concrete topology
+  → 检索候选 logical participants
+  → 执行同一套图匹配
+  → 建立 concrete membership
+  → 有完整 mapping 时创建或复用 MappedReaction
+```
+
+图匹配需要按整个 reactant/product 组分集合完成一一对应，结合 side、stoichiometry、
+元素组成、电荷和反应 atom-map 关系，不能对每个组分取第一个匹配结果。哈希可以作为
+候选索引，但不能作为最终包含关系。对多个合法候选应使用确定性的 specificity/反应
+映射判定；无法唯一判定时保留歧义，不套用几何“最近者”规则。
+
+### 9.5 MappedReaction 的创建规则
+
+当 concrete topology 已匹配到 logical participant，且对应 LogicalReaction 下存在可复用的
+严格 mapped reaction/template 时，不要求新 concrete topology 自身携带完整 atom mapping。
+新立体异构体的 mapping 通过已有 mapping 和抽象拓扑转移得到：
+
+```text
+已有严格 mapping
+  → 抽象拓扑临时原子序号
+  → 新严格 topology 的 GetSubstructMatch
+  → 新 concrete mapping
+```
+
+对每个 side、component occurrence 和临时原子序号，先建立已有原子与已有 atom map 的
+对应，再建立新原子与相同临时序号的对应，合并两条关系即可得到新 mapping。抽象拓扑
+匹配时必须保留抽象范围以外的立体约束，并验证原子/键图、电荷、组分角色、计量和映射
+覆盖范围；不能把新分子的 isomeric SMILES 作为 mapping 的来源。若图对称导致
+`GetSubstructMatch` 返回多个结果，应使用已有 reaction mapping、side/occurrence 和
+反应中心约束确定匹配；无法消歧时记录歧义，而不是任取第一个结果。
+
+映射反应建立步骤为：
+
+1. 通过 concrete-to-logical 匹配和已有 mapping template 转移 atom maps；
+2. 校验反应两侧的原子映射、反应中心和严格 isomeric mapped SMILES；
+3. 用严格 mapped SMILES 计算 `mapping_hash`；
+4. 先按“对应 LogicalReaction + 每个 occurrence 的 concrete topology + atom-map assignment”
+   建立物理幂等身份；atom-map assignment 对 concrete topology 的连接图自动同构做规范化，
+   以消除对称原子导致的等价映射和不同 SMILES 遍历。该身份在创建前加事务 advisory lock，
+   找到已有行时复用它。随后仍按 `(logical_reaction_id, mapping_hash)` 维护严格文本身份；
+   `mapping_hash` 不能单独承担物理映射去重；
+5. 创建带 `concrete_topology_id` 的 MappedReactionParticipant；
+6. 将该具体拓扑的 Geometry、热力学和无虚频计算帧绑定到 mapped participant。
+
+判定规则固定为：
+
+```text
+同一 concrete topology + 同一 atom mapping + 新计算帧
+  → 复用 MappedReaction，新增 Geometry
+
+新的 concrete topology，但匹配同一 logical participant
+  → 同一 LogicalReaction 下新增 MappedReaction
+
+非可翻转立体仍不匹配
+  → 新建 LogicalReaction
+
+没有任何已有 mapping/template
+  → 只建立 concrete membership，不创建 MappedReaction
+
+已有 mapping/template，但新分子只是同一抽象拓扑下的立体异构体
+  → 通过“已有 mapping--临时序号--新 mapping”得到完整 mapping，创建新的
+    MappedReaction 或复用相同 mapping_hash 的 MappedReaction
+```
+
+### 9.6 三种含 N diene 的固定验收结果
+
+对于现有三个含 N diene，目标结果为：
+
+```text
+1 个 LogicalReaction
+  └─ 1 个抽象 diene participant
+       ├─ concrete diene-1
+       ├─ concrete diene-2
+       └─ concrete diene-3
+
+3 个严格 MappedReaction（若三者 mapping_hash 不同）
+同一个具体 product topology 可以复用
+同一个 TS Geometry 可以被三个 mapped reaction 分别绑定
+```
+
+后体/TS 中的 sp3 N 用于识别 inversion-labile atom；前体对应 atom map 虽然是 sp2 N，
+仍需清除其与该中心相关的 N=C E/Z。若 strict product/TS topology 仍被错误表示成 sp2，
+必须先修复或确认具体 topology 的化学表示，不能由 logical projection 静默掩盖。
+
+### 9.7 实施顺序与禁止事项
+
+实施按以下顺序进行：
+
+1. 增加 concrete topology 引用和 concrete membership 数据模型，明确 logical/concrete
+   不变量，并为现有数据制定可审计的回填策略；抽象 topology 只按实际请求的规则和级别
+   延迟物化，禁止按全部 stereo feature 做幂集展开；
+2. 拆分 strict reaction draft、logical projection、logical resolution 和 mapped
+   reaction persistence；
+3. 实现可版本化的双侧 inversion 规则及选择性 stereo projection；
+4. 实现抽象到具体、具体到抽象的图包含匹配和匹配审计；
+5. 将 Geometry/thermodynamics reconciliation 改为 concrete topology 驱动；
+6. 修改 reaction 查询、API DTO、批次缓存和导入回溯逻辑；缓存 key 不得只使用已经
+   可能收敛的 `inferred.reaction_smiles`；
+7. 用上述三个 diene、N inversion、非可翻转 E/Z/R/S、重复 Geometry 和无 mapping
+   concrete topology 进行回归和全量重导入验收。
+
+当前 `MappedReaction.logical_reaction_id` 是非空外键，因此“严格 mapped 先于 logical”
+在语义上成立，但数据库物理插入顺序可以是先生成 strict draft，再创建/找到 logical，
+最后写入 mapped；如果必须先持久化 mapped 行，则另增 staging 表或临时父实体，不通过
+绕过外键制造不一致数据。
+
+### 9.8 本轮实现状态（2026-09-02）
+
+本轮已将上述主链落地：
+
+- Alembic `0024`–`0026` 增加拓扑抽象 DAG、显式 upstream 标记、具体拓扑成员关系和
+  `MappedReactionParticipant.concrete_topology_id`；旧数据通过可审计回填保持可读；
+- strict concrete topology、选择性 N inversion logical projection、具体成员检索和
+  `mapping → 临时原子序号 → 新 concrete mapping` 转移已进入服务层；
+- Geometry、热力学汇总、反应查询、可见性反向查询和导入缓存均已切换到 concrete topology
+  语义；缓存身份不再只依赖可能收敛的 reaction SMILES；
+- 未明确/冲突的持久化 stereo 不再被序列化为任意 E/Z；只有已确认的 stereo 才进入严格
+  isomeric mapped SMILES；
+- 非数据库测试为 `452 passed, 122 skipped`，新增 concrete mapping、拓扑抽象和 artifact
+  回溯的数据库定向测试通过；ruff、定向 pyright 和 `alembic check` 通过。
+
+完整数据库测试在已填充的开发库上为 `556 passed, 16 skipped, 2 failed`：其中 artifact
+  回溯失败已修复并单独复验通过；剩余 reaction search 失败是测试固定 `limit=200` 依赖
+  小型空库，而当前库已有约 964 条 logical reaction，临时测试行落在第一页之外，不属于
+  本轮拓扑/映射逻辑失败。清洁数据库或使用稳定的唯一过滤条件后再进行该测试。

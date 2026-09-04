@@ -25,21 +25,27 @@ from sqlalchemy.sql.sqltypes import Enum, Uuid
 
 from tricycle_reaction_db.db.models import metadata
 
-SCHEMA_REVISION = "20260813_0038"
+SCHEMA_REVISION = "0028_restore_mapped_text_id"
 OUTPUT_PATH = Path(__file__).parents[1] / "docs" / "database-erd.md"
 
 POSTGRESQL_GROUPS = {
     "身份、组织与项目授权": (
         "user_account",
+        "auth_session",
+        "mcp_access_token",
         "external_identity",
         "organization",
         "organization_membership",
         "project",
         "project_membership",
+        "project_invitation",
+        "audit_event",
     ),
     "Artifact、解析与计算帧": (
         "artifact_file",
         "artifact_ingestion",
+        "upload_batch",
+        "upload_batch_item",
         "calculation_protocol",
         "parse_revision",
         "calculation_segment",
@@ -52,8 +58,11 @@ POSTGRESQL_GROUPS = {
     "化学身份与几何": (
         "molecular_formula",
         "molecular_topology",
+        "molecular_topology_abstraction",
         "molecular_topology_derivation",
         "geometry",
+        "project_geometry_catalog",
+        "project_geometry_catalog_count",
     ),
     "逐帧科学结果": (
         "frame_energy_result",
@@ -84,13 +93,16 @@ POSTGRESQL_GROUPS = {
         "manifest_artifact_binding",
         "logical_reaction",
         "logical_reaction_participant",
+        "logical_participant_concrete_topology",
         "mapped_reaction",
+        "mapped_reaction_thermodynamic_profile",
         "mapped_reaction_participant",
         "mapped_reaction_node",
         "mapped_reaction_node_geometry",
         "mapped_reaction_node_geometry_mapping",
         "mapped_reaction_edge",
         "transition_state_inference",
+        "transition_state_endpoint",
     ),
 }
 
@@ -102,6 +114,10 @@ SPECIAL_NODE_LABELS = {
     "storage_garbage_collection_run": "storage_garbage_collection_run<br/>audit",
     "external_identity": "external_identity<br/>OIDC issuer + subject",
     "molecular_topology": "molecular_topology<br/>RDKit mol",
+    "molecular_topology_abstraction": "molecular_topology_abstraction<br/>stereo DAG edge",
+    "logical_participant_concrete_topology": (
+        "logical_participant_concrete_topology<br/>logical → concrete"
+    ),
     "geometry": "geometry<br/>RDKit mol + NPY BYTEA",
     "scientific_array": "scientific_array<br/>NPY BYTEA",
 }
@@ -354,8 +370,8 @@ def _document() -> str:
     lines = [
         "# 数据库实体关系图",
         "",
-        f"> 当前 schema：Alembic `{SCHEMA_REVISION}`  ",
-        "> 生成来源：`tricycle_reaction_db.db.models.metadata`  ",
+        f"> 当前 schema：Alembic `{SCHEMA_REVISION}`",
+        "> 生成来源：`tricycle_reaction_db.db.models.metadata`",
         f"> 完整性：{totals['tables']} 张表、{totals['columns']} 个列、",
         f"> {totals['foreign_keys']} 条外键约束，未省略物理表、列或 FK。",
         "",

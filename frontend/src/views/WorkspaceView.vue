@@ -22,17 +22,28 @@ const projectContext = useProjectContext();
 const currentUser = session.user;
 const currentProjectId = projectContext.currentProjectId;
 
+const REACTION_PAGE_SIZE = 12;
+const ARTIFACT_PAGE_SIZE = 50;
+
+function pageNumberFromQuery(value: unknown): number {
+  const candidate = Array.isArray(value) ? value[0] : value;
+  const page = Number(candidate);
+  return Number.isInteger(page) && page >= 1 ? page : 1;
+}
+
+function offsetFromPage(value: unknown, limit: number): number {
+  return (pageNumberFromQuery(value) - 1) * limit;
+}
+
+function pageNumberFromOffset(offset: number, limit: number): number {
+  return Math.floor(Math.max(0, offset) / limit) + 1;
+}
+
 const activeView = computed<CatalogView>(() =>
   route.name === "reactions" || route.name === "reaction-detail" || route.name === "mapped-reaction-detail"
     ? "reactions"
     : "artifacts",
 );
-const routeReactionId = computed(() => route.name === "reactions"
-  ? (typeof route.query.preview_reaction === "string" ? route.query.preview_reaction : null)
-  : (typeof route.params.logicalReactionId === "string" ? route.params.logicalReactionId : null));
-const routeMappedReactionId = computed(() => route.name === "reactions"
-  ? (typeof route.query.preview_mapped === "string" ? route.query.preview_mapped : null)
-  : (typeof route.params.mappedReactionId === "string" ? route.params.mappedReactionId : null));
 function artifactRouteQueryValue(name: string): string | null {
   const value = route.query[name];
   return typeof value === "string" ? value : null;
@@ -61,17 +72,19 @@ const artifactQueryFilters = computed<ArtifactFilterValues>(() => ({
   storageStatus: artifactStorageStatusFilter.value,
   ingestionStatus: artifactIngestionStatusFilter.value,
 }));
-const selectedMappedId = ref<string | null>(routeMappedReactionId.value);
 const selectedFrameId = ref<string | null>(null);
 const selectedArtifactId = ref<string | null>(null);
 const expandedArtifactId = ref<string | null>(null);
-const reactionOffset = ref(0);
+const reactionOffset = ref(
+  route.name === "reactions" ? offsetFromPage(route.query.page, REACTION_PAGE_SIZE) : 0,
+);
 const reactionFilters = ref<ReactionQueryFilters>({});
 const reactionSort = ref<ReactionSort>({ sortBy: "default", sortDirection: "asc" });
-const artifactOffset = ref(0);
+const artifactOffset = ref(
+  route.name === "artifacts" ? offsetFromPage(route.query.page, ARTIFACT_PAGE_SIZE) : 0,
+);
 const artifactSort = ref<ArtifactSort>({ sortBy: "created_at", sortDirection: "desc" });
 
-const mappedReactionId = computed(() => routeMappedReactionId.value ?? selectedMappedId.value);
 const queries = useCatalogQueries({
   projectId: currentProjectId,
   activeView,
@@ -87,8 +100,6 @@ const queries = useCatalogQueries({
   artifactFilenameFilter,
   artifactStorageStatusFilter,
   artifactIngestionStatusFilter,
-  reactionId: routeReactionId,
-  mappedReactionId,
   frameId: selectedFrameId,
   artifactId: selectedArtifactId,
   expandedArtifactId,
@@ -96,9 +107,6 @@ const queries = useCatalogQueries({
 
 const reactions = computed(() => queries.reactions.data.value?.items ?? []);
 const artifacts = computed(() => queries.artifacts.data.value?.items ?? []);
-const reaction = computed(() => queries.reaction.data.value ?? null);
-const mappedReaction = computed(() => queries.mappedReaction.data.value ?? null);
-const activeReactionId = computed(() => routeReactionId.value ?? reaction.value?.id ?? null);
 const selectedFrame = computed(() => queries.frame.data.value ?? null);
 const artifactPreview = computed(() => queries.artifactPreview.data.value ?? null);
 const reactionPage = computed<PageInfo>(() => queries.reactions.data.value?.page ?? { total: 0, limit: 12, offset: reactionOffset.value });
@@ -110,7 +118,7 @@ const querying = computed(() => {
 });
 const globalError = computed(() => {
   const errors = activeView.value === "reactions"
-    ? [queries.reactions.error.value, queries.reaction.error.value, queries.mappedReaction.error.value]
+    ? [queries.reactions.error.value]
     : [queries.artifacts.error.value];
   const error = errors.find((item): item is Error => item instanceof Error);
   return error?.message ?? "";
@@ -119,19 +127,13 @@ const drawerError = computed(() => queries.frame.error.value instanceof Error ? 
 const artifactPreviewError = computed(() => queries.artifactPreview.error.value instanceof Error ? queries.artifactPreview.error.value.message : "");
 const forbiddenNotice = computed(() => Boolean(route.query.forbidden) || route.query.unavailable === "forbidden");
 
-watch(
-  [routeReactionId, routeMappedReactionId, () => reaction.value?.mapped_reactions],
-  ([reactionId, mappedId, available]) => {
-    selectedMappedId.value = reactionId || mappedId ? (mappedId ?? available?.[0]?.id ?? null) : null;
-  },
-  { immediate: true },
-);
-
 watch(currentProjectId, (next, previous) => {
   if (next === previous) return;
-  reactionOffset.value = 0;
+  if (previous !== null && previous !== undefined) {
+    if (route.name === "reactions") setReactionPage(0, true);
+    if (route.name === "artifacts") setArtifactPage(0, true);
+  }
   resetArtifactPagination();
-  selectedMappedId.value = null;
   selectedFrameId.value = null;
   selectedArtifactId.value = null;
   expandedArtifactId.value = null;
@@ -155,23 +157,19 @@ watch(
     }
   },
 );
-
-function selectReaction(id: string): void {
-  if (activeReactionId.value === id) {
-    selectedMappedId.value = null;
-    const query = { ...withoutAccessState(route.query) };
-    delete query.preview_reaction;
-    delete query.preview_mapped;
-    void router.push({ name: "reactions", query });
-    return;
-  }
-  void router.push({ name: "reactions", query: { ...withoutAccessState(route.query), preview_reaction: id, preview_mapped: undefined } });
-}
-
-function selectMapped(id: string): void {
-  selectedMappedId.value = id;
-  void router.push({ name: "reactions", query: { ...withoutAccessState(route.query), preview_reaction: reaction.value?.id ?? routeReactionId.value ?? undefined, preview_mapped: id } });
-}
+watch(
+  [() => route.name, () => route.query.page],
+  ([name, page]) => {
+    if (name === "reactions") {
+      const nextOffset = offsetFromPage(page, REACTION_PAGE_SIZE);
+      if (reactionOffset.value !== nextOffset) reactionOffset.value = nextOffset;
+    } else if (name === "artifacts") {
+      const nextOffset = offsetFromPage(page, ARTIFACT_PAGE_SIZE);
+      if (artifactOffset.value !== nextOffset) artifactOffset.value = nextOffset;
+    }
+  },
+  { immediate: true },
+);
 
 function openFrame(id: string): void {
   selectedFrameId.value = id;
@@ -182,12 +180,12 @@ function applyReactionFilters(filters: ReactionQueryFilters): void {
   reactionSort.value = filters.similarityReactionSmiles
     ? { sortBy: "similarity", sortDirection: "desc" }
     : { sortBy: "default", sortDirection: "asc" };
-  reactionOffset.value = 0;
+  setReactionPage(0, true);
 }
 
 function updateReactionSort(sort: ReactionSort): void {
   reactionSort.value = sort;
-  reactionOffset.value = 0;
+  setReactionPage(0, true);
 }
 
 function closeFrame(): void {
@@ -209,6 +207,7 @@ const artifactFilterQueryKeys = [
   "original_filename_contains",
   "storage_status",
   "ingestion_status",
+  "page",
 ] as const;
 
 function artifactFilterQuery(filters: ArtifactFilterValues): LocationQueryRaw {
@@ -231,7 +230,7 @@ function applyArtifactFilters(filters: ArtifactFilterValues): void {
 
 function updateArtifactSort(sort: ArtifactSort): void {
   artifactSort.value = sort;
-  resetArtifactPagination();
+  setArtifactPage(0, true);
 }
 
 function closeArtifactPreview(): void {
@@ -244,32 +243,55 @@ async function refreshAfterDelete(artifactId: string): Promise<void> {
   queryClient.removeQueries({ queryKey: ["catalog", "artifact-preview", { id: artifactId }] });
   const projectId = currentProjectId.value;
   if (!projectId) return;
-  resetArtifactPagination();
+  setArtifactPage(0, true);
   await Promise.all([
     queryClient.invalidateQueries({ queryKey: ["catalog", "artifacts", { projectId }] }),
     queryClient.invalidateQueries({ queryKey: ["catalog", "totals", { projectId }] }),
   ]);
 }
 
-function previousReactionPage(): void { reactionOffset.value = Math.max(0, reactionOffset.value - reactionPage.value.limit); }
-function nextReactionPage(): void {
-  if (reactionOffset.value + reactionPage.value.limit < reactionPage.value.total) reactionOffset.value += reactionPage.value.limit;
+function catalogPageQuery(page: number): LocationQueryRaw {
+  const query = { ...withoutAccessState(route.query) };
+  if (page <= 1) delete query.page;
+  else query.page = String(page);
+  return query;
 }
-function jumpReactionPage(offset: number): void { reactionOffset.value = offset; }
+
+function setReactionPage(offset: number, replace = false): void {
+  const nextOffset = Math.max(0, offset);
+  reactionOffset.value = nextOffset;
+  const page = pageNumberFromOffset(nextOffset, REACTION_PAGE_SIZE);
+  const navigate = replace ? router.replace : router.push;
+  void navigate({ name: "reactions", query: catalogPageQuery(page) });
+}
+
+function setArtifactPage(offset: number, replace = false): void {
+  const nextOffset = Math.max(0, offset);
+  artifactOffset.value = nextOffset;
+  const page = pageNumberFromOffset(nextOffset, ARTIFACT_PAGE_SIZE);
+  const navigate = replace ? router.replace : router.push;
+  void navigate({ name: "artifacts", query: catalogPageQuery(page) });
+}
+
+function previousReactionPage(): void { setReactionPage(reactionOffset.value - reactionPage.value.limit); }
+function nextReactionPage(): void {
+  if (reactionOffset.value + reactionPage.value.limit < reactionPage.value.total) {
+    setReactionPage(reactionOffset.value + reactionPage.value.limit);
+  }
+}
+function jumpReactionPage(offset: number): void { setReactionPage(offset); }
 function resetArtifactPagination(): void {
   artifactOffset.value = 0;
 }
 function previousArtifactPage(): void {
-  artifactOffset.value = Math.max(0, artifactOffset.value - artifactPage.value.limit);
+  setArtifactPage(artifactOffset.value - artifactPage.value.limit);
 }
 function nextArtifactPage(): void {
   if (artifactOffset.value + artifactPage.value.limit < artifactPage.value.total) {
-    artifactOffset.value += artifactPage.value.limit;
+    setArtifactPage(artifactOffset.value + artifactPage.value.limit);
   }
 }
-function jumpArtifactPage(offset: number): void {
-  artifactOffset.value = offset;
-}
+function jumpArtifactPage(offset: number): void { setArtifactPage(offset); }
 </script>
 
 <template>
@@ -291,21 +313,13 @@ function jumpArtifactPage(offset: number): void {
     <ReactionView
       v-if="activeView === 'reactions'"
       :reactions="reactions"
-      :selected-reaction-id="activeReactionId"
-      :reaction="reaction"
-      :mapped-reaction="mappedReaction"
-      :selected-mapped-id="selectedMappedId"
       :loading="loading"
       :querying="querying"
-      :mapped-loading="queries.mappedReaction.isLoading.value"
       :project-id="currentProjectId"
       :total="reactionPage.total"
       :page="reactionPage"
       :query-filters="reactionFilters"
       :sort="reactionSort"
-      @select-reaction="selectReaction"
-      @select-mapped="selectMapped"
-      @open-frame="openFrame"
       @previous-page="previousReactionPage"
       @next-page="nextReactionPage"
       @jump-page="jumpReactionPage"

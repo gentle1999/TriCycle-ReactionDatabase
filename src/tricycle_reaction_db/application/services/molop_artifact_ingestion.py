@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
 from typing import Any
+from uuid import UUID
 
 from sqlmodel import Session
 
@@ -64,10 +65,16 @@ from tricycle_reaction_db.application.services.reaction_geometry_reconciliation 
     reconcile_geometry_with_reactions,
     reconcile_mapped_reaction_with_geometries,
 )
+from tricycle_reaction_db.application.services.reaction_mapping_resolution import (
+    ensure_mapped_reactions_for_concrete_topology,
+    ensure_mapped_reactions_for_logical_reaction,
+)
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
     CalculationFrame,
     ElectronicState,
+    LogicalReaction,
+    MolecularTopology,
     ParseRevision,
 )
 from tricycle_reaction_db.domain.enums import (
@@ -132,6 +139,7 @@ _GEOMETRY_CONTEXT_FIELDS = (
     "formulas_by_hash",
     "topologies_by_identity",
     "topology_derivations_by_key",
+    "topology_upstreams_by_key",
     "geometries_by_hash",
     "exact_geometry_keys_loaded",
     "equivalent_geometry_by_key",
@@ -800,8 +808,66 @@ def reconcile_molop_geometry_context(
     reconciliation_cache = context.reconciliation_cache
     if not isinstance(reconciliation_cache, ReconciliationBatchCache):
         reconciliation_cache = ReconciliationBatchCache()
-    reconciliation_cache.thermodynamic_property_geometry_ids.update(reconcilable_ids)
     context.reconciliation_cache = reconciliation_cache
+
+    # Deferred TS inference creates its first mapped reaction while the fast
+    # insert queue is still active.  Once that queue is flushed, expand each
+    # affected logical reaction across every already-materialized concrete DAG
+    # member.  Temporarily use the regular persistence path for this small
+    # reaction graph so each newly-created mapping is immediately visible to
+    # the fixed-point expansion.
+    logical_reaction_ids = {
+        mapped_reaction.logical_reaction_id
+        for mapped_reaction in (
+            *tuple(context.mapped_reactions_by_id.values()),
+            *tuple(context.mapped_reactions_to_reconcile.values()),
+        )
+        if isinstance(mapped_reaction.logical_reaction_id, UUID)
+    }
+    previous_fast_insert = session.info.get("tricycle_fast_insert", False)
+    previous_autoflush = session.autoflush
+    session.info["tricycle_fast_insert"] = False
+    session.autoflush = True
+    try:
+        for logical_reaction_id in sorted(logical_reaction_ids, key=str):
+            logical_reaction = session.get(LogicalReaction, logical_reaction_id)
+            if logical_reaction is not None:
+                ensure_mapped_reactions_for_logical_reaction(
+                    session,
+                    logical_reaction,
+                    topology_context=context,
+                    reconciliation_cache=reconciliation_cache,
+                    refresh_thermodynamics=False,
+                )
+    finally:
+        session.autoflush = previous_autoflush
+        session.info["tricycle_fast_insert"] = previous_fast_insert
+
+    for topology_id in context.topologies_to_resolve_reactions:
+        topology = session.get(MolecularTopology, topology_id)
+        if topology is None:
+            topology = next(
+                (
+                    candidate
+                    for candidate in (
+                        *tuple(session.new),
+                        *tuple(session.info.get("_fast_pending_entities", ())),
+                    )
+                    if isinstance(candidate, MolecularTopology) and candidate.id == topology_id
+                ),
+                None,
+            )
+        if topology is not None:
+            ensure_mapped_reactions_for_concrete_topology(
+                session,
+                topology,
+                topology_context=context,
+                reconciliation_cache=reconciliation_cache,
+                refresh_thermodynamics=False,
+            )
+    _attach_pending_entities(session)
+    session.flush()
+    reconciliation_cache.thermodynamic_property_geometry_ids.update(reconcilable_ids)
     preload_reconciliation_context(
         session,
         {

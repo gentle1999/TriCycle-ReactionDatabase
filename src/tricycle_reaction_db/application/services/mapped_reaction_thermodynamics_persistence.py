@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy import delete, func
@@ -168,7 +168,9 @@ def refresh_mapped_reaction_thermodynamics(
             EndpointComponentRequirement(
                 side=side,
                 mapped_reaction_participant_id=participant_id,
-                topology_id=logical_participant.topology_id,
+                topology_id=(
+                    mapped_participant.concrete_topology_id or logical_participant.topology_id
+                ),
                 stoichiometric_coefficient=logical_participant.stoichiometric_coefficient,
             )
         )
@@ -280,7 +282,7 @@ def refresh_mapped_reaction_thermodynamics(
             ).encode("utf-8")
         ).hexdigest()
         profile_rows.append(
-            MappedReactionThermodynamicProfile(
+            cast(Any, MappedReactionThermodynamicProfile)(
                 mapped_reaction_id=mapped_reaction_id,
                 policy_version=profile.policy_version,
                 source_key_hash=source_key_hash,

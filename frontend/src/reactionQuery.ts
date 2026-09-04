@@ -15,6 +15,8 @@ export type ReactionQueryField =
   | "maximum_activation_gibbs_free_energy_kcal_mol"
   | "minimum_reaction_gibbs_free_energy_kcal_mol"
   | "maximum_reaction_gibbs_free_energy_kcal_mol"
+  | "minimum_mapped_reaction_count"
+  | "maximum_mapped_reaction_count"
   | "reactant_product_changed"
   | "created_after"
   | "created_before";
@@ -35,6 +37,10 @@ export interface ReactionSort {
   sortDirection: "asc" | "desc";
 }
 
+/**
+ * Reaction structure fields are evaluated on MappedReaction rows; the
+ * reaction catalog only groups those matches back into LogicalReaction paths.
+ */
 export interface ReactionQueryFilters {
   projectId?: string;
   topologyId?: string;
@@ -51,6 +57,8 @@ export interface ReactionQueryFilters {
   maximumActivationGibbsFreeEnergyKcalMol?: number;
   minimumReactionGibbsFreeEnergyKcalMol?: number;
   maximumReactionGibbsFreeEnergyKcalMol?: number;
+  minimumMappedReactionCount?: number;
+  maximumMappedReactionCount?: number;
   hasActivationGibbsFreeEnergy?: boolean;
   hasReactionGibbsFreeEnergy?: boolean;
   reactantProductChanged?: boolean;
@@ -92,15 +100,17 @@ export const reactionQueryFieldOptions: ReactionQueryFieldOption[] = [
   { value: "label", label: "反应名称", kind: "text" },
   { value: "reaction_hash", label: "反应 hash", kind: "text" },
   { value: "reaction_class", label: "反应类型", kind: "class" },
-  { value: "reactant_smarts", label: "前体 SMARTS", kind: "smarts" },
-  { value: "product_smarts", label: "后体 SMARTS", kind: "smarts" },
-  { value: "rxn_smarts", label: "RXN SMILES / SMARTS", kind: "reaction" },
-  { value: "reactant_mol_block", label: "前体结构", kind: "mol_block" },
-  { value: "product_mol_block", label: "后体结构", kind: "mol_block" },
+  { value: "reactant_smarts", label: "映射反应前体 SMARTS", kind: "smarts" },
+  { value: "product_smarts", label: "映射反应后体 SMARTS", kind: "smarts" },
+  { value: "rxn_smarts", label: "映射反应 RXN SMILES / SMARTS", kind: "reaction" },
+  { value: "reactant_mol_block", label: "映射反应前体结构", kind: "mol_block" },
+  { value: "product_mol_block", label: "映射反应后体结构", kind: "mol_block" },
   { value: "minimum_activation_gibbs_free_energy_kcal_mol", label: "最低活化自由能（kcal/mol）", kind: "number" },
   { value: "maximum_activation_gibbs_free_energy_kcal_mol", label: "最高活化自由能（kcal/mol）", kind: "number" },
   { value: "minimum_reaction_gibbs_free_energy_kcal_mol", label: "最低反应自由能（kcal/mol）", kind: "number" },
   { value: "maximum_reaction_gibbs_free_energy_kcal_mol", label: "最高反应自由能（kcal/mol）", kind: "number" },
+  { value: "minimum_mapped_reaction_count", label: "最少映射反应数", kind: "number" },
+  { value: "maximum_mapped_reaction_count", label: "最多映射反应数", kind: "number" },
   { value: "reactant_product_changed", label: "前后体拓扑发生变化", kind: "boolean" },
   { value: "created_after", label: "创建时间不早于", kind: "datetime" },
   { value: "created_before", label: "创建时间不晚于", kind: "datetime" },
@@ -145,6 +155,8 @@ export function reactionFilterExpression(filters: ReactionQueryFilters): Reactio
     "maximum_reaction_gibbs_free_energy_kcal_mol",
     filters.maximumReactionGibbsFreeEnergyKcalMol,
   );
+  add("minimum_mapped_reaction_count", filters.minimumMappedReactionCount);
+  add("maximum_mapped_reaction_count", filters.maximumMappedReactionCount);
   add("reactant_product_changed", filters.reactantProductChanged);
   add("created_after", filters.createdAfter);
   add("created_before", filters.createdBefore);

@@ -36,6 +36,8 @@ const messages = {
     },
     common: {
       none: "—",
+      first: "首页",
+      last: "末页",
       previous: "上一页",
       next: "下一页",
       close: "关闭",
@@ -151,6 +153,8 @@ const messages = {
     },
     common: {
       none: "—",
+      first: "First page",
+      last: "Last page",
       previous: "Previous page",
       next: "Next page",
       close: "Close",

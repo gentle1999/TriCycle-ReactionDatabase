@@ -25,8 +25,6 @@ interface CatalogQueryOptions {
   artifactFilenameFilter: ComputedRef<string | null>;
   artifactStorageStatusFilter: ComputedRef<string | null>;
   artifactIngestionStatusFilter: ComputedRef<string | null>;
-  reactionId: Ref<string | null>;
-  mappedReactionId: Ref<string | null>;
   frameId: Ref<string | null>;
   artifactId: Ref<string | null>;
   expandedArtifactId: Ref<string | null>;
@@ -121,23 +119,6 @@ export function useCatalogQueries(options: CatalogQueryOptions) {
     staleTime: 30_000,
   });
 
-  const mappedReaction = useQuery({
-    queryKey: computed(() => ["catalog", "mapped-reaction", { projectId: options.projectId.value, id: options.mappedReactionId.value }]),
-    queryFn: ({ signal }) => api.mappedReaction(options.mappedReactionId.value ?? "", { projectId: options.projectId.value ?? undefined }, signal),
-    enabled: computed(() => options.activeView.value === "reactions" && options.projectId.value !== null && options.mappedReactionId.value !== null),
-    staleTime: 60_000,
-  });
-
-  const effectiveReactionId = computed(() =>
-    options.reactionId.value ?? mappedReaction.data.value?.logical_reaction_id ?? null,
-  );
-  const reaction = useQuery({
-    queryKey: computed(() => ["catalog", "reaction", { projectId: options.projectId.value, id: effectiveReactionId.value }]),
-    queryFn: ({ signal }) => api.reaction(effectiveReactionId.value ?? "", { projectId: options.projectId.value ?? undefined }, signal),
-    enabled: computed(() => options.activeView.value === "reactions" && options.projectId.value !== null && effectiveReactionId.value !== null),
-    staleTime: 60_000,
-  });
-
   const artifactFrames = useQuery({
     queryKey: computed(() => ["catalog", "artifact-frames", { projectId: options.projectId.value, artifactId: options.expandedArtifactId.value, all: true }]),
     queryFn: ({ signal }) => loadAllArtifactFrames(
@@ -209,8 +190,6 @@ export function useCatalogQueries(options: CatalogQueryOptions) {
   return {
     databaseTotals,
     reactions,
-    reaction,
-    mappedReaction,
     artifactFrames,
     frame,
     artifacts,

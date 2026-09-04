@@ -214,7 +214,7 @@ def topology_id_is_visible(scope: QueryVisibilityScope, topology_id: Any) -> Any
     endpoint_topology_ids = select(col(TransitionStateEndpoint.topology_id)).where(
         col(TransitionStateEndpoint.calculation_frame_id).in_(visible_frame_ids(scope))
     )
-    participant_topology_ids = (
+    logical_participant_topology_ids = (
         select(col(LogicalReactionParticipant.topology_id))
         .join(
             MappedReactionParticipant,
@@ -228,8 +228,21 @@ def topology_id_is_visible(scope: QueryVisibilityScope, topology_id: Any) -> Any
             )
         )
     )
+    concrete_participant_topology_ids = select(
+        col(MappedReactionParticipant.concrete_topology_id)
+    ).where(
+        col(MappedReactionParticipant.concrete_topology_id).is_not(None),
+        _mapped_reaction_id_has_visible_source(
+            scope,
+            col(MappedReactionParticipant.mapped_reaction_id),
+        ),
+    )
     return topology_id.in_(
-        geometry_topology_ids.union(endpoint_topology_ids, participant_topology_ids)
+        geometry_topology_ids.union(
+            endpoint_topology_ids,
+            logical_participant_topology_ids,
+            concrete_participant_topology_ids,
+        )
     )
 
 

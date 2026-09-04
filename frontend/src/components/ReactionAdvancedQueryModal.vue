@@ -300,7 +300,7 @@ watch(
       >
         <header class="advanced-query-header">
           <div>
-            <span class="eyebrow">LogicalReaction query builder</span>
+            <span class="eyebrow">MappedReaction → LogicalReaction query builder</span>
             <h2 id="reaction-advanced-query-title">高级查询</h2>
           </div>
           <div class="advanced-query-header-actions">

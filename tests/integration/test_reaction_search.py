@@ -71,6 +71,18 @@ def test_reaction_smarts_and_similarity_use_indexed_rdkit_projections(
                 logical_ids.append(logical.id)
                 logical_hashes.append(logical_hash)
                 mapped_hashes.append(mapped.mapping_hash)
+            # One logical reaction can have several concrete mapped paths.  A
+            # logical-path structure query must match either mapped row and
+            # return the logical reaction only once.
+            session.add(
+                MappedReaction(
+                    logical_reaction_id=logical_ids[0],
+                    mapped_reaction_key="path-0-alternate",
+                    mapped_reaction_kind=MappedReactionKind.OTHER,
+                    mapped_reaction_smiles="[C:1]#[C:2]>>[C:1]-[C:2]",
+                    mapping_hash=_hash("mapped-alternate"),
+                )
+            )
             session.commit()
 
         smarts = asyncio.run(
@@ -99,6 +111,28 @@ def test_reaction_smarts_and_similarity_use_indexed_rdkit_projections(
             )
         )
         assert [item.id for item in logical_structure.items] == [logical_ids[0]]
+
+        logical_mapped_structure = asyncio.run(
+            LogicalReactionQueryService.list_logical_reactions(
+                reaction_hash=logical_hashes[0],
+                reaction_smarts=query_smiles,
+                limit=20,
+                offset=0,
+            )
+        )
+        assert [item.id for item in logical_mapped_structure.items] == [logical_ids[0]]
+        assert logical_mapped_structure.items[0].mapped_reaction_count == 2
+
+        logical_mapped_similarity = asyncio.run(
+            LogicalReactionQueryService.list_logical_reactions(
+                reaction_hash=logical_hashes[0],
+                similarity_reaction_smiles=query_smiles,
+                limit=20,
+                offset=0,
+            )
+        )
+        assert [item.id for item in logical_mapped_similarity.items] == [logical_ids[0]]
+        assert logical_mapped_similarity.items[0].similarity_score == pytest.approx(1.0)
 
         logical_and = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(

@@ -9,14 +9,13 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from tricycle_reaction_db.application.dtos import GeometryEnergyView
+from tricycle_reaction_db.core.chemistry_config import GEOMETRY_ENERGY_POLICY_VERSION
 from tricycle_reaction_db.db.models import (
     CalculationFrame,
     CalculationProtocol,
     ThermochemistryResult,
 )
 from tricycle_reaction_db.domain.precision import round_energy_hartree
-
-GEOMETRY_ENERGY_POLICY_VERSION = "geometry-energy-view-v1"
 
 _METHOD_FAMILY_RANKS = {
     "POST-HF": 400,

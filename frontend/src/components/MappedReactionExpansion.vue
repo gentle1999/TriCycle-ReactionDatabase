@@ -23,13 +23,11 @@ const ReactionPotentialEnergyDiagram = defineAsyncComponent(() => import("./Reac
 const props = defineProps<{
   reaction: LogicalReactionDetail;
   mappedReaction: MappedReactionDetail | null;
-  selectedMappedId: string | null;
   mappedLoading: boolean;
   projectId: string | null;
 }>();
 
 const emit = defineEmits<{
-  selectMapped: [id: string];
   openFrame: [id: string];
 }>();
 const route = useRoute();
@@ -207,11 +205,11 @@ watch(orderedNodes, (nodes) => { activeNodeId.value = nodes[0]?.id ?? null; }, {
   <section class="mapped-reaction-expansion" :aria-labelledby="`mapped-reaction-title-${reaction.id}`">
     <header class="workspace-header compact-workspace-header">
       <div>
-        <span class="eyebrow">MappedReaction</span>
-        <h2 :id="`mapped-reaction-title-${reaction.id}`">{{ reaction.label || reaction.reaction_key }} 的映射路径</h2>
+        <span class="eyebrow">MappedReaction · 严格映射反应</span>
+        <h2 :id="`mapped-reaction-title-${reaction.id}`">{{ mappedReaction?.label || mappedReaction?.mapped_reaction_key || "映射反应详情" }}</h2>
         <code class="mapped-reaction-smiles">{{ mappedReaction?.mapped_reaction_smiles ?? "正在读取映射反应…" }}</code>
       </div>
-      <dl class="header-facts"><div><dt>映射方案</dt><dd>{{ reaction.mapped_reactions.length }}</dd></div><div><dt>参与物</dt><dd>{{ reaction.participants.length }}</dd></div></dl>
+      <dl class="header-facts"><div><dt>所属逻辑反应</dt><dd>{{ shortId(reaction.id) }}</dd></div><div><dt>参与物</dt><dd>{{ mappedReaction?.participants.length ?? "—" }}</dd></div></dl>
     </header>
 
     <section v-if="profiles.length" class="reaction-thermodynamics" aria-label="反应热力学">
@@ -246,15 +244,27 @@ watch(orderedNodes, (nodes) => { activeNodeId.value = nodes[0]?.id ?? null; }, {
     <section v-if="mappedReaction" class="reaction-equation compact-equation" aria-label="已映射的底物和产物">
       <div class="equation-side">
         <article v-for="participant in mappedReactants" :key="participant.id" class="molecule-item">
-          <div class="molecule-caption"><span><strong>{{ labelFor(mappedParticipantRole(participant.logical_reaction_participant_id, participant.side)) }}</strong><small>{{ participant.mapped_smiles }}</small></span><RouterLink :to="{ name: 'topology-detail', params: { topologyId: participant.topology_id }, query: navigationQuery }" title="查看分子拓扑" :aria-label="`查看分子拓扑 ${participant.topology_id}`"><ArrowUpRight :size="15" aria-hidden="true" /></RouterLink></div>
+          <div class="molecule-caption"><span><strong>{{ labelFor(mappedParticipantRole(participant.logical_reaction_participant_id, participant.side)) }}</strong><small>{{ participant.mapped_smiles }}</small></span><RouterLink :to="{ name: 'topology-detail', params: { topologyId: participant.topology_id }, query: navigationQuery }" title="查看具体分子拓扑" :aria-label="`查看具体分子拓扑 ${participant.topology_id}`"><ArrowUpRight :size="15" aria-hidden="true" /></RouterLink></div>
           <ChemDoodleMolecule :topology-id="participant.topology_id" :atom-map-numbers="participant.atom_map_numbers" :height="170" :label="participant.mapped_smiles" />
+          <div class="mapped-topology-links">
+            <span>具体拓扑</span><RouterLink :to="{ name: 'topology-detail', params: { topologyId: participant.topology_id }, query: navigationQuery }">{{ shortId(participant.topology_id) }}</RouterLink>
+            <template v-if="participant.logical_topology_id !== participant.topology_id">
+              <span>逻辑拓扑</span><RouterLink :to="{ name: 'topology-detail', params: { topologyId: participant.logical_topology_id }, query: navigationQuery }">{{ shortId(participant.logical_topology_id) }}</RouterLink>
+            </template>
+          </div>
         </article>
       </div>
       <div class="equation-arrow"><ArrowRight :size="24" aria-hidden="true" /></div>
       <div class="equation-side is-product">
         <article v-for="participant in mappedProducts" :key="participant.id" class="molecule-item">
-          <div class="molecule-caption"><span><strong>{{ labelFor(mappedParticipantRole(participant.logical_reaction_participant_id, participant.side)) }}</strong><small>{{ participant.mapped_smiles }}</small></span><RouterLink :to="{ name: 'topology-detail', params: { topologyId: participant.topology_id }, query: navigationQuery }" title="查看分子拓扑" :aria-label="`查看分子拓扑 ${participant.topology_id}`"><ArrowUpRight :size="15" aria-hidden="true" /></RouterLink></div>
+          <div class="molecule-caption"><span><strong>{{ labelFor(mappedParticipantRole(participant.logical_reaction_participant_id, participant.side)) }}</strong><small>{{ participant.mapped_smiles }}</small></span><RouterLink :to="{ name: 'topology-detail', params: { topologyId: participant.topology_id }, query: navigationQuery }" title="查看具体分子拓扑" :aria-label="`查看具体分子拓扑 ${participant.topology_id}`"><ArrowUpRight :size="15" aria-hidden="true" /></RouterLink></div>
           <ChemDoodleMolecule :topology-id="participant.topology_id" :atom-map-numbers="participant.atom_map_numbers" :height="170" :label="participant.mapped_smiles" />
+          <div class="mapped-topology-links">
+            <span>具体拓扑</span><RouterLink :to="{ name: 'topology-detail', params: { topologyId: participant.topology_id }, query: navigationQuery }">{{ shortId(participant.topology_id) }}</RouterLink>
+            <template v-if="participant.logical_topology_id !== participant.topology_id">
+              <span>逻辑拓扑</span><RouterLink :to="{ name: 'topology-detail', params: { topologyId: participant.logical_topology_id }, query: navigationQuery }">{{ shortId(participant.logical_topology_id) }}</RouterLink>
+            </template>
+          </div>
         </article>
       </div>
     </section>
@@ -263,7 +273,6 @@ watch(orderedNodes, (nodes) => { activeNodeId.value = nodes[0]?.id ?? null; }, {
     <section class="mapped-section">
       <div class="section-heading mapped-heading">
         <div><span class="eyebrow">MappedReaction</span><h3>节点和几何构象</h3></div>
-        <label v-if="reaction.mapped_reactions.length" class="select-field"><span class="sr-only">选择映射反应</span><select :value="selectedMappedId ?? ''" @change="emit('selectMapped', ($event.target as HTMLSelectElement).value)"><option v-for="mapped in reaction.mapped_reactions" :key="mapped.id" :value="mapped.id">{{ mapped.label || mapped.mapped_reaction_key }}</option></select></label>
       </div>
       <div v-if="mappedLoading" class="loading-block is-wide"></div>
       <div v-else-if="!mappedReaction" class="compact-empty">该反应没有映射路径</div>

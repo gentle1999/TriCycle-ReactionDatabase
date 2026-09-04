@@ -21,6 +21,10 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ARRAY, INTEGER, JSONB, SMALLINT
 from sqlmodel import Field, Relationship, SQLModel
 
+from tricycle_reaction_db.core.chemistry_config import (
+    LOGICAL_PARTICIPANT_CONCRETE_MATCH_POLICY_VERSION,
+)
+from tricycle_reaction_db.core.units import HARTREE_PER_PARTICLE_TO_KCAL_PER_MOLE_FACTOR
 from tricycle_reaction_db.db.models.base import created_at_field, uuid_primary_key_field
 from tricycle_reaction_db.domain.enums import (
     ArtifactResolutionStatus,
@@ -355,8 +359,85 @@ class LogicalReactionParticipant(SQLModel, table=True):
     stoichiometric_coefficient: int = Field(default=1, sa_type=SMALLINT, nullable=False)
     logical_reaction: LogicalReaction = Relationship(back_populates="participants")
     topology: "MolecularTopology" = Relationship(back_populates="logical_reaction_participants")
+    concrete_topology_memberships: list["LogicalParticipantConcreteTopology"] = Relationship(
+        back_populates="logical_reaction_participant",
+        cascade_delete=True,
+        passive_deletes=True,
+    )
     mapped_participants: list["MappedReactionParticipant"] = Relationship(
         back_populates="logical_reaction_participant", cascade_delete=True, passive_deletes=True
+    )
+
+
+class LogicalParticipantConcreteTopology(SQLModel, table=True):
+    """A concrete topology member of one abstract reaction participant.
+
+    ``LogicalReactionParticipant.topology_id`` is the reusable logical query
+    topology.  This table records each strict topology proven to match that
+    query, including the policy/evidence needed to audit or recompute the
+    relation.  It is deliberately separate from ``MappedReactionParticipant``
+    because a concrete topology can be known before a complete reaction
+    mapping exists.
+    """
+
+    __tablename__ = "logical_participant_concrete_topology"  # pyright: ignore[reportAssignmentType]
+    __table_args__ = (
+        UniqueConstraint(
+            "logical_reaction_participant_id",
+            "concrete_topology_id",
+            name="uq_logical_participant_concrete_topology",
+        ),
+        Index(
+            "ix_logical_participant_concrete_topology_concrete",
+            "concrete_topology_id",
+        ),
+        Index(
+            "ix_logical_participant_concrete_topology_logical",
+            "logical_reaction_participant_id",
+        ),
+        CheckConstraint(
+            "match_status IN ('matched', 'ambiguous')",
+            name="ck_logical_participant_concrete_match_status",
+        ),
+    )
+
+    id: UUID | None = uuid_primary_key_field()
+    created_at: datetime | None = created_at_field()
+    logical_reaction_participant_id: UUID = Field(
+        foreign_key="logical_reaction_participant.id",
+        ondelete="CASCADE",
+        nullable=False,
+    )
+    concrete_topology_id: UUID = Field(
+        foreign_key="molecular_topology.id",
+        ondelete="RESTRICT",
+        nullable=False,
+    )
+    match_policy_version: str = Field(
+        default=LOGICAL_PARTICIPANT_CONCRETE_MATCH_POLICY_VERSION,
+        sa_column=Column(
+            Text,
+            nullable=False,
+            server_default=LOGICAL_PARTICIPANT_CONCRETE_MATCH_POLICY_VERSION,
+        ),
+    )
+    match_status: str = Field(
+        default="matched",
+        sa_column=Column(
+            Text,
+            nullable=False,
+            server_default="matched",
+        ),
+    )
+    match_metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default="{}"),
+    )
+    logical_reaction_participant: LogicalReactionParticipant = Relationship(
+        back_populates="concrete_topology_memberships"
+    )
+    concrete_topology: "MolecularTopology" = Relationship(
+        back_populates="logical_participant_concrete_topologies"
     )
 
 
@@ -543,7 +624,8 @@ class MappedReactionThermodynamicProfile(SQLModel, table=True):
         sa_column=Column(
             Float,
             Computed(
-                "(transition_state_enthalpy_hartree - reactants_enthalpy_hartree) * 627.5094740631",
+                "(transition_state_enthalpy_hartree - reactants_enthalpy_hartree) * "
+                f"{HARTREE_PER_PARTICLE_TO_KCAL_PER_MOLE_FACTOR}",
                 persisted=True,
             ),
             nullable=True,
@@ -555,7 +637,8 @@ class MappedReactionThermodynamicProfile(SQLModel, table=True):
             Float,
             Computed(
                 "(transition_state_gibbs_free_energy_hartree "
-                "- reactants_gibbs_free_energy_hartree) * 627.5094740631",
+                "- reactants_gibbs_free_energy_hartree) * "
+                f"{HARTREE_PER_PARTICLE_TO_KCAL_PER_MOLE_FACTOR}",
                 persisted=True,
             ),
             nullable=True,
@@ -577,7 +660,8 @@ class MappedReactionThermodynamicProfile(SQLModel, table=True):
         sa_column=Column(
             Float,
             Computed(
-                "(products_enthalpy_hartree - reactants_enthalpy_hartree) * 627.5094740631",
+                "(products_enthalpy_hartree - reactants_enthalpy_hartree) * "
+                f"{HARTREE_PER_PARTICLE_TO_KCAL_PER_MOLE_FACTOR}",
                 persisted=True,
             ),
             nullable=True,
@@ -589,7 +673,8 @@ class MappedReactionThermodynamicProfile(SQLModel, table=True):
             Float,
             Computed(
                 "(products_gibbs_free_energy_hartree "
-                "- reactants_gibbs_free_energy_hartree) * 627.5094740631",
+                "- reactants_gibbs_free_energy_hartree) * "
+                f"{HARTREE_PER_PARTICLE_TO_KCAL_PER_MOLE_FACTOR}",
                 persisted=True,
             ),
             nullable=True,
@@ -619,6 +704,10 @@ class MappedReactionParticipant(SQLModel, table=True):
             "logical_reaction_participant_id",
             name="uq_mapped_participant_logical",
         ),
+        Index(
+            "ix_mapped_reaction_participant_concrete_topology",
+            "concrete_topology_id",
+        ),
         CheckConstraint("template_index >= 0", name="ck_mapped_participant_template_index"),
         CheckConstraint(
             "cardinality(atom_map_numbers) > 0 AND array_position(atom_map_numbers, NULL) IS NULL "
@@ -638,6 +727,14 @@ class MappedReactionParticipant(SQLModel, table=True):
         index=True,
         nullable=False,
     )
+    # Nullable only for a short compatibility window with manually inserted
+    # legacy rows. All service-created rows set this field and the 0026
+    # migration backfills every existing participant that can be resolved.
+    concrete_topology_id: UUID | None = Field(
+        default=None,
+        foreign_key="molecular_topology.id",
+        ondelete="RESTRICT",
+    )
     side: LogicalReactionParticipantSide = Field(
         sa_column=Column(
             string_enum(LogicalReactionParticipantSide, name="mapped_reaction_participant_side"),
@@ -650,6 +747,9 @@ class MappedReactionParticipant(SQLModel, table=True):
     mapped_reaction: MappedReaction = Relationship(back_populates="participants")
     logical_reaction_participant: LogicalReactionParticipant = Relationship(
         back_populates="mapped_participants"
+    )
+    concrete_topology: Optional["MolecularTopology"] = Relationship(
+        back_populates="mapped_reaction_participants"
     )
     node_geometries: list["MappedReactionNodeGeometry"] = Relationship(
         back_populates="mapped_reaction_participant", passive_deletes="all"
@@ -964,6 +1064,7 @@ class MappedReactionEdge(SQLModel, table=True):
 __all__ = [
     "ManifestArtifactBinding",
     "LogicalReaction",
+    "LogicalParticipantConcreteTopology",
     "LogicalReactionParticipant",
     "MappedReaction",
     "MappedReactionEdge",

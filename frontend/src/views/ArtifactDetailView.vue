@@ -7,6 +7,7 @@ import { RouterLink, useRoute } from "vue-router";
 import { api, artifactDownloadUrl } from "@/api";
 import ArtifactIngestionStatus from "@/components/ArtifactIngestionStatus.vue";
 import CalculationFrameList from "@/components/CalculationFrameList.vue";
+import ChemDoodleFrameMovie3D from "@/components/ChemDoodleFrameMovie3D.vue";
 import FrameDrawer from "@/components/FrameDrawer.vue";
 import { useProjectContext } from "@/composables/useProjectContext";
 import { formatBytes, formatDurationSeconds, labelFor, shortId, statusTone } from "@/format";
@@ -166,7 +167,23 @@ const frameError = computed(() => frameQuery.error.value instanceof Error ? fram
           <div><span class="eyebrow">CalculationFrame</span><h2 id="artifact-frames-title">关联计算帧</h2></div>
           <span>{{ framesQuery.data.value?.page.total ?? "—" }} 帧</span>
         </header>
-        <CalculationFrameList :frames="framesQuery.data.value?.items ?? []" :loading="framesQuery.isLoading.value" :error="framesError" @open="selectedFrameId = $event" />
+        <div class="artifact-frames-content">
+          <section class="artifact-frame-list-pane">
+            <header>
+              <div><span class="eyebrow">CalculationFrame</span><strong>文件中的全部计算帧</strong></div>
+              <span>{{ framesQuery.data.value?.items.length ?? 0 }} 帧</span>
+            </header>
+            <div class="artifact-frame-list-scroll">
+              <CalculationFrameList :frames="framesQuery.data.value?.items ?? []" :loading="framesQuery.isLoading.value" :error="framesError" @open="selectedFrameId = $event" />
+            </div>
+          </section>
+          <ChemDoodleFrameMovie3D
+            :frames="framesQuery.data.value?.items ?? []"
+            :project-id="artifact.project_id"
+            title="优化动画"
+            canvas-label="原始文件优化动画"
+          />
+        </div>
       </section>
     </template>
 

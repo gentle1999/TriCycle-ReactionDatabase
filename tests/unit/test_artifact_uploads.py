@@ -101,6 +101,38 @@ def test_inference_context_snapshot_restores_nested_reconciliation_cache_lists()
     assert node_id in cache.loaded_node_geometries
 
 
+def test_inference_cache_key_keeps_strict_stereo_variants_distinct() -> None:
+    negative_a = Chem.MolFromSmiles("C[C@H](F)Cl")
+    negative_b = Chem.MolFromSmiles("C[C@@H](F)Cl")
+    assert negative_a is not None
+    assert negative_b is not None
+
+    common = {
+        "file_frame_index": 0,
+        "imaginary_mode_index": 0,
+        "imaginary_frequency_cm1": -100.0,
+        "reaction_smiles": "[C:1]([F:2])([Cl:3])[C:4]>>[C:1]([F:2])([Cl:3])[C:4]",
+        "negative_displacement_ratio": 1.0,
+        "positive_displacement_ratio": 1.0,
+        "charge": 0,
+        "multiplicity": 1,
+    }
+    inferred_a = _SuccessfulInference(
+        negative_endpoint=negative_a,
+        positive_endpoint=Chem.Mol(negative_a),
+        **common,
+    )
+    inferred_b = _SuccessfulInference(
+        negative_endpoint=negative_b,
+        positive_endpoint=Chem.Mol(negative_b),
+        **common,
+    )
+
+    assert upload_module._inference_reaction_cache_key(inferred_a) != (
+        upload_module._inference_reaction_cache_key(inferred_b)
+    )
+
+
 @pytest.fixture(autouse=True)
 def close_parser_pool_after_test() -> None:
     """Keep MolOP's native child-process guard isolated between test cases."""

@@ -31,6 +31,8 @@ const props = withDefaults(defineProps<{
   frames: CalculationFrameSummary[];
   projectId?: string;
   height?: number;
+  title?: string;
+  canvasLabel?: string;
 }>(), { height: 360 });
 
 const host = ref<HTMLElement | null>(null);
@@ -359,11 +361,11 @@ onBeforeUnmount(() => {
     :style="panelStyle"
   >
     <header>
-      <div><span class="eyebrow">MovieCanvas3D</span><strong>全帧结构动画</strong></div>
+      <div><span class="eyebrow">MovieCanvas3D</span><strong>{{ title ?? "全帧结构动画" }}</strong></div>
       <span class="frame-movie-position" aria-live="polite">{{ movieFrameCount ? `第 ${currentFrame + 1} / ${movieFrameCount} 帧` : "—" }}</span>
     </header>
     <div ref="host" class="frame-movie-canvas molecule-canvas geometry-canvas-3d">
-      <canvas :id="canvasElementId" :key="canvasElementId" aria-label="文件全部计算帧结构动画" role="img"></canvas>
+      <canvas :id="canvasElementId" :key="canvasElementId" :aria-label="canvasLabel ?? '文件全部计算帧结构动画'" role="img"></canvas>
       <div v-if="loading" class="molecule-state">{{ recovering ? "正在恢复全帧动画" : `正在加载 ${loadedFrameCount} / ${uniqueGeometryCount} 个构象` }}</div>
       <div v-else-if="error" class="molecule-state is-error">{{ error }}</div>
       <div v-else-if="!frames.length" class="molecule-state">没有可播放的计算帧</div>

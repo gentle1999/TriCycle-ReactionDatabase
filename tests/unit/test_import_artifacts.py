@@ -88,6 +88,37 @@ def test_import_state_only_skips_unchanged_success(tmp_path: Path) -> None:
     )
 
 
+def test_import_state_keeps_partial_ingestion_retryable(tmp_path: Path) -> None:
+    source = tmp_path / "partial.log"
+    source.write_text("payload", encoding="utf-8")
+    state = ImportState(tmp_path / "state.jsonl")
+    candidate = discover_files([source])[0]
+    fingerprint = file_fingerprint(source)
+    project_id = UUID("00000000-0000-0000-0000-000000000201")
+
+    state.append(
+        {
+            "source": str(source.resolve()),
+            # Older import checkpoints used this transport-level status even
+            # when the durable ingestion was partial.
+            "status": "succeeded",
+            "ingestion_status": "partial",
+            "project_id": str(project_id),
+            "artifact_kind": ArtifactKind.CALCULATION_OUTPUT.value,
+            "size_bytes": fingerprint.size_bytes,
+            "mtime_ns": fingerprint.mtime_ns,
+            "sha256": fingerprint.sha256,
+        }
+    )
+
+    assert not state.terminal(
+        candidate.path,
+        project_id=project_id,
+        artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+        fingerprint=fingerprint,
+    )
+
+
 def test_import_files_passes_local_paths_to_upload_service(monkeypatch, tmp_path: Path) -> None:
     source = tmp_path / "archive" / "nested" / "input.dat"
     source.parent.mkdir(parents=True)

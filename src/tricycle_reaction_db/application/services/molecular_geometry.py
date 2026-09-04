@@ -9,6 +9,7 @@ from uuid import UUID
 import numpy as np
 import numpy.typing as npt
 from sqlalchemy import Float, SmallInteger, String, and_, func, literal, text
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import load_only
@@ -28,6 +29,8 @@ from tricycle_reaction_db.application.services._persistence import (
 from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
     reconcile_geometry_with_reactions,
 )
+from tricycle_reaction_db.core.chemistry_config import GEOMETRY_MATCH_POLICY_VERSION
+from tricycle_reaction_db.core.units import radians_to_degrees
 from tricycle_reaction_db.db.models import (
     Geometry,
     MappedReaction,
@@ -86,6 +89,12 @@ class GeometryPersistenceContext:
     topology_derivations_by_key: dict[tuple[UUID, str, str], MolecularTopologyDerivation] = field(
         default_factory=dict
     )
+    # Effective upstreams are cached only for this transaction.  The cache is
+    # invalidated whenever a newly materialized abstraction upstream appears
+    # in the context, so a previous reflexive fallback cannot hide it.
+    topology_upstreams_by_key: dict[tuple[UUID, str], tuple[MolecularTopology, ...]] = field(
+        default_factory=dict
+    )
     geometries_by_hash: dict[tuple[UUID, str, str, int, int], Geometry] = field(
         default_factory=dict
     )
@@ -128,17 +137,24 @@ class GeometryPersistenceContext:
     # (reaction -> existing Geometry) lookup as well as the normal Geometry ->
     # existing reaction lookup.
     mapped_reactions_to_reconcile: dict[UUID, MappedReaction] = field(default_factory=dict)
-    # TS inference commonly repeats the same mapped reaction across files. The
-    # reaction identity is immutable, so reuse the first successful creation
-    # result while still binding each source frame independently.
-    inferred_reaction_ids_by_smiles: dict[str, tuple[UUID, UUID]] = field(default_factory=dict)
-    inferred_reaction_topology_records: dict[str, tuple[Any, ...]] = field(default_factory=dict)
+    # Concrete topologies are resolved after the batch's deferred TS reactions
+    # have been flushed, so a Geometry arriving before its logical template is
+    # not missed and the frame loop does not repeat the same global lookup.
+    topologies_to_resolve_reactions: set[UUID] = field(default_factory=set)
+    # TS inference commonly repeats the same strict endpoint reaction across
+    # files. The cache key is a digest of the mapped reaction plus the strict
+    # endpoint/topology identities; reaction_smiles alone is not sufficient
+    # because one logical reaction can have several concrete stereochemical
+    # variants.
+    inferred_reaction_ids_by_key: dict[str, tuple[UUID, UUID]] = field(default_factory=dict)
+    inferred_reaction_topology_records_by_key: dict[str, tuple[Any, ...]] = field(
+        default_factory=dict
+    )
     inferred_reaction_cache_hits: int = 0
     # Created lazily by batch reconciliation to avoid a module import cycle.
     reconciliation_cache: Any = None
 
 
-GEOMETRY_MATCH_POLICY_VERSION = "geometry-internal-coordinate-match-v4"
 # Keep each set-based equivalence statement below the database statement
 # timeout even when one file batch contains many thousands of frame keys.
 GEOMETRY_MATCH_INPUT_BATCH_SIZE = 128
@@ -321,7 +337,7 @@ def _internal_coordinate_arrays_equivalent(
     length_scale = max(minimum_positive_distance, 0.1)
     angular_tolerance = max(
         1e-6,
-        float(np.degrees(4.0 * coordinate_tolerance / length_scale)),
+        float(radians_to_degrees(4.0 * coordinate_tolerance / length_scale)),
     )
     if np.any(np.abs(candidate_angle_values - observed_angle_values) > angular_tolerance):
         return False
@@ -526,6 +542,80 @@ def _validate_cached_topology(
     )
 
 
+def _promote_stereo_abstraction_upstream_marker(
+    session: Session,
+    topology: MolecularTopology,
+    should_mark: bool,
+    *,
+    context: GeometryPersistenceContext | None,
+) -> None:
+    """Monotonically promote a topology proven by the TS abstraction path."""
+
+    if not should_mark or topology.is_stereo_abstraction_upstream:
+        return
+    topology.is_stereo_abstraction_upstream = True
+    if context is not None:
+        context.topology_upstreams_by_key.clear()
+
+    state = cast(Any, sa_inspect(topology))
+    if state.persistent:
+        session.flush([topology])
+    elif state.detached:
+        # Fast bulk insertion detaches rows after the Core INSERT.  A later
+        # explicit proof of the marker must still update that already inserted
+        # row, while transient/pending rows will carry the changed field into
+        # their deferred INSERT naturally.
+        topology_id = _require_id(topology, label="MolecularTopology")
+        session.execute(
+            text(
+                "UPDATE molecular_topology "
+                "SET is_stereo_abstraction_upstream = true "
+                "WHERE id = :topology_id"
+            ),
+            {"topology_id": topology_id},
+        )
+
+
+def _register_topology_upstreams(
+    session: Session,
+    topology: MolecularTopology,
+    *,
+    context: GeometryPersistenceContext | None,
+) -> tuple[MolecularTopology, ...]:
+    """Resolve and persist marked abstraction upstreams for one topology."""
+
+    from tricycle_reaction_db.application.services.topology_abstraction import (
+        STEREO_ABSTRACTION_POLICY_VERSION,
+        ensure_topology_upstreams,
+    )
+
+    topology_id = _require_id(topology, label="MolecularTopology")
+    cache_key = (topology_id, STEREO_ABSTRACTION_POLICY_VERSION)
+    if context is not None:
+        cached = context.topology_upstreams_by_key.get(cache_key)
+        if cached is not None:
+            return cached
+
+    candidates: list[MolecularTopology] = []
+    if context is not None:
+        candidates.extend(context.topologies_by_identity.values())
+    session_info = getattr(session, "info", {})
+    candidates.extend(
+        entity
+        for entity in session_info.get("_fast_pending_entities", ())
+        if isinstance(entity, MolecularTopology)
+    )
+    upstreams = ensure_topology_upstreams(
+        session,
+        topology,
+        abstraction_policy_version=STEREO_ABSTRACTION_POLICY_VERSION,
+        candidate_topologies=candidates,
+    )
+    if context is not None:
+        context.topology_upstreams_by_key[cache_key] = upstreams
+    return upstreams
+
+
 def _preload_molecular_topologies(
     session: Session,
     records: Sequence[NormalizedTopologyRecord],
@@ -614,6 +704,12 @@ def _preload_molecular_topologies(
         if topology is not None:
             if topology.formula_id != formula.id:
                 raise ValueError("topology identity resolved to a different molecular formula")
+            _promote_stereo_abstraction_upstream_marker(
+                session,
+                topology,
+                record.topology.is_stereo_abstraction_upstream,
+                context=context,
+            )
             continue
         topology = _new_entity(
             session, MolecularTopology, formula=formula, **record.topology.model_dump()
@@ -625,6 +721,8 @@ def _preload_molecular_topologies(
             defer_if_fast=True,
         )
         context.topologies_by_identity[identity_key] = topology
+        if topology.is_stereo_abstraction_upstream:
+            context.topology_upstreams_by_key.clear()
 
     derivation_keys = {
         (
@@ -709,11 +807,13 @@ def _preload_molecular_topologies(
                 record.topology_derivation,
                 label="MolecularTopologyDerivation",
             )
-        context.topologies[context_key] = PersistedMolecularTopology(
+        persisted = PersistedMolecularTopology(
             formula=context.formulas_by_hash[record.formula.composition_hash],
             topology=topology,
             topology_derivation=topology_derivation,
         )
+        context.topologies[context_key] = persisted
+        _register_topology_upstreams(session, topology, context=context)
 
 
 def persist_molecular_topology(
@@ -721,12 +821,21 @@ def persist_molecular_topology(
     record: NormalizedTopologyRecord,
     *,
     context: GeometryPersistenceContext | None = None,
+    register_upstream: bool = True,
 ) -> PersistedMolecularTopology:
     """Insert or reuse Formula and Topology without requiring a Geometry."""
 
     context_key = _topology_context_key(record)
     if context is not None and (cached := context.topologies.get(context_key)) is not None:
         _validate_cached_topology(cached, record)
+        _promote_stereo_abstraction_upstream_marker(
+            session,
+            cached.topology,
+            record.topology.is_stereo_abstraction_upstream,
+            context=context,
+        )
+        if register_upstream:
+            _register_topology_upstreams(session, cached.topology, context=context)
         return cached
 
     formula = (
@@ -770,6 +879,7 @@ def persist_molecular_topology(
                 MolecularTopology.graph_hash == record.topology.graph_hash,
             )
         ).first()
+    topology_created = topology is None
     if topology is None:
         topology = _new_entity(
             session,
@@ -780,8 +890,16 @@ def persist_molecular_topology(
         _flush_shared_entity(session, topology, label="MolecularTopology", defer_if_fast=True)
     elif topology.formula_id != formula.id:
         raise ValueError("topology identity resolved to a different molecular formula")
+    _promote_stereo_abstraction_upstream_marker(
+        session,
+        topology,
+        record.topology.is_stereo_abstraction_upstream,
+        context=context,
+    )
     if context is not None:
         context.topologies_by_identity[topology_identity] = topology
+        if topology_created and topology.is_stereo_abstraction_upstream:
+            context.topology_upstreams_by_key.clear()
     # The graph identity is canonical, but the stored descriptors are one
     # projection of that graph.  A batch may legitimately produce another
     # projection for the same identity, so the first persisted projection wins.
@@ -844,6 +962,8 @@ def persist_molecular_topology(
     )
     if context is not None:
         context.topologies[context_key] = persisted
+    if register_upstream:
+        _register_topology_upstreams(session, topology, context=context)
     return persisted
 
 
@@ -1015,9 +1135,22 @@ def persist_molecular_geometry(
             multiplicity=record.multiplicity,
         )
     geometry_id = _require_id(geometry, label="Geometry")
+    # A concrete Geometry may arrive after its logical reaction/template.  In
+    # that direction, materialize any strict mapped-reaction instance before
+    # the normal Geometry -> existing participant reconciliation pass.
+    from tricycle_reaction_db.application.services.reaction_mapping_resolution import (
+        ensure_mapped_reactions_for_concrete_topology,
+    )
+
     if context is None:
+        ensure_mapped_reactions_for_concrete_topology(
+            session,
+            topology,
+            refresh_thermodynamics=True,
+        )
         reconcile_geometry_with_reactions(session, geometry)
     else:
+        context.topologies_to_resolve_reactions.add(topology_id)
         context.geometries_to_reconcile[geometry_id] = geometry
     return PersistedMolecularGeometry(
         formula=formula,

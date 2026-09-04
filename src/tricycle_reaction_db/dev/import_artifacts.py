@@ -33,10 +33,11 @@ from tricycle_reaction_db.domain.enums import ArtifactIngestionStatus, ArtifactK
 HASH_CHUNK_BYTES = 1024 * 1024
 MAX_FINGERPRINT_WORKERS = 32
 # Parsing concurrency, the queued candidate window, and persistence commit
-# frequency are independent controls. A 128-file window keeps a 32-worker
-# parser supplied when individual files finish at different times, while
-# completed results are still committed in smaller recovery-friendly groups.
-IMPORT_COMMIT_BATCH_FILES = 16
+# frequency are independent controls. Keep the offline import commit size
+# aligned with the 128-file pipeline window so reconciliation barriers are not
+# repeated for every small group of completed files. Callers can still lower
+# this value explicitly when a smaller recovery unit is required.
+IMPORT_COMMIT_BATCH_FILES = 128
 IMPORT_PIPELINE_WINDOW_FILES = 128
 IMPORT_STREAM_QUEUE_SIZE = 128
 
@@ -271,6 +272,12 @@ class ImportState:
         return bool(
             record
             and record.get("status") in {"succeeded", "filtered"}
+            # A partial ingestion has a successful upload reservation but not
+            # a complete TS inference set.  It must remain retryable after a
+            # persistence fix; older state files recorded it as
+            # ``status=succeeded`` because the HTTP batch item itself was
+            # transport-successful, so inspect the durable ingestion status.
+            and record.get("ingestion_status") not in {"partial", "failed"}
             and record.get("project_id") == str(project_id)
             and record.get("artifact_kind") == artifact_kind.value
             and record.get("size_bytes") == fingerprint.size_bytes

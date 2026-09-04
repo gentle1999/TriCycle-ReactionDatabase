@@ -408,7 +408,7 @@ async function downloadExport(): Promise<void> {
       <div>
         <span class="eyebrow">REACTION PATH ANALYTICS</span>
         <h1>反应路径分布统计</h1>
-        <p>{{ currentProject?.project_name ?? "当前项目" }} · 物化热力学 profile 的可见数据汇总</p>
+        <p>{{ currentProject?.project_name ?? "当前项目" }} · 按可见 MappedReaction 物化热力学 profile 汇总</p>
       </div>
       <button class="command-button" type="button" :disabled="downloading || !currentProjectId" @click="downloadExport">
         <Download :size="15" aria-hidden="true" />
@@ -420,12 +420,12 @@ async function downloadExport(): Promise<void> {
       <form class="analytics-filter-form" @submit.prevent="applyQuickFilter">
         <label class="search-field is-wide">
           <Search :size="15" aria-hidden="true" />
-          <span class="sr-only">反应 SMILES 快速查询</span>
+          <span class="sr-only">映射反应 SMILES 快速查询</span>
           <input
             v-model="quickReactionInput"
             type="search"
-            placeholder="反应物>>产物，例如 C=C>>CC"
-            aria-label="反应 SMILES 快速查询"
+            placeholder="映射反应物>>产物，例如 C=C>>CC"
+            aria-label="映射反应 SMILES 快速查询"
           >
         </label>
         <button class="command-button" type="submit" :disabled="validatingQuickFilter">

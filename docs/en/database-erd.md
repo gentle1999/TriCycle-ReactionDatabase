@@ -4,6 +4,10 @@
 
 > Current physical-schema reference. The Chinese counterpart contains the full
 > ERD and table-by-table inventory; SQL identifiers are identical in both pages.
+>
+> Current schema: Alembic `0028_restore_mapped_text_id`. The ORM inventory contains
+> 63 tables, 756 columns, 93 foreign keys, 77 UNIQUE constraints, 198 CHECK constraints,
+> and 158 indexes.
 
 ## Storage Boundaries
 
@@ -19,7 +23,11 @@ ArtifactFile -> ParseRevision -> CalculationSegment -> CalculationFrame -> Geome
                                       `-> TransitionStateInference -> LogicalReaction -> MappedReaction
 
 MolecularFormula -> MolecularTopology -> Geometry
-                         `-> MolecularTopologyDerivation
+                         |            `-> MolecularTopologyDerivation
+                         `-> MolecularTopologyAbstraction (directed stereo DAG)
+
+LogicalReactionParticipant -> LogicalParticipantConcreteTopology -> MolecularTopology
+MappedReaction -> MappedReactionParticipant -> concrete MolecularTopology
 
 Organization -> Project -> ArtifactFile and visibility scope
 ```

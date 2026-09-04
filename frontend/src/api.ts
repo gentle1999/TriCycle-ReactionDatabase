@@ -557,6 +557,8 @@ export const api = {
         ...(options.maximumActivationGibbsFreeEnergyKcalMol !== undefined ? { maximum_activation_gibbs_free_energy_kcal_mol: String(options.maximumActivationGibbsFreeEnergyKcalMol) } : {}),
         ...(options.minimumReactionGibbsFreeEnergyKcalMol !== undefined ? { minimum_reaction_gibbs_free_energy_kcal_mol: String(options.minimumReactionGibbsFreeEnergyKcalMol) } : {}),
         ...(options.maximumReactionGibbsFreeEnergyKcalMol !== undefined ? { maximum_reaction_gibbs_free_energy_kcal_mol: String(options.maximumReactionGibbsFreeEnergyKcalMol) } : {}),
+        ...(options.minimumMappedReactionCount !== undefined ? { minimum_mapped_reaction_count: String(options.minimumMappedReactionCount) } : {}),
+        ...(options.maximumMappedReactionCount !== undefined ? { maximum_mapped_reaction_count: String(options.maximumMappedReactionCount) } : {}),
         ...(options.hasActivationGibbsFreeEnergy ? { has_activation_gibbs_free_energy: "true" } : {}),
         ...(options.hasReactionGibbsFreeEnergy ? { has_reaction_gibbs_free_energy: "true" } : {}),
         ...(options.reactantProductChanged !== undefined ? { reactant_product_changed: String(options.reactantProductChanged) } : {}),
@@ -892,4 +894,9 @@ export function transitionStateModeDofAnimationUrl(frameId: string, projectId?: 
 export function geometryDepictionUrl(geometryId: string, projectId?: string): string {
   const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
   return apiUrl(`/api/depictions/geometry/${encodeURIComponent(geometryId)}.svg${query}`);
+}
+
+export function reactionDepictionUrl(reactionSmiles: string): string {
+  const query = new URLSearchParams({ reaction_smiles: reactionSmiles });
+  return apiUrl(`/api/depictions/reaction.svg?${query.toString()}`);
 }

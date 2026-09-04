@@ -9,6 +9,7 @@ from tricycle_reaction_db.application.dtos.artifacts import (
     ArtifactFileRecord,
     CalculationProtocolRecord,
 )
+from tricycle_reaction_db.core.chemistry_config import CALCULATION_PROTOCOL_VERSION
 from tricycle_reaction_db.domain.enums import (
     ArtifactKind,
     ArtifactVisibility,
@@ -16,8 +17,6 @@ from tricycle_reaction_db.domain.enums import (
     StorageStatus,
 )
 from tricycle_reaction_db.ingestion.media_type import detect_artifact_media_type
-
-CALCULATION_PROTOCOL_VERSION = "calculation-protocol-v1"
 
 
 def _hash_file(path: Path) -> str:

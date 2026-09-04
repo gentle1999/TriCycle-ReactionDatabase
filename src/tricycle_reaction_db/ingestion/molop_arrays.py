@@ -12,6 +12,7 @@ from tricycle_reaction_db.application.dtos import (
     ScientificArrayAssignmentRecord,
     ScientificArrayRecord,
 )
+from tricycle_reaction_db.core.units import magnitude_in
 from tricycle_reaction_db.db.types import encode_numpy_array, summarize_numpy_array
 from tricycle_reaction_db.domain.enums import (
     ElectronicStateSetKind,
@@ -58,7 +59,7 @@ def _rotational_constant_difference(
 
 def _quantity_array(quantity: Any, unit: str) -> npt.NDArray[np.float64]:
     return np.array(
-        quantity.to(unit).magnitude,
+        magnitude_in(quantity, unit),
         dtype="<f8",
         copy=True,
         order="C",

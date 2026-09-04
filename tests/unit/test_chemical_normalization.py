@@ -4,14 +4,18 @@ from molgr.utils.converter import METAL_UNPAIRED_ELECTRONS_PROP
 from pydantic import ValidationError
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdDepictor
+from rdkit.Geometry import Point3D
 
 from tricycle_reaction_db.application.dtos import (
     GeometryRecord,
     MolecularTopologyRecord,
     NormalizedMoleculeRecord,
 )
+from tricycle_reaction_db.application.services.artifact_uploads import _mapped_reaction_smiles
+from tricycle_reaction_db.application.services.reactions import mapped_smiles_for_topology
 from tricycle_reaction_db.domain.enums import StereoStatus, TopologySanitizationStatus
 from tricycle_reaction_db.ingestion.normalization import (
+    StereoProjectionError,
     _canonical_isomeric_smiles_signature,
     ensure_serializable_double_bond_stereochemistry,
     infer_molgr_stereochemistry_from_3d,
@@ -19,6 +23,7 @@ from tricycle_reaction_db.ingestion.normalization import (
     normalize_molgr_stereochemistry,
     normalize_topology,
     normalize_topology_with_mapping,
+    validate_serializable_double_bond_stereochemistry,
 )
 
 
@@ -31,6 +36,64 @@ def _explicit_molecule() -> Chem.Mol:
 
 def _coordinates(atom_count: int) -> np.ndarray:
     return np.arange(atom_count * 3, dtype=np.float64).reshape(atom_count, 3) / 10
+
+
+def _molop_n_diene_with_source_coordinates() -> Chem.Mol:
+    """Build the source-order graph from the reported MolOP diene frame."""
+
+    molecule = Chem.RWMol()
+    for atomic_number in (6, 6, 7, 7, 6, 6, 7, 7, *([1] * 10)):
+        atom = Chem.Atom(atomic_number)
+        atom.SetNoImplicit(True)
+        molecule.AddAtom(atom)
+    for begin, end, bond_type in (
+        (10, 0, Chem.BondType.SINGLE),
+        (13, 5, Chem.BondType.SINGLE),
+        (15, 5, Chem.BondType.SINGLE),
+        (3, 2, Chem.BondType.SINGLE),
+        (3, 12, Chem.BondType.SINGLE),
+        (3, 11, Chem.BondType.SINGLE),
+        (5, 4, Chem.BondType.SINGLE),
+        (5, 14, Chem.BondType.SINGLE),
+        (4, 6, Chem.BondType.DOUBLE),
+        (4, 1, Chem.BondType.SINGLE),
+        (6, 7, Chem.BondType.SINGLE),
+        (1, 2, Chem.BondType.DOUBLE),
+        (1, 0, Chem.BondType.SINGLE),
+        (7, 17, Chem.BondType.SINGLE),
+        (7, 16, Chem.BondType.SINGLE),
+        (0, 9, Chem.BondType.SINGLE),
+        (0, 8, Chem.BondType.SINGLE),
+    ):
+        molecule.AddBond(begin, end, bond_type)
+    result = molecule.GetMol()
+    conformer = Chem.Conformer(result.GetNumAtoms())
+    conformer.Set3D(True)
+    for atom_index, coordinates in enumerate(
+        (
+            (-1.76327, -1.63010, 0.05416),
+            (-0.97871, -0.36352, -0.00037),
+            (-1.67802, 0.72697, 0.03676),
+            (-1.13729, 1.94404, -0.09989),
+            (0.46114, -0.42304, -0.04225),
+            (1.16006, -1.74338, -0.06377),
+            (1.14355, 0.67427, -0.00180),
+            (2.48778, 0.65068, 0.00909),
+            (-1.43531, -2.25475, 0.88471),
+            (-2.81942, -1.39767, 0.18943),
+            (-1.65240, -2.19425, -0.87192),
+            (-1.70850, 2.64603, 0.35586),
+            (-0.15879, 2.00921, 0.17820),
+            (2.04833, -1.67985, -0.69183),
+            (1.47306, -2.02508, 0.94211),
+            (0.52275, -2.53150, -0.45937),
+            (2.89701, -0.08360, 0.57981),
+            (2.84907, 1.55378, 0.29116),
+        ),
+    ):
+        conformer.SetAtomPosition(atom_index, Point3D(*coordinates))
+    result.AddConformer(conformer, assignId=False)
+    return result
 
 
 def _assert_source_mapping_matches_topology(
@@ -566,6 +629,56 @@ def test_mapped_symmetric_topology_is_standardized_after_map_removal() -> None:
     assert all(atom.GetAtomMapNum() == 0 for atom in second.topology.mol.GetAtoms())
 
 
+def test_coordinate_authoritative_diene_survives_topology_projection_and_mapping() -> None:
+    # The source atom/bond order and coordinates are taken from the MolOP frame
+    # that previously became Z/Z during the topology projection.  The actual
+    # source geometry is Z on source edge 1--2 and E on source edge 4--6.
+    source = _molop_n_diene_with_source_coordinates()
+    record, source_to_topology = normalize_topology_with_mapping(
+        source,
+        add_hydrogens=False,
+        reconstruction_method="molgr/cpp",
+        reconstruction_version="0.1.8",
+    )
+
+    expected_source_stereo = {
+        frozenset((1, 2)): Chem.BondStereo.STEREOZ,
+        frozenset((4, 6)): Chem.BondStereo.STEREOE,
+    }
+    for source_edge, expected in expected_source_stereo.items():
+        topology_edge = record.topology.mol.GetBondBetweenAtoms(
+            *(source_to_topology[index] for index in source_edge)
+        )
+        assert topology_edge is not None
+        assert topology_edge.GetStereo() is expected
+
+    source_maps = list(range(7, 25))
+    topology_maps = [0] * record.topology.atom_count
+    for source_index, topology_index in enumerate(source_to_topology):
+        topology_maps[topology_index] = source_maps[source_index]
+    assert mapped_smiles_for_topology(record.topology, topology_maps) == (
+        "[C:7]([C:8](=[N:9]/[N:10]([H:18])[H:19])/[C:11]"
+        "([C:12]([H:20])([H:21])[H:22])=[N:13]/[N:14]([H:23])[H:24])"
+        "([H:15])([H:16])[H:17]"
+    )
+
+
+def test_initial_mapped_reaction_projection_preserves_source_diene_geometry() -> None:
+    """Reaction-map serialization must preserve MolGR's selected control atoms."""
+
+    source = _molop_n_diene_with_source_coordinates()
+    inferred = infer_molgr_stereochemistry_from_3d(source)
+
+    mapped_reaction = _mapped_reaction_smiles(inferred, Chem.Mol(inferred))
+
+    expected = (
+        "[C:1]([C:2](=[N:3]/[N:4]([H:12])[H:13])/[C:5]"
+        "([C:6]([H:14])([H:15])[H:16])=[N:7]/[N:8]([H:17])[H:18])"
+        "([H:9])([H:10])[H:11]"
+    )
+    assert mapped_reaction == f"{expected}>>{expected}"
+
+
 @pytest.mark.parametrize(
     ("source_smiles", "expected_stereo"),
     [
@@ -621,12 +734,37 @@ def test_substituted_double_bond_clears_provisional_neighbor_directions() -> Non
         isomericSmiles=True,
         allHsExplicit=True,
     )
-    reparsed = Chem.MolFromSmiles(serialized)
+    parser = Chem.SmilesParserParams()
+    parser.removeHs = False
+    reparsed = Chem.MolFromSmiles(serialized, parser)
     assert reparsed is not None
     reparsed_double_bond = next(
         bond for bond in reparsed.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE
     )
-    assert reparsed_double_bond.GetStereo() == Chem.BondStereo.STEREOE
+    # The source deliberately chooses methyl/Br as the stereo-atom pair.  A
+    # canonical SMILES traversal is allowed to use Cl/Br instead; in that
+    # representation the same physical geometry is spelled Z, not E.
+    assert reparsed_double_bond.GetStereo() == Chem.BondStereo.STEREOZ
+
+
+def test_stereo_validation_accepts_physical_projection_and_rejects_flip() -> None:
+    parser = Chem.SmilesParserParams()
+    parser.removeHs = False
+    source = Chem.MolFromSmiles("C/C(Cl)=C(Br)/C", parser)
+    flipped = Chem.MolFromSmiles("C/C(Cl)=C(Br)\\C", parser)
+    assert source is not None
+    assert flipped is not None
+
+    projected = ensure_serializable_double_bond_stereochemistry(source)
+    # The validator accepts the writer's physical projection, even when its
+    # canonical traversal chooses a different slash/control-atom spelling.
+    validate_serializable_double_bond_stereochemistry(source, projected)
+
+    with pytest.raises(
+        StereoProjectionError,
+        match="changed the source E/Z control-atom relationship",
+    ):
+        validate_serializable_double_bond_stereochemistry(source, flipped)
 
 
 def test_trusted_molgr_normalization_preserves_e_z_stereochemistry(

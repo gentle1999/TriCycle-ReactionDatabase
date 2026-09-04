@@ -39,6 +39,8 @@ from tricycle_reaction_db.application.dtos import (
     TotalSpinResultRecord,
     VibrationResultRecord,
 )
+from tricycle_reaction_db.core.chemistry_config import GEOMETRY_MATCH_POLICY_VERSION
+from tricycle_reaction_db.core.units import CM_INVERSE, HARTREE, magnitude_in
 from tricycle_reaction_db.domain.enums import (
     ElectronicStateSetKind,
     EnergyQuantitySemantics,
@@ -356,7 +358,7 @@ def frame_records_from_molop(
             observation_index=index,
             method=observation["method"],
             quantity_semantics=EnergyQuantitySemantics(observation["quantity_semantics"]),
-            value_hartree=float(observation["value"].to("hartree").magnitude),
+            value_hartree=float(magnitude_in(observation["value"], HARTREE)),
             source_label=observation["source_label"],
         )
         for index, observation in enumerate(
@@ -496,7 +498,8 @@ def _scf_status(value: bool | None) -> SCFStatus:
 
 
 def _quantity(value: Any, unit: str) -> float | None:
-    return float(value.to(unit).magnitude) if value is not None else None
+    magnitude = magnitude_in(value, unit)
+    return float(magnitude) if magnitude is not None else None
 
 
 def _energy_record(
@@ -570,7 +573,7 @@ def _vibration_record(
     if vibrations is None:
         return None
     frequencies = np.asarray(
-        vibrations["frequencies"].to("1/centimeter").magnitude,
+        magnitude_in(vibrations["frequencies"], CM_INVERSE),
         dtype=np.float64,
     )
     return VibrationResultRecord(
@@ -965,7 +968,7 @@ def _frame_record(
         observed_to_geometry_transform=molecule.observed_to_geometry_transform,
         geometry_assignment_rmsd_angstrom=molecule.geometry_assignment_rmsd_angstrom,
         geometry_assignment_max_abs_angstrom=molecule.geometry_assignment_max_abs_angstrom,
-        geometry_assignment_policy_version="geometry-internal-coordinate-match-v4",
+        geometry_assignment_policy_version=GEOMETRY_MATCH_POLICY_VERSION,
         scf_status=_scf_status(frame["status"]["scf_converged"] if frame["status"] else None),
         optimization_status=optimization_status,
         electronic_total_energy_hartree=(energy.electronic_energy_hartree if energy else None),

@@ -32,6 +32,8 @@ from tricycle_reaction_db.ingestion.normalization import (
     normalize_molgr_stereochemistry,
     normalize_topology,
     normalize_topology_with_mapping,
+    project_serializable_double_bond_stereochemistry,
+    validate_serializable_double_bond_stereochemistry,
 )
 
 __all__ = [
@@ -42,6 +44,7 @@ __all__ = [
     "ensure_serializable_double_bond_stereochemistry",
     "infer_molgr_stereochemistry_from_3d",
     "normalize_molgr_stereochemistry",
+    "project_serializable_double_bond_stereochemistry",
     "StereoProjectionError",
     "frame_records_from_molop",
     "MOLECULAR_GRAPH_RECONSTRUCTION_FAILURE_POLICY",
@@ -50,6 +53,7 @@ __all__ = [
     "normalize_topology",
     "normalize_topology_with_mapping",
     "normalize_molop_frame",
+    "validate_serializable_double_bond_stereochemistry",
     "parse_revision_record_from_molop",
     "protocol_record_from_molop_segment",
     "scientific_array_export_from_molop_frame",

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { Activity, Building2, Code2, Database, ExternalLink, FolderKanban, LogIn, LogOut, RefreshCw, UserRound } from "@lucide/vue";
 import { computed, onMounted, ref, watch } from "vue";
-import { RouterLink, RouterView, useRoute, useRouter } from "vue-router";
+import { RouterLink, RouterView, type LocationQueryRaw, useRoute, useRouter } from "vue-router";
 
 import { api, apiUrl } from "@/api";
 import { frontendAppName, frontendBrandName, frontendTagline } from "@/branding";
@@ -52,6 +52,16 @@ const activeView = computed<ViewName>(() => {
   return "reactions";
 });
 
+function queryForTarget(target: string): LocationQueryRaw {
+  const query: LocationQueryRaw = { ...navigationQuery.value };
+  const keepsCatalogPage = (target === "reactions" && activeView.value === "reactions")
+    || (target === "artifacts" && activeView.value === "artifacts");
+  if (!keepsCatalogPage) delete query.page;
+  return query;
+}
+
+const reactionsNavigationQuery = computed(() => queryForTarget("reactions"));
+
 const tabs = computed(() => [
   { id: "reactions" as const, label: t("app.navigation.reactions"), route: "reactions" },
   { id: "geometry" as const, label: t("app.navigation.geometry"), route: "geometries" },
@@ -71,7 +81,7 @@ async function refreshHealth(): Promise<void> {
 
 async function selectTab(view: ViewName): Promise<void> {
   const target = tabs.value.find((tab) => tab.id === view)?.route ?? "reactions";
-  await router.push({ name: target, query: navigationQuery.value });
+  await router.push({ name: target, query: queryForTarget(target) });
 }
 
 async function recoverRouteAfterSession(): Promise<void> {
@@ -131,7 +141,7 @@ watch(
 <template>
   <div class="app-shell">
     <header class="topbar">
-      <RouterLink class="brand" :to="{ name: 'reactions', query: navigationQuery }" :aria-label="`${frontendAppName}${t('app.navigation.reactions')}`">
+      <RouterLink class="brand" :to="{ name: 'reactions', query: reactionsNavigationQuery }" :aria-label="`${frontendAppName}${t('app.navigation.reactions')}`">
         <span class="brand-mark" aria-hidden="true"><Database :size="21" /></span>
         <span>
           <strong>{{ frontendAppName }}</strong>

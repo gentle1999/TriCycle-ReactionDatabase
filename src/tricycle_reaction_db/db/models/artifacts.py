@@ -17,6 +17,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlmodel import Field, Relationship, SQLModel
 
+from tricycle_reaction_db.core.chemistry_config import CALCULATION_PROTOCOL_VERSION
 from tricycle_reaction_db.db.models.base import created_at_field, uuid_primary_key_field
 from tricycle_reaction_db.domain.enums import (
     ArtifactKind,
@@ -177,11 +178,11 @@ class CalculationProtocol(SQLModel, table=True):
     created_at: datetime | None = created_at_field()
     protocol_hash: str = Field(max_length=64, unique=True, nullable=False)
     spec_schema_version: str = Field(
-        default="calculation-protocol-v1",
+        default=CALCULATION_PROTOCOL_VERSION,
         sa_column=Column(
             String(64),
             nullable=False,
-            server_default="calculation-protocol-v1",
+            server_default=CALCULATION_PROTOCOL_VERSION,
         ),
     )
     qm_software: QMSoftware = Field(

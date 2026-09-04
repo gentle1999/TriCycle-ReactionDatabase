@@ -52,6 +52,7 @@ def _artifact_summary(artifact: ArtifactFile) -> ArtifactSummary:
         id=artifact.id,
         project_id=artifact.project_id,
         created_by_user_id=artifact.created_by_user_id,
+        created_at=artifact.created_at,
         visibility=artifact.visibility.value,
         original_filename=artifact.original_filename,
         content_sha256=artifact.content_sha256,

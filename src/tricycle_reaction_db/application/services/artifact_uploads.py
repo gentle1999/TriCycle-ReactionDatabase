@@ -14,7 +14,7 @@ import tempfile
 import threading
 import zlib
 from collections import Counter
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, MutableMapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, MutableMapping, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -32,7 +32,6 @@ import numpy as np
 from molop import AutoFileParser
 from molop.config import molopconfig
 from molop.io.base_models.ChemFileFrame import BaseCalcFrame
-from molop.unit import atom_ureg
 from rdkit import Chem
 from sqlalchemy.orm import Session as SQLAlchemySession
 from sqlalchemy.orm import joinedload
@@ -90,6 +89,7 @@ from tricycle_reaction_db.application.services.reaction_geometry_reconciliation 
     ensure_transition_state_path,
 )
 from tricycle_reaction_db.core.config import get_settings
+from tricycle_reaction_db.core.units import ANGSTROM, CM_INVERSE, magnitude_in
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
     ArtifactIngestion,
@@ -1377,6 +1377,16 @@ def _mapped_reaction_smiles(reactant: Chem.Mol, product: Chem.Mol) -> str:
                 fragment,
                 preserve_atom_maps=True,
             )
+            # A terminal alkene can carry direction-only flags from MolOP's
+            # source traversal even though RDKit correctly reports no E/Z
+            # assignment. Those flags are not stereochemical evidence and
+            # would make the SMILES writer emit arbitrary slash markers.
+            if not any(
+                bond.GetStereo() in {Chem.BondStereo.STEREOE, Chem.BondStereo.STEREOZ}
+                for bond in repaired.GetBonds()  # type: ignore[no-untyped-call]
+            ):
+                for bond in repaired.GetBonds():  # type: ignore[no-untyped-call]
+                    bond.SetBondDir(Chem.BondDir.NONE)
             repaired.RemoveAllConformers()
             serialized_fragments.append(repaired)
         sides.append(
@@ -1426,9 +1436,12 @@ def _signed_ts_endpoints(
     reactant, product = frame.possible_pre_post_ts(show_3D=True)
     if frame.vibrations is None:
         raise ValueError("TS frame has no vibration mode")
-    center = np.asarray(frame.coords.to(atom_ureg.angstrom).magnitude, dtype=np.float64)
+    center = np.asarray(magnitude_in(frame.coords, ANGSTROM), dtype=np.float64)
     mode = np.asarray(
-        frame.vibrations[vibration_position].vibration_mode.to(atom_ureg.angstrom).magnitude,
+        magnitude_in(
+            frame.vibrations[vibration_position].vibration_mode,
+            ANGSTROM,
+        ),
         dtype=np.float64,
     )
     mode_norm = float(np.sum(np.square(mode)))
@@ -1485,7 +1498,7 @@ def _infer_ts_frame(frame: BaseCalcFrame[Any], fallback_index: int) -> _Inferenc
     frequency = vibrations[imaginary_position].frequency
     if frequency is None:
         return None
-    frequency_cm1 = float(frequency.to(atom_ureg.cm_1).magnitude)
+    frequency_cm1 = float(magnitude_in(frequency, CM_INVERSE))
     try:
         (
             negative_endpoint,
@@ -2991,7 +3004,7 @@ def persist_transition_state_endpoints_from_molop_frame(
         inferred=_SuccessfulInference(
             file_frame_index=file_frame_index,
             imaginary_mode_index=imaginary_mode_index,
-            imaginary_frequency_cm1=float(frequency.to(atom_ureg.cm_1).magnitude),
+            imaginary_frequency_cm1=float(magnitude_in(frequency, CM_INVERSE)),
             reaction_smiles="signed-mode-anchors-only",
             negative_endpoint=negative,
             positive_endpoint=positive,
@@ -3012,16 +3025,31 @@ def _resolve_and_bind_transition_state_reaction(
 ) -> tuple[UUID, UUID]:
     """Create the mapped endpoint reaction and bind its TS coordinate evidence."""
 
-    cached_reaction_ids = (
-        topology_context.inferred_reaction_ids_by_smiles.get(inferred.reaction_smiles)
-        if topology_context is not None
-        else None
-    )
+    if topology_context is not None:
+        # Build the strict records before consulting either cache. A mapped
+        # reaction string is only one part of the identity: different MolGR
+        # endpoint stereochemistry can otherwise reuse the first reaction row.
+        strict_records = tuple(_inference_topology_records(inferred))
+        cache_key = _inference_reaction_cache_key(inferred, strict_records)
+        cached_reaction_ids = topology_context.inferred_reaction_ids_by_key.get(cache_key)
+    else:
+        strict_records = ()
+        cache_key = None
+        cached_reaction_ids = None
     if cached_reaction_ids is None:
         if topology_context is not None:
-            precomputed_topology_records = topology_context.inferred_reaction_topology_records.get(
-                inferred.reaction_smiles
+            assert cache_key is not None
+            cached_participant_records = (
+                topology_context.inferred_reaction_topology_records_by_key.get(cache_key)
             )
+            if cached_participant_records is None:
+                precomputed_topology_records = tuple(strict_records[2:])
+            else:
+                # Preserve the explicit empty sentinel used by preload when
+                # normalization failed. Passing it through makes the
+                # inference fail explicitly instead of silently switching to
+                # RDKit template normalization.
+                precomputed_topology_records = tuple(cached_participant_records)
         else:
             # The endpoint fragments are authoritative MolGR graphs. Reusing
             # their records here avoids sanitizing RDKit reaction templates,
@@ -3053,7 +3081,8 @@ def _resolve_and_bind_transition_state_reaction(
         logical_reaction_id = reaction_result.logical_reaction_id
         mapped_reaction_id = reaction_result.mapped_reaction_id
         if topology_context is not None:
-            topology_context.inferred_reaction_ids_by_smiles[inferred.reaction_smiles] = (
+            assert cache_key is not None
+            topology_context.inferred_reaction_ids_by_key[cache_key] = (
                 logical_reaction_id,
                 mapped_reaction_id,
             )
@@ -3258,11 +3287,12 @@ _INFERENCE_CONTEXT_MUTABLE_FIELDS = (
     "equivalent_geometry_keys_loaded",
     "in_memory_geometries_by_identity",
     "geometries_to_reconcile",
+    "topologies_to_resolve_reactions",
     "reaction_participants_by_topology",
     "mapped_reactions_by_id",
     "mapped_reactions_to_reconcile",
-    "inferred_reaction_ids_by_smiles",
-    "inferred_reaction_topology_records",
+    "inferred_reaction_ids_by_key",
+    "inferred_reaction_topology_records_by_key",
 )
 _RECONCILIATION_CACHE_MUTABLE_FIELDS = (
     "nodes_by_reaction",
@@ -4238,32 +4268,48 @@ def _inference_topology_records(
                 asMols=True,
                 sanitizeFrags=False,
             )
-            serializable_fragments: list[Chem.Mol] = []
+            # Keep the source fragment for topology normalization and retain a
+            # separate writer projection for deterministic ordering.  The
+            # serialization helper may update a local BondStereo cache while
+            # solving RDKit's traversal constraints; that cache must never
+            # replace the coordinate-authoritative MolGR fragment.
+            serializable_fragments: list[tuple[Chem.Mol, str]] = []
             for fragment in fragments:
                 try:
-                    repaired = ensure_serializable_double_bond_stereochemistry(
+                    projection = ensure_serializable_double_bond_stereochemistry(
                         fragment,
                         preserve_atom_maps=True,
                     )
-                    # Keep the fragment conformer through normalize_topology.
-                    # Its canonical atom-order projection also needs the
-                    # coordinate-authoritative stereo state; removing it here
-                    # would reintroduce the same local BondStereo/BondDir
-                    # ambiguity one stage later.
-                    serializable_fragments.append(repaired)
+                    projection_smiles = Chem.MolToSmiles(
+                        projection,
+                        canonical=True,
+                        isomericSmiles=True,
+                        allHsExplicit=True,
+                    )
+                    # Keep the source fragment conformer through
+                    # normalize_topology. Its canonical atom-order projection
+                    # needs the coordinate-authoritative stereo state; using
+                    # ``projection`` here would reintroduce the local
+                    # BondStereo/BondDir ambiguity one stage later.
+                    serializable_fragments.append((fragment, projection_smiles))
                 except StereoProjectionError:
                     fragment.RemoveAllConformers()
-                    serializable_fragments.append(fragment)
+                    serializable_fragments.append(
+                        (
+                            fragment,
+                            Chem.MolToSmiles(
+                                fragment,
+                                canonical=True,
+                                isomericSmiles=True,
+                                allHsExplicit=True,
+                            ),
+                        )
+                    )
             serializable_fragments = sorted(
                 serializable_fragments,
-                key=lambda fragment: Chem.MolToSmiles(
-                    fragment,
-                    canonical=True,
-                    isomericSmiles=True,
-                    allHsExplicit=True,
-                ),
+                key=lambda item: item[1],
             )
-            for template_index, fragment in enumerate(serializable_fragments):
+            for template_index, (fragment, _projection_smiles) in enumerate(serializable_fragments):
                 participant_records.append(
                     normalize_topology(
                         fragment,
@@ -4287,6 +4333,103 @@ def _inference_topology_records(
     if reaction_records:
         records.extend(reaction_records)
     return records
+
+
+def _inference_molecule_cache_signature(molecule: Chem.Mol) -> object:
+    """Return a deterministic strict graph signature for an inference endpoint.
+
+    MolOP endpoint molecules are coordinate-authoritative and can contain
+    unsanitized graphs. Isomeric SMILES is the compact path; the explicit
+    graph fallback keeps cache entries distinct when RDKit cannot serialize a
+    partially sanitized endpoint.
+    """
+
+    try:
+        return {
+            "encoding": "rdkit-isomeric-smiles-v1",
+            "value": Chem.MolToSmiles(
+                molecule,
+                canonical=True,
+                isomericSmiles=True,
+                allHsExplicit=True,
+            ),
+        }
+    except Exception:
+        atoms = [
+            {
+                "index": atom.GetIdx(),
+                "atomic_number": atom.GetAtomicNum(),
+                "isotope": atom.GetIsotope(),
+                "formal_charge": atom.GetFormalCharge(),
+                "radical_electrons": atom.GetNumRadicalElectrons(),
+                "explicit_hydrogens": atom.GetNumExplicitHs(),
+                "no_implicit": atom.GetNoImplicit(),
+                "aromatic": atom.GetIsAromatic(),
+                "chiral_tag": str(atom.GetChiralTag()),
+                "map_number": atom.GetAtomMapNum(),
+            }
+            for atom in molecule.GetAtoms()  # type: ignore[no-untyped-call]
+        ]
+        bonds = [
+            {
+                "begin": bond.GetBeginAtomIdx(),
+                "end": bond.GetEndAtomIdx(),
+                "type": str(bond.GetBondType()),
+                "aromatic": bond.GetIsAromatic(),
+                "stereo": str(bond.GetStereo()),
+                "stereo_atoms": list(bond.GetStereoAtoms()),
+                "direction": str(bond.GetBondDir()),
+            }
+            for bond in molecule.GetBonds()  # type: ignore[no-untyped-call]
+        ]
+        return {
+            "encoding": "rdkit-explicit-graph-v1",
+            "atoms": atoms,
+            "bonds": bonds,
+        }
+
+
+def _inference_topology_record_cache_signature(record: Any) -> dict[str, object]:
+    """Extract the immutable strict identity from a normalized record."""
+
+    topology = record.topology
+    formula = record.formula
+    derivation = record.topology_derivation
+    return {
+        "formula_composition_hash": formula.composition_hash,
+        "identity_schema_version": topology.identity_schema_version,
+        "graph_hash": topology.graph_hash,
+        "canonical_isomeric_smiles": topology.canonical_isomeric_smiles,
+        "stereo_status": getattr(topology.stereo_status, "value", topology.stereo_status),
+        "provenance_schema_version": derivation.provenance_schema_version,
+        "provenance_hash": derivation.provenance_hash,
+    }
+
+
+def _inference_reaction_cache_key(
+    inferred: _SuccessfulInference,
+    records: Sequence[Any] = (),
+) -> str:
+    """Hash all strict inference inputs used to create a mapped reaction.
+
+    ``reaction_smiles`` is retained as a field for reaction identity, but it
+    is deliberately not used as the cache key by itself. The endpoint
+    signatures cover the coordinate-derived strict state and the normalized
+    records cover MolGR graph identities/provenance.
+    """
+
+    payload = {
+        "schema_version": "molop-inference-reaction-cache-v2",
+        "reaction_smiles": inferred.reaction_smiles,
+        "negative_endpoint": _inference_molecule_cache_signature(inferred.negative_endpoint),
+        "positive_endpoint": _inference_molecule_cache_signature(inferred.positive_endpoint),
+        "topology_records": [
+            _inference_topology_record_cache_signature(record) for record in records
+        ],
+    }
+    return sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
 
 
 def _run_result(
@@ -4883,7 +5026,11 @@ class ArtifactUploadService:
                         retry_failed = (
                             reparse_failed_ingestions
                             and not created
-                            and ingestion.status is ArtifactIngestionStatus.FAILED
+                            and ingestion.status
+                            in {
+                                ArtifactIngestionStatus.FAILED,
+                                ArtifactIngestionStatus.PARTIAL,
+                            }
                         )
                         if retry_failed:
                             # Reopen the durable ingestion reservation. Existing
@@ -4989,9 +5136,9 @@ class ArtifactUploadService:
         expires only that worker is terminated and the next queued file can
         acquire the released slot. A single bounded consumer writes parse
         results to the database; the final transaction remains atomic for the
-        request. ``reparse_failed_ingestions`` reopens existing failed parse
-        records so a retry runs MolOP instead of only confirming the stored
-        content-addressed object.
+        request. ``reparse_failed_ingestions`` reopens existing failed or
+        partial parse records so a retry runs MolOP instead of only confirming
+        the stored content-addressed object.
         """
 
         if persistence_batch_files < 1:
@@ -5333,16 +5480,23 @@ class ArtifactUploadService:
                     for inferred in parsed.inferences:
                         if not isinstance(inferred, _SuccessfulInference):
                             continue
-                        cached = None
+                        cache_key: str | None = None
+                        cached: tuple[Any, ...] | None = None
                         try:
-                            cached = geometry_context.inferred_reaction_topology_records.get(
-                                inferred.reaction_smiles
+                            base_records = tuple(_inference_topology_records(inferred))
+                            cache_key = _inference_reaction_cache_key(inferred, base_records)
+                            cached = geometry_context.inferred_reaction_topology_records_by_key.get(
+                                cache_key
                             )
-                            records = _inference_topology_records(inferred, reaction_records=cached)
+                            records = (
+                                _inference_topology_records(inferred, reaction_records=cached)
+                                if cached is not None
+                                else list(base_records)
+                            )
                             inference_topology_records.extend(records)
                             if cached is None and len(records) > 2:
-                                geometry_context.inferred_reaction_topology_records.setdefault(
-                                    inferred.reaction_smiles, tuple(records[2:])
+                                geometry_context.inferred_reaction_topology_records_by_key.setdefault(
+                                    cache_key, tuple(records[2:])
                                 )
                         except Exception:
                             logger.warning(
@@ -5355,8 +5509,10 @@ class ArtifactUploadService:
                             # MolGR radical state.  An empty sentinel makes
                             # persistence reject this inference explicitly.
                             if cached is None:
-                                geometry_context.inferred_reaction_topology_records[
-                                    inferred.reaction_smiles
+                                if cache_key is None:
+                                    cache_key = _inference_reaction_cache_key(inferred)
+                                geometry_context.inferred_reaction_topology_records_by_key[
+                                    cache_key
                                 ] = ()
                 if parsed_files:
                     preload_started = perf_counter()
@@ -5508,7 +5664,15 @@ class ArtifactUploadService:
                 new_deferred = deferred_inferences
                 persist_write_started = perf_counter()
                 flush_started = perf_counter()
-                bulk_diagnostics = await session.run_sync(_run_flush)
+                # The next phase creates TS reactions from the already
+                # persisted endpoint Topology objects.  The raw bulk flush
+                # deliberately detaches fast-path rows; that is safe for
+                # revision-local leaves, but not for shared Formula/Topology
+                # identities retained by ``geometry_context``.  Keeping this
+                # barrier attached prevents a later relationship cascade from
+                # trying to attach a second ORM instance for the same UUID.
+                await session.run_sync(_run_flush_attached)
+                bulk_diagnostics: dict[str, object] = {}
                 timings["persist_flush_initial_ms"] = (
                     timings.get("persist_flush_initial_ms", 0.0)
                     + (perf_counter() - flush_started) * 1000

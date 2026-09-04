@@ -108,6 +108,7 @@ class MolecularTopologyCoreDTO(DefineSubset):  # type: ignore[misc]
             "radical_electron_count",
             "fragment_count",
             "stereo_status",
+            "is_stereo_abstraction_upstream",
             "sanitization_status",
             "sanitization_error",
         ),
@@ -149,6 +150,7 @@ async def list_topologies(
             radical_electron_count=item.radical_electron_count,
             fragment_count=item.fragment_count,
             stereo_status=item.stereo_status,
+            is_stereo_abstraction_upstream=item.is_stereo_abstraction_upstream,
             sanitization_status=item.sanitization_status,
             sanitization_error=item.sanitization_error,
             formula=formula_dto(
@@ -323,6 +325,8 @@ async def list_logical_reactions(
     maximum_activation_gibbs_free_energy_kcal_mol: float | None = None,
     minimum_reaction_gibbs_free_energy_kcal_mol: float | None = None,
     maximum_reaction_gibbs_free_energy_kcal_mol: float | None = None,
+    minimum_mapped_reaction_count: int | None = Query(default=None, ge=0),
+    maximum_mapped_reaction_count: int | None = Query(default=None, ge=0),
     has_activation_gibbs_free_energy: bool | None = None,
     has_reaction_gibbs_free_energy: bool | None = None,
     reactant_product_changed: bool | None = None,
@@ -331,6 +335,8 @@ async def list_logical_reactions(
     sort_by: str = "default",
     sort_direction: str = "asc",
 ) -> LogicalReactionPage:
+    """Return logical paths whose reaction-structure filters match MappedReaction rows."""
+
     try:
         return cast(
             LogicalReactionPage,
@@ -357,6 +363,8 @@ async def list_logical_reactions(
                 maximum_reaction_gibbs_free_energy_kcal_mol=(
                     maximum_reaction_gibbs_free_energy_kcal_mol
                 ),
+                minimum_mapped_reaction_count=minimum_mapped_reaction_count,
+                maximum_mapped_reaction_count=maximum_mapped_reaction_count,
                 has_activation_gibbs_free_energy=has_activation_gibbs_free_energy,
                 has_reaction_gibbs_free_energy=has_reaction_gibbs_free_energy,
                 reactant_product_changed=reactant_product_changed,

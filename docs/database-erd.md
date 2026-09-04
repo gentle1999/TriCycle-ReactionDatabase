@@ -1,11 +1,9 @@
 # 数据库实体关系图
 
-> English edition: [Database entity relationship diagram](en/database-erd.md).
-
-> 当前 schema：Alembic `20260813_0038`  
-> 生成来源：`tricycle_reaction_db.db.models.metadata`  
-> 完整性：51 张表、605 个列、
-> 75 条外键约束，未省略物理表、列或 FK。
+> 当前 schema：Alembic `0028_restore_mapped_text_id`
+> 生成来源：`tricycle_reaction_db.db.models.metadata`
+> 完整性：63 张表、756 个列、
+> 93 条外键约束，未省略物理表、列或 FK。
 
 本文区分物理持久化后端和进程内对象。RustFS 与 PostgreSQL 不共享事务；
 `artifact_file` 只保存 RustFS locator、内容 hash 和状态，原始逻辑字节不进入
@@ -29,15 +27,21 @@ flowchart TB
             direction TB
             subgraph PG_GROUP_1["身份、组织与项目授权"]
                 user_account["user_account"]
+                auth_session["auth_session"]
+                mcp_access_token["mcp_access_token"]
                 external_identity["external_identity<br/>OIDC issuer + subject"]
                 organization["organization"]
                 organization_membership["organization_membership"]
                 project["project"]
                 project_membership["project_membership"]
+                project_invitation["project_invitation"]
+                audit_event["audit_event"]
             end
             subgraph PG_GROUP_2["Artifact、解析与计算帧"]
                 artifact_file["artifact_file<br/>RustFS pointer + visibility"]
                 artifact_ingestion["artifact_ingestion"]
+                upload_batch["upload_batch"]
+                upload_batch_item["upload_batch_item"]
                 calculation_protocol["calculation_protocol"]
                 parse_revision["parse_revision"]
                 calculation_segment["calculation_segment"]
@@ -50,8 +54,11 @@ flowchart TB
             subgraph PG_GROUP_4["化学身份与几何"]
                 molecular_formula["molecular_formula"]
                 molecular_topology["molecular_topology<br/>RDKit mol"]
+                molecular_topology_abstraction["molecular_topology_abstraction<br/>stereo DAG edge"]
                 molecular_topology_derivation["molecular_topology_derivation"]
                 geometry["geometry<br/>RDKit mol + NPY BYTEA"]
+                project_geometry_catalog["project_geometry_catalog"]
+                project_geometry_catalog_count["project_geometry_catalog_count"]
             end
             subgraph PG_GROUP_5["逐帧科学结果"]
                 frame_energy_result["frame_energy_result"]
@@ -82,13 +89,16 @@ flowchart TB
                 manifest_artifact_binding["manifest_artifact_binding"]
                 logical_reaction["logical_reaction"]
                 logical_reaction_participant["logical_reaction_participant"]
+                logical_participant_concrete_topology["logical_participant_concrete_topology<br/>logical → concrete"]
                 mapped_reaction["mapped_reaction"]
+                mapped_reaction_thermodynamic_profile["mapped_reaction_thermodynamic_profile"]
                 mapped_reaction_participant["mapped_reaction_participant"]
                 mapped_reaction_node["mapped_reaction_node"]
                 mapped_reaction_node_geometry["mapped_reaction_node_geometry"]
                 mapped_reaction_node_geometry_mapping["mapped_reaction_node_geometry_mapping"]
                 mapped_reaction_edge["mapped_reaction_edge"]
                 transition_state_inference["transition_state_inference"]
+                transition_state_endpoint["transition_state_endpoint"]
             end
         end
     end
@@ -107,14 +117,14 @@ flowchart TB
     classDef postgres fill:#eaf2ff,stroke:#0969da,color:#1f2328
     classDef memory fill:#f1f3f5,stroke:#57606a,color:#1f2328,stroke-dasharray: 5 5
     class rustfs_object rustfs
-    class user_account,external_identity,organization,organization_membership,project,project_membership,artifact_file,artifact_ingestion,calculation_protocol,parse_revision,calculation_segment,calculation_frame,storage_garbage_collection_state,storage_garbage_collection_run,molecular_formula,molecular_topology,molecular_topology_derivation,geometry,frame_energy_result,energy_observation,geometry_optimization_result,vibration_result,calculation_status_result,scientific_array,thermochemistry_result,molecular_orbital_result,charge_spin_population_result,atomic_population_series,polarizability_result,nmr_result,nmr_shielding_tensor,bond_order_result,total_spin_result,single_point_property_result,electronic_state_set,electronic_state,electronic_configuration,multireference_result,implicit_solvation_result,scientific_array_assignment,workflow_manifest,manifest_artifact_binding,logical_reaction,logical_reaction_participant,mapped_reaction,mapped_reaction_participant,mapped_reaction_node,mapped_reaction_node_geometry,mapped_reaction_node_geometry_mapping,mapped_reaction_edge,transition_state_inference postgres
+    class user_account,auth_session,mcp_access_token,external_identity,organization,organization_membership,project,project_membership,project_invitation,audit_event,artifact_file,artifact_ingestion,upload_batch,upload_batch_item,calculation_protocol,parse_revision,calculation_segment,calculation_frame,storage_garbage_collection_state,storage_garbage_collection_run,molecular_formula,molecular_topology,molecular_topology_abstraction,molecular_topology_derivation,geometry,project_geometry_catalog,project_geometry_catalog_count,frame_energy_result,energy_observation,geometry_optimization_result,vibration_result,calculation_status_result,scientific_array,thermochemistry_result,molecular_orbital_result,charge_spin_population_result,atomic_population_series,polarizability_result,nmr_result,nmr_shielding_tensor,bond_order_result,total_spin_result,single_point_property_result,electronic_state_set,electronic_state,electronic_configuration,multireference_result,implicit_solvation_result,scientific_array_assignment,workflow_manifest,manifest_artifact_binding,logical_reaction,logical_reaction_participant,logical_participant_concrete_topology,mapped_reaction,mapped_reaction_thermodynamic_profile,mapped_reaction_participant,mapped_reaction_node,mapped_reaction_node_geometry,mapped_reaction_node_geometry_mapping,mapped_reaction_edge,transition_state_inference,transition_state_endpoint postgres
     class molop_models,runtime_objects memory
 ```
 
 | 数据形态 | 持久化后端 | 权威内容 |
 | --- | --- | --- |
 | 原始 Gaussian/ORCA/input/manifest bytes | RustFS | object bytes 和 object-store version/ETag |
-| Artifact 索引、解析、化学、反应与结果实体 | PostgreSQL | 51 张关系表及其约束 |
+| Artifact 索引、解析、化学、反应与结果实体 | PostgreSQL | 63 张关系表及其约束 |
 | 用户、外部身份、组织、项目与成员关系 | PostgreSQL | 本地授权主体、OIDC 映射和角色权限边界 |
 | `molecular_topology.mol`、`geometry.mol` | PostgreSQL + RDKit cartridge | 分子图与带坐标 mol |
 | `geometry.internal_coordinates`、`scientific_array.data` | PostgreSQL `BYTEA` | `allow_pickle=False` 的 NPY bytes |
@@ -124,7 +134,7 @@ flowchart TB
 
 ## 全量物理 ERD
 
-下图逐列展开全部 51 张 PostgreSQL 表，并为 75 条外键约束各生成一条关系线。
+下图逐列展开全部 63 张 PostgreSQL 表，并为 93 条外键约束各生成一条关系线。
 关系标签是子表 FK 列名；复合 FK 使用 `__` 连接列名。`nullable` 表示列允许
 SQL `NULL`。单列唯一键标为 `UK`；复合 UNIQUE、CHECK 和 index 在后续清单中
 逐表计数，并以 SQLModel/Alembic 定义为权威。
@@ -136,6 +146,9 @@ erDiagram
     project ||--o{ artifact_file : project_id
     artifact_file ||--o| artifact_ingestion : artifact_file_id
     charge_spin_population_result ||--o{ atomic_population_series : result_id
+    user_account o|--o{ audit_event : actor_user_id
+    project o|--o{ audit_event : project_id
+    user_account ||--o{ auth_session : user_id
     calculation_frame ||--o| bond_order_result : frame_id
     geometry ||--o{ calculation_frame : geometry_id
     calculation_segment ||--o{ calculation_frame : segment_id__parse_revision_id
@@ -153,6 +166,8 @@ erDiagram
     molecular_topology ||--o{ geometry : topology_id
     calculation_frame ||--o| geometry_optimization_result : frame_id
     calculation_frame ||--o| implicit_solvation_result : frame_id
+    molecular_topology ||--o{ logical_participant_concrete_topology : concrete_topology_id
+    logical_reaction_participant ||--o{ logical_participant_concrete_topology : logical_reaction_participant_id
     logical_reaction ||--o{ logical_reaction_participant : logical_reaction_id
     molecular_topology ||--o{ logical_reaction_participant : topology_id
     artifact_file o|--o{ manifest_artifact_binding : artifact_file_id
@@ -168,10 +183,15 @@ erDiagram
     mapped_reaction_node ||--o{ mapped_reaction_node_geometry : mapped_reaction_node_id
     mapped_reaction_participant o|--o{ mapped_reaction_node_geometry : mapped_reaction_participant_id
     mapped_reaction_node_geometry ||--o| mapped_reaction_node_geometry_mapping : mapped_reaction_node_geometry_id
+    molecular_topology o|--o{ mapped_reaction_participant : concrete_topology_id
     logical_reaction_participant ||--o{ mapped_reaction_participant : logical_reaction_participant_id
     mapped_reaction ||--o{ mapped_reaction_participant : mapped_reaction_id
+    mapped_reaction ||--o{ mapped_reaction_thermodynamic_profile : mapped_reaction_id
+    user_account ||--o{ mcp_access_token : user_id
     calculation_frame ||--o| molecular_orbital_result : frame_id
     molecular_formula ||--o{ molecular_topology : formula_id
+    molecular_topology ||--o{ molecular_topology_abstraction : general_topology_id
+    molecular_topology ||--o{ molecular_topology_abstraction : specific_topology_id
     molecular_topology ||--o{ molecular_topology_derivation : topology_id
     electronic_state_set o|--o| multireference_result : electronic_state_set_id
     calculation_frame ||--o| multireference_result : frame_id
@@ -183,6 +203,8 @@ erDiagram
     parse_revision o|--o{ parse_revision : reparse_of_id
     calculation_frame ||--o| polarizability_result : frame_id
     organization ||--o{ project : organization_id
+    user_account ||--o{ project_invitation : invited_by_user_id
+    project ||--o{ project_invitation : project_id
     project ||--o{ project_membership : project_id
     user_account ||--o{ project_membership : user_id
     calculation_frame ||--o{ scientific_array : frame_id
@@ -199,11 +221,17 @@ erDiagram
     storage_garbage_collection_state ||--o{ storage_garbage_collection_run : state_id
     calculation_frame ||--o| thermochemistry_result : frame_id
     calculation_frame ||--o| total_spin_result : frame_id
+    calculation_frame ||--o{ transition_state_endpoint : calculation_frame_id
+    molecular_topology ||--o{ transition_state_endpoint : topology_id
     artifact_ingestion ||--o{ transition_state_inference : artifact_ingestion_id
     calculation_frame o|--o{ transition_state_inference : calculation_frame_id
     logical_reaction o|--o{ transition_state_inference : logical_reaction_id
     mapped_reaction o|--o{ transition_state_inference : mapped_reaction_id
     parse_revision ||--o{ transition_state_inference : parse_revision_id
+    user_account ||--o{ upload_batch : created_by_user_id
+    project ||--o{ upload_batch : project_id
+    artifact_file o|--o{ upload_batch_item : artifact_file_id
+    upload_batch ||--o{ upload_batch_item : batch_id
     calculation_frame ||--o| vibration_result : frame_id
     artifact_file ||--o| workflow_manifest : artifact_file_id
     workflow_manifest o|--o{ workflow_manifest : manifest_key__supersedes_id
@@ -233,9 +261,10 @@ erDiagram
         datetime created_at
         text reaction_key
         text label "nullable"
-        enum reaction_class
+        enum reaction_class "nullable"
         string cycloaddition_pattern "nullable"
         string reaction_hash UK
+        array reactant_sort_key "nullable"
     }
     molecular_formula {
         uuid id PK
@@ -256,6 +285,19 @@ erDiagram
         text name
         enum status
     }
+    project_geometry_catalog {
+        uuid project_id PK
+        uuid geometry_id PK
+        bigint frame_count
+        datetime geometry_created_at
+        boolean has_frequency_data
+        boolean has_imaginary_frequency
+        boolean has_thermodynamic_property
+    }
+    project_geometry_catalog_count {
+        uuid project_id PK
+        bigint geometry_count
+    }
     storage_garbage_collection_state {
         uuid id PK
         datetime created_at
@@ -273,6 +315,17 @@ erDiagram
         enum status
         boolean is_service_account
         datetime last_authenticated_at "nullable"
+    }
+    auth_session {
+        uuid id PK
+        datetime created_at
+        uuid user_id FK
+        string token_hash UK
+        datetime expires_at
+        datetime last_seen_at
+        datetime revoked_at "nullable"
+        text user_agent "nullable"
+        string ip_address "nullable"
     }
     external_identity {
         uuid id PK
@@ -296,15 +349,30 @@ erDiagram
         rdkitbitfingerprint reaction_structural_bfp
         text reaction_structural_bfp_schema_version
         string mapping_hash
+        text thermodynamic_profile_policy_version "nullable"
+        float minimum_activation_gibbs_free_energy_kcal_mol "nullable"
+        float maximum_activation_gibbs_free_energy_kcal_mol "nullable"
+        float minimum_reaction_gibbs_free_energy_kcal_mol "nullable"
+        float maximum_reaction_gibbs_free_energy_kcal_mol "nullable"
+    }
+    mcp_access_token {
+        uuid id PK
+        datetime created_at
+        uuid user_id FK
+        string name
+        string token_hash UK
+        datetime expires_at
+        datetime last_used_at "nullable"
+        datetime revoked_at "nullable"
     }
     molecular_topology {
         uuid id PK
         datetime created_at
         uuid formula_id FK
         mol mol "PostgreSQL RDKit cartridge"
-        rdkitbitfingerprint morgan_bfp "nullable when sanitize fails"
+        rdkitbitfingerprint morgan_bfp "nullable"
         string morgan_bfp_schema_version
-        text canonical_isomeric_smiles "nullable when sanitize fails"
+        text canonical_isomeric_smiles "nullable"
         string graph_hash
         string identity_schema_version
         integer atom_count
@@ -313,6 +381,7 @@ erDiagram
         smallint radical_electron_count
         smallint fragment_count
         enum stereo_status
+        boolean is_stereo_abstraction_upstream
         enum sanitization_status
         text sanitization_error "nullable"
     }
@@ -355,7 +424,7 @@ erDiagram
         string bucket "RustFS locator"
         text object_key "RustFS locator"
         text version_id "nullable; RustFS locator"
-        string content_sha256 UK
+        string content_sha256
         bigint size_bytes
         text original_filename
         string media_type
@@ -364,14 +433,30 @@ erDiagram
         text etag "nullable"
         datetime storage_verified_at "nullable"
     }
+    audit_event {
+        uuid id PK
+        datetime created_at
+        uuid actor_user_id FK "nullable"
+        uuid project_id FK "nullable"
+        string action
+        string entity_type
+        uuid entity_id "nullable"
+        jsonb metadata_json
+    }
     geometry {
         uuid id PK
         datetime created_at
         uuid topology_id FK
         mol mol "PostgreSQL RDKit cartridge"
         bytea internal_coordinates "NPY encoded BYTEA"
+        array internal_coordinate_distances_angstrom
+        array internal_coordinate_angles_degrees
+        array internal_coordinate_dihedrals_degrees
+        smallint minimum_coordinate_decimal_places "nullable"
         string internal_coordinate_hash
         string geometry_hash
+        smallint charge
+        smallint multiplicity
         string canonicalization_version
     }
     logical_reaction_participant {
@@ -392,6 +477,47 @@ erDiagram
         integer node_index
         enum role
     }
+    mapped_reaction_thermodynamic_profile {
+        uuid id PK
+        datetime created_at
+        uuid mapped_reaction_id FK
+        text policy_version
+        string source_key_hash
+        jsonb electronic_level
+        jsonb thermochemistry_level
+        float temperature_kelvin
+        float pressure_atm
+        jsonb reactants
+        jsonb transition_state "nullable"
+        jsonb products "nullable"
+        float reactants_enthalpy_hartree
+        float reactants_gibbs_free_energy_hartree
+        float reactants_entropy_cal_mol_k
+        float transition_state_enthalpy_hartree "nullable"
+        float transition_state_gibbs_free_energy_hartree "nullable"
+        float transition_state_entropy_cal_mol_k "nullable"
+        float products_enthalpy_hartree "nullable"
+        float products_gibbs_free_energy_hartree "nullable"
+        float products_entropy_cal_mol_k "nullable"
+        float reactants_running_time_seconds "nullable"
+        float transition_state_running_time_seconds "nullable"
+        float products_running_time_seconds "nullable"
+        float total_running_time_seconds "nullable"
+        float activation_enthalpy_kcal_mol "nullable"
+        float activation_gibbs_free_energy_kcal_mol "nullable"
+        float activation_entropy_cal_mol_k "nullable"
+        float reaction_enthalpy_kcal_mol "nullable"
+        float reaction_gibbs_free_energy_kcal_mol "nullable"
+        float reaction_entropy_cal_mol_k "nullable"
+    }
+    molecular_topology_abstraction {
+        uuid id PK
+        datetime created_at
+        uuid specific_topology_id FK
+        uuid general_topology_id FK
+        string abstraction_policy_version
+        jsonb abstraction_metadata
+    }
     molecular_topology_derivation {
         uuid id PK
         datetime created_at
@@ -402,12 +528,43 @@ erDiagram
         string provenance_schema_version
         string provenance_hash
     }
+    project_invitation {
+        uuid id PK
+        datetime created_at
+        uuid project_id FK
+        uuid invited_by_user_id FK
+        string email
+        enum role
+        string token_hash UK
+        datetime expires_at
+        datetime accepted_at "nullable"
+        datetime revoked_at "nullable"
+        string delivery_status
+        text delivery_error "nullable"
+        datetime delivery_sent_at "nullable"
+    }
     project_membership {
         uuid id PK
         datetime created_at
         uuid project_id FK
         uuid user_id FK
         enum role
+    }
+    upload_batch {
+        uuid id PK
+        datetime created_at
+        datetime updated_at
+        uuid project_id FK
+        uuid created_by_user_id FK
+        enum artifact_kind
+        enum status
+        jsonb shared_metadata
+        integer total_count
+        bigint total_bytes
+        integer succeeded_count
+        integer failed_count
+        integer cancelled_count
+        integer uploading_count
     }
     artifact_ingestion {
         uuid id PK
@@ -424,6 +581,15 @@ erDiagram
         text error_message "nullable"
         jsonb parser_metadata
     }
+    logical_participant_concrete_topology {
+        uuid id PK
+        datetime created_at
+        uuid logical_reaction_participant_id FK
+        uuid concrete_topology_id FK
+        text match_policy_version
+        text match_status
+        jsonb match_metadata
+    }
     mapped_reaction_edge {
         uuid id PK
         datetime created_at
@@ -439,6 +605,7 @@ erDiagram
         datetime created_at
         uuid mapped_reaction_id FK
         uuid logical_reaction_participant_id FK
+        uuid concrete_topology_id FK "nullable"
         enum side
         smallint template_index
         array atom_map_numbers
@@ -480,6 +647,24 @@ erDiagram
         datetime started_at "nullable"
         datetime completed_at "nullable"
     }
+    upload_batch_item {
+        uuid id PK
+        datetime created_at
+        datetime updated_at
+        uuid batch_id FK
+        uuid client_file_id
+        integer position
+        text original_filename
+        text relative_path
+        bigint size_bytes
+        string media_type
+        enum status
+        integer attempt_count
+        uuid artifact_file_id FK "nullable"
+        string error_code "nullable"
+        text error_message "nullable"
+        jsonb metadata_json
+    }
     workflow_manifest {
         uuid id PK
         datetime created_at
@@ -501,13 +686,13 @@ erDiagram
         uuid protocol_id FK "nullable"
         integer segment_index
         text segment_label "nullable"
-        bigint source_start_byte
-        bigint source_end_byte
+        bigint source_start_byte "nullable"
+        bigint source_end_byte "nullable"
         bigint source_start_char "nullable"
         bigint source_end_char "nullable"
-        integer source_start_line
-        integer source_end_line
-        string source_block_sha256
+        integer source_start_line "nullable"
+        integer source_end_line "nullable"
+        string source_block_sha256 "nullable"
         integer source_frame_count "nullable"
         jsonb parse_presence
         enum parse_completeness
@@ -554,13 +739,13 @@ erDiagram
         integer frame_index
         integer file_frame_index
         enum frame_role
-        bigint source_start_byte
-        bigint source_end_byte
+        bigint source_start_byte "nullable"
+        bigint source_end_byte "nullable"
         bigint source_start_char "nullable"
         bigint source_end_char "nullable"
-        integer source_start_line
-        integer source_end_line
-        string source_block_sha256
+        integer source_start_line "nullable"
+        integer source_end_line "nullable"
+        string source_block_sha256 "nullable"
         jsonb parse_presence
         enum parse_completeness
         jsonb parse_diagnostics
@@ -788,6 +973,21 @@ erDiagram
         float spin_quantum_number "nullable"
         string source_schema_version
     }
+    transition_state_endpoint {
+        uuid id PK
+        datetime created_at
+        uuid calculation_frame_id FK
+        uuid topology_id FK
+        smallint charge
+        smallint multiplicity
+        enum direction
+        integer atom_count
+        float displacement_ratio
+        bytea source_coordinates "NPY encoded BYTEA"
+        string source_coordinate_hash
+        array source_to_topology_atom_indices
+        jsonb provenance
+    }
     transition_state_inference {
         uuid id PK
         datetime created_at
@@ -922,42 +1122,53 @@ erDiagram
 
 ## Schema 完整性清单
 
-- `51` tables；
-- `605` columns；
-- `75` FK；
-- `72` UNIQUE；
-- `168` CHECK；
-- `94` indexes。
+- `63` tables；
+- `756` columns；
+- `93` FK；
+- `77` UNIQUE；
+- `198` CHECK；
+- `158` indexes。
 
 | table | columns | FK constraints | UNIQUE constraints | CHECK constraints | indexes |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `calculation_protocol` | 18 | 0 | 1 | 2 | 3 |
-| `logical_reaction` | 7 | 0 | 1 | 2 | 3 |
+| `logical_reaction` | 8 | 0 | 1 | 2 | 6 |
 | `molecular_formula` | 10 | 0 | 1 | 4 | 2 |
 | `organization` | 5 | 0 | 1 | 2 | 1 |
+| `project_geometry_catalog` | 7 | 0 | 0 | 1 | 7 |
+| `project_geometry_catalog_count` | 2 | 0 | 0 | 1 | 0 |
 | `storage_garbage_collection_state` | 7 | 0 | 1 | 0 | 0 |
 | `user_account` | 7 | 0 | 0 | 1 | 2 |
+| `auth_session` | 9 | 1 | 0 | 0 | 5 |
 | `external_identity` | 8 | 1 | 1 | 0 | 1 |
-| `mapped_reaction` | 11 | 1 | 2 | 3 | 5 |
-| `molecular_topology` | 15 | 1 | 1 | 6 | 5 |
+| `mapped_reaction` | 16 | 1 | 2 | 3 | 9 |
+| `mcp_access_token` | 8 | 1 | 0 | 0 | 5 |
+| `molecular_topology` | 18 | 1 | 1 | 8 | 6 |
 | `organization_membership` | 5 | 2 | 1 | 1 | 3 |
 | `project` | 6 | 1 | 1 | 2 | 2 |
 | `storage_garbage_collection_run` | 13 | 1 | 0 | 6 | 3 |
-| `artifact_file` | 16 | 2 | 2 | 5 | 6 |
-| `geometry` | 8 | 1 | 1 | 2 | 1 |
+| `artifact_file` | 16 | 2 | 1 | 5 | 11 |
+| `audit_event` | 8 | 2 | 0 | 0 | 4 |
+| `geometry` | 14 | 1 | 1 | 4 | 3 |
 | `logical_reaction_participant` | 8 | 2 | 1 | 4 | 3 |
 | `mapped_reaction_node` | 6 | 1 | 3 | 2 | 2 |
+| `mapped_reaction_thermodynamic_profile` | 31 | 1 | 1 | 4 | 2 |
+| `molecular_topology_abstraction` | 6 | 2 | 1 | 1 | 3 |
 | `molecular_topology_derivation` | 8 | 1 | 2 | 1 | 1 |
+| `project_invitation` | 13 | 2 | 0 | 1 | 7 |
 | `project_membership` | 5 | 2 | 1 | 1 | 3 |
+| `upload_batch` | 14 | 2 | 0 | 6 | 4 |
 | `artifact_ingestion` | 13 | 1 | 1 | 6 | 1 |
+| `logical_participant_concrete_topology` | 7 | 2 | 1 | 1 | 2 |
 | `mapped_reaction_edge` | 8 | 4 | 2 | 2 | 5 |
-| `mapped_reaction_participant` | 8 | 2 | 2 | 3 | 2 |
-| `parse_revision` | 33 | 2 | 1 | 10 | 4 |
+| `mapped_reaction_participant` | 9 | 3 | 2 | 3 | 3 |
+| `parse_revision` | 34 | 2 | 1 | 11 | 4 |
+| `upload_batch_item` | 16 | 2 | 2 | 4 | 4 |
 | `workflow_manifest` | 12 | 2 | 3 | 6 | 2 |
 | `calculation_segment` | 23 | 2 | 2 | 12 | 2 |
 | `manifest_artifact_binding` | 14 | 3 | 1 | 8 | 4 |
 | `mapped_reaction_node_geometry` | 9 | 3 | 3 | 1 | 4 |
-| `calculation_frame` | 66 | 3 | 3 | 38 | 6 |
+| `calculation_frame` | 66 | 3 | 3 | 38 | 9 |
 | `mapped_reaction_node_geometry_mapping` | 8 | 1 | 1 | 1 | 1 |
 | `bond_order_result` | 5 | 1 | 1 | 1 | 0 |
 | `calculation_status_result` | 6 | 1 | 1 | 0 | 0 |
@@ -973,6 +1184,7 @@ erDiagram
 | `single_point_property_result` | 7 | 1 | 1 | 0 | 0 |
 | `thermochemistry_result` | 18 | 1 | 1 | 6 | 0 |
 | `total_spin_result` | 6 | 1 | 1 | 0 | 0 |
+| `transition_state_endpoint` | 13 | 2 | 1 | 6 | 2 |
 | `transition_state_inference` | 15 | 5 | 1 | 4 | 6 |
 | `vibration_result` | 12 | 1 | 1 | 0 | 0 |
 | `atomic_population_series` | 10 | 1 | 1 | 2 | 1 |

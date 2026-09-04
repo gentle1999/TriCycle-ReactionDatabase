@@ -11,6 +11,7 @@ from molalchemy.rdkit.types import RdkitBitFingerprint, RdkitMol
 from pydantic import ConfigDict
 from rdkit import Chem
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     Column,
     Computed,
@@ -19,11 +20,19 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, INTEGER, JSONB, SMALLINT
 from sqlalchemy.orm import deferred
 from sqlmodel import Field, Relationship, SQLModel
 
+from tricycle_reaction_db.core.chemistry_config import (
+    FORMULA_COMPOSITION_VERSION,
+    GEOMETRY_CANONICALIZATION_VERSION,
+    STEREO_ABSTRACTION_POLICY_VERSION,
+    TOPOLOGY_DERIVATION_VERSION,
+    TOPOLOGY_IDENTITY_VERSION,
+)
 from tricycle_reaction_db.db.models.base import created_at_field, uuid_primary_key_field
 from tricycle_reaction_db.db.types import NumpyArray
 from tricycle_reaction_db.domain.enums import (
@@ -43,8 +52,10 @@ from tricycle_reaction_db.domain.formulas import (
 if TYPE_CHECKING:
     from tricycle_reaction_db.db.models.calculations import CalculationFrame
     from tricycle_reaction_db.db.models.reactions import (
+        LogicalParticipantConcreteTopology,
         LogicalReactionParticipant,
         MappedReactionNodeGeometry,
+        MappedReactionParticipant,
     )
     from tricycle_reaction_db.db.models.uploads import TransitionStateEndpoint
 
@@ -92,11 +103,11 @@ class MolecularFormula(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=False),
     )
     composition_schema_version: str = Field(
-        default="formula-composition-v1",
+        default=FORMULA_COMPOSITION_VERSION,
         sa_column=Column(
             String(64),
             nullable=False,
-            server_default="formula-composition-v1",
+            server_default=FORMULA_COMPOSITION_VERSION,
         ),
     )
     atom_count: int = Field(sa_type=INTEGER, nullable=False)
@@ -158,6 +169,11 @@ class MolecularTopology(SQLModel, table=True):
         ),
         RdkitIndex("ix_molecular_topology_mol_gist", "mol"),
         RdkitIndex("ix_molecular_topology_morgan_bfp_gist", "morgan_bfp"),
+        Index(
+            "ix_molecular_topology_upstream_candidates",
+            "formula_id",
+            "is_stereo_abstraction_upstream",
+        ),
     )
     model_config = ConfigDict(arbitrary_types_allowed=True)  # type: ignore[assignment]
 
@@ -199,11 +215,11 @@ class MolecularTopology(SQLModel, table=True):
     )
     graph_hash: str = Field(max_length=64, nullable=False)
     identity_schema_version: str = Field(
-        default="topology-identity-v1",
+        default=TOPOLOGY_IDENTITY_VERSION,
         sa_column=Column(
             String(64),
             nullable=False,
-            server_default="topology-identity-v1",
+            server_default=TOPOLOGY_IDENTITY_VERSION,
         ),
     )
     atom_count: int = Field(sa_type=INTEGER, nullable=False)
@@ -218,6 +234,10 @@ class MolecularTopology(SQLModel, table=True):
             nullable=False,
             server_default=StereoStatus.UNKNOWN.value,
         ),
+    )
+    is_stereo_abstraction_upstream: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default=text("false")),
     )
     sanitization_status: TopologySanitizationStatus = Field(
         default=TopologySanitizationStatus.SANITIZED,
@@ -245,9 +265,106 @@ class MolecularTopology(SQLModel, table=True):
         back_populates="topology",
         passive_deletes="all",
     )
+    logical_participant_concrete_topologies: list["LogicalParticipantConcreteTopology"] = (
+        Relationship(
+            back_populates="concrete_topology",
+            passive_deletes="all",
+        )
+    )
+    mapped_reaction_participants: list["MappedReactionParticipant"] = Relationship(
+        back_populates="concrete_topology",
+        passive_deletes="all",
+    )
     transition_state_endpoints: list["TransitionStateEndpoint"] = Relationship(
         back_populates="topology",
         passive_deletes="all",
+    )
+    generalization_edges: list["MolecularTopologyAbstraction"] = Relationship(
+        back_populates="specific_topology",
+        passive_deletes="all",
+        sa_relationship_kwargs={
+            "foreign_keys": "[MolecularTopologyAbstraction.specific_topology_id]",
+        },
+    )
+    specialization_edges: list["MolecularTopologyAbstraction"] = Relationship(
+        back_populates="general_topology",
+        passive_deletes="all",
+        sa_relationship_kwargs={
+            "foreign_keys": "[MolecularTopologyAbstraction.general_topology_id]",
+        },
+    )
+
+
+class MolecularTopologyAbstraction(SQLModel, table=True):
+    """A directed edge from one stereo topology to a more general topology.
+
+    The relation is intentionally stored as an edge rather than as one parent
+    foreign key on ``MolecularTopology``.  A molecule with two independently
+    specified stereocentres has two immediate generalizations (one for each
+    centre), so the abstraction structure is a DAG/partial order.
+    """
+
+    __tablename__ = "molecular_topology_abstraction"  # pyright: ignore[reportAssignmentType]
+    __table_args__ = (
+        UniqueConstraint(
+            "specific_topology_id",
+            "general_topology_id",
+            "abstraction_policy_version",
+            name="uq_molecular_topology_abstraction_edge_policy",
+        ),
+        CheckConstraint(
+            "specific_topology_id <> general_topology_id",
+            name="ck_molecular_topology_abstraction_distinct_endpoints",
+        ),
+        Index(
+            "ix_molecular_topology_abstraction_specific",
+            "specific_topology_id",
+        ),
+        Index(
+            "ix_molecular_topology_abstraction_general",
+            "general_topology_id",
+        ),
+        Index(
+            "ix_molecular_topology_abstraction_abstraction_policy_version",
+            "abstraction_policy_version",
+        ),
+    )
+
+    id: UUID | None = uuid_primary_key_field()
+    created_at: datetime | None = created_at_field()
+    specific_topology_id: UUID = Field(
+        foreign_key="molecular_topology.id",
+        ondelete="CASCADE",
+        nullable=False,
+    )
+    general_topology_id: UUID = Field(
+        foreign_key="molecular_topology.id",
+        ondelete="CASCADE",
+        nullable=False,
+    )
+    abstraction_policy_version: str = Field(
+        default=STEREO_ABSTRACTION_POLICY_VERSION,
+        sa_column=Column(
+            String(64),
+            nullable=False,
+            server_default=STEREO_ABSTRACTION_POLICY_VERSION,
+        ),
+    )
+    abstraction_metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default="{}"),
+    )
+    specific_topology: MolecularTopology = Relationship(
+        back_populates="generalization_edges",
+        sa_relationship_kwargs={
+            "foreign_keys": "[MolecularTopologyAbstraction.specific_topology_id]",
+        },
+    )
+    general_topology: MolecularTopology = Relationship(
+        back_populates="specialization_edges",
+        sa_relationship_kwargs={
+            "foreign_keys": "[MolecularTopologyAbstraction.general_topology_id]",
+        },
     )
 
 
@@ -288,11 +405,11 @@ class MolecularTopologyDerivation(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=False),
     )
     provenance_schema_version: str = Field(
-        default="topology-derivation-v1",
+        default=TOPOLOGY_DERIVATION_VERSION,
         sa_column=Column(
             String(64),
             nullable=False,
-            server_default="topology-derivation-v1",
+            server_default=TOPOLOGY_DERIVATION_VERSION,
         ),
     )
     provenance_hash: str = Field(max_length=64, nullable=False)
@@ -396,11 +513,11 @@ class Geometry(SQLModel, table=True):
     charge: int = Field(default=0, sa_type=SMALLINT, nullable=False)
     multiplicity: int = Field(default=1, sa_type=SMALLINT, nullable=False)
     canonicalization_version: str = Field(
-        default="geometry-internal-coordinates-v1",
+        default=GEOMETRY_CANONICALIZATION_VERSION,
         sa_column=Column(
             String(64),
             nullable=False,
-            server_default="geometry-internal-coordinates-v1",
+            server_default=GEOMETRY_CANONICALIZATION_VERSION,
         ),
     )
     topology: MolecularTopology = Relationship(back_populates="geometries")
@@ -422,5 +539,6 @@ __all__ = [
     "Geometry",
     "MolecularFormula",
     "MolecularTopology",
+    "MolecularTopologyAbstraction",
     "MolecularTopologyDerivation",
 ]

@@ -3,8 +3,10 @@
 import json
 from collections import Counter
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from functools import lru_cache
 from hashlib import sha256
+from uuid import UUID
 
 from rdkit import Chem
 from rdkit.Chem import rdChemReactions
@@ -62,6 +64,10 @@ from tricycle_reaction_db.ingestion.normalization import (
 )
 
 ParticipantIdentity = tuple[LogicalReactionParticipantSide, MolecularTopology, int]
+MappedReactionConcreteIdentity = tuple[
+    tuple[str, int, UUID, tuple[int, ...]],
+    ...,
+]
 
 _ENDPOINT_NODE_KEY_ALIASES: dict[MappedReactionNodeRole, tuple[str, ...]] = {
     MappedReactionNodeRole.REACTANT: ("reactants", "reactant"),
@@ -294,14 +300,19 @@ def mapped_smiles_for_topology(
         atom.SetAtomMapNum(map_number)
     # PostgreSQL/RDKit preserves the BondStereo assignment but may drop the
     # neighboring BondDir flags required by the SMILES writer. Recreate those
-    # flags on the mapped clone when the projection is trusted. An ambiguous
-    # topology deliberately uses a connectivity-only reaction component so a
-    # stale/contradictory E/Z marker never enters the reaction identity.
-    isomeric_smiles = getattr(topology, "stereo_status", None) is not StereoStatus.AMBIGUOUS
+    # flags on the mapped clone only when stereo is actually assigned. Unknown,
+    # unassigned, conflicting, and ambiguous stereo must be connectivity-only;
+    # otherwise stale direction flags can turn an unassigned terminal alkene
+    # into an arbitrary E/Z reaction component.
+    stereo_status = getattr(topology, "stereo_status", None)
+    # ``None`` is retained for lightweight/legacy topology objects that do
+    # not expose the status field; their graph itself is the only available
+    # stereo evidence. Persisted MolecularTopology rows always carry an
+    # explicit status and therefore require ASSIGNED before isomeric output.
+    isomeric_smiles = stereo_status is None or stereo_status is StereoStatus.ASSIGNED
     if isomeric_smiles:
         mapped = ensure_serializable_double_bond_stereochemistry(
             mapped,
-            reference_smiles=getattr(topology, "canonical_isomeric_smiles", None),
             preserve_atom_maps=True,
         )
     return Chem.MolToSmiles(
@@ -409,6 +420,487 @@ def _mapping_assignment_for_topology(
     if set(atom_maps) != set(template_maps):
         raise ValueError("source atom-map numbers do not match the reaction template")
     return atom_maps, mapped_smiles_for_topology(topology, atom_maps)
+
+
+class MappingTransferAmbiguityError(ValueError):
+    """Several symmetry-equivalent graph matches produce different mappings."""
+
+    def __init__(
+        self,
+        *,
+        logical_participant_id: UUID,
+        source_topology_id: UUID,
+        target_topology_id: UUID,
+        candidate_atom_maps: Iterable[Iterable[int]],
+    ) -> None:
+        self.logical_participant_id = logical_participant_id
+        self.source_topology_id = source_topology_id
+        self.target_topology_id = target_topology_id
+        self.candidate_atom_maps = tuple(
+            tuple(int(number) for number in maps) for maps in candidate_atom_maps
+        )
+        super().__init__(
+            "abstract topology mapping is ambiguous for logical participant "
+            f"{logical_participant_id}: source={source_topology_id}, target={target_topology_id}, "
+            f"candidates={len(self.candidate_atom_maps)}"
+        )
+
+    def evidence(self) -> dict[str, object]:
+        return {
+            "error_code": "reaction_mapping_transfer_ambiguous",
+            "logical_participant_id": str(self.logical_participant_id),
+            "source_topology_id": str(self.source_topology_id),
+            "target_topology_id": str(self.target_topology_id),
+            "candidate_atom_maps": [list(maps) for maps in self.candidate_atom_maps],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class TransferredMappedReaction:
+    """A strict mapped-reaction projection derived through logical topology."""
+
+    mapped_reaction_smiles: str
+    mapping_hash: str
+    atom_maps_by_template: dict[tuple[LogicalReactionParticipantSide, int], tuple[int, ...]]
+    mapped_smiles_by_template: dict[tuple[LogicalReactionParticipantSide, int], str]
+    concrete_topologies_by_template: dict[
+        tuple[LogicalReactionParticipantSide, int], MolecularTopology
+    ]
+
+
+def _resolve_topology_value(
+    session: Session,
+    value: object,
+) -> MolecularTopology:
+    if isinstance(value, MolecularTopology):
+        _require_id(value, label="MolecularTopology")
+        return value
+    topology = session.get(MolecularTopology, value)
+    if topology is None:
+        topology = next(
+            (
+                entity
+                for entity in (
+                    *tuple(session.new),
+                    *tuple(session.info.get("_fast_pending_entities", ())),
+                )
+                if isinstance(entity, MolecularTopology) and entity.id == value
+            ),
+            None,
+        )
+    if topology is None:
+        raise ValueError(f"MolecularTopology {value!r} does not exist")
+    return topology
+
+
+def _canonical_atom_maps_for_topology(
+    session: Session,
+    topology: MolecularTopology,
+    atom_maps: tuple[int, ...],
+) -> tuple[int, ...]:
+    """Canonicalize atom maps modulo connectivity-preserving automorphisms.
+
+    Mapping transfer can encounter a symmetric endpoint through different
+    source atom orders.  Those assignments can serialize to different mapped
+    SMILES even though they describe the same concrete component.  Stereo is
+    intentionally ignored while finding the automorphisms: the concrete
+    topology id already carries the strict stereo identity, while the
+    automorphism step only removes representation-level symmetry from the
+    atom-map assignment.
+    """
+
+    topology_id = _require_id(topology, label="MolecularTopology")
+    if len(atom_maps) != topology.atom_count:
+        return atom_maps
+    cache: dict[tuple[UUID, tuple[int, ...]], tuple[int, ...]] = session.info.setdefault(
+        "_mapped_reaction_canonical_atom_maps", {}
+    )
+    cache_key = (topology_id, atom_maps)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    molecule = Chem.Mol(topology.mol)
+    for atom in molecule.GetAtoms():  # type: ignore[no-untyped-call]
+        atom.SetAtomMapNum(0)
+    automorphisms = molecule.GetSubstructMatches(
+        molecule,
+        uniquify=False,
+        useChirality=False,
+    )
+    candidates = tuple(tuple(atom_maps[index] for index in match) for match in automorphisms)
+    canonical = min(candidates) if candidates else atom_maps
+    cache[cache_key] = canonical
+    return canonical
+
+
+def mapped_reaction_concrete_identity(
+    session: Session,
+    mapped_reaction: MappedReaction,
+    *,
+    participants: Iterable[MappedReactionParticipant] | None = None,
+) -> MappedReactionConcreteIdentity | None:
+    """Return the concrete identity of one complete mapped reaction.
+
+    ``mapping_hash`` is intentionally a strict text identity.  It is not a
+    suitable identity for a physical mapped reaction, because equivalent
+    atom-mapped projections can differ only in the SMILES traversal (for
+    example, a symmetric alkene may be rendered with the opposite slash
+    direction).  The durable identity used for materialization is therefore
+    the concrete topology of every participant together with the atom-map
+    assignment on that topology.
+
+    The atom-map tuple is included deliberately: two different atom mappings
+    of the same concrete components can represent different reaction paths and
+    must remain separate.  The tuple is returned in template order-independent
+    form so it is stable for a logical reaction whose participants were loaded
+    in a different order.
+    """
+
+    mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
+    if participants is None:
+        rows = tuple(
+            session.exec(
+                select(MappedReactionParticipant).where(
+                    MappedReactionParticipant.mapped_reaction_id == mapped_reaction_id
+                )
+            ).all()
+        )
+        rows += tuple(
+            entity
+            for entity in (
+                *tuple(session.new),
+                *tuple(session.info.get("_fast_pending_entities", ())),
+            )
+            if isinstance(entity, MappedReactionParticipant)
+            and entity.mapped_reaction_id == mapped_reaction_id
+        )
+    else:
+        rows = tuple(participants)
+
+    identities: list[tuple[str, int, UUID, tuple[int, ...]]] = []
+    template_keys: set[tuple[str, int]] = set()
+    for participant in rows:
+        logical_participant = participant.logical_reaction_participant
+        if logical_participant is None:
+            logical_participant = session.get(
+                LogicalReactionParticipant,
+                participant.logical_reaction_participant_id,
+            )
+        if logical_participant is None:
+            return None
+        concrete_topology_id = participant.concrete_topology_id or logical_participant.topology_id
+        if concrete_topology_id is None:
+            return None
+        atom_maps = tuple(int(number) for number in participant.atom_map_numbers)
+        if not atom_maps or any(number <= 0 for number in atom_maps):
+            return None
+        if len(set(atom_maps)) != len(atom_maps):
+            return None
+        concrete_topology = _resolve_topology_value(session, concrete_topology_id)
+        atom_maps = _canonical_atom_maps_for_topology(session, concrete_topology, atom_maps)
+        template_key = (participant.side.value, participant.template_index)
+        if template_key in template_keys:
+            return None
+        template_keys.add(template_key)
+        identities.append(
+            (
+                participant.side.value,
+                participant.template_index,
+                concrete_topology_id,
+                atom_maps,
+            )
+        )
+    if not identities:
+        return None
+    return tuple(sorted(identities))
+
+
+def mapped_reaction_concrete_identity_for_templates(
+    session: Session,
+    reaction: LogicalReaction,
+    *,
+    atom_maps_by_template: Mapping[tuple[LogicalReactionParticipantSide, int], Iterable[int]],
+    concrete_topology_ids_by_template: Mapping[tuple[LogicalReactionParticipantSide, int], object],
+) -> MappedReactionConcreteIdentity:
+    """Build the concrete identity before a mapped reaction is persisted."""
+
+    participants_by_key = {
+        (participant.side, participant.participant_index): participant
+        for participant in reaction.participants
+    }
+    expected_keys = set(participants_by_key)
+    if expected_keys != set(atom_maps_by_template) or expected_keys != set(
+        concrete_topology_ids_by_template
+    ):
+        raise ValueError("concrete identity inputs must cover every logical participant")
+
+    identities: list[tuple[str, int, UUID, tuple[int, ...]]] = []
+    for side, template_index in sorted(
+        expected_keys,
+        key=lambda item: (item[0].value, item[1]),
+    ):
+        concrete_topology = _resolve_topology_value(
+            session,
+            concrete_topology_ids_by_template[(side, template_index)],
+        )
+        atom_maps = tuple(int(number) for number in atom_maps_by_template[(side, template_index)])
+        if not atom_maps or any(number <= 0 for number in atom_maps):
+            raise ValueError("concrete identity atom maps must be positive")
+        if len(set(atom_maps)) != len(atom_maps):
+            raise ValueError("concrete identity atom maps must be unique")
+        atom_maps = _canonical_atom_maps_for_topology(session, concrete_topology, atom_maps)
+        identities.append(
+            (
+                side.value,
+                template_index,
+                _require_id(concrete_topology, label="MolecularTopology"),
+                atom_maps,
+            )
+        )
+    return tuple(identities)
+
+
+def find_mapped_reaction_by_concrete_identity(
+    session: Session,
+    logical_reaction_id: UUID,
+    identity: MappedReactionConcreteIdentity,
+    *,
+    refresh: bool = False,
+) -> MappedReaction | None:
+    """Find a persisted or same-batch mapped reaction with one identity."""
+
+    index_by_reaction: dict[
+        UUID,
+        dict[MappedReactionConcreteIdentity, MappedReaction],
+    ] = session.info.setdefault("_mapped_reaction_concrete_identity_index", {})
+    if refresh:
+        index_by_reaction.pop(logical_reaction_id, None)
+    index = index_by_reaction.get(logical_reaction_id)
+    if index is None:
+        candidates = tuple(
+            session.exec(
+                select(MappedReaction).where(
+                    MappedReaction.logical_reaction_id == logical_reaction_id
+                )
+            ).all()
+        )
+        candidates += tuple(
+            entity
+            for entity in (
+                *tuple(session.new),
+                *tuple(session.info.get("_fast_pending_entities", ())),
+            )
+            if isinstance(entity, MappedReaction)
+            and entity.logical_reaction_id == logical_reaction_id
+        )
+        by_id = {
+            _require_id(candidate, label="MappedReaction"): candidate
+            for candidate in candidates
+            if isinstance(candidate.id, UUID)
+        }
+        index = {}
+        for candidate in sorted(
+            by_id.values(),
+            key=lambda item: (item.mapping_hash, str(_require_id(item, label="MappedReaction"))),
+        ):
+            candidate_identity = mapped_reaction_concrete_identity(session, candidate)
+            if candidate_identity is not None:
+                index.setdefault(candidate_identity, candidate)
+        index_by_reaction[logical_reaction_id] = index
+    return index.get(identity)
+
+
+def _register_mapped_reaction_concrete_identity(
+    session: Session,
+    mapped_reaction: MappedReaction,
+) -> None:
+    """Add a newly persisted mapping to the session-local identity index."""
+
+    logical_reaction_id = mapped_reaction.logical_reaction_id
+    index_by_reaction: dict[
+        UUID,
+        dict[MappedReactionConcreteIdentity, MappedReaction],
+    ] = session.info.setdefault("_mapped_reaction_concrete_identity_index", {})
+    index = index_by_reaction.setdefault(logical_reaction_id, {})
+    identity = mapped_reaction_concrete_identity(session, mapped_reaction)
+    if identity is not None:
+        index.setdefault(identity, mapped_reaction)
+
+
+def _transferred_atom_maps(
+    *,
+    logical_participant: LogicalReactionParticipant,
+    source_topology: MolecularTopology,
+    source_atom_maps: Iterable[int],
+    target_topology: MolecularTopology,
+) -> list[int]:
+    """Compose source-map → abstract-index → target-index correspondences."""
+
+    source_maps = list(source_atom_maps)
+    if len(source_maps) != source_topology.atom_count:
+        raise ValueError("source mapped participant does not cover its concrete topology")
+    if any(number <= 0 for number in source_maps) or len(set(source_maps)) != len(source_maps):
+        raise ValueError("source mapped participant atom maps must be unique and positive")
+    if source_topology.formula_id != target_topology.formula_id:
+        raise ValueError("source and target concrete topologies use different formulas")
+    if source_topology.atom_count != target_topology.atom_count:
+        raise ValueError("source and target concrete topologies use different atom counts")
+
+    from tricycle_reaction_db.application.services.topology_abstraction import (
+        find_topology_matches,
+    )
+
+    abstract_topology = logical_participant.topology
+    source_matches = find_topology_matches(source_topology.mol, abstract_topology.mol)
+    target_matches = find_topology_matches(target_topology.mol, abstract_topology.mol)
+    if not source_matches or not target_matches:
+        raise ValueError(
+            "source or target concrete topology is not a stereo-aware match for its "
+            "logical topology"
+        )
+    candidate_maps: set[tuple[int, ...]] = set()
+    for source_match in source_matches:
+        abstract_to_source_map = {
+            abstract_index: source_maps[source_index]
+            for abstract_index, source_index in enumerate(source_match)
+        }
+        for target_match in target_matches:
+            target_maps = [0] * target_topology.atom_count
+            for abstract_index, target_index in enumerate(target_match):
+                target_maps[target_index] = abstract_to_source_map[abstract_index]
+            if any(number <= 0 for number in target_maps) or len(set(target_maps)) != len(
+                target_maps
+            ):
+                raise ValueError("abstract mapping transfer did not cover target topology")
+            candidate_maps.add(tuple(target_maps))
+    if not candidate_maps:
+        raise ValueError("abstract mapping transfer produced no complete mapping")
+    if len(candidate_maps) > 1:
+        raise MappingTransferAmbiguityError(
+            logical_participant_id=_require_id(
+                logical_participant,
+                label="LogicalReactionParticipant",
+            ),
+            source_topology_id=_require_id(source_topology, label="MolecularTopology"),
+            target_topology_id=_require_id(target_topology, label="MolecularTopology"),
+            candidate_atom_maps=sorted(candidate_maps),
+        )
+    return list(next(iter(candidate_maps)))
+
+
+def transfer_mapped_reaction_to_concrete_topologies(
+    session: Session,
+    mapped_reaction: MappedReaction,
+    concrete_topologies_by_template: Mapping[tuple[LogicalReactionParticipantSide, int], object],
+) -> TransferredMappedReaction:
+    """Transfer one complete mapping through each logical participant topology.
+
+    The existing mapped reaction is the only source of atom-map labels.  Both
+    the source and target concrete topologies are matched to the same logical
+    graph, and the two graph correspondences are composed.  Isomeric SMILES is
+    rendered only after this graph operation; it is never used to infer the
+    atom mapping.
+    """
+
+    _require_id(mapped_reaction, label="MappedReaction")
+    source_participants = tuple(mapped_reaction.participants)
+    if not source_participants:
+        persisted_participants = tuple(
+            session.exec(
+                select(MappedReactionParticipant).where(
+                    MappedReactionParticipant.mapped_reaction_id == mapped_reaction.id
+                )
+            ).all()
+        )
+        pending_participants = tuple(
+            entity
+            for entity in (
+                *tuple(session.new),
+                *tuple(session.info.get("_fast_pending_entities", ())),
+            )
+            if isinstance(entity, MappedReactionParticipant)
+            and entity.mapped_reaction_id == mapped_reaction.id
+        )
+        participants_by_id = {
+            _require_id(participant, label="MappedReactionParticipant"): participant
+            for participant in (*persisted_participants, *pending_participants)
+            if isinstance(participant.id, UUID)
+        }
+        source_participants = tuple(participants_by_id.values())
+    expected_keys = {
+        (participant.side, participant.template_index) for participant in source_participants
+    }
+    if expected_keys != set(concrete_topologies_by_template):
+        raise ValueError("concrete topology keys must match every mapped reaction participant")
+
+    atom_maps_by_template: dict[tuple[LogicalReactionParticipantSide, int], tuple[int, ...]] = {}
+    mapped_smiles_by_template: dict[tuple[LogicalReactionParticipantSide, int], str] = {}
+    resolved_topologies: dict[tuple[LogicalReactionParticipantSide, int], MolecularTopology] = {}
+    for source_participant in sorted(
+        source_participants,
+        key=lambda participant: (participant.side.value, participant.template_index),
+    ):
+        key = (source_participant.side, source_participant.template_index)
+        logical_participant = source_participant.logical_reaction_participant
+        source_topology = (
+            _resolve_topology_value(session, source_participant.concrete_topology_id)
+            if source_participant.concrete_topology_id is not None
+            else logical_participant.topology
+        )
+        target_topology = _resolve_topology_value(
+            session,
+            concrete_topologies_by_template[key],
+        )
+        if source_topology.id == target_topology.id:
+            atom_maps = list(source_participant.atom_map_numbers)
+        else:
+            atom_maps = _transferred_atom_maps(
+                logical_participant=logical_participant,
+                source_topology=source_topology,
+                source_atom_maps=source_participant.atom_map_numbers,
+                target_topology=target_topology,
+            )
+        mapped_smiles = mapped_smiles_for_topology(target_topology, atom_maps)
+        atom_maps_by_template[key] = tuple(atom_maps)
+        mapped_smiles_by_template[key] = mapped_smiles
+        resolved_topologies[key] = target_topology
+
+    canonical_sides: dict[LogicalReactionParticipantSide, list[tuple[int, str]]] = {
+        LogicalReactionParticipantSide.REACTANT: [],
+        LogicalReactionParticipantSide.PRODUCT: [],
+    }
+    side_map_sets: dict[LogicalReactionParticipantSide, set[int]] = {}
+    for key, mapped_smiles in mapped_smiles_by_template.items():
+        side, template_index = key
+        canonical_sides[side].append((template_index, mapped_smiles))
+        side_map_sets.setdefault(side, set()).update(atom_maps_by_template[key])
+    if (
+        not canonical_sides[LogicalReactionParticipantSide.REACTANT]
+        or not canonical_sides[LogicalReactionParticipantSide.PRODUCT]
+    ):
+        raise ValueError("mapped reaction transfer requires reactant and product participants")
+    if (
+        side_map_sets[LogicalReactionParticipantSide.REACTANT]
+        != side_map_sets[LogicalReactionParticipantSide.PRODUCT]
+    ):
+        raise ValueError("transferred reaction atom maps do not conserve both sides")
+    reactants = ".".join(
+        mapped_smiles
+        for _, mapped_smiles in sorted(canonical_sides[LogicalReactionParticipantSide.REACTANT])
+    )
+    products = ".".join(
+        mapped_smiles
+        for _, mapped_smiles in sorted(canonical_sides[LogicalReactionParticipantSide.PRODUCT])
+    )
+    mapped_reaction_smiles = f"{reactants}>>{products}"
+    return TransferredMappedReaction(
+        mapped_reaction_smiles=mapped_reaction_smiles,
+        mapping_hash=sha256(mapped_reaction_smiles.encode("utf-8")).hexdigest(),
+        atom_maps_by_template=atom_maps_by_template,
+        mapped_smiles_by_template=mapped_smiles_by_template,
+        concrete_topologies_by_template=resolved_topologies,
+    )
 
 
 def persist_workflow_manifest(
@@ -576,8 +1068,10 @@ def persist_logical_reaction_participant(
     reaction: LogicalReaction,
     topology: MolecularTopology,
     record: LogicalReactionParticipantRecord,
+    *,
+    candidate_topologies: Iterable[MolecularTopology] = (),
 ) -> LogicalReactionParticipant:
-    """Insert or reuse one mapped participant through LogicalReaction and Topology objects."""
+    """Insert/reuse a logical participant and register its concrete members."""
 
     reaction_id = _require_id(reaction, label="LogicalReaction")
     topology_id = _require_id(topology, label="MolecularTopology")
@@ -613,6 +1107,15 @@ def persist_logical_reaction_participant(
                     "LogicalReactionParticipant identity resolved to different role: "
                     f"{participant.role!r} != {record.role!r}"
                 )
+        from tricycle_reaction_db.application.services.reaction_topology_membership import (
+            ensure_logical_participant_concrete_memberships,
+        )
+
+        ensure_logical_participant_concrete_memberships(
+            session,
+            participant,
+            candidate_topologies=candidate_topologies,
+        )
         return participant
 
     participant = LogicalReactionParticipant(
@@ -621,6 +1124,15 @@ def persist_logical_reaction_participant(
         **record.model_dump(),
     )
     _flush_new_entity(session, participant, label="LogicalReactionParticipant")
+    from tricycle_reaction_db.application.services.reaction_topology_membership import (
+        ensure_logical_participant_concrete_memberships,
+    )
+
+    ensure_logical_participant_concrete_memberships(
+        session,
+        participant,
+        candidate_topologies=candidate_topologies,
+    )
     return participant
 
 
@@ -679,6 +1191,8 @@ def persist_mapped_reaction(
     | None = None,
     topology_ids_by_template: Mapping[tuple[LogicalReactionParticipantSide, int], object]
     | None = None,
+    concrete_topology_ids_by_template: Mapping[tuple[LogicalReactionParticipantSide, int], object]
+    | None = None,
     precomputed_mapped_smiles_by_template: Mapping[tuple[LogicalReactionParticipantSide, int], str]
     | None = None,
 ) -> MappedReaction:
@@ -695,6 +1209,22 @@ def persist_mapped_reaction(
             topology_ids_by_template
         ):
             raise ValueError("precomputed mapped reaction participant keys must match")
+        if concrete_topology_ids_by_template is not None and component_keys != set(
+            concrete_topology_ids_by_template
+        ):
+            raise ValueError("concrete mapped reaction participant keys must match")
+        participants_by_key = {
+            (participant.side, participant.participant_index): participant
+            for participant in reaction.participants
+        }
+        if component_keys != set(participants_by_key):
+            raise ValueError(
+                "precomputed mapped reaction components must match logical participants"
+            )
+        normalized_atom_maps = {
+            key: tuple(int(number) for number in atom_maps)
+            for key, atom_maps in source_atom_maps_by_template.items()
+        }
         canonical_sides: dict[LogicalReactionParticipantSide, list[tuple[int, str]]] = {
             LogicalReactionParticipantSide.REACTANT: [],
             LogicalReactionParticipantSide.PRODUCT: [],
@@ -716,16 +1246,63 @@ def persist_mapped_reaction(
         if record.mapping_hash != expected_hash:
             raise ValueError("mapping_hash does not match mapped_reaction_smiles")
 
+        concrete_topologies_by_key: dict[
+            tuple[LogicalReactionParticipantSide, int], MolecularTopology
+        ] = {}
+        for component_key in component_keys:
+            participant = participants_by_key[component_key]
+            expected_topology_id = topology_ids_by_template[component_key]
+            if participant.topology_id != expected_topology_id:
+                raise ValueError(
+                    "precomputed mapped reaction component resolved to a different topology"
+                )
+            concrete_topology_value = (
+                concrete_topology_ids_by_template.get(component_key)
+                if concrete_topology_ids_by_template is not None
+                else participant.topology_id
+            )
+            concrete_topologies_by_key[component_key] = _resolve_topology_value(
+                session,
+                concrete_topology_value,
+            )
+
+        # The text hash above remains the strict mapped-SMILES identity, but
+        # it cannot distinguish a new physical mapping from a different
+        # serialization of the same concrete components.  Before creating a
+        # row, also lock and check the concrete topology + atom-map identity.
+        # This is the important idempotency barrier for mappings transferred
+        # through the logical-topology DAG.
+        if concrete_topology_ids_by_template is not None:
+            concrete_identity = mapped_reaction_concrete_identity_for_templates(
+                session,
+                reaction,
+                atom_maps_by_template=normalized_atom_maps,
+                concrete_topology_ids_by_template=concrete_topology_ids_by_template,
+            )
+            _acquire_identity_locks(
+                session,
+                ("mapped_reaction_concrete_identity", reaction_id, concrete_identity),
+            )
+            existing_concrete = find_mapped_reaction_by_concrete_identity(
+                session,
+                reaction_id,
+                concrete_identity,
+                refresh=True,
+            )
+            if existing_concrete is not None:
+                return existing_concrete
+
         _acquire_identity_locks(
             session,
             ("mapped_reaction", reaction_id, record.mapping_hash),
         )
-        mapped_reaction = session.exec(
+        mapped_reaction_result = session.exec(
             select(MappedReaction).where(
                 MappedReaction.logical_reaction_id == reaction_id,
                 MappedReaction.mapping_hash == record.mapping_hash,
             )
-        ).first()
+        )
+        mapped_reaction = mapped_reaction_result.first()
         if mapped_reaction is None:
             mapped_reaction = _new_entity(
                 session,
@@ -735,32 +1312,21 @@ def persist_mapped_reaction(
             )
             _flush_new_entity(session, mapped_reaction, label="MappedReaction")
 
-        participants_by_key = {
-            (participant.side, participant.participant_index): participant
-            for participant in reaction.participants
-        }
-        if component_keys != set(participants_by_key):
-            raise ValueError(
-                "precomputed mapped reaction components must match logical participants"
-            )
         for component_key in sorted(
             component_keys,
             key=lambda item: (item[0].value, item[1]),
         ):
             participant = participants_by_key[component_key]
-            expected_topology_id = topology_ids_by_template[component_key]
-            if participant.topology_id != expected_topology_id:
-                raise ValueError(
-                    "precomputed mapped reaction component resolved to a different topology"
-                )
             persist_mapped_reaction_participant(
                 session,
                 mapped_reaction,
                 participant,
                 template_index=component_key[1],
-                atom_map_numbers=list(source_atom_maps_by_template[component_key]),
+                atom_map_numbers=list(normalized_atom_maps[component_key]),
                 mapped_smiles=precomputed_mapped_smiles_by_template[component_key],
+                concrete_topology=concrete_topologies_by_key[component_key],
             )
+        _register_mapped_reaction_concrete_identity(session, mapped_reaction)
         return mapped_reaction
 
     definition = _reaction_from_representation(record.mapped_reaction_smiles)
@@ -777,16 +1343,25 @@ def persist_mapped_reaction(
     if record.mapping_hash != expected_hash:
         raise ValueError("mapping_hash does not match mapped_reaction_smiles")
 
+    normalized_source_atom_maps = (
+        {
+            key: tuple(int(number) for number in atom_maps)
+            for key, atom_maps in source_atom_maps_by_template.items()
+        }
+        if source_atom_maps_by_template is not None
+        else None
+    )
     _acquire_identity_locks(
         session,
         ("mapped_reaction", reaction_id, record.mapping_hash),
     )
-    mapped_reaction = session.exec(
+    mapped_reaction_result = session.exec(
         select(MappedReaction).where(
             MappedReaction.logical_reaction_id == reaction_id,
             MappedReaction.mapping_hash == record.mapping_hash,
         )
-    ).first()
+    )
+    mapped_reaction = mapped_reaction_result.first()
     if mapped_reaction is None:
         mapped_reaction = _new_entity(
             session, MappedReaction, logical_reaction=reaction, **record.model_dump()
@@ -804,13 +1379,23 @@ def persist_mapped_reaction(
             match = None
             template_key = (side, template_index)
             source_atom_maps = (
-                source_atom_maps_by_template.get(template_key)
-                if source_atom_maps_by_template is not None
+                normalized_source_atom_maps.get(template_key)
+                if normalized_source_atom_maps is not None
                 else None
             )
             expected_topology_id = (
                 topology_ids_by_template.get(template_key)
                 if topology_ids_by_template is not None
+                else None
+            )
+            expected_concrete_topology_value = (
+                concrete_topology_ids_by_template.get(template_key)
+                if concrete_topology_ids_by_template is not None
+                else None
+            )
+            expected_concrete_topology = (
+                _resolve_topology_value(session, expected_concrete_topology_value)
+                if expected_concrete_topology_value is not None
                 else None
             )
             for participant in unused:
@@ -820,10 +1405,15 @@ def persist_mapped_reaction(
                 ):
                     continue
                 try:
-                    atom_maps, mapped_smiles = _mapping_assignment_for_topology(
+                    atom_maps, logical_mapped_smiles = _mapping_assignment_for_topology(
                         template,
                         participant.topology,
                         source_atom_map_numbers=source_atom_maps,
+                    )
+                    mapped_smiles = (
+                        mapped_smiles_for_topology(expected_concrete_topology, atom_maps)
+                        if expected_concrete_topology is not None
+                        else logical_mapped_smiles
                     )
                 except ValueError:
                     continue
@@ -842,6 +1432,7 @@ def persist_mapped_reaction(
                 template_index=template_index,
                 atom_map_numbers=atom_maps,
                 mapped_smiles=mapped_smiles,
+                concrete_topology=expected_concrete_topology,
             )
     return mapped_reaction
 
@@ -854,12 +1445,38 @@ def persist_mapped_reaction_participant(
     template_index: int,
     atom_map_numbers: list[int],
     mapped_smiles: str,
+    concrete_topology: MolecularTopology | None = None,
+    concrete_topology_id: UUID | None = None,
 ) -> MappedReactionParticipant:
     mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
     logical_participant_id = _require_id(logical_participant, label="LogicalReactionParticipant")
     if logical_participant.logical_reaction_id != mapped_reaction.logical_reaction_id:
         raise ValueError("mapped participant must belong to the same LogicalReaction")
-    if mapped_smiles_for_topology(logical_participant.topology, atom_map_numbers) != mapped_smiles:
+    if (
+        concrete_topology is not None
+        and concrete_topology_id is not None
+        and (_require_id(concrete_topology, label="MolecularTopology") != concrete_topology_id)
+    ):
+        raise ValueError("concrete topology object and id do not match")
+    if concrete_topology is None:
+        concrete_topology = (
+            _resolve_topology_value(session, concrete_topology_id)
+            if concrete_topology_id is not None
+            else logical_participant.topology
+        )
+    if concrete_topology is None:
+        raise ValueError("mapped participant requires a concrete MolecularTopology")
+    concrete_topology_id = _require_id(concrete_topology, label="MolecularTopology")
+    from tricycle_reaction_db.application.services.reaction_topology_membership import (
+        persist_logical_participant_concrete_topology,
+    )
+
+    persist_logical_participant_concrete_topology(
+        session,
+        logical_participant,
+        concrete_topology,
+    )
+    if mapped_smiles_for_topology(concrete_topology, atom_map_numbers) != mapped_smiles:
         raise ValueError("mapped participant SMILES does not match its Topology atom maps")
     _acquire_identity_locks(
         session,
@@ -876,10 +1493,16 @@ def persist_mapped_reaction_participant(
             raise ValueError("mapped participant resolved to different side")
         if assignment.template_index != template_index:
             raise ValueError("mapped participant resolved to different template_index")
+        if assignment.concrete_topology_id not in {None, concrete_topology_id}:
+            raise ValueError("mapped participant resolved to a different concrete topology")
         if assignment.mapped_smiles != mapped_smiles:
             raise ValueError("mapped participant resolved to different mapped_smiles")
         if set(assignment.atom_map_numbers) != set(atom_map_numbers):
             raise ValueError("mapped participant resolved to a different atom-map set")
+        if assignment.concrete_topology_id is None:
+            assignment.concrete_topology_id = concrete_topology_id
+            session.add(assignment)
+            session.flush()
         return assignment
     assignment = _new_entity(
         session,
@@ -888,6 +1511,8 @@ def persist_mapped_reaction_participant(
         mapped_reaction_id=mapped_reaction_id,
         logical_reaction_participant=logical_participant,
         logical_reaction_participant_id=logical_participant_id,
+        concrete_topology=concrete_topology,
+        concrete_topology_id=concrete_topology_id,
         side=logical_participant.side,
         template_index=template_index,
         atom_map_numbers=atom_map_numbers,
@@ -1017,8 +1642,11 @@ def persist_mapped_reaction_node_geometry(
         if mapped_reaction_participant.mapped_reaction_id != node.mapped_reaction_id:
             raise ValueError("coordinate participant must belong to the same MappedReaction")
         logical_participant = mapped_reaction_participant.logical_reaction_participant
-        if logical_participant.topology_id != geometry.topology_id:
-            raise ValueError("coordinate Geometry must match the participant Topology")
+        participant_topology_id = (
+            mapped_reaction_participant.concrete_topology_id or logical_participant.topology_id
+        )
+        if participant_topology_id != geometry.topology_id:
+            raise ValueError("coordinate Geometry must match the participant concrete Topology")
         expected_side = (
             LogicalReactionParticipantSide.REACTANT
             if node.role is MappedReactionNodeRole.REACTANT
@@ -1312,9 +1940,13 @@ def persist_mapped_reaction_edge(
 
 
 __all__ = [
+    "MappedReactionConcreteIdentity",
     "ParticipantIdentity",
     "atom_maps_from_source_order",
+    "find_mapped_reaction_by_concrete_identity",
     "mapped_smiles_for_topology",
+    "mapped_reaction_concrete_identity",
+    "mapped_reaction_concrete_identity_for_templates",
     "persist_manifest_artifact_binding",
     "persist_logical_reaction",
     "persist_logical_reaction_participant",

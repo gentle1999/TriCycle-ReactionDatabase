@@ -1,6 +1,6 @@
 """NexusX commands for topology-first reaction creation."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from typing import cast
 
@@ -31,8 +31,11 @@ from tricycle_reaction_db.application.services.reaction_geometry_reconciliation 
     reconcile_mapped_reaction_with_geometries,
     resolve_endpoint_node,
 )
+from tricycle_reaction_db.application.services.reaction_stereo_projection import (
+    inversion_labile_atom_map_numbers,
+    project_logical_topology,
+)
 from tricycle_reaction_db.application.services.reactions import (
-    _canonical_mapped_reaction_smiles,
     _reaction_from_representation,
     mapped_smiles_for_topology,
     persist_logical_reaction,
@@ -67,6 +70,7 @@ class _ResolvedComponent:
     formula: MolecularFormula
     topology: MolecularTopology
     topology_atom_map_numbers: list[int]
+    logical_topology: MolecularTopology | None = None
 
 
 def _resolve_components(
@@ -236,6 +240,51 @@ def _has_complete_mapping(components: list[_ResolvedComponent]) -> bool:
     return True
 
 
+def _logicalize_components(
+    session: Session,
+    components: list[_ResolvedComponent],
+    *,
+    topology_context: GeometryPersistenceContext | None = None,
+) -> list[_ResolvedComponent]:
+    """Project inversion-labile stereo symmetrically across both endpoints.
+
+    Reactant/product labels are a storage convention, not a direction for the
+    inversion rule.  A mapped atom may satisfy an inversion rule on either
+    endpoint (normally the N is ``sp3`` on one side and ``sp2`` on the other),
+    so collect rule evidence from the complete mapped reaction first.  The
+    resulting atom-map set is then applied to every endpoint, allowing the
+    opposite endpoint to remove the stereo feature that depends on that atom.
+    """
+
+    complete_mapping = _has_complete_mapping(components)
+    if not complete_mapping:
+        return [replace(component, logical_topology=component.topology) for component in components]
+
+    labile_atom_maps: set[int] = set()
+    reaction_rule_ids: set[str] = set()
+    for component in components:
+        rule_matches = inversion_labile_atom_map_numbers(
+            component.topology,
+            component.topology_atom_map_numbers,
+        )
+        for rule_id, atom_map in rule_matches:
+            reaction_rule_ids.add(rule_id)
+            labile_atom_maps.add(atom_map)
+
+    logical_components: list[_ResolvedComponent] = []
+    for component in components:
+        logical_topology = project_logical_topology(
+            session,
+            component.topology,
+            component.topology_atom_map_numbers,
+            labile_atom_maps,
+            context=topology_context,
+            rule_ids=reaction_rule_ids,
+        )
+        logical_components.append(replace(component, logical_topology=logical_topology))
+    return logical_components
+
+
 def _automatic_reaction_label(
     components: list[_ResolvedComponent],
     reaction_hash: str,
@@ -247,9 +296,8 @@ def _automatic_reaction_label(
         LogicalReactionParticipantSide.PRODUCT: [],
     }
     for component in components:
-        sides[component.side].append(
-            (component.formula.hill_formula, component.topology.graph_hash)
-        )
+        topology = component.logical_topology or component.topology
+        sides[component.side].append((component.formula.hill_formula, topology.graph_hash))
 
     def format_side(side: LogicalReactionParticipantSide) -> str:
         return " + ".join(formula for formula, _ in sorted(sides[side], key=lambda item: item[0:2]))
@@ -284,9 +332,17 @@ def _create_reaction(
         precomputed_topology_records=precomputed_topology_records,
     )
     mapping_complete = _has_complete_mapping(components)
-    identities = [(component.side, component.topology, 1) for component in components]
+    logical_components = _logicalize_components(
+        session,
+        components,
+        topology_context=topology_context,
+    )
+    identities = [
+        (component.side, component.logical_topology or component.topology, 1)
+        for component in logical_components
+    ]
     reaction_hash = reaction_hash_for_participants(identities)
-    automatic_label = _automatic_reaction_label(components, reaction_hash)
+    automatic_label = _automatic_reaction_label(logical_components, reaction_hash)
     existing_logical = session.exec(
         select(LogicalReaction).where(LogicalReaction.reaction_hash == reaction_hash)
     ).first()
@@ -301,21 +357,22 @@ def _create_reaction(
         ),
     )
     logical_created = existing_logical is None
-    if logical_created:
-        for component in components:
-            persist_logical_reaction_participant(
-                session,
-                logical_reaction,
-                component.topology,
-                LogicalReactionParticipantRecord(
-                    side=component.side,
-                    participant_index=component.template_index,
-                ),
-            )
+    for component in logical_components:
+        persist_logical_reaction_participant(
+            session,
+            logical_reaction,
+            component.logical_topology or component.topology,
+            LogicalReactionParticipantRecord(
+                side=component.side,
+                participant_index=component.template_index,
+            ),
+            candidate_topologies=(component.topology,),
+        )
     validate_logical_reaction(logical_reaction)
 
     topology_ids = [
-        _require_id(component.topology, label="MolecularTopology") for component in components
+        _require_id(component.logical_topology or component.topology, label="MolecularTopology")
+        for component in logical_components
     ]
     if not mapping_complete:
         return CreateReactionResult(
@@ -331,38 +388,51 @@ def _create_reaction(
             mapped_reaction_created=False,
         )
 
-    precomputed_mapped_smiles_by_template = None
-    if precomputed_topology_records is not None:
-        precomputed_mapped_smiles_by_template = {
-            (component.side, component.template_index): mapped_smiles_for_topology(
-                component.topology,
-                component.topology_atom_map_numbers,
-            )
-            for component in components
-        }
-        canonical_sides: dict[LogicalReactionParticipantSide, list[tuple[int, str]]] = {
-            LogicalReactionParticipantSide.REACTANT: [],
-            LogicalReactionParticipantSide.PRODUCT: [],
-        }
-        for component_key, mapped_smiles in precomputed_mapped_smiles_by_template.items():
-            side, template_index = component_key
-            canonical_sides[side].append((template_index, mapped_smiles))
-        reactants = ".".join(
-            smiles for _, smiles in sorted(canonical_sides[LogicalReactionParticipantSide.REACTANT])
+    precomputed_mapped_smiles_by_template = {
+        (component.side, component.template_index): mapped_smiles_for_topology(
+            component.topology,
+            component.topology_atom_map_numbers,
         )
-        products = ".".join(
-            smiles for _, smiles in sorted(canonical_sides[LogicalReactionParticipantSide.PRODUCT])
-        )
-        canonical_smiles = f"{reactants}>>{products}"
-    else:
-        if definition is None:  # pragma: no cover - guarded above
-            raise AssertionError("reaction definition was not initialized")
-        canonical_smiles = _canonical_mapped_reaction_smiles(definition)
+        for component in components
+    }
+    canonical_sides: dict[LogicalReactionParticipantSide, list[tuple[int, str]]] = {
+        LogicalReactionParticipantSide.REACTANT: [],
+        LogicalReactionParticipantSide.PRODUCT: [],
+    }
+    for component_key, mapped_smiles in precomputed_mapped_smiles_by_template.items():
+        side, template_index = component_key
+        canonical_sides[side].append((template_index, mapped_smiles))
+    reactants = ".".join(
+        smiles for _, smiles in sorted(canonical_sides[LogicalReactionParticipantSide.REACTANT])
+    )
+    products = ".".join(
+        smiles for _, smiles in sorted(canonical_sides[LogicalReactionParticipantSide.PRODUCT])
+    )
+    canonical_smiles = f"{reactants}>>{products}"
     mapping_hash = sha256(canonical_smiles.encode("utf-8")).hexdigest()
+    source_atom_maps_by_template = {
+        (component.side, component.template_index): component.topology_atom_map_numbers
+        for component in components
+    }
+    topology_ids_by_template = {
+        (component.side, component.template_index): _require_id(
+            component.logical_topology or component.topology,
+            label="MolecularTopology",
+        )
+        for component in logical_components
+    }
+    concrete_topology_ids_by_template = {
+        (component.side, component.template_index): _require_id(
+            component.topology,
+            label="MolecularTopology",
+        )
+        for component in components
+    }
     existing_mapped = (
         session.exec(
             select(MappedReaction).where(
-                MappedReaction.logical_reaction_id == logical_reaction.id,
+                MappedReaction.logical_reaction_id
+                == _require_id(logical_reaction, label="LogicalReaction"),
                 MappedReaction.mapping_hash == mapping_hash,
             )
         ).first()
@@ -379,19 +449,27 @@ def _create_reaction(
             mapped_reaction_smiles=canonical_smiles,
             mapping_hash=mapping_hash,
         ),
-        source_atom_maps_by_template={
-            (component.side, component.template_index): component.topology_atom_map_numbers
-            for component in components
-        },
-        topology_ids_by_template={
-            (component.side, component.template_index): _require_id(
-                component.topology,
-                label="MolecularTopology",
-            )
-            for component in components
-        },
+        source_atom_maps_by_template=source_atom_maps_by_template,
+        topology_ids_by_template=topology_ids_by_template,
+        concrete_topology_ids_by_template=concrete_topology_ids_by_template,
         precomputed_mapped_smiles_by_template=precomputed_mapped_smiles_by_template,
     )
+    # A logical reaction may have been created after other concrete topology
+    # rows were already persisted.  Expand those existing DAG members now
+    # whenever the caller is not deferring the batch barrier.  The deferred
+    # path performs the same reaction-level pass after all pending rows are
+    # flushed, because fast insertion deliberately hides them from SQL reads.
+    if not defer_geometry_reconciliation:
+        from tricycle_reaction_db.application.services.reaction_mapping_resolution import (
+            ensure_mapped_reactions_for_logical_reaction,
+        )
+
+        ensure_mapped_reactions_for_logical_reaction(
+            session,
+            logical_reaction,
+            reconciliation_cache=reconciliation_cache,
+            refresh_thermodynamics=not defer_thermodynamic_refresh,
+        )
     reactant_node = resolve_endpoint_node(
         session,
         mapped_reaction,
@@ -430,7 +508,11 @@ def _create_reaction(
         topologies_created=topologies_created,
         mapping_complete=True,
         logical_reaction_created=logical_created,
-        mapped_reaction_created=(existing_mapped is None if include_creation_metadata else False),
+        mapped_reaction_created=(
+            existing_mapped is None and mapped_reaction.mapping_hash == mapping_hash
+            if include_creation_metadata
+            else False
+        ),
     )
 
 

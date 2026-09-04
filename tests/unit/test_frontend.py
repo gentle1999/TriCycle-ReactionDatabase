@@ -9,6 +9,7 @@ from tricycle_reaction_db.application.services.depictions import (
     draw_geometry_xyz,
     draw_molecule_molfile,
     draw_molecule_svg,
+    draw_reaction_svg,
     draw_transition_state_mode_dof_svg,
 )
 
@@ -47,6 +48,27 @@ def test_rdkit_molfile_has_2d_coordinates_without_mutating_molecule() -> None:
     )
     assert Chem.MolToSmiles(molecule) == original_smiles
     assert molecule.GetNumConformers() == original_conformer_count
+
+
+def test_rdkit_reaction_depiction_returns_stereo_aware_svg() -> None:
+    reaction_smiles = "F/C([CH3:1])=[C:2](Cl)\\Br>>F/C([CH3:1])=[C:2](Cl)\\Br"
+
+    svg = draw_reaction_svg(reaction_smiles)
+
+    assert svg.startswith("<?xml")
+    assert "<svg" in svg
+    assert "bond-" in svg
+    assert len(svg) > 1_000
+
+
+def test_rdkit_reaction_depiction_keeps_explicit_reactant_hydrogens() -> None:
+    explicit = "[C:1](=[C:2]([H:3])[H:4])([H:5])[H:6]>>[C:1]([H:5])([H:6])=[C:2]([H:3])[H:4]"
+    implicit = "[CH2:1]=[CH2:2]>>[CH2:1]=[CH2:2]"
+
+    explicit_svg = draw_reaction_svg(explicit)
+    implicit_svg = draw_reaction_svg(implicit)
+
+    assert explicit_svg.count("class='atom-") > implicit_svg.count("class='atom-")
 
 
 def test_geometry_sdf_preserves_stored_three_dimensional_conformer() -> None:
@@ -189,6 +211,7 @@ def test_combined_app_exposes_core_rest_routes() -> None:
     assert "/api/depictions/geometry/{geometry_id}.sdf" in paths
     assert "/api/depictions/geometry/{geometry_id}.xyz" in paths
     assert "/api/depictions/geometry/{geometry_id}.svg" in paths
+    assert "/api/depictions/reaction.svg" in paths
     assert "/api/artifacts" in paths
     assert "/api/artifacts/batch" in paths
     assert "/api/artifacts/validate" in paths
@@ -240,6 +263,21 @@ async def test_reaction_representation_conversion_round_trips_reaction_smiles_an
 
     assert rxn_response.status_code == 200
     assert rxn_response.json()["reaction_smiles"] == "C=C>>CC"
+
+
+@pytest.mark.asyncio
+async def test_reaction_depiction_endpoint_returns_svg() -> None:
+    transport = ASGITransport(app=create_app())
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/api/depictions/reaction.svg",
+            params={"reaction_smiles": "F/C=C/F>>F/C=C/F"},
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("image/svg+xml")
+    assert response.text.startswith("<?xml")
+    assert response.headers["x-depiction-renderer"] == "rdkit-reaction"
 
 
 @pytest.mark.asyncio

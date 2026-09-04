@@ -6,10 +6,10 @@ from typing import Any, Literal
 from molgr.config import CONFIG as MOLGR_CONFIG
 from molop.config import molopconfig
 from molop.io.base_models.ChemFileFrame import BaseCalcFrame
-from molop.unit import atom_ureg
 from rdkit import Chem
 
 from tricycle_reaction_db.application.dtos.chemistry import NormalizedMoleculeRecord
+from tricycle_reaction_db.core.units import ANGSTROM, magnitude_in
 from tricycle_reaction_db.ingestion.normalization import (
     normalize_molecule,
     normalize_molgr_stereochemistry,
@@ -60,7 +60,7 @@ def normalize_molop_frame(frame: BaseCalcFrame[Any]) -> NormalizedMoleculeRecord
     # RDKit's SMILES writer may still need neighboring BondDir metadata. Keep
     # this as the single MolGR -> ingestion stereo boundary.
     mol = normalize_molgr_stereochemistry(rdmol)
-    coordinates = frame.coords.to(atom_ureg.angstrom).magnitude
+    coordinates = magnitude_in(frame.coords, ANGSTROM)
     reconstruction_backend = frame.topology_reconstruction_backend or "unknown"
     reconstruction_status = getattr(
         frame.topology_reconstruction_status,

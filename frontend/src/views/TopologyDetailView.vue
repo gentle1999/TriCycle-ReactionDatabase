@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ArrowLeft, ArrowUpRight, Network } from "@lucide/vue";
+import { ArrowLeft, ArrowUpRight, Check, Clipboard, Network } from "@lucide/vue";
 import { useQuery } from "@tanstack/vue-query";
-import { computed, ref, watch } from "vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { RouterLink, useRoute, useRouter } from "vue-router";
 
 import { api } from "@/api";
@@ -88,6 +88,9 @@ const reactionsQuery = usePaginatedQuery({
 const topology = computed(() => topologyQuery.data.value ?? null);
 const geometries = computed(() => geometriesQuery.data.value?.items ?? []);
 const reactions = computed(() => reactionsQuery.data.value?.items ?? []);
+const copiedSmiles = ref(false);
+const smilesCopyError = ref("");
+let smilesCopyResetTimer: number | null = null;
 const geometryPage = computed(() => geometriesQuery.data.value?.page ?? {
   total: 0,
   limit: relatedPageLimit,
@@ -99,6 +102,41 @@ const reactionPage = computed(() => reactionsQuery.data.value?.page ?? {
   offset: reactionOffset.value,
 });
 const detailError = computed(() => topologyQuery.error.value instanceof Error ? topologyQuery.error.value.message : "");
+
+async function copyText(value: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("clipboard unavailable");
+}
+
+async function copyTopologySmiles(): Promise<void> {
+  const smiles = topology.value?.canonical_isomeric_smiles;
+  if (!smiles) return;
+  smilesCopyError.value = "";
+  try {
+    await copyText(smiles);
+    copiedSmiles.value = true;
+    if (smilesCopyResetTimer !== null) window.clearTimeout(smilesCopyResetTimer);
+    smilesCopyResetTimer = window.setTimeout(() => {
+      copiedSmiles.value = false;
+      smilesCopyResetTimer = null;
+    }, 1600);
+  } catch {
+    copiedSmiles.value = false;
+    smilesCopyError.value = "浏览器不允许自动复制，请手动选择完整 SMILES。";
+  }
+}
 
 watch([currentProjectId, topologyId], () => {
   geometryOffset.value = 0;
@@ -136,6 +174,10 @@ function jumpReactionPage(offset: number): void {
 function openGeometry(id: string): void {
   void router.push({ name: "geometry-detail", params: { geometryId: id }, query: navigationQuery.value });
 }
+
+onBeforeUnmount(() => {
+  if (smilesCopyResetTimer !== null) window.clearTimeout(smilesCopyResetTimer);
+});
 </script>
 
 <template>
@@ -157,10 +199,26 @@ function openGeometry(id: string): void {
       <section class="topology-overview">
         <div class="topology-structure-panel">
           <ChemDoodleMolecule :topology-id="topology.id" :label="topology.canonical_isomeric_smiles ?? undefined" :height="360" />
-          <code
-            class="topology-smiles-value"
-            :title="topology.canonical_isomeric_smiles ?? undefined"
-          >{{ topology.canonical_isomeric_smiles ?? "SMILES 不可用" }}</code>
+          <div class="topology-smiles-row">
+            <code
+              class="topology-smiles-value"
+              :title="topology.canonical_isomeric_smiles ?? undefined"
+            >{{ topology.canonical_isomeric_smiles ?? "SMILES 不可用" }}</code>
+            <button
+              class="command-button command-button-muted topology-smiles-copy-button"
+              type="button"
+              :disabled="!topology.canonical_isomeric_smiles"
+              :title="copiedSmiles ? '已复制完整 SMILES' : '复制完整 SMILES'"
+              :aria-label="copiedSmiles ? '已复制完整 SMILES' : '复制完整 SMILES'"
+              @click="copyTopologySmiles"
+            >
+              <Check v-if="copiedSmiles" :size="14" aria-hidden="true" />
+              <Clipboard v-else :size="14" aria-hidden="true" />
+              {{ copiedSmiles ? "已复制" : "复制" }}
+            </button>
+          </div>
+          <p v-if="smilesCopyError" class="topology-smiles-copy-status is-error" role="alert">{{ smilesCopyError }}</p>
+          <p v-else-if="copiedSmiles" class="topology-smiles-copy-status" role="status" aria-live="polite">完整 SMILES 已复制。</p>
         </div>
         <div class="topology-facts-panel">
           <header><strong>{{ topology.hill_formula }}</strong><code :title="topology.id">{{ topology.id }}</code></header>

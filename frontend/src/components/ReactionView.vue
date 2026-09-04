@@ -5,23 +5,17 @@ import { RouterLink } from "vue-router";
 
 import { api } from "@/api";
 import QueryValidationIndicator from "@/components/QueryValidationIndicator.vue";
-import type { LogicalReactionDetail, LogicalReactionSummary, MappedReactionDetail, PageInfo } from "@/types";
+import type { LogicalReactionSummary, PageInfo } from "@/types";
 import type { ReactionQueryFilters, ReactionSort, ReactionSortBy } from "@/reactionQuery";
 
-import MappedReactionExpansion from "./MappedReactionExpansion.vue";
 import ReactionAdvancedQueryModal from "./ReactionAdvancedQueryModal.vue";
 import ReactionPathCard from "./ReactionPathCard.vue";
 import PaginationControls from "./PaginationControls.vue";
 
 const props = defineProps<{
   reactions: LogicalReactionSummary[];
-  selectedReactionId: string | null;
-  reaction: LogicalReactionDetail | null;
-  mappedReaction: MappedReactionDetail | null;
-  selectedMappedId: string | null;
   loading: boolean;
   querying: boolean;
-  mappedLoading: boolean;
   projectId: string | null;
   total: number;
   page: PageInfo;
@@ -30,9 +24,6 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
-  selectReaction: [id: string];
-  selectMapped: [id: string];
-  openFrame: [id: string];
   previousPage: [];
   nextPage: [];
   jumpPage: [offset: number];
@@ -44,6 +35,8 @@ const quickReactionInput = ref(props.queryFilters.similarityReactionSmiles ?? pr
 const hasActivationGibbsFreeEnergy = ref(props.queryFilters.hasActivationGibbsFreeEnergy ?? false);
 const hasReactionGibbsFreeEnergy = ref(props.queryFilters.hasReactionGibbsFreeEnergy ?? false);
 const reactantProductChanged = ref<boolean | null>(props.queryFilters.reactantProductChanged ?? null);
+const minimumMappedReactionCount = ref<number | string | null>(props.queryFilters.minimumMappedReactionCount ?? null);
+const maximumMappedReactionCount = ref<number | string | null>(props.queryFilters.maximumMappedReactionCount ?? null);
 const validationError = ref("");
 type QueryValidationStatus = "idle" | "pending" | "valid" | "invalid";
 const quickValidation = ref<{ status: QueryValidationStatus; message: string }>({ status: "idle", message: "" });
@@ -54,8 +47,8 @@ let quickValidationGeneration = 0;
 const advancedConditionCount = computed(() => props.queryFilters.filterExpression?.conditions.length ?? 0);
 const resultTitle = computed(() => {
   if (advancedConditionCount.value) return "高级查询结果";
-  if (props.queryFilters.similarityReactionSmiles) return "反应相似度查询结果";
-  if (props.queryFilters.reactionSmarts) return "反应结构查询结果";
+  if (props.queryFilters.similarityReactionSmiles) return "映射反应相似度查询结果";
+  if (props.queryFilters.reactionSmarts) return "映射反应结构查询结果";
   return "反应路径";
 });
 
@@ -71,13 +64,57 @@ watch(() => props.queryFilters.hasReactionGibbsFreeEnergy, (value) => {
 watch(() => props.queryFilters.reactantProductChanged, (value) => {
   reactantProductChanged.value = value ?? null;
 });
+watch(() => props.queryFilters.minimumMappedReactionCount, (value) => {
+  minimumMappedReactionCount.value = value ?? null;
+});
+watch(() => props.queryFilters.maximumMappedReactionCount, (value) => {
+  maximumMappedReactionCount.value = value ?? null;
+});
 
 function selectedEnergyFilters(): ReactionQueryFilters {
+  const minimumMappedCount = mappedReactionCountValue(minimumMappedReactionCount.value);
+  const maximumMappedCount = mappedReactionCountValue(maximumMappedReactionCount.value);
   return {
     ...(hasActivationGibbsFreeEnergy.value ? { hasActivationGibbsFreeEnergy: true } : { hasActivationGibbsFreeEnergy: undefined }),
     ...(hasReactionGibbsFreeEnergy.value ? { hasReactionGibbsFreeEnergy: true } : { hasReactionGibbsFreeEnergy: undefined }),
     ...(reactantProductChanged.value === null ? { reactantProductChanged: undefined } : { reactantProductChanged: reactantProductChanged.value }),
+    ...(minimumMappedCount === undefined ? { minimumMappedReactionCount: undefined } : { minimumMappedReactionCount: minimumMappedCount }),
+    ...(maximumMappedCount === undefined ? { maximumMappedReactionCount: undefined } : { maximumMappedReactionCount: maximumMappedCount }),
   };
+}
+
+function mappedReactionCountValue(value: number | string | null): number | undefined {
+  if (value === null || (typeof value === "string" && !value.trim())) return undefined;
+  return typeof value === "number" ? value : Number(value);
+}
+
+function validateMappedReactionCountRange(): boolean {
+  for (const [value, label] of [
+    [mappedReactionCountValue(minimumMappedReactionCount.value), "最少映射反应数"],
+    [mappedReactionCountValue(maximumMappedReactionCount.value), "最多映射反应数"],
+  ] as const) {
+    if (value !== undefined && (!Number.isInteger(value) || value < 0)) {
+      validationError.value = `${label}必须是非负整数`;
+      return false;
+    }
+  }
+  const minimumMappedCount = mappedReactionCountValue(minimumMappedReactionCount.value);
+  const maximumMappedCount = mappedReactionCountValue(maximumMappedReactionCount.value);
+  if (
+    minimumMappedCount !== undefined
+    && maximumMappedCount !== undefined
+    && minimumMappedCount > maximumMappedCount
+  ) {
+    validationError.value = "最少映射反应数不能大于最多映射反应数";
+    return false;
+  }
+  return true;
+}
+
+function applyOuterFilters(): void {
+  if (!validateMappedReactionCountRange()) return;
+  validationError.value = "";
+  emit("applyFilters", outerReactionFilters());
 }
 
 function outerReactionFilters(): ReactionQueryFilters {
@@ -138,11 +175,8 @@ function scheduleQuickValidation(value: string): void {
   }, 320);
 }
 
-function chooseReaction(id: string): void {
-  emit("selectReaction", id);
-}
-
 async function applyQuickQuery(): Promise<void> {
+  if (!validateMappedReactionCountRange()) return;
   if (quickValidationTimer !== null) window.clearTimeout(quickValidationTimer);
   quickValidationTimer = null;
   const reactionSmarts = quickReactionInput.value.trim();
@@ -168,25 +202,26 @@ function clearFilters(): void {
   hasActivationGibbsFreeEnergy.value = false;
   hasReactionGibbsFreeEnergy.value = false;
   reactantProductChanged.value = null;
+  minimumMappedReactionCount.value = null;
+  maximumMappedReactionCount.value = null;
   validationError.value = "";
   advancedQueryOpen.value = false;
   emit("applyFilters", {});
 }
 
 function applyAdvancedQuery(filters: ReactionQueryFilters): void {
+  if (!validateMappedReactionCountRange()) return;
   quickReactionInput.value = "";
   validationError.value = "";
   advancedQueryOpen.value = false;
   emit("applyFilters", {
     ...filters,
-    ...(hasActivationGibbsFreeEnergy.value ? { hasActivationGibbsFreeEnergy: true } : {}),
-    ...(hasReactionGibbsFreeEnergy.value ? { hasReactionGibbsFreeEnergy: true } : {}),
-    ...(reactantProductChanged.value === null ? {} : { reactantProductChanged: reactantProductChanged.value }),
+    ...selectedEnergyFilters(),
   });
 }
 
 function applyOuterEnergyFilters(): void {
-  emit("applyFilters", outerReactionFilters());
+  applyOuterFilters();
 }
 
 function updateSortBy(event: Event): void {
@@ -216,13 +251,13 @@ onBeforeUnmount(() => {
       <div class="panel-heading">
         <span class="eyebrow">LogicalReaction</span>
         <h1 id="reaction-view-title">反应路径</h1>
-        <p>输入反应 SMILES 快速查询，复杂条件使用高级查询。</p>
+        <p>结构条件按 MappedReaction 查询，再按 LogicalReaction 归并；复杂条件使用高级查询。</p>
       </div>
       <form class="reaction-filter-form" @submit.prevent="applyQuickQuery">
         <label class="search-field" :class="`is-validation-${quickValidation.status}`">
           <Search :size="15" aria-hidden="true" />
-          <span class="sr-only">反应 SMILES 快速查询</span>
-          <input v-model="quickReactionInput" type="search" placeholder="反应物&gt;&gt;产物，例如 C=C&gt;&gt;CC" aria-label="反应 SMILES 快速查询" :aria-invalid="quickValidation.status === 'invalid'">
+          <span class="sr-only">映射反应 SMILES 快速查询</span>
+          <input v-model="quickReactionInput" type="search" placeholder="映射反应物&gt;&gt;产物，例如 C=C&gt;&gt;CC" aria-label="映射反应 SMILES 快速查询" :aria-invalid="quickValidation.status === 'invalid'">
           <QueryValidationIndicator :status="quickValidation.status" :message="quickValidation.message" />
         </label>
         <div class="filter-actions">
@@ -253,6 +288,36 @@ onBeforeUnmount(() => {
           <option :value="false">未发生变化</option>
         </select>
       </label>
+      <div class="reaction-mapping-count-filters" aria-label="映射反应数量筛选">
+        <span class="filter-field-label">映射反应数</span>
+        <div class="reaction-mapping-count-range">
+          <label>
+            <span>至少</span>
+            <input
+              v-model.number="minimumMappedReactionCount"
+              type="number"
+              min="0"
+              step="1"
+              placeholder="不限"
+              aria-label="最少映射反应数"
+              @change="applyOuterFilters"
+            >
+          </label>
+          <span class="reaction-mapping-count-range-separator" aria-hidden="true">–</span>
+          <label>
+            <span>最多</span>
+            <input
+              v-model.number="maximumMappedReactionCount"
+              type="number"
+              min="0"
+              step="1"
+              placeholder="不限"
+              aria-label="最多映射反应数"
+              @change="applyOuterFilters"
+            >
+          </label>
+        </div>
+      </div>
       <div v-if="advancedConditionCount" class="advanced-query-active">
         <span>高级查询</span><strong>{{ advancedConditionCount }} 个条件</strong>
         <button class="icon-button" type="button" title="清除高级查询" aria-label="清除高级查询" @click="clearFilters"><X :size="14" aria-hidden="true" /></button>
@@ -280,29 +345,12 @@ onBeforeUnmount(() => {
       <div v-if="loading && !reactions.length" class="workspace-loading"><div class="loading-block is-wide"></div><div class="loading-block is-wide"></div></div>
       <div v-else-if="!reactions.length" class="workspace-empty"><FlaskConical :size="32" /><strong>没有匹配的逻辑反应</strong><p>请调整反应 SMILES，或使用高级查询组合其他条件。</p></div>
       <div v-else class="reaction-card-list">
-        <div
-          v-for="item in reactions"
-          :key="item.id"
-          class="reaction-card-group"
-          :class="{ 'is-expanded': item.id === selectedReactionId && reaction?.id === item.id }"
-        >
+        <template v-for="item in reactions" :key="item.id">
           <ReactionPathCard
             :reaction="item"
             :project-id="projectId"
-            :active="item.id === selectedReactionId"
-            @select="chooseReaction"
           />
-          <MappedReactionExpansion
-            v-if="reaction && reaction.id === item.id && item.id === selectedReactionId"
-            :reaction="reaction"
-            :mapped-reaction="mappedReaction"
-            :selected-mapped-id="selectedMappedId"
-            :mapped-loading="mappedLoading"
-            :project-id="projectId"
-            @select-mapped="emit('selectMapped', $event)"
-            @open-frame="emit('openFrame', $event)"
-          />
-        </div>
+        </template>
       </div>
       <PaginationControls :page="page" label="反应分页（底部）" @previous="emit('previousPage')" @next="emit('nextPage')" @jump="emit('jumpPage', $event)" />
     </section>

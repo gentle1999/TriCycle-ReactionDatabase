@@ -22,6 +22,13 @@ from tricycle_reaction_db.application.dtos.chemistry import (
     NormalizedMoleculeRecord,
     NormalizedTopologyRecord,
 )
+from tricycle_reaction_db.core.chemistry_config import (
+    FORMULA_COMPOSITION_VERSION,
+    GEOMETRY_CANONICALIZATION_VERSION,
+    TOPOLOGY_DERIVATION_VERSION,
+    TOPOLOGY_IDENTITY_VERSION,
+    TOPOLOGY_SOURCE_ORDER_STEREO_IDENTITY_VERSION,
+)
 from tricycle_reaction_db.domain.enums import StereoStatus, TopologySanitizationStatus
 from tricycle_reaction_db.domain.formulas import element_count_vector_from_composition
 from tricycle_reaction_db.domain.internal_coordinates import (
@@ -32,11 +39,6 @@ from tricycle_reaction_db.domain.internal_coordinates import (
     proper_rigid_alignment,
 )
 
-FORMULA_COMPOSITION_VERSION = "formula-composition-v1"
-TOPOLOGY_IDENTITY_VERSION = "topology-identity-v1"
-TOPOLOGY_SOURCE_ORDER_STEREO_IDENTITY_VERSION = "topology-source-order-stereo-identity-v1"
-TOPOLOGY_DERIVATION_VERSION = "topology-derivation-v1"
-GEOMETRY_CANONICALIZATION_VERSION = "geometry-internal-coordinates-v1"
 _INTERNAL_COORDINATE_ROUNDTRIP_TOLERANCE_ANGSTROM = 1e-7
 
 
@@ -141,6 +143,37 @@ def _renumber_atoms_preserving_stereochemistry(
             continue
         _copy_rdkit_property(mol, renumbered, prop_name)
     return renumbered
+
+
+def _clear_bond_directions(mol: Chem.Mol) -> None:
+    """Remove SMILES-writer directions from a stereo-authoritative graph.
+
+    ``BondDir`` is projection metadata.  MolGR's coordinate pass assigns the
+    actual E/Z value to ``BondStereo`` and RDKit may choose a different set of
+    neighboring directional bonds for another atom traversal.  Retaining
+    those directions across a canonical projection lets a later SMILES write
+    override the source atom identities, which is especially dangerous for
+    symmetric conjugated systems.
+    """
+
+    for bond in mol.GetBonds():  # type: ignore[no-untyped-call]
+        bond.SetBondDir(Chem.BondDir.NONE)
+
+
+def _copy_bond_directions(source: Chem.Mol, target: Chem.Mol) -> None:
+    """Copy writer directions by atom pair without copying stereo caches."""
+
+    if source.GetNumAtoms() != target.GetNumAtoms():
+        raise ValueError("direction source and target atom counts differ")
+    _clear_bond_directions(target)
+    for source_bond in source.GetBonds():  # type: ignore[no-untyped-call]
+        target_bond = target.GetBondBetweenAtoms(
+            source_bond.GetBeginAtomIdx(),
+            source_bond.GetEndAtomIdx(),
+        )
+        if target_bond is None:
+            raise ValueError("direction source and target graphs differ")
+        target_bond.SetBondDir(source_bond.GetBondDir())
 
 
 def _canonical_smiles_atom_order(mol: Chem.Mol) -> list[int] | None:
@@ -540,6 +573,11 @@ def infer_molgr_stereochemistry_from_3d(mol: Chem.Mol) -> Chem.Mol:
         stereo = _LEGACY_DOUBLE_BOND_STEREO_TO_E_Z.get(bond.GetStereo())
         if stereo is not None:
             bond.SetStereo(stereo)
+    # ``AssignStereochemistryFrom3D`` also leaves a traversal-specific set of
+    # BondDir flags.  They are not an additional coordinate measurement and
+    # become misleading as soon as atoms are reordered or reaction maps are
+    # attached.  Freeze only BondStereo as the source-of-truth state.
+    _clear_bond_directions(inferred)
     inferred.SetBoolProp("_tricycle_molgr_stereo_normalized", True)
     return inferred
 
@@ -602,6 +640,7 @@ def normalize_molgr_stereochemistry(mol: Chem.Mol) -> Chem.Mol:
         stereo = _LEGACY_DOUBLE_BOND_STEREO_TO_E_Z.get(bond.GetStereo())
         if stereo is not None:
             bond.SetStereo(stereo)
+    _clear_bond_directions(normalized)
     normalized.SetBoolProp("_tricycle_molgr_stereo_normalized", True)
     return normalized
 
@@ -610,23 +649,85 @@ def _has_serialized_e_z_marker(smiles: str | None) -> bool:
     return smiles is not None and ("/" in smiles or "\\" in smiles)
 
 
-def _serialized_e_z_stereo(
+DoubleBondStereoSignature = tuple[
+    Chem.BondStereo,
+    tuple[int, int],
+    tuple[int, int],
+]
+
+
+def _stereo_identity_numbers(
+    mol: Chem.Mol,
+    *,
+    preserve_atom_maps: bool,
+) -> list[int]:
+    """Return stable atom identities used by a stereo projection comparison."""
+
+    existing_maps = [
+        atom.GetAtomMapNum()
+        for atom in mol.GetAtoms()  # type: ignore[no-untyped-call]
+    ]
+    if preserve_atom_maps:
+        if any(number <= 0 for number in existing_maps) or len(set(existing_maps)) != len(
+            existing_maps
+        ):
+            raise ValueError("preserve_atom_maps requires unique positive atom maps")
+        return existing_maps
+    return list(range(1, mol.GetNumAtoms() + 1))
+
+
+def _e_z_stereo_signature(
+    mol: Chem.Mol,
+    *,
+    preserve_atom_maps: bool,
+) -> dict[frozenset[int], DoubleBondStereoSignature]:
+    """Describe E/Z with its double-bond endpoints and control atoms.
+
+    ``BondStereo`` alone identifies only the double-bond edge.  It does not
+    identify which substituent on either endpoint is the stereo reference.
+    That distinction matters for substituted conjugated systems: moving one
+    slash to the other substituent changes the physical geometry while the
+    edge-level E/Z enum can remain unchanged.
+    """
+
+    identities = _stereo_identity_numbers(
+        mol,
+        preserve_atom_maps=preserve_atom_maps,
+    )
+    result: dict[frozenset[int], DoubleBondStereoSignature] = {}
+    for bond in mol.GetBonds():  # type: ignore[no-untyped-call]
+        stereo = {
+            Chem.BondStereo.STEREOCIS: Chem.BondStereo.STEREOZ,
+            Chem.BondStereo.STEREOTRANS: Chem.BondStereo.STEREOE,
+        }.get(bond.GetStereo(), bond.GetStereo())
+        if stereo not in _SERIALIZED_DOUBLE_BOND_STEREO:
+            continue
+        begin = bond.GetBeginAtomIdx()
+        end = bond.GetEndAtomIdx()
+        stereo_atoms = tuple(identities[index] for index in bond.GetStereoAtoms())
+        if len(stereo_atoms) != 2:
+            stereo_atoms = (-1, -1)
+        result[frozenset((identities[begin], identities[end]))] = (
+            stereo,
+            stereo_atoms,
+            (identities[begin], identities[end]),
+        )
+    return result
+
+
+def _serialized_e_z_stereo_signature(
     mol: Chem.Mol,
     *,
     preserve_atom_maps: bool = False,
-) -> dict[frozenset[int], Chem.BondStereo]:
-    """Return SMILES-round-tripped E/Z assignments keyed by atom identities."""
+) -> dict[frozenset[int], DoubleBondStereoSignature]:
+    """Return the complete stereo signature after an explicit-H SMILES round trip."""
 
     projected = Chem.Mol(mol)
-    existing_maps = [
-        atom.GetAtomMapNum()
-        for atom in projected.GetAtoms()  # type: ignore[no-untyped-call]
-    ]
-    if not (
-        preserve_atom_maps
-        and all(number > 0 for number in existing_maps)
-        and len(set(existing_maps)) == len(existing_maps)
-    ):
+    _stereo_identity_numbers(
+        projected,
+        preserve_atom_maps=preserve_atom_maps,
+    )
+    if not preserve_atom_maps:
         for atom_index, atom in enumerate(
             projected.GetAtoms(),  # type: ignore[no-untyped-call]
             start=1,
@@ -638,55 +739,50 @@ def _serialized_e_z_stereo(
     if not _has_serialized_e_z_marker(smiles):
         return {}
     try:
-        # Let the SMILES parser assign the double-bond stereo from the emitted
-        # directions. Keep explicit hydrogens: dropping them here makes a
-        # valid all-hydrogen stereo pair look unassigned and makes the map-key
-        # comparison silently incomplete.
         parser: Any = Chem.SmilesParserParams()
         parser.removeHs = False
         parser.sanitize = True
         serialized = Chem.MolFromSmiles(smiles, parser)
         if serialized is None:
             return {}
-        result: dict[frozenset[int], Chem.BondStereo] = {}
-        for bond in serialized.GetBonds():  # type: ignore[no-untyped-call]
-            stereo = bond.GetStereo()
-            if stereo not in _SERIALIZED_DOUBLE_BOND_STEREO:
-                continue
-            # ``SetBondStereoFromDirections`` reports the legacy CIS/TRANS
-            # enum for a direction-only parse when sanitization is disabled.
-            # Normalize that spelling to the E/Z value stored by MolGR before
-            # comparing the assigned state with the serialized projection.
-            stereo = {
-                Chem.BondStereo.STEREOCIS: Chem.BondStereo.STEREOZ,
-                Chem.BondStereo.STEREOTRANS: Chem.BondStereo.STEREOE,
-            }.get(stereo, stereo)
-            result[
-                frozenset(
-                    (
-                        serialized.GetAtomWithIdx(bond.GetBeginAtomIdx()).GetAtomMapNum(),
-                        serialized.GetAtomWithIdx(bond.GetEndAtomIdx()).GetAtomMapNum(),
-                    )
-                )
-            ] = stereo
-        return result
+        return _e_z_stereo_signature(serialized, preserve_atom_maps=True)
     except Exception:
         return {}
 
 
-def _serialized_double_bond_keys_match(
-    serialized: dict[frozenset[int], Chem.BondStereo],
-    expected: dict[frozenset[int], Chem.BondStereo],
+def _flip_e_z_stereo(stereo: Chem.BondStereo) -> Chem.BondStereo:
+    """Flip E/Z when exactly one endpoint's control substituent changes."""
+
+    return Chem.BondStereo.STEREOZ if stereo is Chem.BondStereo.STEREOE else Chem.BondStereo.STEREOE
+
+
+def _stereo_signatures_match(
+    serialized: dict[frozenset[int], DoubleBondStereoSignature],
+    expected: dict[frozenset[int], DoubleBondStereoSignature],
 ) -> bool:
-    """Check that every assigned double bond retains its E/Z designation.
+    """Compare physical double-bond geometry, not only edge-level E/Z."""
 
-    The atom-map key identifies the double bond independently of canonical
-    traversal. The value must also match: a stale or contradictory BondDir can
-    otherwise make the SMILES writer emit the opposite E/Z state while the
-    source molecule still reports its original BondStereo value.
-    """
-
-    return serialized == expected
+    if set(serialized) != set(expected):
+        return False
+    for edge, (expected_stereo, expected_pair, expected_order) in expected.items():
+        observed_stereo, observed_pair, observed_order = serialized[edge]
+        if -1 in expected_pair or -1 in observed_pair:
+            return False
+        if observed_order == expected_order:
+            source_pair_in_observed_order = expected_pair
+        elif observed_order == (expected_order[1], expected_order[0]):
+            source_pair_in_observed_order = (expected_pair[1], expected_pair[0])
+        else:
+            return False
+        changes_one_side = (observed_pair[0] != source_pair_in_observed_order[0]) ^ (
+            observed_pair[1] != source_pair_in_observed_order[1]
+        )
+        effective_stereo = (
+            _flip_e_z_stereo(observed_stereo) if changes_one_side else observed_stereo
+        )
+        if effective_stereo is not expected_stereo:
+            return False
+    return True
 
 
 def _canonical_isomeric_smiles_signature(smiles: str | None) -> str | None:
@@ -723,63 +819,6 @@ def _canonical_isomeric_smiles_signature(smiles: str | None) -> str | None:
     return None
 
 
-def _canonical_isomeric_smiles_for_molecule(mol: Chem.Mol) -> str | None:
-    """Return the canonical isomeric signature emitted by an RDKit graph."""
-
-    return _canonical_isomeric_smiles_signature(_graph_smiles(mol, all_hydrogens_explicit=True))
-
-
-def _restore_double_bond_directions_from_smiles_reference(
-    mol: Chem.Mol,
-    reference_smiles: str,
-    stereo_bonds: list[Chem.Bond],
-) -> bool:
-    """Copy SMILES slash directions onto a graph with the same atom order."""
-
-    # The persisted projection explicitly contains every coordinate-bearing
-    # hydrogen. RDKit's default SMILES parser removes those H atoms, which
-    # makes a valid reference look like a different graph and silently skips
-    # this repair path.
-    parser: Any = Chem.SmilesParserParams()
-    parser.removeHs = False
-    parser.sanitize = False
-    reference = Chem.MolFromSmiles(reference_smiles, parser)
-    if reference is None or reference.GetNumAtoms() != mol.GetNumAtoms():
-        return False
-    try:
-        # The stored canonical projection has the same graph but may use a
-        # different atom order.  Ignore stereo while finding the graph
-        # correspondence; the directions are precisely what we are restoring.
-        source_to_reference = reference.GetSubstructMatch(mol, useChirality=False)
-    except (RuntimeError, ValueError):
-        return False
-    if len(source_to_reference) != mol.GetNumAtoms():
-        return False
-
-    # The canonical reference may choose a different equivalent substituent
-    # as the SMILES stereo-atom pair than the source graph.  Copy every
-    # directional single bond, rather than only the pair currently stored on
-    # each source double bond, so branched conjugated systems are covered too.
-    reference_to_source = {
-        reference_index: source_index
-        for source_index, reference_index in enumerate(source_to_reference)
-    }
-    for bond in mol.GetBonds():  # type: ignore[no-untyped-call]
-        bond.SetBondDir(Chem.BondDir.NONE)
-    for reference_bond in reference.GetBonds():  # type: ignore[no-untyped-call]
-        direction = reference_bond.GetBondDir()
-        if direction == Chem.BondDir.NONE:
-            continue
-        source_bond = mol.GetBondBetweenAtoms(
-            reference_to_source[reference_bond.GetBeginAtomIdx()],
-            reference_to_source[reference_bond.GetEndAtomIdx()],
-        )
-        if source_bond is None:
-            return False
-        source_bond.SetBondDir(direction)
-    return True
-
-
 def _solve_double_bond_direction_constraints(
     mol: Chem.Mol,
     stereo_bonds: list[Chem.Bond],
@@ -788,258 +827,139 @@ def _solve_double_bond_direction_constraints(
 ) -> bool:
     """Set writer directions while respecting bonds shared by two E/Z bonds.
 
-    RDKit's SMILES writer consumes neighboring ``BondDir`` values, not the
-    source bond's ``BondStereo`` cache.  Clear the latter while probing and
-    while committing the solution; otherwise the writer can keep emitting the
-    old local stereo assignment regardless of the solved directions.
+    RDKit's SMILES writer consumes neighboring ``BondDir`` values, not only
+    the source bond's ``BondStereo`` cache.  Clear stale directions before
+    asking RDKit to rebuild them from the frozen stereo-atom pairs; otherwise
+    the writer can keep emitting an old traversal-specific projection.
     """
 
-    # ``SetDoubleBondNeighborDirections`` may have assigned directions to more
-    # than the selected stereo-atom pair on a substituted alkene. Clear those
-    # provisional flags before applying the solved constraint set; otherwise
-    # RDKit can suppress the SMILES stereo marker or emit a contradictory one.
-    constraints: list[tuple[int, int, int]] = []
-    for bond in stereo_bonds:
-        stereo_atoms = list(bond.GetStereoAtoms())
-        if len(stereo_atoms) != 2:
-            return False
-        first_bond = mol.GetBondBetweenAtoms(bond.GetBeginAtomIdx(), stereo_atoms[0])
-        second_bond = mol.GetBondBetweenAtoms(bond.GetEndAtomIdx(), stereo_atoms[1])
-        if first_bond is None or second_bond is None:
-            return False
-        candidate = Chem.Mol(mol)
-        for candidate_bond in candidate.GetBonds():  # type: ignore[no-untyped-call]
-            candidate_bond.SetBondDir(Chem.BondDir.NONE)
-            if candidate_bond.GetBondType() == Chem.BondType.DOUBLE:
-                candidate_bond.SetStereo(Chem.BondStereo.STEREONONE)
-        candidate.GetBondWithIdx(first_bond.GetIdx()).SetBondDir(Chem.BondDir.ENDUPRIGHT)
-        candidate.GetBondWithIdx(second_bond.GetIdx()).SetBondDir(Chem.BondDir.ENDUPRIGHT)
-        Chem.SetBondStereoFromDirections(candidate)
-        serialized = _serialized_e_z_stereo(
-            candidate,
-            preserve_atom_maps=preserve_atom_maps,
-        )
-        key = (
-            frozenset(
-                (
-                    mol.GetAtomWithIdx(bond.GetBeginAtomIdx()).GetAtomMapNum(),
-                    mol.GetAtomWithIdx(bond.GetEndAtomIdx()).GetAtomMapNum(),
-                )
-            )
-            if preserve_atom_maps
-            else frozenset((bond.GetBeginAtomIdx() + 1, bond.GetEndAtomIdx() + 1))
-        )
-        base_stereo = serialized.get(key)
-        if base_stereo not in _DOUBLE_BOND_E_Z_STEREO:
-            return False
-        parity = 0 if base_stereo == bond.GetStereo() else 1
-        constraints.append((first_bond.GetIdx(), second_bond.GetIdx(), parity))
-
-    for bond in mol.GetBonds():  # type: ignore[no-untyped-call]
-        bond.SetBondDir(Chem.BondDir.NONE)
-        if bond.GetBondType() == Chem.BondType.DOUBLE:
-            bond.SetStereo(Chem.BondStereo.STEREONONE)
-
-    directions: dict[int, int] = {}
-    for first_bond_index, second_bond_index, parity in constraints:
-        if first_bond_index not in directions:
-            directions[first_bond_index] = (
-                directions[second_bond_index] ^ parity if second_bond_index in directions else 0
-            )
-        expected_second = directions[first_bond_index] ^ parity
-        if second_bond_index in directions and directions[second_bond_index] != expected_second:
-            return False
-        directions[second_bond_index] = expected_second
-
-    for bond in mol.GetBonds():  # type: ignore[no-untyped-call]
-        if bond.GetIdx() in directions:
-            bond.SetBondDir(
-                Chem.BondDir.ENDUPRIGHT
-                if directions[bond.GetIdx()] == 0
-                else Chem.BondDir.ENDDOWNRIGHT
-            )
-    Chem.SetBondStereoFromDirections(mol)
-    for bond in mol.GetBonds():  # type: ignore[no-untyped-call]
-        stereo = _LEGACY_DOUBLE_BOND_STEREO_TO_E_Z.get(bond.GetStereo())
-        if stereo is not None:
-            bond.SetStereo(stereo)
+    if not stereo_bonds:
+        return True
+    try:
+        # RDKit already has the correct global solver for conjugated systems.
+        # It uses each BondStereo's stored stereo-atom pair and therefore knows
+        # when two adjacent E/Z bonds share a directional single bond.  The
+        # previous local XOR solver compared only edge-level E/Z and could
+        # select the other substituent on one side of a shared bond.
+        for bond in mol.GetBonds():  # type: ignore[no-untyped-call]
+            bond.SetBondDir(Chem.BondDir.NONE)
+        Chem.SetDoubleBondNeighborDirections(mol)
+    except (RuntimeError, ValueError):
+        return False
     return True
 
 
-def ensure_serializable_double_bond_stereochemistry(
+def project_serializable_double_bond_stereochemistry(
     mol: Chem.Mol,
     *,
-    reference_smiles: str | None = None,
     preserve_atom_maps: bool = False,
 ) -> Chem.Mol:
-    """Preserve assigned stereo state in an explicit-H SMILES projection.
+    """Project frozen source stereo into SMILES-writer direction metadata.
 
-    MolGR 0.1.8 can assign ``STEREOE``/``STEREOZ`` and its stereo-atom pair
-    without the adjacent RDKit bond-direction flags required by the SMILES
-    writer. This function only prepares a clone for serialization and verifies
-    its explicit-H SMILES round trip. It never reads a conformer, performs a
-    coordinate assignment, or uses a SMILES representation to change the
-    source molecule's stereo state.
-
-    The returned clone may contain writer-facing ``BondDir`` values and the
-    local RDKit stereo cache produced while solving adjacent-double-bond
-    constraints. Callers must therefore retain the input molecule as the
-    coordinate-authoritative source and use this result only as a projection.
+    ``BondStereo`` and ``Bond.GetStereoAtoms()`` are the source state.  The
+    returned clone is the only object this function mutates: its ``BondDir``
+    values are generated once for RDKit's SMILES writer.  No conformer,
+    canonical SMILES, or previously serialized text is consulted.
     """
 
-    repaired = Chem.Mol(mol)
-    for bond in repaired.GetBonds():  # type: ignore[no-untyped-call]
+    projected = Chem.Mol(mol)
+    for bond in projected.GetBonds():  # type: ignore[no-untyped-call]
         stereo = _LEGACY_DOUBLE_BOND_STEREO_TO_E_Z.get(bond.GetStereo())
         if stereo is not None:
             bond.SetStereo(stereo)
     stereo_bonds = [
         bond
-        for bond in repaired.GetBonds()  # type: ignore[no-untyped-call]
+        for bond in projected.GetBonds()  # type: ignore[no-untyped-call]
         if bond.GetStereo() in _DOUBLE_BOND_E_Z_STEREO
     ]
-    if preserve_atom_maps:
-        atom_maps = [
-            atom.GetAtomMapNum()
-            for atom in repaired.GetAtoms()  # type: ignore[no-untyped-call]
-        ]
-        if any(number <= 0 for number in atom_maps) or len(set(atom_maps)) != len(atom_maps):
-            raise ValueError("preserve_atom_maps requires unique positive atom maps")
-        expected_stereo = {
-            frozenset(
-                (
-                    atom_maps[bond.GetBeginAtomIdx()],
-                    atom_maps[bond.GetEndAtomIdx()],
-                )
-            ): bond.GetStereo()
-            for bond in stereo_bonds
-        }
-    else:
-        expected_stereo = {
-            frozenset((bond.GetBeginAtomIdx() + 1, bond.GetEndAtomIdx() + 1)): bond.GetStereo()
-            for bond in stereo_bonds
-        }
-    serialized_stereo = _serialized_e_z_stereo(
-        repaired,
-        preserve_atom_maps=preserve_atom_maps,
-    )
-    reference_signature = _canonical_isomeric_smiles_signature(reference_smiles)
-
-    def projection_is_lossless() -> bool:
-        if _serialized_double_bond_keys_match(serialized_stereo, expected_stereo):
-            return True
-        # After RenumberAtoms, RDKit can retain a valid directional SMILES
-        # projection while its copied BondStereo/stereo-atom cache refers to a
-        # different local atom pair.  Compare against the pre-projection
-        # canonical representation in that case.  This also accepts genuinely
-        # equivalent assignments on symmetric molecular graphs.
-        if reference_signature is not None:
-            return _canonical_isomeric_smiles_for_molecule(repaired) == reference_signature
-        # A complete marker count is not enough: stale directions can encode
-        # the opposite E/Z state. Keep the strict atom-edge comparison above
-        # and let the conformer/constraint repair paths establish the
-        # direction state first. In particular, never accept a 3D graph merely
-        # because it emitted the same number of slash markers.
-        return False
-
-    if not stereo_bonds or projection_is_lossless():
-        return repaired
-    # At this point the expected stereo is already frozen from the caller's
-    # source graph. The remaining operations are serialization-only: solve the
-    # writer direction constraints, then validate the emitted map-labelled
-    # double bonds against that frozen state.
-    if _solve_double_bond_direction_constraints(
-        repaired,
+    if not stereo_bonds:
+        _clear_bond_directions(projected)
+        return projected
+    if not _solve_double_bond_direction_constraints(
+        projected,
         stereo_bonds,
         preserve_atom_maps=preserve_atom_maps,
     ):
-        serialized_stereo = _serialized_e_z_stereo(
-            repaired,
+        expected = _e_z_stereo_signature(
+            projected,
             preserve_atom_maps=preserve_atom_maps,
         )
-        if projection_is_lossless():
-            return repaired
-    if reference_smiles is not None and _restore_double_bond_directions_from_smiles_reference(
-        repaired,
-        reference_smiles,
-        stereo_bonds,
-    ):
-        serialized_stereo = _serialized_e_z_stereo(
-            repaired,
-            preserve_atom_maps=preserve_atom_maps,
-        )
-        if projection_is_lossless():
-            return repaired
-    if repaired.GetNumConformers() != 1:
         raise _stereo_projection_failure(
-            repaired,
-            "MolGR assigned E/Z stereochemistry without a serializable SMILES projection",
-            reason="missing_conformer_for_direction_recovery",
-            expected=expected_stereo,
-            serialized=serialized_stereo,
+            projected,
+            "MolGR assigned E/Z stereochemistry without writer directions",
+            reason="stereo_direction_projection_failed",
+            expected={edge: signature[0] for edge, signature in expected.items()},
         )
-    reference = Chem.MolFromMolBlock(
-        Chem.MolToMolBlock(repaired),
-        sanitize=False,
-        removeHs=False,
-        strictParsing=True,
-    )
-    if reference is None or reference.GetNumAtoms() != repaired.GetNumAtoms():
-        raise _stereo_projection_failure(
-            repaired,
-            "could not recover MolGR E/Z SMILES direction metadata",
-            reason="molblock_direction_recovery_failed",
-            expected=expected_stereo,
-            serialized=serialized_stereo,
-        )
-    for bond in stereo_bonds:
-        stereo_atoms = list(bond.GetStereoAtoms())
-        if len(stereo_atoms) != 2:
-            raise _stereo_projection_failure(
-                repaired,
-                "MolGR assigned E/Z stereochemistry without two stereo atoms",
-                reason="stereo_atom_pair_missing",
-                expected=expected_stereo,
-                serialized=serialized_stereo,
-            )
-        for atom_index, stereo_atom_index in zip(
-            (bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()),
-            stereo_atoms,
-            strict=True,
-        ):
-            source_bond = repaired.GetBondBetweenAtoms(atom_index, stereo_atom_index)
-            if source_bond is None:
-                raise _stereo_projection_failure(
-                    repaired,
-                    "MolGR E/Z stereo atoms are not adjacent to their double bond",
-                    reason="stereo_atom_pair_not_adjacent",
-                    expected=expected_stereo,
-                    serialized=serialized_stereo,
-                )
-            reference_bond = reference.GetBondWithIdx(source_bond.GetIdx())
-            direction = reference_bond.GetBondDir()
-            if direction == Chem.BondDir.NONE:
-                raise _stereo_projection_failure(
-                    repaired,
-                    "could not recover MolGR E/Z SMILES direction metadata",
-                    reason="molblock_direction_metadata_missing",
-                    expected=expected_stereo,
-                    serialized=serialized_stereo,
-                )
-            source_bond.SetBondDir(direction)
-    serialized_stereo = _serialized_e_z_stereo(
-        repaired,
+    return projected
+
+
+def validate_serializable_double_bond_stereochemistry(
+    source: Chem.Mol,
+    projected: Chem.Mol,
+    *,
+    preserve_atom_maps: bool = False,
+) -> None:
+    """Check only physical E/Z preservation across the final SMILES round trip.
+
+    The expected state is the source molecule's assigned ``BondStereo`` plus
+    ``Bond.GetStereoAtoms()``—ultimately the marker recovered from its 3D
+    conformer. The observed state is parsed from the projected explicit-H
+    SMILES. Acceptance means that every double-bond edge has the same relative
+    geometry for its two endpoint sides. RDKit may choose another valid
+    substituent pair or the opposite E/Z spelling after a canonical traversal,
+    so raw E/Z enums, slash directions, and string/traversal identity are not
+    validated here.
+
+    This check does not infer, canonicalize, repair, or otherwise mutate either
+    molecule. It also does not validate reaction chemistry, atom-map
+    completeness, or endpoint correspondence; those are separate contracts.
+    """
+
+    if source.GetNumAtoms() != projected.GetNumAtoms():
+        raise ValueError("stereo projection atom counts differ")
+    normalized_source = Chem.Mol(source)
+    for bond in normalized_source.GetBonds():  # type: ignore[no-untyped-call]
+        stereo = _LEGACY_DOUBLE_BOND_STEREO_TO_E_Z.get(bond.GetStereo())
+        if stereo is not None:
+            bond.SetStereo(stereo)
+    expected_signature = _e_z_stereo_signature(
+        normalized_source,
         preserve_atom_maps=preserve_atom_maps,
     )
-    if not projection_is_lossless():
-        raise _stereo_projection_failure(
-            repaired,
-            "MolGR E/Z stereochemistry is not fully representable in explicit-H SMILES "
-            f"({len(serialized_stereo)}/{len(stereo_bonds)} double bonds serialized)",
-            reason="serialized_stereo_does_not_match_source",
-            expected=expected_stereo,
-            serialized=serialized_stereo,
-        )
-    return repaired
+    serialized_signature = _serialized_e_z_stereo_signature(
+        projected,
+        preserve_atom_maps=preserve_atom_maps,
+    )
+    if _stereo_signatures_match(serialized_signature, expected_signature):
+        return
+    expected = {edge: signature[0] for edge, signature in expected_signature.items()}
+    serialized = {edge: signature[0] for edge, signature in serialized_signature.items()}
+    raise _stereo_projection_failure(
+        source,
+        "SMILES projection changed the source E/Z control-atom relationship",
+        reason="serialized_stereo_does_not_match_source",
+        expected=expected,
+        serialized=serialized,
+    )
+
+
+def ensure_serializable_double_bond_stereochemistry(
+    mol: Chem.Mol,
+    *,
+    preserve_atom_maps: bool = False,
+) -> Chem.Mol:
+    """Create a writer projection and verify its physical E/Z round trip."""
+
+    projected = project_serializable_double_bond_stereochemistry(
+        mol,
+        preserve_atom_maps=preserve_atom_maps,
+    )
+    validate_serializable_double_bond_stereochemistry(
+        mol,
+        projected,
+        preserve_atom_maps=preserve_atom_maps,
+    )
+    return projected
 
 
 def _preserved_stereo_status(mol: Chem.Mol) -> StereoStatus:
@@ -1077,24 +997,18 @@ def _normalized_topology_records(
     # stereo status below instead of discarding the calculation frame.
     map_free_mol = _remove_atom_maps(mol)
     stereo_projection_error: StereoProjectionError | None = None
+    source = Chem.Mol(map_free_mol)
     if preserve_stereochemistry:
         try:
-            source = ensure_serializable_double_bond_stereochemistry(map_free_mol)
+            # This is a one-way writer projection. Keep the source graph and
+            # its BondStereo/stereo-atom cache authoritative; copy only the
+            # generated BondDir values needed by the topology writer.
+            source_projection = ensure_serializable_double_bond_stereochemistry(map_free_mol)
+            _copy_bond_directions(source_projection, source)
         except StereoProjectionError as error:
             evidence = error.evidence()
             evidence["failure_boundary"] = "source_molecule_projection"
             stereo_projection_error = StereoProjectionError(str(error), evidence=evidence)
-            source = Chem.Mol(map_free_mol)
-    else:
-        source = Chem.Mol(map_free_mol)
-    # Keep the writer-facing source representation available while the source
-    # conformer and its directional evidence still exist.  The canonical
-    # topology copy below intentionally removes conformers; its local
-    # BondStereo cache can then differ after atom-order normalization even when
-    # the complete isomeric graph remains equivalent.
-    source_reference_smiles = (
-        _graph_smiles(source, all_hydrogens_explicit=True) if preserve_stereochemistry else None
-    )
     (
         topology_mol,
         source_to_topology,
@@ -1108,13 +1022,20 @@ def _normalized_topology_records(
     )
     if preserve_stereochemistry and stereo_projection_error is None:
         # RDKit copies can retain the E/Z designation while dropping the
-        # neighboring writer directions. Restore the lossless projection on
-        # the complete topology before any endpoint fragment is extracted.
+        # neighboring writer directions. Project the complete topology once
+        # from its retained source stereo cache before fragment extraction.
         try:
-            topology_mol = ensure_serializable_double_bond_stereochemistry(
+            topology_projection = ensure_serializable_double_bond_stereochemistry(
                 topology_mol,
-                reference_smiles=source_reference_smiles,
             )
+            _copy_bond_directions(topology_projection, topology_mol)
+            if _graph_smiles(topology_projection, all_hydrogens_explicit=True) is None:
+                raise _stereo_projection_failure(
+                    topology_projection,
+                    "MolGR topology has no explicit-H SMILES projection",
+                    reason="topology_explicit_h_smiles_missing",
+                    expected={},
+                )
         except StereoProjectionError as error:
             evidence = error.evidence()
             evidence["failure_boundary"] = "topology_source_order_projection"
@@ -1153,12 +1074,12 @@ def _normalized_topology_records(
             )
             if preserve_stereochemistry:
                 try:
-                    topology_mol = ensure_serializable_double_bond_stereochemistry(
+                    topology_projection = ensure_serializable_double_bond_stereochemistry(
                         topology_mol,
-                        reference_smiles=source_order_smiles,
                     )
+                    _copy_bond_directions(topology_projection, topology_mol)
                     explicit_graph_smiles = _graph_smiles(
-                        topology_mol,
+                        topology_projection,
                         all_hydrogens_explicit=True,
                     )
                     if explicit_graph_smiles is None:
@@ -1304,6 +1225,9 @@ def _normalized_topology_records(
                     else StereoStatus.UNKNOWN
                 )
             )
+        ),
+        is_stereo_abstraction_upstream=(
+            (reconstruction_metadata or {}).get("is_stereo_abstraction_upstream") is True
         ),
         sanitization_status=sanitization_status,
         sanitization_error=sanitization_error,
@@ -1557,4 +1481,6 @@ __all__ = [
     "normalize_molecule",
     "normalize_topology",
     "normalize_topology_with_mapping",
+    "project_serializable_double_bond_stereochemistry",
+    "validate_serializable_double_bond_stereochemistry",
 ]

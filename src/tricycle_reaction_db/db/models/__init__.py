@@ -34,6 +34,7 @@ from tricycle_reaction_db.db.models.chemistry import (
     Geometry,
     MolecularFormula,
     MolecularTopology,
+    MolecularTopologyAbstraction,
     MolecularTopologyDerivation,
 )
 from tricycle_reaction_db.db.models.identity import (
@@ -49,6 +50,7 @@ from tricycle_reaction_db.db.models.identity import (
     UserAccount,
 )
 from tricycle_reaction_db.db.models.reactions import (
+    LogicalParticipantConcreteTopology,
     LogicalReaction,
     LogicalReactionParticipant,
     ManifestArtifactBinding,
@@ -101,6 +103,7 @@ __all__ = [
     "MolecularFormula",
     "MolecularOrbitalResult",
     "MolecularTopology",
+    "MolecularTopologyAbstraction",
     "MolecularTopologyDerivation",
     "ParseRevision",
     "MultireferenceResult",
@@ -115,6 +118,7 @@ __all__ = [
     "ProjectInvitation",
     "ProjectMembership",
     "LogicalReaction",
+    "LogicalParticipantConcreteTopology",
     "LogicalReactionParticipant",
     "MappedReaction",
     "MappedReactionEdge",

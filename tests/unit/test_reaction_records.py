@@ -1,9 +1,12 @@
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import cast
+from uuid import UUID
 
 import pytest
 from pydantic import ValidationError
 from rdkit import Chem
+from sqlmodel import Session
 
 from tricycle_reaction_db.application.dtos import (
     CreateReactionCommand,
@@ -16,8 +19,10 @@ from tricycle_reaction_db.application.services.reactions import (
     _canonical_mapped_reaction_smiles,
     _mapped_reaction_from_smiles,
     _mapping_assignment_for_topology,
+    mapped_reaction_concrete_identity,
     mapped_smiles_for_topology,
 )
+from tricycle_reaction_db.db.models import MappedReaction, MappedReactionParticipant
 from tricycle_reaction_db.domain.enums import (
     ArtifactResolutionStatus,
     LogicalReactionParticipantRole,
@@ -227,6 +232,59 @@ def test_mapping_assignment_preserves_global_maps_for_endpoint_fragments() -> No
     assert mapped_smiles == "[CH2:7]=[CH2:8]"
 
 
+def test_concrete_mapping_identity_collapses_symmetric_atom_assignments() -> None:
+    """Equivalent source automorphisms do not create a second mapping row."""
+
+    molecule = Chem.MolFromSmiles("C1CC1")
+    assert molecule is not None
+    topology_id = UUID("00000000-0000-0000-0000-000000000001")
+    topology = SimpleNamespace(id=topology_id, atom_count=3, mol=molecule)
+
+    class _Session:
+        info: dict[str, object] = {}
+        new: tuple[object, ...] = ()
+
+        def get(self, _model: object, value: object) -> object | None:
+            return topology if value == topology_id else None
+
+    logical_participant = SimpleNamespace(topology_id=topology_id, topology=topology)
+
+    def participant(atom_maps: tuple[int, ...]) -> MappedReactionParticipant:
+        return cast(
+            MappedReactionParticipant,
+            SimpleNamespace(
+                side=LogicalReactionParticipantSide.REACTANT,
+                template_index=0,
+                concrete_topology_id=topology_id,
+                logical_reaction_participant=logical_participant,
+                logical_reaction_participant_id=UUID("00000000-0000-0000-0000-000000000002"),
+                atom_map_numbers=list(atom_maps),
+            ),
+        )
+
+    first = cast(
+        MappedReaction,
+        SimpleNamespace(id=UUID("00000000-0000-0000-0000-000000000003")),
+    )
+    second = cast(
+        MappedReaction,
+        SimpleNamespace(id=UUID("00000000-0000-0000-0000-000000000004")),
+    )
+    session = _Session()
+
+    first_identity = mapped_reaction_concrete_identity(
+        cast(Session, session),
+        first,
+        participants=(participant((1, 2, 3)),),
+    )
+    second_identity = mapped_reaction_concrete_identity(
+        cast(Session, session),
+        second,
+        participants=(participant((2, 3, 1)),),
+    )
+    assert first_identity == second_identity
+
+
 @pytest.mark.parametrize(
     ("source_smiles", "expected_stereo"),
     [
@@ -256,6 +314,44 @@ def test_mapped_smiles_restores_ez_after_database_round_trip(
     )
     assert double_bond.GetStereo() == expected_stereo
     assert "/" in mapped_smiles or "\\" in mapped_smiles
+
+
+def test_mapped_smiles_keeps_distinct_symmetric_diene_configurations() -> None:
+    """Adding reaction maps must not collapse strict E/Z topologies."""
+
+    parser = Chem.SmilesParserParams()
+    parser.removeHs = False
+    configurations = (
+        "[H][N]([H])/[N]=[C]([C](=[N]\\[N]([H])[H])\\[C]([H])([H])[H])/[C]([H])([H])[H]",
+        "[H][N]([H])/[N]=[C]([C](=[N]/[N]([H])[H])/[C]([H])([H])[H])\\[C]([H])([H])[H]",
+        "[H][N]([H])/[N]=[C]([C](=[N]/[N]([H])[H])\\[C]([H])([H])[H])/[C]([H])([H])[H]",
+    )
+    mapped = []
+    for smiles in configurations:
+        molecule = Chem.MolFromSmiles(smiles, parser)
+        assert molecule is not None
+        topology = SimpleNamespace(
+            atom_count=molecule.GetNumAtoms(),
+            mol=molecule,
+            canonical_isomeric_smiles=smiles,
+        )
+        mapped_smiles = mapped_smiles_for_topology(
+            topology,
+            list(range(1, molecule.GetNumAtoms() + 1)),
+        )
+        reparsed = Chem.MolFromSmiles(mapped_smiles, parser)
+        assert reparsed is not None
+        mapped.append(mapped_smiles)
+        assert (
+            sum(
+                bond.GetStereo() in {Chem.BondStereo.STEREOE, Chem.BondStereo.STEREOZ}
+                for bond in reparsed.GetBonds()
+                if bond.GetBondType() == Chem.BondType.DOUBLE
+            )
+            == 2
+        )
+
+    assert len(set(mapped)) == 3
 
 
 def test_mapped_smiles_uses_persisted_projection_for_complex_ez_after_round_trip() -> None:

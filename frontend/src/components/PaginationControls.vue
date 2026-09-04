@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Check, ChevronLeft, ChevronRight } from "@lucide/vue";
+import { Check, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight } from "@lucide/vue";
 import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 
@@ -60,6 +60,9 @@ function submitJump(): void {
 
 <template>
   <nav v-if="visible" class="catalog-pagination" :aria-label="label">
+    <UiIconButton v-if="!cursorMode" :label="t('common.first')" :disabled="currentPage <= 1" @click="emit('jump', 0)">
+      <ChevronsLeft :size="16" aria-hidden="true" />
+    </UiIconButton>
     <UiIconButton :label="t('common.previous')" :disabled="!hasPrevious" @click="emit('previous')">
       <ChevronLeft :size="16" aria-hidden="true" />
     </UiIconButton>
@@ -71,6 +74,9 @@ function submitJump(): void {
     </form>
     <UiIconButton :label="t('common.next')" :disabled="!hasNext" @click="emit('next')">
       <ChevronRight :size="16" aria-hidden="true" />
+    </UiIconButton>
+    <UiIconButton v-if="!cursorMode" :label="t('common.last')" :disabled="currentPage >= totalPages" @click="emit('jump', (totalPages - 1) * props.page.limit)">
+      <ChevronsRight :size="16" aria-hidden="true" />
     </UiIconButton>
   </nav>
 </template>

@@ -453,10 +453,9 @@ test("reaction cards render paths and open mapped/frame detail", async ({ page }
   expect(await page.locator(".reaction-path-card").count()).toBeLessThanOrEqual(12);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 
-  const firstReactionGroup = page.locator(".reaction-card-group").first();
-  await expect(firstReactionGroup.getByRole("link", { name: /在独立页面打开反应路径/ })).toHaveAttribute("href", /\/reactions\//);
-  const reactionCard = firstReactionGroup.locator(".reaction-path-card");
-  const directLink = firstReactionGroup.locator(".reaction-card-direct-link");
+  const reactionCard = page.locator(".reaction-path-card").first();
+  await expect(reactionCard.getByRole("link", { name: /在独立页面打开反应路径/ })).toHaveAttribute("href", /\/reactions\//);
+  const directLink = reactionCard.locator(".reaction-card-direct-link");
   const cardLayout = await reactionCard.evaluate((card) => {
     const direct = card.querySelector<HTMLElement>(".reaction-card-direct-link");
     const hash = card.querySelector<HTMLElement>(".reaction-card-footer code");
@@ -473,17 +472,33 @@ test("reaction cards render paths and open mapped/frame detail", async ({ page }
   });
   expect(cardLayout.directTop).toBeGreaterThanOrEqual(cardLayout.cardTop);
   expect(cardLayout.directBottom).toBeLessThan(cardLayout.hashTop);
-  await expect(firstReactionGroup.locator(".reaction-card-toggle")).toHaveAttribute("aria-label", "展开路径");
-  await firstReactionGroup.locator(".reaction-path-card").click();
-  await expect(firstReactionGroup.locator(".reaction-card-toggle")).toHaveAttribute("aria-label", "收起路径");
-  expect(new URL(page.url()).searchParams.get("preview_reaction")).not.toBeNull();
-  await expect(firstReactionGroup.locator(".mapped-reaction-expansion")).toBeVisible();
-  await expect(page.locator(".reaction-results > .mapped-reaction-expansion")).toHaveCount(0);
-  await firstReactionGroup.locator(".reaction-path-card").click();
-  await expect(firstReactionGroup.locator(".mapped-reaction-expansion")).toHaveCount(0);
-
-  await firstReactionGroup.locator(".reaction-path-card").click();
-  const expansion = firstReactionGroup.locator(".mapped-reaction-expansion");
+  await reactionCard.locator(".reaction-path-strip").click();
+  await expect(page).toHaveURL(/\/reactions(?:\?.*)?$/);
+  await directLink.click();
+  await expect(page).toHaveURL(/\/reactions\/[0-9a-f-]+/);
+  await expect(page.locator("#reaction-detail-title")).toBeVisible();
+  await expect(page.locator("#logical-reaction-overview-title")).toHaveText("逻辑反应参与物");
+  await expect(page.getByText("抽象反应参与物", { exact: true })).toHaveCount(0);
+  const logicalMolecules = page.locator(".logical-participant-card .molecule-canvas");
+  await expect(logicalMolecules).not.toHaveCount(0);
+  await expect(logicalMolecules.first()).toHaveAttribute("data-atom-mapped", "false");
+  await page.waitForFunction(() => {
+    const canvases = [...document.querySelectorAll<HTMLCanvasElement>(".logical-participant-card .molecule-canvas canvas")];
+    return canvases.length > 0 && canvases.every((canvas) => canvas.width > 100 && canvas.height > 100);
+  });
+  const mappingCards = page.locator(".mapped-summary-card");
+  await expect(mappingCards.first()).toBeVisible();
+  await expect(mappingCards.first()).not.toHaveAttribute("open", "");
+  await mappingCards.first().locator("summary").click();
+  await expect(mappingCards.first().locator(".mapped-summary-representation img")).toBeVisible();
+  await expect(mappingCards.first().locator(".mapped-summary-thermodynamics")).toBeVisible();
+  await expect(mappingCards.first().locator(".mapped-summary-thermodynamics .thermo-profile, .mapped-summary-thermodynamics .compact-empty")).not.toHaveCount(0);
+  const mappedLink = mappingCards.first().getByRole("link", { name: "打开映射反应详情" });
+  const mappedHref = await mappedLink.getAttribute("href");
+  expect(mappedHref).toMatch(/\/mapped-reactions\//);
+  await mappedLink.click();
+  await expect(page).toHaveURL(/\/mapped-reactions\//);
+  const expansion = page.locator(".mapped-reaction-expansion");
   await expect(expansion).toBeVisible();
   await expect(expansion.locator(".mapped-reaction-smiles")).toContainText(":1");
   await expect(expansion.locator(".mapped-reaction-smiles")).toContainText(">>");
@@ -541,13 +556,16 @@ test("reaction IDs open a standalone mapped path page", async ({ page }, testInf
   await page.setViewportSize({ width: 1440, height: 960 });
   await page.goto(`/reactions/${reaction.id}?project_id=${projectId}`);
   await expect(page.locator("#reaction-detail-title")).toBeVisible();
-  await expect(page.locator(".reaction-detail-body .mapped-reaction-expansion")).toBeVisible();
-  await expect(page.locator(".reaction-detail-body .mapped-reaction-smiles")).toContainText(">>");
-  const mappedHref = await page.getByRole("link", { name: "映射路径页" }).getAttribute("href");
+  const mappingCard = page.locator(".mapped-summary-card").first();
+  await expect(mappingCard).toBeVisible();
+  await expect(mappingCard).not.toHaveAttribute("open", "");
+  await mappingCard.locator("summary").click();
+  const mappedHref = await mappingCard.getByRole("link", { name: "打开映射反应详情" }).getAttribute("href");
   expect(mappedHref).toMatch(/\/mapped-reactions\//);
   await page.goto(mappedHref ?? "");
   await expect(page).toHaveURL(/\/mapped-reactions\//);
-  await expect(page.locator(".reaction-detail-body .mapped-reaction-expansion")).toBeVisible();
+  await expect(page.locator("#mapped-reaction-detail-title")).toBeVisible();
+  await expect(page.locator(".mapped-reaction-page-body .mapped-reaction-expansion")).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await page.screenshot({ path: testInfo.outputPath("desktop-reaction-detail.png"), fullPage: true });
 });
@@ -606,9 +624,13 @@ test("TS frame detail interpolates persisted signed mode anchors", async ({ page
 
   await page.setViewportSize({ width: 1440, height: 960 });
   await page.goto("/");
-  const reactionGroup = page.locator(".reaction-card-group").first();
-  await reactionGroup.locator(".reaction-path-card").click();
-  const expansion = reactionGroup.locator(".mapped-reaction-expansion");
+  const reactionCard = page.locator(".reaction-path-card").first();
+  await reactionCard.locator(".reaction-card-direct-link").click();
+  await expect(page).toHaveURL(/\/reactions\/[0-9a-f-]+/);
+  const mappingCard = page.locator(".mapped-summary-card").first();
+  await mappingCard.locator("summary").click();
+  await mappingCard.getByRole("link", { name: "打开映射反应详情" }).click();
+  const expansion = page.locator(".mapped-reaction-expansion");
   await expect(expansion).toBeVisible();
   const transitionStateStep = expansion.locator(".node-step").filter({ hasText: "过渡态" });
   await expect(transitionStateStep).toHaveCount(1);
@@ -803,10 +825,10 @@ test("mobile reaction workspace has no page-level overflow", async ({ page }, te
   await waitForMolecules(page);
 
   expect(await allCanvasesHaveDrawing(page)).toBe(true);
-  const firstReactionGroup = page.locator(".reaction-card-group").first();
-  await firstReactionGroup.locator(".reaction-path-card").click();
-  await expect(firstReactionGroup.locator(".mapped-reaction-expansion")).toBeVisible();
-  await expect(firstReactionGroup.locator(".compact-equation .molecule-state")).toHaveCount(0);
+  await page.locator(".reaction-path-card").first().locator(".reaction-card-direct-link").click();
+  await expect(page).toHaveURL(/\/reactions\/[0-9a-f-]+/);
+  await expect(page.locator(".logical-reaction-page-body")).toBeVisible();
+  await expect(page.locator(".mapped-summary-card").first()).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await page.screenshot({ path: testInfo.outputPath("mobile-reaction.png"), fullPage: true });
 });
@@ -818,7 +840,7 @@ test("reaction quick query ranks by reaction similarity", async ({ page }) => {
     && response.request().method() === "GET"
     && response.url().includes("similarity_reaction_smiles=C%3DC%3E%3ECC"),
   );
-  await page.getByRole("searchbox", { name: "反应 SMILES 快速查询" }).fill("C=C>>CC");
+  await page.getByRole("searchbox", { name: "映射反应 SMILES 快速查询" }).fill("C=C>>CC");
   await page.getByRole("button", { name: "查询", exact: true }).click();
   const response = await responsePromise;
   expect(response.status()).toBe(200);
@@ -828,7 +850,7 @@ test("reaction quick query ranks by reaction similarity", async ({ page }) => {
   };
   expect(payload.page.total).toBeGreaterThan(0);
   expect(payload.items[0]?.similarity_score).not.toBeNull();
-  await expect(page.getByRole("heading", { name: "反应相似度查询结果" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "映射反应相似度查询结果" })).toBeVisible();
 });
 
 test("reaction query help is reachable from quick and advanced query controls", async ({ page }) => {
@@ -887,7 +909,7 @@ test("reaction structure inputs show validation errors while editing", async ({ 
   expect(reactionIndicatorBox).not.toBeNull();
   expect((reactionIndicatorBox?.x ?? 0)).toBeGreaterThan((reactionInputBox?.x ?? 0) + (reactionInputBox?.width ?? 0) - 30);
   await dialog.getByRole("button", { name: "关闭高级查询" }).click();
-  const quickInput = page.getByRole("searchbox", { name: "反应 SMILES 快速查询" });
+  const quickInput = page.getByRole("searchbox", { name: "映射反应 SMILES 快速查询" });
   await quickInput.fill("not a reaction");
   await expect(page.locator(".search-field .query-validation-indicator.is-invalid")).toHaveAttribute("title", "请输入“反应物>>产物”格式");
 });
@@ -928,10 +950,10 @@ test("reaction advanced query builds a structured AND/OR/NOT expression", async 
   await dialog.getByRole("checkbox", { name: "排除（NOT）" }).nth(1).check();
   await dialog.getByRole("button", { name: "添加条件" }).click();
   await conditionFields.nth(2).selectOption("reactant_smarts");
-  await dialog.getByRole("textbox", { name: "前体 SMARTS条件值" }).fill("[C]=[C]");
+  await dialog.getByRole("textbox", { name: "映射反应前体 SMARTS条件值" }).fill("[C]=[C]");
   await dialog.getByRole("button", { name: "添加条件" }).click();
   await conditionFields.nth(3).selectOption("product_smarts");
-  await dialog.getByRole("textbox", { name: "后体 SMARTS条件值" }).fill("[C][C]");
+  await dialog.getByRole("textbox", { name: "映射反应后体 SMARTS条件值" }).fill("[C][C]");
   await dialog.getByRole("combobox", { name: "反应高级查询逻辑运算" }).selectOption("or");
   await page.screenshot({ path: testInfo.outputPath("desktop-reaction-advanced-query.png"), fullPage: true });
 
@@ -971,22 +993,39 @@ test("catalog pagination jumps directly to a requested page", async ({ page }) =
   await mockReactionCatalog(page, 24);
   await page.goto("/");
   await expect(page.locator(".reaction-path-card").first()).toBeVisible();
-  await expect(page.getByLabel("跳转页码").first()).toHaveValue("1");
+  await expect(page.getByRole("spinbutton", { name: "页码" }).first()).toHaveValue("1");
 
-  await page.getByLabel("跳转页码").first().fill("2");
-  const responsePromise = page.waitForResponse((response) =>
-    response.url().includes("/api/logical-reactions")
-    && response.url().includes("limit=12")
-    && response.url().includes("offset=12"),
-  );
+  await page.getByRole("spinbutton", { name: "页码" }).first().fill("2");
+  const pageChangePromise = page.waitForURL(/\/reactions\?.*page=2/);
   await page.getByRole("button", { name: "跳转" }).first().click();
-  const response = await responsePromise;
-
-  expect(response.status()).toBe(200);
-  await expect(page.getByLabel("跳转页码").first()).toHaveValue("2");
-  await expect(page.getByLabel("跳转页码").nth(1)).toHaveValue("2");
+  await pageChangePromise;
+  await expect(page.getByRole("heading", { name: "E2E catalog reaction 13" })).toBeVisible();
+  await expect(page.getByRole("spinbutton", { name: "页码" }).first()).toHaveValue("2");
+  await expect(page.getByRole("spinbutton", { name: "页码" }).nth(1)).toHaveValue("2");
+  await expect(page.getByRole("button", { name: "首页" }).first()).toBeEnabled();
+  await expect(page.getByRole("button", { name: "末页" }).first()).toBeDisabled();
   await expect(page.locator(".catalog-pagination").first()).toContainText("13-24");
   await expect(page.locator(".catalog-pagination").nth(1)).toContainText("13-24");
+  await expect(page).toHaveURL(/\/reactions\?.*page=2/);
+
+  await page.getByRole("button", { name: "首页" }).first().click();
+  await expect(page.getByRole("spinbutton", { name: "页码" }).first()).toHaveValue("1");
+  expect(new URL(page.url()).searchParams.get("page")).toBeNull();
+  await page.getByRole("button", { name: "末页" }).first().click();
+  await expect(page).toHaveURL(/\/reactions\?.*page=2/);
+  await expect(page.getByRole("spinbutton", { name: "页码" }).first()).toHaveValue("2");
+
+  await page.reload();
+  await expect(page.locator(".reaction-path-card").first()).toBeVisible();
+  await expect(page.getByRole("spinbutton", { name: "页码" }).first()).toHaveValue("2");
+  await expect(page.locator(".catalog-pagination").first()).toContainText("13-24");
+
+  await page.getByRole("button", { name: "原始文件", exact: true }).click();
+  await expect(page).toHaveURL(/\/artifacts(?:\?.*)?$/);
+  expect(new URL(page.url()).searchParams.get("page")).toBeNull();
+  await page.getByRole("button", { name: "反应路径", exact: true }).click();
+  await expect(page.locator(".reaction-path-card").first()).toBeVisible();
+  await expect(page.getByRole("spinbutton", { name: "页码" }).first()).toHaveValue("1");
 });
 
 test("mapped reaction shows every partial thermodynamic profile and level", async ({ page }, testInfo) => {
@@ -1085,10 +1124,12 @@ test("mapped reaction shows every partial thermodynamic profile and level", asyn
   });
 
   await page.goto("/");
-  const firstReactionGroup = page.locator(".reaction-card-group").first();
-  await expect(firstReactionGroup.locator(".reaction-path-card")).toBeVisible();
-  await firstReactionGroup.locator(".reaction-path-card").click();
-  const expansion = firstReactionGroup.locator(".mapped-reaction-expansion");
+  await page.locator(".reaction-path-card").first().locator(".reaction-card-direct-link").click();
+  await expect(page).toHaveURL(/\/reactions\/[0-9a-f-]+/);
+  const mappingCard = page.locator(".mapped-summary-card").first();
+  await mappingCard.locator("summary").click();
+  await mappingCard.getByRole("link", { name: "打开映射反应详情" }).click();
+  const expansion = page.locator(".mapped-reaction-expansion");
   await expect(expansion.locator(".thermo-profile")).toHaveCount(2);
   await expect(expansion.locator(".thermo-level").nth(0)).toHaveText("B3LYP-D3BJ/Def2SVP//wB97M-V/Def2TZVPP");
   await expect(expansion.locator(".thermo-level").nth(1)).toHaveText("B3LYP/Def2SVP");
@@ -1137,21 +1178,24 @@ test("V2000 M CHG records survive ChemDoodle rendering", async ({ page }) => {
       response.url().includes("/api/logical-reactions")
       && response.url().includes(`offset=${targetOffset}`),
     );
-    await page.getByLabel("跳转页码").first().fill(String(target.pageNumber));
+    await page.getByRole("spinbutton", { name: "页码" }).first().fill(String(target.pageNumber));
     await page.getByRole("button", { name: "跳转" }).first().click();
     expect((await responsePromise).status()).toBe(200);
   }
 
-  const reactionGroup = page.locator(".reaction-card-group").filter({
+  const reactionCard = page.locator(".reaction-path-card").filter({
     hasText: "DA bench",
   });
-  const reactionCard = reactionGroup.locator(".reaction-path-card");
   await expect(reactionCard).toBeVisible();
   await reactionCard.scrollIntoViewIfNeeded();
   await expect(reactionCard.locator('[data-formal-charges="-1,1"]')).toHaveCount(1);
 
-  await reactionCard.click();
-  const expansion = reactionGroup.locator(".mapped-reaction-expansion");
+  await reactionCard.locator(".reaction-card-direct-link").click();
+  await expect(page).toHaveURL(/\/reactions\/[0-9a-f-]+/);
+  const mappingCard = page.locator(".mapped-summary-card").first();
+  await mappingCard.locator("summary").click();
+  await mappingCard.getByRole("link", { name: "打开映射反应详情" }).click();
+  const expansion = page.locator(".mapped-reaction-expansion");
   await expect(expansion).toBeVisible();
   await expect(expansion.locator('[data-formal-charges="-1,1"]')).not.toHaveCount(0);
 });
@@ -1602,7 +1646,7 @@ test("artifact catalog pages by offset and jumps to a requested page", async ({ 
 
   await page.goto("/artifacts");
   await expect(page.getByText("offset-page-1.log")).toBeVisible();
-  const pageInput = page.getByLabel("跳转页码").first();
+  const pageInput = page.getByRole("spinbutton", { name: "页码" }).first();
   await expect(pageInput).toHaveValue("1");
 
   await pageInput.fill("2");
@@ -1619,6 +1663,50 @@ test("artifact catalog pages by offset and jumps to a requested page", async ({ 
   await expect(page.getByText("offset-page-2.log")).toBeVisible();
   await page.getByRole("button", { name: "下一页" }).first().click();
   await expect(page.getByText("offset-page-3.log")).toBeVisible();
+});
+
+test("artifact catalog sorts directly from table headers", async ({ page }) => {
+  const artifact = {
+    id: "00000000-0000-7000-8000-000000000001",
+    original_filename: "header-sort.log",
+    size_bytes: 12,
+    content_sha256: "1".repeat(64),
+    visibility: "project",
+    artifact_kind: "calculation_output",
+    storage_status: "available",
+    project_id: "00000000-0000-7000-8000-000000000201",
+    created_by_user_id: "00000000-0000-7000-8000-000000000002",
+    media_type: "text/plain",
+    storage_verified_at: "2026-08-16T00:00:00Z",
+    preview_available: true,
+  };
+  const sortRequests: Array<{ sortBy: string | null; sortDirection: string | null }> = [];
+  await page.route("**/api/artifacts?*", async (route) => {
+    const url = new URL(route.request().url());
+    sortRequests.push({
+      sortBy: url.searchParams.get("sort_by"),
+      sortDirection: url.searchParams.get("sort_direction"),
+    });
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ items: [artifact], page: { total: 1, limit: 50, offset: 0 } }),
+    });
+  });
+
+  await page.goto("/artifacts");
+  await expect(page.getByText("header-sort.log")).toBeVisible();
+  await expect(page.locator('th[aria-sort="descending"] button[data-sort-by="created_at"]')).toHaveCount(1);
+
+  const filenameSort = page.locator('button.data-table-sort-button[data-sort-by="original_filename"]');
+  await filenameSort.click();
+  await expect.poll(() => sortRequests.some((request) => request.sortBy === "original_filename" && request.sortDirection === "asc")).toBe(true);
+  await expect(filenameSort).toHaveAttribute("aria-label", "文件名，当前升序，点击切换");
+  await expect(filenameSort.locator("svg")).toHaveCount(1);
+
+  await filenameSort.click();
+  await expect.poll(() => sortRequests.some((request) => request.sortBy === "original_filename" && request.sortDirection === "desc")).toBe(true);
+  await expect(filenameSort).toHaveAttribute("aria-label", "文件名，当前降序，点击切换");
+  await expect(page.locator('th[aria-sort="descending"] button[data-sort-by="original_filename"]')).toHaveCount(1);
 });
 
 test("geometry catalog scrolling uses static SVG without WebGL contexts", async ({ page }) => {

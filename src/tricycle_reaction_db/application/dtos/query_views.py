@@ -25,6 +25,7 @@ class ArtifactSummary(QueryView):
     id: UUID
     project_id: UUID
     created_by_user_id: UUID
+    created_at: datetime | None = None
     visibility: str
     original_filename: str
     content_sha256: str
@@ -88,6 +89,7 @@ class MolecularTopologySearchResult(QueryView):
     radical_electron_count: int
     fragment_count: int
     stereo_status: str
+    is_stereo_abstraction_upstream: bool = False
     sanitization_status: str
     sanitization_error: str | None = None
     substructure_match_count: int | None = None
@@ -190,6 +192,7 @@ class LogicalReactionSummary(QueryView):
     reaction_class: str | None = None
     cycloaddition_pattern: str | None = None
     reaction_hash: str
+    mapped_reaction_count: int = Field(ge=0)
     similarity_score: float | None = None
     # True when canonical reactant/product topology multisets differ.
     reactant_product_changed: bool | None = None
@@ -918,7 +921,11 @@ class MappedReactionParticipantView(QueryView):
     logical_reaction_participant_id: UUID
     side: str
     template_index: int
+    # The mapped participant is a strict concrete projection.  The logical
+    # participant topology is exposed separately so clients do not have to
+    # infer the abstraction layer from the mapped SMILES.
     topology_id: UUID
+    logical_topology_id: UUID
     atom_map_numbers: list[int]
     mapped_smiles: str
 

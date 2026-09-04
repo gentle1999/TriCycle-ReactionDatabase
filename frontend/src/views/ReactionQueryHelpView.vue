@@ -19,7 +19,7 @@ import { RouterLink } from "vue-router";
         </RouterLink>
         <span class="eyebrow">Reaction query reference</span>
         <h1 id="reaction-query-help-title">反应查询帮助</h1>
-        <p>快速查询适合输入单个反应，并按反应结构相似度从高到低排序；高级查询可以组合结构、元数据、能量和时间条件。</p>
+        <p>反应路径目录展示 LogicalReaction；其中结构检索始终先匹配由三维端点生成的 MappedReaction，再按逻辑反应归并。快速查询按相似度排序，高级查询可以组合结构、元数据、能量和时间条件。</p>
       </div>
       <div class="query-help-mark" aria-hidden="true"><CircleHelp :size="25" /></div>
     </header>
@@ -29,9 +29,9 @@ import { RouterLink } from "vue-router";
         <span class="eyebrow">01 · Quick query</span>
         <h2 id="query-help-quick-title">快速查询：反应 SMILES / SMARTS</h2>
       </header>
-      <p>在反应路径侧栏输入反应物和产物，用 <code>&gt;&gt;</code> 分隔，例如 <code>C=C&gt;&gt;CC</code>。后端使用 RDKit 的反应 SMARTS 解析器校验输入，因此这里也可以使用 SMARTS 原子或键条件。</p>
+      <p>在反应路径侧栏输入映射反应的反应物和产物，用 <code>&gt;&gt;</code> 分隔，例如 <code>C=C&gt;&gt;CC</code>。后端使用 RDKit 的反应 SMARTS 解析器校验输入，因此这里也可以使用 SMARTS 原子或键条件。</p>
       <div class="query-help-example"><code>[C:1]=[C:2]>>[C:1]-[C:2]</code><span>带原子映射的反应结构模式</span></div>
-        <p class="query-help-note">侧栏快速输入使用反应结构指纹进行相似度排序，并显示相似度分数；高级查询中的反应结构条件仍是结构包含匹配：数据库中的完整反应只要包含输入的反应模板就会命中，不要求反应字符串完全相同。</p>
+        <p class="query-help-note">侧栏快速输入使用可见 MappedReaction 的反应结构指纹进行相似度排序，并显示每个 LogicalReaction 下最高的映射反应相似度；高级查询中的反应结构条件也匹配 MappedReaction.reaction 的结构包含关系，命中后只返回对应的 LogicalReaction，不要求反应字符串完全相同。</p>
     </section>
 
     <section class="query-help-section" aria-labelledby="query-help-rxn-title">
@@ -57,12 +57,13 @@ import { RouterLink } from "vue-router";
         <table class="query-help-table">
           <thead><tr><th>字段</th><th>输入方式</th><th>匹配含义</th></tr></thead>
           <tbody>
-            <tr><th><code>reactant_smarts</code></th><td>分子 SMARTS</td><td>只在前体侧匹配，例如 <code>[C]=[C]</code>。</td></tr>
-            <tr><th><code>product_smarts</code></th><td>分子 SMARTS</td><td>只在后体侧匹配，例如 <code>[C][C]</code>。</td></tr>
-            <tr><th><code>rxn_smarts</code> / <code>reaction_smarts</code></th><td>完整 RXN SMARTS</td><td>同时约束反应物、试剂（若有）和产物。</td></tr>
-            <tr><th><code>reactant_mol_block</code> / <code>product_mol_block</code></th><td>绘图编辑器或 MOL Block</td><td>先解析为分子，再转换为结构查询；它不是 SMARTS 通配查询。</td></tr>
-            <tr><th><code>smarts</code></th><td>分子 SMARTS</td><td>在前体侧或后体侧任一侧命中。</td></tr>
+            <tr><th><code>reactant_smarts</code></th><td>分子 SMARTS</td><td>在 MappedReaction 的前体侧匹配，例如 <code>[C]=[C]</code>。</td></tr>
+            <tr><th><code>product_smarts</code></th><td>分子 SMARTS</td><td>在 MappedReaction 的后体侧匹配，例如 <code>[C][C]</code>。</td></tr>
+            <tr><th><code>rxn_smarts</code> / <code>reaction_smarts</code></th><td>完整 RXN SMARTS</td><td>在 MappedReaction 上同时约束反应物、试剂（若有）和产物；命中的映射反应再归并到 LogicalReaction。</td></tr>
+            <tr><th><code>reactant_mol_block</code> / <code>product_mol_block</code></th><td>绘图编辑器或 MOL Block</td><td>先解析为分子，再作为 MappedReaction 的结构查询；它不是 SMARTS 通配查询。</td></tr>
+            <tr><th><code>smarts</code></th><td>分子 SMARTS</td><td>在 MappedReaction 的前体侧或后体侧任一侧命中。</td></tr>
             <tr><th><code>reactant_product_changed</code></th><td>布尔值 <code>true</code> / <code>false</code></td><td>按前体和后体的标准分子拓扑（含顺序标准化）比较多重集合；化学计量系数也参与比较。</td></tr>
+            <tr><th><code>minimum_mapped_reaction_count</code> / <code>maximum_mapped_reaction_count</code></th><td>非负整数</td><td>按逻辑反应下可见映射反应的数量设置下限或上限。</td></tr>
             <tr><th>元数据和能量</th><td>ID、名称、反应类型、自由能、创建时间</td><td>精确、范围或时间边界条件，按字段名称的“最低/最高”含义比较。</td></tr>
           </tbody>
         </table>
@@ -87,7 +88,7 @@ import { RouterLink } from "vue-router";
         <span class="eyebrow">05 · Structure editor</span>
         <h2 id="query-help-editor-title">绘图编辑器</h2>
       </header>
-      <p>选择完整反应字段时，ChemDoodle 组件直接绘制反应并同步 RXN SMILES；选择前体或后体结构字段时，分别绘制对应一侧。完成绘制后可以继续添加其他条件，再用 AND、OR 或 NOT 组合。</p>
+      <p>选择完整反应字段时，ChemDoodle 组件直接绘制反应并同步 RXN SMILES；选择前体或后体结构字段时，分别绘制对应一侧。完成绘制后可以继续添加其他条件，再用 AND、OR 或 NOT 组合。这里绘制的是对 MappedReaction 的查询模板，结果仍以 LogicalReaction 路径卡片呈现。</p>
       <a class="query-help-doc-link" href="https://www.rdkit.org/docs/RDKit_Book.html#smarts-support" target="_blank" rel="noreferrer">
         RDKit SMARTS 参考 <ExternalLink :size="14" aria-hidden="true" />
       </a>

@@ -37,7 +37,7 @@ from rdkit.Chem import rdChemReactions
 from sqlalchemy import Boolean, Text, and_, case, func, literal, not_, or_, select
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.dialects.postgresql import ARRAY, aggregate_order_by, array
-from sqlalchemy.orm import defer, joinedload, load_only
+from sqlalchemy.orm import aliased, defer, joinedload, load_only
 from sqlmodel import col
 from sqlmodel import select as sqlmodel_select
 
@@ -115,6 +115,7 @@ from tricycle_reaction_db.db.models import (
     FrameEnergyResult,
     Geometry,
     GeometryOptimizationResult,
+    LogicalParticipantConcreteTopology,
     LogicalReaction,
     LogicalReactionParticipant,
     MappedReaction,
@@ -176,6 +177,11 @@ def _validate_range(
         raise ValueError(f"{minimum_name} cannot exceed {maximum_name}")
 
 
+def _validate_nonnegative_integer(value: Any, *, name: str) -> None:
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+        raise ValueError(f"{name} must be a non-negative integer")
+
+
 def reaction_smarts_from_mol_blocks(
     reactant_mol_block: str | None,
     product_mol_block: str | None,
@@ -235,6 +241,8 @@ _LOGICAL_REACTION_QUERY_EXPRESSION_FIELDS = frozenset(
         "maximum_activation_gibbs_free_energy_kcal_mol",
         "minimum_reaction_gibbs_free_energy_kcal_mol",
         "maximum_reaction_gibbs_free_energy_kcal_mol",
+        "minimum_mapped_reaction_count",
+        "maximum_mapped_reaction_count",
         "reactant_product_changed",
         "created_after",
         "created_before",
@@ -242,7 +250,32 @@ _LOGICAL_REACTION_QUERY_EXPRESSION_FIELDS = frozenset(
 )
 
 
-def _logical_reaction_structure_predicate(
+def _mapped_reaction_structure_match(query_reaction: Any) -> Any:
+    """Match a parsed reaction structure against the persisted mapped reaction.
+
+    ``LogicalReaction`` stores the abstract participant topology and does not
+    carry an authoritative reaction representation.  Reaction structure
+    queries must therefore always use the indexed ``MappedReaction.reaction``
+    projection, which is derived from the trusted mapped 3D endpoints.
+    """
+
+    return cast(Any, col(MappedReaction.reaction)).op("@>")(query_reaction)
+
+
+def _logical_reaction_ids_for_mapped_match(scope: Any, match: Any) -> Any:
+    """Project visible mapped-reaction matches to their logical reaction IDs."""
+
+    return (
+        select(col(MappedReaction.logical_reaction_id))
+        .where(
+            mapped_reaction_id_is_visible(scope, col(MappedReaction.id)),
+            match,
+        )
+        .correlate(None)
+    )
+
+
+def _logical_reaction_mapped_structure_predicate(
     field: str,
     value: object,
     scope: Any,
@@ -254,7 +287,6 @@ def _logical_reaction_structure_predicate(
         {field: value},
         maximum_characters=get_settings().structure_query_max_characters,
     )
-    stored_reaction = cast(Any, col(MappedReaction.reaction))
     if field in {"smarts", "reactant_smarts", "product_smarts"}:
         if Chem.MolFromSmarts(value) is None:
             raise ValueError("smarts must contain a valid molecular SMARTS")
@@ -269,7 +301,7 @@ def _logical_reaction_structure_predicate(
             raise ValueError("smarts must form a valid reaction-side query")
         structure_predicate = or_(
             *(
-                stored_reaction.op("@>")(
+                _mapped_reaction_structure_match(
                     reaction_from_smarts(cast(CString, sql_cast(item, CString)))
                 )
                 for item in side_smarts
@@ -286,18 +318,11 @@ def _logical_reaction_structure_predicate(
         )
         if reaction_smarts is None or rdChemReactions.ReactionFromSmarts(reaction_smarts) is None:
             raise ValueError(f"{field} must contain a valid reaction structure")
-        structure_predicate = stored_reaction.op("@>")(
+        structure_predicate = _mapped_reaction_structure_match(
             reaction_from_smarts(cast(CString, sql_cast(reaction_smarts, CString)))
         )
     structure_predicates.append(structure_predicate)
-    mapped_structure_ids = (
-        select(col(MappedReaction.logical_reaction_id))
-        .where(
-            mapped_reaction_id_is_visible(scope, col(MappedReaction.id)),
-            structure_predicate,
-        )
-        .correlate(None)
-    )
+    mapped_structure_ids = _logical_reaction_ids_for_mapped_match(scope, structure_predicate)
     return col(LogicalReaction.id).in_(mapped_structure_ids)
 
 
@@ -374,6 +399,20 @@ def _reaction_topology_changed_expression(
     )
 
 
+def _mapped_reaction_count_expression(scope: Any) -> Any:
+    """Count visible mapped reactions correlated to the outer logical reaction."""
+
+    return (
+        select(func.count(col(MappedReaction.id)))
+        .where(
+            col(MappedReaction.logical_reaction_id) == col(LogicalReaction.id),
+            mapped_reaction_id_is_visible(scope, col(MappedReaction.id)),
+        )
+        .correlate(LogicalReaction)
+        .scalar_subquery()
+    )
+
+
 def _logical_reaction_query_leaf_predicate(
     field: object,
     value: object,
@@ -390,7 +429,16 @@ def _logical_reaction_query_leaf_predicate(
         except (TypeError, ValueError) as error:
             raise ValueError("topology_id must be a valid UUID") from error
         reaction_ids = select(col(LogicalReactionParticipant.logical_reaction_id)).where(
-            col(LogicalReactionParticipant.topology_id) == topology_id
+            or_(
+                col(LogicalReactionParticipant.topology_id) == topology_id,
+                col(LogicalReactionParticipant.id).in_(
+                    select(
+                        col(LogicalParticipantConcreteTopology.logical_reaction_participant_id)
+                    ).where(
+                        col(LogicalParticipantConcreteTopology.concrete_topology_id) == topology_id
+                    )
+                ),
+            )
         )
         return col(LogicalReaction.id).in_(reaction_ids)
     if field_name in {"reaction_key", "label", "reaction_hash"}:
@@ -418,7 +466,7 @@ def _logical_reaction_query_leaf_predicate(
         "reactant_mol_block",
         "product_mol_block",
     }:
-        return _logical_reaction_structure_predicate(
+        return _logical_reaction_mapped_structure_predicate(
             field_name,
             value,
             scope,
@@ -462,6 +510,22 @@ def _logical_reaction_query_leaf_predicate(
             comparison,
         )
         return col(LogicalReaction.id).in_(mapped_screening_ids)
+    if field_name in {"minimum_mapped_reaction_count", "maximum_mapped_reaction_count"}:
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            raise ValueError(f"{field_name} must be a non-negative integer")
+        try:
+            parsed_float = float(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{field_name} must be a non-negative integer") from error
+        if not isfinite(parsed_float) or not parsed_float.is_integer() or parsed_float < 0:
+            raise ValueError(f"{field_name} must be a non-negative integer")
+        comparison_value = int(parsed_float)
+        mapped_count = _mapped_reaction_count_expression(scope)
+        return (
+            mapped_count >= comparison_value
+            if field_name == "minimum_mapped_reaction_count"
+            else mapped_count <= comparison_value
+        )
     if field_name == "reactant_product_changed":
         if not isinstance(value, bool):
             raise ValueError("reactant_product_changed must be a boolean")
@@ -659,6 +723,7 @@ def _canonical_reactant_product_changed(
 def _reaction_summary(
     reaction: LogicalReaction,
     *,
+    mapped_reaction_count: int = 0,
     reactant_product_changed: bool | None = None,
     similarity_score: float | None = None,
     reactant_topology_ids: list[UUID] | None = None,
@@ -676,6 +741,7 @@ def _reaction_summary(
         reaction_class=_optional_enum_value(reaction.reaction_class),
         cycloaddition_pattern=reaction.cycloaddition_pattern,
         reaction_hash=reaction.reaction_hash,
+        mapped_reaction_count=mapped_reaction_count,
         reactant_product_changed=reactant_product_changed,
         similarity_score=similarity_score,
         created_at=reaction.created_at,
@@ -895,6 +961,7 @@ def _artifact_summary(
         id=_required_uuid(artifact.id, "ArtifactFile"),
         project_id=artifact.project_id,
         created_by_user_id=artifact.created_by_user_id,
+        created_at=artifact.created_at,
         visibility=_enum_value(artifact.visibility),
         original_filename=artifact.original_filename,
         content_sha256=artifact.content_sha256,
@@ -1235,6 +1302,7 @@ class MolecularTopologyQueryService(UseCaseService):  # type: ignore[misc]
                     radical_electron_count=topology.radical_electron_count,
                     fragment_count=topology.fragment_count,
                     stereo_status=_enum_value(topology.stereo_status),
+                    is_stereo_abstraction_upstream=topology.is_stereo_abstraction_upstream,
                     sanitization_status=_enum_value(topology.sanitization_status),
                     sanitization_error=topology.sanitization_error,
                     substructure_match_count=None,
@@ -1606,6 +1674,7 @@ class MolecularTopologyQueryService(UseCaseService):  # type: ignore[misc]
                     radical_electron_count=topology.radical_electron_count,
                     fragment_count=topology.fragment_count,
                     stereo_status=_enum_value(topology.stereo_status),
+                    is_stereo_abstraction_upstream=topology.is_stereo_abstraction_upstream,
                     sanitization_status=_enum_value(topology.sanitization_status),
                     sanitization_error=topology.sanitization_error,
                     substructure_match_count=(
@@ -1650,7 +1719,7 @@ class MolecularTopologyQueryService(UseCaseService):  # type: ignore[misc]
 
 
 class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
-    """Browse topology-defined logical reactions."""
+    """Browse logical reaction groups indexed by their mapped reactions."""
 
     @query  # type: ignore[untyped-decorator]
     async def list_logical_reactions(
@@ -1670,6 +1739,8 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
         maximum_activation_gibbs_free_energy_kcal_mol: float | None = None,
         minimum_reaction_gibbs_free_energy_kcal_mol: float | None = None,
         maximum_reaction_gibbs_free_energy_kcal_mol: float | None = None,
+        minimum_mapped_reaction_count: int | None = None,
+        maximum_mapped_reaction_count: int | None = None,
         has_activation_gibbs_free_energy: bool | None = None,
         has_reaction_gibbs_free_energy: bool | None = None,
         reactant_product_changed: bool | None = None,
@@ -1681,7 +1752,13 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
         sort_by: str = "default",
         sort_direction: str = "asc",
     ) -> LogicalReactionPage:
-        """List reactions, optionally restricting them by participant topology."""
+        """List logical paths, matching reaction structures on mapped reactions first.
+
+        A structure query is evaluated against visible ``MappedReaction`` rows
+        and then projected to ``LogicalReaction`` IDs.  The logical reaction
+        is only the grouped result; its abstract participant topologies are
+        never used as the source of a reaction structure match.
+        """
 
         if sort_direction not in {"asc", "desc"}:
             raise ValueError("sort_direction must be asc or desc")
@@ -1719,6 +1796,8 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             maximum_activation_gibbs_free_energy_kcal_mol,
             minimum_reaction_gibbs_free_energy_kcal_mol,
             maximum_reaction_gibbs_free_energy_kcal_mol,
+            minimum_mapped_reaction_count,
+            maximum_mapped_reaction_count,
             reactant_product_changed,
             created_after,
             created_before,
@@ -1747,7 +1826,17 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
         predicates: list[Any] = [logical_reaction_id_is_visible(scope, col(LogicalReaction.id))]
         if topology_id is not None:
             reaction_ids = select(col(LogicalReactionParticipant.logical_reaction_id)).where(
-                col(LogicalReactionParticipant.topology_id) == topology_id
+                or_(
+                    col(LogicalReactionParticipant.topology_id) == topology_id,
+                    col(LogicalReactionParticipant.id).in_(
+                        select(
+                            col(LogicalParticipantConcreteTopology.logical_reaction_participant_id)
+                        ).where(
+                            col(LogicalParticipantConcreteTopology.concrete_topology_id)
+                            == topology_id
+                        )
+                    ),
+                )
             )
             predicates.append(col(LogicalReaction.id).in_(reaction_ids))
         if reaction_key is not None:
@@ -1768,16 +1857,11 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             structure_query = reaction_from_smarts(
                 cast(CString, sql_cast(reaction_smarts, CString))
             )
-            stored_reaction = cast(Any, col(MappedReaction.reaction))
-            structure_predicate = stored_reaction.op("@>")(structure_query)
+            structure_predicate = _mapped_reaction_structure_match(structure_query)
             reaction_structure_predicates.append(structure_predicate)
-            mapped_structure_ids = (
-                select(col(MappedReaction.logical_reaction_id))
-                .where(
-                    mapped_reaction_id_is_visible(scope, col(MappedReaction.id)),
-                    structure_predicate,
-                )
-                .correlate(None)
+            mapped_structure_ids = _logical_reaction_ids_for_mapped_match(
+                scope,
+                structure_predicate,
             )
             predicates.append(col(LogicalReaction.id).in_(mapped_structure_ids))
         similarity_score_expression: Any = literal(None)
@@ -1804,6 +1888,9 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                 if similarity_metric == SimilarityMetric.tanimoto
                 else dice_sml(stored_reaction_fp, similarity_fingerprint)
             )
+            # Search and rank individual mapped reactions.  The logical path
+            # catalog consumes the maximum score per logical_reaction_id, but
+            # never calculates similarity from abstract logical participants.
             similarity_rank = (
                 select(
                     col(MappedReaction.logical_reaction_id).label("logical_reaction_id"),
@@ -1839,6 +1926,20 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             maximum_reaction_gibbs_free_energy_kcal_mol,
             minimum_name="minimum_reaction_gibbs_free_energy_kcal_mol",
             maximum_name="maximum_reaction_gibbs_free_energy_kcal_mol",
+        )
+        _validate_nonnegative_integer(
+            minimum_mapped_reaction_count,
+            name="minimum_mapped_reaction_count",
+        )
+        _validate_nonnegative_integer(
+            maximum_mapped_reaction_count,
+            name="maximum_mapped_reaction_count",
+        )
+        _validate_range(
+            minimum_mapped_reaction_count,
+            maximum_mapped_reaction_count,
+            minimum_name="minimum_mapped_reaction_count",
+            maximum_name="maximum_mapped_reaction_count",
         )
         if (
             minimum_activation_gibbs_free_energy_kcal_mol is not None
@@ -1894,6 +1995,12 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                     )
                 )
             predicates.append(col(LogicalReaction.id).in_(mapped_screening_ids))
+        if minimum_mapped_reaction_count is not None or maximum_mapped_reaction_count is not None:
+            mapped_count = _mapped_reaction_count_expression(scope)
+            if minimum_mapped_reaction_count is not None:
+                predicates.append(mapped_count >= minimum_mapped_reaction_count)
+            if maximum_mapped_reaction_count is not None:
+                predicates.append(mapped_count <= maximum_mapped_reaction_count)
         _validate_range(
             created_after,
             created_before,
@@ -2022,6 +2129,26 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                 participants_by_reaction.setdefault(participant.logical_reaction_id, []).append(
                     (participant, topology)
                 )
+            mapped_count_rows = (
+                (
+                    await session.execute(
+                        select(
+                            col(MappedReaction.logical_reaction_id),
+                            func.count(col(MappedReaction.id)),
+                        )
+                        .where(
+                            col(MappedReaction.logical_reaction_id).in_(page_reaction_ids),
+                            mapped_reaction_id_is_visible(scope, col(MappedReaction.id)),
+                        )
+                        .group_by(col(MappedReaction.logical_reaction_id))
+                    )
+                ).all()
+                if page_reaction_ids
+                else []
+            )
+            mapped_counts_by_reaction = {
+                logical_id: int(count) for logical_id, count in mapped_count_rows
+            }
             transition_rows = (
                 (
                     await session.execute(
@@ -2094,6 +2221,9 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             items=[
                 _reaction_summary(
                     reaction,
+                    mapped_reaction_count=mapped_counts_by_reaction.get(
+                        _required_uuid(reaction.id, "LogicalReaction"), 0
+                    ),
                     reactant_product_changed=_canonical_reactant_product_changed(
                         participants_by_reaction.get(
                             _required_uuid(reaction.id, "LogicalReaction"), []
@@ -2215,6 +2345,7 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
         ]
         summary = _reaction_summary(
             reaction,
+            mapped_reaction_count=len(paths),
             reactant_product_changed=_canonical_reactant_product_changed(participant_rows),
             minimum_activation_gibbs_free_energy_kcal_mol=(
                 min(path_minima) if path_minima else None
@@ -2300,10 +2431,21 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
         if logical_reaction_id is not None:
             predicates.append(col(MappedReaction.logical_reaction_id) == logical_reaction_id)
         if topology_id is not None:
-            logical_ids = select(col(LogicalReactionParticipant.logical_reaction_id)).where(
-                col(LogicalReactionParticipant.topology_id) == topology_id
+            mapped_ids = (
+                select(col(MappedReactionParticipant.mapped_reaction_id))
+                .join(
+                    LogicalReactionParticipant,
+                    col(MappedReactionParticipant.logical_reaction_participant_id)
+                    == col(LogicalReactionParticipant.id),
+                )
+                .where(
+                    or_(
+                        col(MappedReactionParticipant.concrete_topology_id) == topology_id,
+                        col(LogicalReactionParticipant.topology_id) == topology_id,
+                    )
+                )
             )
-            predicates.append(col(MappedReaction.logical_reaction_id).in_(logical_ids))
+            predicates.append(col(MappedReaction.id).in_(mapped_ids))
         if geometry_id is not None:
             mapped_ids = (
                 select(col(MappedReactionNode.mapped_reaction_id))
@@ -2455,7 +2597,6 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
         if created_before is not None:
             predicates.append(col(MappedReaction.created_at) <= created_before)
         candidate_predicates = list(predicates)
-        stored_reaction = cast(Any, col(MappedReaction.reaction))
         smarts_match: Any = literal(None)
         if reaction_smarts is not None:
             if rdChemReactions.ReactionFromSmarts(reaction_smarts) is None:
@@ -2463,7 +2604,7 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
             smarts_query_reaction = reaction_from_smarts(
                 cast(CString, sql_cast(reaction_smarts, CString))
             )
-            smarts_match = stored_reaction.op("@>")(smarts_query_reaction)
+            smarts_match = _mapped_reaction_structure_match(smarts_query_reaction)
             predicates.append(smarts_match)
             candidate_predicates.append(smarts_match)
 
@@ -2600,12 +2741,15 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
             if path_row is None:
                 return None
             path, reaction = path_row
+            logical_topology = aliased(MolecularTopology)
+            concrete_topology = aliased(MolecularTopology)
             participant_rows = (
                 await session.execute(
                     select(
                         MappedReactionParticipant,
                         LogicalReactionParticipant,
-                        MolecularTopology,
+                        concrete_topology,
+                        logical_topology,
                     )
                     .join(
                         LogicalReactionParticipant,
@@ -2613,8 +2757,13 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
                         == col(LogicalReactionParticipant.id),
                     )
                     .join(
-                        MolecularTopology,
-                        col(LogicalReactionParticipant.topology_id) == col(MolecularTopology.id),
+                        logical_topology,
+                        col(LogicalReactionParticipant.topology_id) == col(logical_topology.id),
+                    )
+                    .outerjoin(
+                        concrete_topology,
+                        col(MappedReactionParticipant.concrete_topology_id)
+                        == col(concrete_topology.id),
                     )
                     .where(col(MappedReactionParticipant.mapped_reaction_id) == mapped_reaction_id)
                     .order_by(
@@ -2856,8 +3005,13 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
             path,
             reactant_product_changed=_canonical_reactant_product_changed(
                 [
-                    (logical_participant, topology)
-                    for _, logical_participant, topology in participant_rows
+                    (logical_participant, _logical_topology)
+                    for (
+                        _mapped_participant,
+                        logical_participant,
+                        _concrete_topology,
+                        _logical_topology,
+                    ) in participant_rows
                 ]
             ),
         )
@@ -2870,11 +3024,21 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
                     logical_reaction_participant_id=logical_participant.id,
                     side=_enum_value(mapped_participant.side),
                     template_index=mapped_participant.template_index,
-                    topology_id=topology.id,
+                    topology_id=(
+                        concrete_topology.id
+                        if concrete_topology is not None
+                        else logical_topology.id
+                    ),
+                    logical_topology_id=logical_topology.id,
                     atom_map_numbers=mapped_participant.atom_map_numbers,
                     mapped_smiles=mapped_participant.mapped_smiles,
                 )
-                for mapped_participant, logical_participant, topology in participant_rows
+                for (
+                    mapped_participant,
+                    logical_participant,
+                    concrete_topology,
+                    logical_topology,
+                ) in participant_rows
             ],
             nodes=[
                 MappedReactionNodeView(

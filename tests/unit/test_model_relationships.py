@@ -18,6 +18,7 @@ from tricycle_reaction_db.db.models import (
     ExternalIdentity,
     Geometry,
     ImplicitSolvationResult,
+    LogicalParticipantConcreteTopology,
     LogicalReaction,
     LogicalReactionParticipant,
     ManifestArtifactBinding,
@@ -30,6 +31,7 @@ from tricycle_reaction_db.db.models import (
     MolecularFormula,
     MolecularOrbitalResult,
     MolecularTopology,
+    MolecularTopologyAbstraction,
     MultireferenceResult,
     NMRResult,
     NMRShieldingTensor,
@@ -63,6 +65,7 @@ def test_all_sqlmodel_relationships_are_bidirectional() -> None:
     models = (
         MolecularFormula,
         MolecularTopology,
+        MolecularTopologyAbstraction,
         Geometry,
         ArtifactFile,
         CalculationProtocol,
@@ -90,6 +93,7 @@ def test_all_sqlmodel_relationships_are_bidirectional() -> None:
         ManifestArtifactBinding,
         LogicalReaction,
         LogicalReactionParticipant,
+        LogicalParticipantConcreteTopology,
         MappedReaction,
         MappedReactionParticipant,
         MappedReactionNode,
@@ -114,9 +118,34 @@ def test_reaction_axis_has_explicit_topology_and_mapping_foreign_keys() -> None:
     assert _pairs(LogicalReaction, "participants") == {("id", "logical_reaction_id")}
     assert _pairs(LogicalReactionParticipant, "topology") == {("topology_id", "id")}
     assert _pairs(MolecularTopology, "logical_reaction_participants") == {("id", "topology_id")}
+    assert _pairs(MolecularTopology, "generalization_edges") == {("id", "specific_topology_id")}
+    assert _pairs(MolecularTopology, "specialization_edges") == {("id", "general_topology_id")}
+    assert _pairs(
+        MolecularTopology,
+        "logical_participant_concrete_topologies",
+    ) == {("id", "concrete_topology_id")}
+    assert _pairs(MolecularTopology, "mapped_reaction_participants") == {
+        ("id", "concrete_topology_id")
+    }
+    assert _pairs(MolecularTopologyAbstraction, "specific_topology") == {
+        ("specific_topology_id", "id")
+    }
+    assert _pairs(MolecularTopologyAbstraction, "general_topology") == {
+        ("general_topology_id", "id")
+    }
     assert _pairs(MappedReaction, "logical_reaction") == {("logical_reaction_id", "id")}
     assert _pairs(MappedReactionParticipant, "logical_reaction_participant") == {
         ("logical_reaction_participant_id", "id")
+    }
+    assert _pairs(
+        LogicalParticipantConcreteTopology,
+        "logical_reaction_participant",
+    ) == {("logical_reaction_participant_id", "id")}
+    assert _pairs(LogicalParticipantConcreteTopology, "concrete_topology") == {
+        ("concrete_topology_id", "id")
+    }
+    assert _pairs(MappedReactionParticipant, "concrete_topology") == {
+        ("concrete_topology_id", "id")
     }
     assert _pairs(MappedReactionNodeGeometry, "mapped_reaction_participant") == {
         ("mapped_reaction_participant_id", "id")

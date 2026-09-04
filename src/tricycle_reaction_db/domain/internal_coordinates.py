@@ -6,6 +6,8 @@ from typing import Final
 import numpy as np
 import numpy.typing as npt
 
+from tricycle_reaction_db.core.units import degrees_to_radians, radians_to_degrees
+
 INTERNAL_COORDINATE_DECIMAL_PLACES: Final = 12
 
 
@@ -49,7 +51,10 @@ def internal_coordinates_from_cartesian(
             out=np.ones_like(denominator),
             where=denominator != 0,
         )
-        values[2:, 1] = np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+        values[2:, 1] = np.asarray(
+            radians_to_degrees(np.arccos(np.clip(cosine, -1.0, 1.0))),
+            dtype=np.float64,
+        )
     for index in range(3, atom_count):
         p0, p1, p2, p3 = xyz[index - 3 : index + 1]
         b0 = p1 - p0
@@ -61,7 +66,9 @@ def internal_coordinates_from_cartesian(
         b1_unit = b1 / b1_norm
         v = b0 - np.dot(b0, b1_unit) * b1_unit
         w = b2 - np.dot(b2, b1_unit) * b1_unit
-        values[index, 2] = np.degrees(np.arctan2(np.dot(np.cross(b1_unit, v), w), np.dot(v, w)))
+        values[index, 2] = float(
+            radians_to_degrees(np.arctan2(np.dot(np.cross(b1_unit, v), w), np.dot(v, w)))
+        )
     if values.shape != (expected_atom_count, 3) or not np.isfinite(values).all():
         raise ValueError("MolOP produced invalid internal coordinates")
 
@@ -101,14 +108,14 @@ def cartesian_from_internal_coordinates(
         coordinates[1, 0] = values[1, 0]
     if atom_count > 2:
         r = values[2, 0]
-        theta = np.radians(values[2, 1])
+        theta = float(degrees_to_radians(values[2, 1]))
         e1 = np.array([1.0, 0.0, 0.0])
         e2 = np.array([0.0, 1.0, 0.0])
         coordinates[2] = coordinates[1] + r * (-np.cos(theta) * e1 + np.sin(theta) * e2)
     for index in range(3, atom_count):
         r = values[index, 0]
-        theta = np.radians(values[index, 1])
-        phi = np.radians(values[index, 2] - 180.0)
+        theta = float(degrees_to_radians(values[index, 1]))
+        phi = float(degrees_to_radians(values[index, 2] - 180.0))
         rc = coordinates[index - 1]
         rb = coordinates[index - 2]
         ra = coordinates[index - 3]

@@ -259,6 +259,7 @@ class MolecularTopologyRecord(BaseModel):
     radical_electron_count: int = Field(ge=0)
     fragment_count: int = Field(gt=0)
     stereo_status: StereoStatus
+    is_stereo_abstraction_upstream: bool = False
     sanitization_status: TopologySanitizationStatus = TopologySanitizationStatus.SANITIZED
     sanitization_error: str | None = None
 

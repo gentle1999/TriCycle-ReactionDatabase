@@ -3,7 +3,7 @@
 from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, model_validator
 from rdkit import Chem
@@ -11,6 +11,7 @@ from rdkit.Chem import rdChemReactions
 
 from tricycle_reaction_db.application.services.depictions import (
     draw_molecule_molfile,
+    draw_reaction_svg,
     get_geometry_dof_depiction,
     get_geometry_sdf,
     get_geometry_xyz,
@@ -233,6 +234,32 @@ async def validate_chemistry_representation(
                 "mol_block": "MOL block 无法解析",
             }[request.kind],
         )
+
+
+@router.get(
+    "/api/depictions/reaction.svg",
+    response_class=Response,
+)
+async def reaction_depiction(
+    reaction_smiles: str = Query(min_length=1, max_length=65_536),
+) -> Response:
+    """Render one already-persisted reaction representation as a read-only SVG."""
+
+    try:
+        svg = draw_reaction_svg(reaction_smiles)
+    except (TypeError, ValueError, RuntimeError, IndexError) as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="reaction representation could not be rendered",
+        ) from error
+    return Response(
+        content=svg,
+        media_type="image/svg+xml",
+        headers={
+            "Cache-Control": "private, max-age=3600",
+            "X-Depiction-Renderer": "rdkit-reaction",
+        },
+    )
 
 
 @router.get(

@@ -15,10 +15,11 @@ from tricycle_reaction_db.application.dtos import (
     ThermodynamicTopologyMinimumView,
 )
 from tricycle_reaction_db.application.services.geometry_energy import GeometryEnergyComposite
+from tricycle_reaction_db.core.chemistry_config import (
+    MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION,
+)
+from tricycle_reaction_db.core.units import hartree_per_particle_to_kcal_per_mol
 from tricycle_reaction_db.domain.precision import round_energy_hartree
-
-HARTREE_TO_KCAL_MOL = 627.5094740631
-MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION = "mapped-reaction-thermodynamics-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,12 +198,15 @@ def _difference(
 ) -> ThermodynamicDifferenceView:
     return ThermodynamicDifferenceView(
         enthalpy_kcal_mol=round(
-            (target.enthalpy_hartree - reference.enthalpy_hartree) * HARTREE_TO_KCAL_MOL,
+            hartree_per_particle_to_kcal_per_mol(
+                target.enthalpy_hartree - reference.enthalpy_hartree
+            ),
             6,
         ),
         gibbs_free_energy_kcal_mol=round(
-            (target.gibbs_free_energy_hartree - reference.gibbs_free_energy_hartree)
-            * HARTREE_TO_KCAL_MOL,
+            hartree_per_particle_to_kcal_per_mol(
+                target.gibbs_free_energy_hartree - reference.gibbs_free_energy_hartree
+            ),
             6,
         ),
         entropy_cal_mol_k=round(

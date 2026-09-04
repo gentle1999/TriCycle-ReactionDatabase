@@ -7,7 +7,7 @@ from uuid import UUID
 
 import numpy as np
 from rdkit import Chem
-from rdkit.Chem import rdDepictor
+from rdkit.Chem import rdChemReactions, rdDepictor
 from rdkit.Chem.Draw import rdMolDraw2D
 from rdkit.Geometry import Point3D
 from rdkit_dof import (  # type: ignore[import-untyped]
@@ -54,6 +54,42 @@ def draw_molecule_svg(molecule: Chem.Mol, *, width: int = 360, height: int = 220
     options.bondLineWidth = 1.8
     options.addStereoAnnotation = True
     rdMolDraw2D.PrepareAndDrawMolecule(drawer, drawable)
+    drawer.FinishDrawing()
+    return drawer.GetDrawingText()
+
+
+def draw_reaction_svg(
+    reaction_smiles: str,
+    *,
+    width: int = 960,
+    height: int = 300,
+) -> str:
+    """Render one stored reaction representation without re-projecting its chemistry."""
+
+    reaction = rdChemReactions.ReactionFromSmiles(reaction_smiles)
+    if reaction is None:
+        raise ValueError("reaction SMILES could not be parsed")
+    # Do not sanitize the reaction here.  RDKit's reaction sanitization folds
+    # explicit hydrogens in reactant templates into implicit hydrogens, while
+    # the stored mapped reaction representation must remain visually faithful.
+    if reaction.GetNumReactantTemplates() == 0 or reaction.GetNumProductTemplates() == 0:
+        raise ValueError("reaction must contain at least one reactant and one product")
+
+    # Keep the mapped-reaction identity visible in the depiction.  The reaction
+    # was parsed from the request and is therefore safe to annotate in place.
+    for molecule in (*reaction.GetReactants(), *reaction.GetProducts()):
+        for atom in molecule.GetAtoms():
+            map_number = atom.GetAtomMapNum()
+            if map_number > 0:
+                atom.SetProp("atomNote", str(map_number))
+
+    drawer = rdMolDraw2D.MolDraw2DSVG(width, height)
+    options: Any = drawer.drawOptions()
+    options.clearBackground = False
+    options.padding = 0.06
+    options.bondLineWidth = 1.8
+    options.addStereoAnnotation = True
+    drawer.DrawReaction(reaction)
     drawer.FinishDrawing()
     return drawer.GetDrawingText()
 
@@ -514,6 +550,7 @@ async def get_transition_state_anchor_sdf(
 __all__ = [
     "draw_molecule_molfile",
     "draw_molecule_svg",
+    "draw_reaction_svg",
     "draw_geometry_dof_svg",
     "draw_transition_state_mode_dof_svg",
     "draw_geometry_sdf",
