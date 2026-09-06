@@ -343,7 +343,7 @@ NexusX `ErManager` 当前不接受复合 relationship join。Voyager ER 子图�
 
 - OpenAPI：<http://127.0.0.1:8000/docs>
 - `GET /health/live`：进程存活检查，不访问数据库
-- `GET /health/ready`：检查 PostgreSQL 和 RDKit extension
+- `GET /health/ready`：检查 PostgreSQL、RDKit extension 和 RustFS bucket
 - `POST /api/{service}/{method}`：NexusX 从白名单 use case 生成的 REST
 - `POST /graphql`：NexusX Compose GraphQL HTTP endpoint
 - `GET /graphql`：开发环境 GraphiQL；生产环境返回 404

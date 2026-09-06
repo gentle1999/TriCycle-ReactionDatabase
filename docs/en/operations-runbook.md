@@ -43,7 +43,7 @@ unchanged after any list/delete/database error.
 Monitor public live/ready state, PostgreSQL/RustFS/Redis/OIDC/SMTP reachability,
 upload pending/failure/object integrity, scheduled-unit failures, rate limits,
 and query latency/timeouts. `/health/live` alone is insufficient; `/health/ready`
-must include PostgreSQL and RDKit readiness.
+must include PostgreSQL, RDKit, and RustFS bucket readiness.
 
 Before release, run `tricycle-deployment-smoke` on every API node and retain its
 redacted JSON output. Then exercise OIDC login/logout, invitation sending and

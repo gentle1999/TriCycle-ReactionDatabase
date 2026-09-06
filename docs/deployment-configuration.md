@@ -541,7 +541,8 @@ uv run alembic check
 SELECT extversion FROM pg_extension WHERE extname = 'rdkit';
 ~~~
 
-没有 RDKit extension 时，/health/ready 会失败，结构查询和迁移不能视为可用。
+没有 RDKit extension 或 RustFS bucket 不可达时，/health/ready 会失败，结构查询和文件服务
+不能视为可用。
 
 ## 7. RustFS/S3 对象存储
 
@@ -749,8 +750,8 @@ caddy validate --config infra/caddy/Caddyfile --adapter caddyfile
 ~~~
 
 并完成一次真实 OIDC 登录、退出、项目邀请邮件、邀请接受、artifact 上传/下载和备份恢复
-演练。/health/ready 必须确认 PostgreSQL 和 RDKit extension 均正常；仅 /health/live 成功
-不能证明应用可用。
+演练。/health/ready 必须确认 PostgreSQL、RDKit extension 和 RustFS bucket 均正常；仅
+/health/live 成功不能证明应用可用。
 
 ## 13. 常见问题
 
