@@ -78,8 +78,10 @@ http://{$CADDY_SERVER_NAME:localhost}:{$CADDY_HTTP_PORT:80} {
 		reverse_proxy {$CADDY_API_UPSTREAM:api:8000}
 	}
 	handle @nx_graphql {
-		uri strip_prefix /nexusx
-		reverse_proxy {$CADDY_API_UPSTREAM:api:8000}
+		uri replace /nexusx/graphql /graphql-playground
+		reverse_proxy {$CADDY_API_UPSTREAM:api:8000} {
+			header_up X-Forwarded-Prefix /nexusx
+		}
 	}
 	handle @nx_core {
 		uri strip_prefix /nexusx/core

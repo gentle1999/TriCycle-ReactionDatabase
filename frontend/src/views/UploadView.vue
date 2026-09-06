@@ -72,6 +72,11 @@ interface DroppedFile {
 
 const MAX_QUEUE_FILES = 20_000;
 const MAX_AUTOMATIC_ATTEMPTS = 6;
+// Keep each HTTP request within the validated local upload window. The API
+// may enforce a smaller deployment-specific limit; runTaskBatch can split a
+// rejected multi-file request and retry the smaller batches.
+const MOLOP_BATCH_MAX_FILES = 32;
+const MOLOP_BATCH_MAX_BYTES = 256 * 1024 * 1024;
 // Leave the completed batch summary on screen briefly before resetting the
 // queue so the user (and the acceptance suite) can observe the final counts.
 const BATCH_COMPLETION_RESET_DELAY_MS = 2_000;
@@ -131,6 +136,11 @@ const pageCount = computed(() => Math.max(1, Math.ceil(filteredTotal.value / PAG
 const succeededCount = computed(() => tasks.value.filter((task) => task.status === "succeeded").length);
 const failedCount = computed(() => tasks.value.filter((task) => task.status === "failed").length);
 const cancelledCount = computed(() => tasks.value.filter((task) => task.status === "cancelled").length);
+
+function uploadCount(value: number | null | undefined): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
 const uploadedBytes = computed(() => tasks.value.reduce((total, task) => {
   if (["staged", "processing", "succeeded"].includes(task.status)) return total + task.size;
   if (task.status === "uploading") return total + Math.min(task.loaded, task.size);
@@ -147,12 +157,12 @@ const canStart = computed(() => Boolean(
   && !queueCancelled.value,
 ));
 const batchCounters = computed(() => batch.value ? {
-  succeeded: remoteMode.value ? batch.value.succeeded_count : succeededCount.value,
-  failed: remoteMode.value ? batch.value.failed_count : failedCount.value,
-  cancelled: remoteMode.value ? batch.value.cancelled_count : cancelledCount.value,
-  staged: remoteMode.value ? batch.value.staged_count : tasks.value.filter((task) => task.status === "staged").length,
-  processing: remoteMode.value ? batch.value.processing_count : tasks.value.filter((task) => task.status === "processing").length,
-  total: batch.value.total_count,
+  succeeded: remoteMode.value ? uploadCount(batch.value.succeeded_count) : succeededCount.value,
+  failed: remoteMode.value ? uploadCount(batch.value.failed_count) : failedCount.value,
+  cancelled: remoteMode.value ? uploadCount(batch.value.cancelled_count) : cancelledCount.value,
+  staged: remoteMode.value ? uploadCount(batch.value.staged_count) : tasks.value.filter((task) => task.status === "staged").length,
+  processing: remoteMode.value ? uploadCount(batch.value.processing_count) : tasks.value.filter((task) => task.status === "processing").length,
+  total: uploadCount(batch.value.total_count),
 } : {
   succeeded: succeededCount.value,
   failed: failedCount.value,
@@ -585,66 +595,115 @@ function closeTaskError(): void {
   selectedErrorTask.value = null;
 }
 
+function updateBatchProgress(selected: QueueTask[], loaded: number, total: number): void {
+  const selectedBytes = selected.reduce((sum, task) => sum + task.size, 0);
+  let remaining = total > 0
+    ? Math.min(selectedBytes, Math.round((loaded / total) * selectedBytes))
+    : 0;
+  for (const task of selected) {
+    task.loaded = Math.min(task.size, remaining);
+    remaining = Math.max(0, remaining - task.size);
+  }
+}
+
 function claimTaskBatch(): QueueTask[] {
   const selected: QueueTask[] = [];
+  let selectedBytes = 0;
   for (const task of tasks.value) {
     if (task.status !== "queued" || !task.file || task.reserved) continue;
+    if (selected.length >= MOLOP_BATCH_MAX_FILES) break;
+    if (selected.length && selectedBytes + task.size > MOLOP_BATCH_MAX_BYTES) continue;
     task.reserved = true;
     selected.push(task);
-    break;
+    selectedBytes += task.size;
   }
   return selected;
 }
 
 async function runTaskBatch(selected: QueueTask[], runId: number): Promise<void> {
   if (!batch.value || !selected.length) return;
-  const task = selected[0];
-  if (!task) return;
   try {
     while (runId === queueRunId && !queueCancelled.value) {
-      task.status = "uploading";
-      task.attempt += 1;
-      task.loaded = 0;
-      task.error = "";
-      task.parsePhase = "uploading";
-      task.parseCompleted = 0;
-      task.parseTotal = 1;
+      for (const task of selected) {
+        task.status = "uploading";
+        task.attempt += 1;
+        task.loaded = 0;
+        task.error = "";
+        task.parsePhase = "uploading";
+        task.parseCompleted = 0;
+        task.parseTotal = selected.length;
+      }
       const controller = new AbortController();
-      task.controller = controller;
+      for (const task of selected) task.controller = controller;
       try {
-        const item = await api.uploadBatchFile(
+        const items = await api.uploadBatchFiles(
           batch.value.id,
-          task.clientFileId,
-          task.file!,
+          selected.map((task) => ({ clientFileId: task.clientFileId, file: task.file! })),
           (loaded, total) => {
-            task.loaded = Math.min(task.size, loaded);
-            if (total > 0 && loaded >= total && task.status === "uploading") {
-              task.parsePhase = "staging";
+            updateBatchProgress(selected, loaded, total);
+            if (total > 0 && loaded >= total) {
+              for (const task of selected) {
+                if (task.status === "uploading") task.parsePhase = "parsing";
+              }
             }
           },
           controller.signal,
         );
-        applyItem(task, item);
+        const itemsByClientId = new Map(items.map((item) => [item.client_file_id, item]));
+        for (const task of selected) {
+          const item = itemsByClientId.get(task.clientFileId);
+          if (!item) throw new Error(`批量上传未返回文件结果：${task.filename}`);
+          applyItem(task, item);
+        }
         return;
       } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") {
-          task.status = "cancelled";
-          task.error = "";
-          task.parsePhase = null;
+          for (const task of selected) {
+            task.status = "cancelled";
+            task.error = "";
+            task.parsePhase = null;
+          }
+          return;
+        }
+        // The API may be configured with a smaller request window than the
+        // frontend's local window. A preflight 413, or an unexpected batch
+        // 500 after some files have committed, is recoverable by recursively
+        // splitting the same reserved tasks; a singleton remains a genuine
+        // per-file failure.
+        if (
+          error instanceof ApiError
+          && (error.status === 413 || error.status === 500)
+          && selected.length > 1
+        ) {
+          const midpoint = Math.ceil(selected.length / 2);
+          for (const task of selected) {
+            task.status = "queued";
+            task.loaded = 0;
+            task.error = "正在调整批次大小";
+            task.parsePhase = null;
+          }
+          await Promise.all([
+            runTaskBatch(selected.slice(0, midpoint), runId),
+            runTaskBatch(selected.slice(midpoint), runId),
+          ]);
           return;
         }
         const retryable = error instanceof ApiError
           && (error.status === 0 || error.status === 429 || error.status === 502 || error.status === 503 || error.status === 504);
-        if (!retryable || task.attempt >= MAX_AUTOMATIC_ATTEMPTS) {
-          task.status = "failed";
-          task.error = error instanceof Error ? error.message : "上传失败";
-          task.parsePhase = "failed";
+        if (!retryable || selected.some((task) => task.attempt >= MAX_AUTOMATIC_ATTEMPTS)) {
+          for (const task of selected) {
+            task.status = "failed";
+            task.error = error instanceof Error ? error.message : "上传失败";
+            task.parsePhase = "failed";
+          }
           return;
         }
-        const attempt = task.attempt;
+        const attempt = Math.max(...selected.map((task) => task.attempt));
         const retrySeconds = error.retryAfterSeconds ?? Math.min(30, 2 ** (attempt - 1));
-        task.status = "queued";
-        task.error = `${retrySeconds} 秒后自动重试`;
+        for (const task of selected) {
+          task.status = "queued";
+          task.error = `${retrySeconds} 秒后自动重试`;
+        }
         const retryAt = Date.now() + retrySeconds * 1000;
         while (
           Date.now() < retryAt
@@ -656,12 +715,14 @@ async function runTaskBatch(selected: QueueTask[], runId: number): Promise<void>
         }
         if (queuePaused.value || queueCancelled.value || runId !== queueRunId) return;
       } finally {
-        task.controller = null;
+        for (const task of selected) task.controller = null;
       }
     }
   } finally {
-    task.reserved = false;
-    if (runId !== queueRunId && task.status === "uploading") task.status = "cancelled";
+    for (const task of selected) {
+      task.reserved = false;
+      if (runId !== queueRunId && task.status === "uploading") task.status = "cancelled";
+    }
   }
 }
 
@@ -691,10 +752,15 @@ async function startQueue(): Promise<void> {
       await Promise.all(Array.from({ length: concurrency.value }, () => queueWorker(runId)));
       if (runId === queueRunId && viewMounted) {
         await refreshBatch();
-        // Upload requests only reach `staged`; the worker may have advanced an
-        // item while the browser was sending the next file. Reconcile all
-        // items once before deciding whether the batch is visibly complete.
-        await refreshLocalItems();
+        // Upload requests may only reach `staged` or `processing`; reconcile
+        // those server-side transitions while avoiding an extra items request
+        // after a terminal upload response has already supplied every item.
+        if (
+          batch.value?.status !== "completed"
+          || tasks.value.some((task) => ["uploading", "staged", "processing"].includes(task.status))
+        ) {
+          await refreshLocalItems();
+        }
         await refreshRecentBatches();
         if (
           batch.value?.status === "completed"

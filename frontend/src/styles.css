@@ -3314,6 +3314,63 @@ table.data-table {
   }
 }
 
+@media (max-width: 980px) {
+  .topbar {
+    height: 60px;
+    padding: 0 14px;
+  }
+
+  .topbar-actions {
+    min-width: 0;
+    gap: 7px;
+  }
+
+  .brand-mark {
+    width: 34px;
+    height: 34px;
+  }
+
+  .brand strong {
+    font-size: 14px;
+  }
+
+  .brand small,
+  .health span,
+  .current-user span,
+  .api-link {
+    display: none;
+  }
+
+  .utility-nav {
+    gap: 2px;
+  }
+
+  .utility-link {
+    width: 30px;
+    justify-content: center;
+    padding: 0;
+  }
+
+  .utility-link span,
+  .project-selector > span {
+    display: none;
+  }
+
+  .project-selector select {
+    max-width: 128px;
+    min-height: 30px;
+    font-size: 11px;
+  }
+
+  .health,
+  .current-user {
+    width: 34px;
+    height: 34px;
+    justify-content: center;
+    padding: 0;
+  }
+}
+
 @media (max-width: 720px) {
   .nexusx-launch-band {
     display: block;

@@ -51,6 +51,7 @@ const reactantProductChanged = ref<boolean | null>(null);
 const advancedQueryOpen = ref(false);
 const filterError = ref("");
 const validatingQuickFilter = ref(false);
+const hoveredScatterDatum = ref<ScatterDatum | null>(null);
 
 const appliedFilters = computed<ReactionQueryFilters>(() => ({
   ...filters.value,
@@ -73,6 +74,7 @@ interface ScatterDatum {
 
 interface ScatterEvent {
   data?: unknown;
+  dataIndex?: number;
 }
 
 const statistics = useQuery({
@@ -167,11 +169,25 @@ function isScatterDatum(value: unknown): value is ScatterDatum {
     && typeof candidate.detailHref === "string";
 }
 
-function scatterTooltip(params: unknown): string {
+function scatterDatumFromEvent(params: unknown): ScatterDatum | null {
   const candidate = Array.isArray(params) ? params[0] : params;
-  if (!candidate || typeof candidate !== "object") return "";
-  const data = (candidate as { data?: unknown }).data;
-  if (!isScatterDatum(data)) return "";
+  if (!candidate || typeof candidate !== "object") return null;
+  const event = candidate as ScatterEvent;
+  if (isScatterDatum(event.data)) return event.data;
+
+  // ECharts can expose a normalized data array in callback params instead of
+  // the original object. Resolve the stable data index against the API
+  // response so the tooltip and click target still retain the 3D-derived
+  // reaction identity and representation.
+  if (typeof event.dataIndex !== "number" || event.dataIndex < 0) return null;
+  const point = statistics.data.value?.scatter?.[event.dataIndex];
+  return point ? scatterDatum(point) : null;
+}
+
+function scatterTooltip(params: unknown): string {
+  const data = scatterDatumFromEvent(params);
+  if (!data) return "";
+  hoveredScatterDatum.value = data;
   const [reaction, activation] = data.value;
   return [
     '<div class="thermo-point-tooltip">',
@@ -187,11 +203,16 @@ function scatterTooltip(params: unknown): string {
   ].join("");
 }
 
-function openScatterPoint(params: ScatterEvent): void {
-  if (!isScatterDatum(params.data)) return;
+function openHoveredScatterPoint(): void {
+  // The axis tooltip deliberately resolves the nearest profile even when the
+  // pointer lands between symbols. A native wrapper click keeps navigation
+  // consistent with that visible selection because ECharts does not emit its
+  // series click event for an axis-only hit.
+  const data = hoveredScatterDatum.value;
+  if (!data) return;
   void router.push({
     name: "mapped-reaction-detail",
-    params: { mappedReactionId: params.data.mappedReactionId },
+    params: { mappedReactionId: data.mappedReactionId },
     query: navigationQuery.value,
   });
 }
@@ -214,7 +235,7 @@ const scatterOption = computed<EChartsOption>(() => {
     animation: false,
     grid: { top: 16, right: 18, bottom: 48, left: 56 },
     tooltip: {
-      trigger: "item",
+      trigger: "axis",
       renderMode: "html",
       enterable: true,
       confine: true,
@@ -492,7 +513,9 @@ async function downloadExport(): Promise<void> {
         </article>
         <article class="analytics-panel analytics-panel-wide">
           <div class="analytics-panel-heading"><div><span class="eyebrow">RELATIONSHIP</span><h2>动力学与热力学关系</h2></div><span>最多显示 1000 个 profile</span></div>
-          <VChart class="analytics-chart analytics-chart-tall analytics-scatter-chart" :option="scatterOption" autoresize @click="openScatterPoint" />
+          <div class="analytics-scatter-chart-shell" @click="openHoveredScatterPoint">
+            <VChart class="analytics-chart analytics-chart-tall analytics-scatter-chart" :option="scatterOption" autoresize />
+          </div>
         </article>
         <article class="analytics-panel">
           <div class="analytics-panel-heading"><div><span class="eyebrow">METHOD</span><h2>计算层级构成</h2></div><span>profile 数</span></div>
