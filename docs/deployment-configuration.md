@@ -119,7 +119,7 @@ curl --insecure https://localhost/health/ready
 ~~~
 
 也可使用 `make stack-up`、`make stack-logs` 和 `make stack-down`。启动顺序由健康检查保证：
-PostgreSQL -> Alembic migration -> bootstrap -> API；RustFS 与前端 healthy 后才启动 Caddy。
+PostgreSQL -> Alembic migration -> bootstrap -> API/upload-worker；RustFS 与前端 healthy 后才启动 Caddy。
 `docker compose down` 保留 named volumes；只有显式 `docker compose down --volumes` 才删除
 数据库、对象存储、Keycloak 和自签名证书数据。
 
@@ -181,7 +181,7 @@ docker compose -f compose.data.yaml up -d --wait
 允许算力服务器私网地址使用 TLS + SCRAM。RustFS S3 API 只允许算力服务器访问，Console
 只绑定回环或管理网访问。
 
-算力服务器（运行 API、迁移、bootstrap、前端、Caddy 和开发 Keycloak）配置 `.env`：
+算力服务器（运行 API、upload-worker、迁移、bootstrap、前端、Caddy 和开发 Keycloak）配置 `.env`：
 
 ~~~dotenv
 COMPOSE_PROJECT_NAME=reaction-database-compute
@@ -207,7 +207,7 @@ TRICYCLE_BOOTSTRAP_MODE=production
 ~~~
 
 把私有 CA 放在 `TRICYCLE_COMPOSE_CA_DIRECTORY` 指定的算力服务器目录中；overlay 会将该
-目录只读挂载到 API/migration/bootstrap 容器的 `/etc/reaction-database/ca`。如果 CA 已在
+目录只读挂载到 API/upload-worker/migration/bootstrap 容器的 `/etc/reaction-database/ca`。如果 CA 已在
 基础镜像信任库中，可省略 `sslrootcert`/`TRICYCLE_RUSTFS_CA_BUNDLE`，但仍保持证书校验。
 密码中的 `@`、`:`、`/`、`#` 等字符必须 URL 编码。TLS 证书 SAN 应包含应用实际使用的
 DNS 名称；不要用裸 IP 规避 DNS，除非证书明确包含该 IP SAN。

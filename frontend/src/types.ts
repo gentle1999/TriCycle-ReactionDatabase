@@ -681,7 +681,14 @@ export interface ArtifactBatchUploadResult {
 }
 
 export type UploadBatchStatus = "active" | "paused" | "completed" | "cancelled";
-export type UploadBatchItemStatus = "queued" | "uploading" | "succeeded" | "failed" | "cancelled";
+export type UploadBatchItemStatus =
+  | "queued"
+  | "uploading"
+  | "staged"
+  | "processing"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
 
 export interface UploadBatchFileCreate {
   client_file_id: string;
@@ -713,6 +720,8 @@ export interface UploadBatch {
   failed_count: number;
   cancelled_count: number;
   uploading_count: number;
+  staged_count: number;
+  processing_count: number;
 }
 
 export interface UploadBatchPage {
@@ -734,6 +743,8 @@ export interface UploadBatchItem {
   media_type: string;
   status: UploadBatchItemStatus;
   attempt_count: number;
+  processing_attempt_count: number;
+  content_sha256: string | null;
   artifact_file_id: string | null;
   ingestion_status: ArtifactSummary["ingestion_status"];
   ingestion_error_message: string | null;

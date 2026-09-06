@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
+from ipaddress import ip_address
 from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Literal
@@ -162,7 +163,13 @@ class RustFSObjectStore:
     ) -> None:
         self.settings = settings
         endpoint_host = urlsplit(settings.endpoint_url).hostname
-        local_endpoint = endpoint_host in {
+        private_endpoint = False
+        if endpoint_host is not None:
+            try:
+                private_endpoint = ip_address(endpoint_host).is_private
+            except ValueError:
+                private_endpoint = False
+        local_endpoint = private_endpoint or endpoint_host in {
             "localhost",
             "127.0.0.1",
             "::1",
@@ -210,6 +217,11 @@ class RustFSObjectStore:
                 except ClientError as create_error:
                     if not self._is_already_exists(create_error):
                         raise
+
+    def check_bucket(self) -> None:
+        """Verify that the configured bucket is reachable without mutating it."""
+
+        self._client.head_bucket(Bucket=self.settings.bucket)
 
     def bucket_versioning_status(self) -> str | None:
         response = self._client.get_bucket_versioning(Bucket=self.settings.bucket)

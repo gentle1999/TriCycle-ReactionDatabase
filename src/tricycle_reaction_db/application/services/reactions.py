@@ -1329,6 +1329,17 @@ def persist_mapped_reaction(
         _register_mapped_reaction_concrete_identity(session, mapped_reaction)
         return mapped_reaction
 
+    # A mapped reaction must preserve the atom sequence from the trusted
+    # source graph (MolOP/coordinates).  RDKit is allowed to reorder atoms in
+    # a reaction template during canonical serialization, so falling back to
+    # that template order silently attaches maps to the wrong topology atoms.
+    # All current callers have the source-order bindings; fail closed here so
+    # a new caller cannot reintroduce the old corruption.
+    if source_atom_maps_by_template is None or topology_ids_by_template is None:
+        raise ValueError(
+            "mapped reaction persistence requires source atom-map and topology bindings"
+        )
+
     definition = _reaction_from_representation(record.mapped_reaction_smiles)
     canonical_smiles = _canonical_mapped_reaction_smiles(definition)
     expected_hash = sha256(canonical_smiles.encode("utf-8")).hexdigest()
@@ -1343,14 +1354,22 @@ def persist_mapped_reaction(
     if record.mapping_hash != expected_hash:
         raise ValueError("mapping_hash does not match mapped_reaction_smiles")
 
-    normalized_source_atom_maps = (
-        {
-            key: tuple(int(number) for number in atom_maps)
-            for key, atom_maps in source_atom_maps_by_template.items()
-        }
-        if source_atom_maps_by_template is not None
-        else None
-    )
+    normalized_source_atom_maps = {
+        key: tuple(int(number) for number in atom_maps)
+        for key, atom_maps in source_atom_maps_by_template.items()
+    }
+    expected_template_keys = {
+        (side, template_index)
+        for side, templates in (
+            (LogicalReactionParticipantSide.REACTANT, definition.GetReactants()),
+            (LogicalReactionParticipantSide.PRODUCT, definition.GetProducts()),
+        )
+        for template_index, _template in enumerate(templates)
+    }
+    if set(normalized_source_atom_maps) != expected_template_keys:
+        raise ValueError("source atom-map bindings must cover every mapped reaction template")
+    if set(topology_ids_by_template) != expected_template_keys:
+        raise ValueError("topology bindings must cover every mapped reaction template")
     _acquire_identity_locks(
         session,
         ("mapped_reaction", reaction_id, record.mapping_hash),
@@ -1378,16 +1397,8 @@ def persist_mapped_reaction(
         for template_index, template in enumerate(templates):
             match = None
             template_key = (side, template_index)
-            source_atom_maps = (
-                normalized_source_atom_maps.get(template_key)
-                if normalized_source_atom_maps is not None
-                else None
-            )
-            expected_topology_id = (
-                topology_ids_by_template.get(template_key)
-                if topology_ids_by_template is not None
-                else None
-            )
+            source_atom_maps = normalized_source_atom_maps[template_key]
+            expected_topology_id = topology_ids_by_template[template_key]
             expected_concrete_topology_value = (
                 concrete_topology_ids_by_template.get(template_key)
                 if concrete_topology_ids_by_template is not None

@@ -86,7 +86,7 @@ Prometheus multiprocess design.
 2. Set production secrets plus TLS/CA configuration.
 3. Run `uv run alembic upgrade head`.
 4. Run `uv run tricycle-bootstrap --mode production`.
-5. Start API/frontend/edge and schedulers as separate processes.
+5. Start API, the durable upload worker, frontend/edge, and schedulers as separate processes.
 6. Exercise real OIDC login/logout, invitation, artifact upload/download, and recovery.
 
 ```bash

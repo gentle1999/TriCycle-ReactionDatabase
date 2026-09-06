@@ -52,11 +52,13 @@ class UploadBatch(SQLModel, table=True):
         CheckConstraint("total_bytes >= 0", name="ck_upload_batch_total_bytes_nonnegative"),
         CheckConstraint(
             "succeeded_count >= 0 AND failed_count >= 0 AND "
-            "cancelled_count >= 0 AND uploading_count >= 0",
+            "cancelled_count >= 0 AND uploading_count >= 0 AND "
+            "staged_count >= 0 AND processing_count >= 0",
             name="ck_upload_batch_counts_nonnegative",
         ),
         CheckConstraint(
-            "succeeded_count + failed_count + cancelled_count + uploading_count <= total_count",
+            "succeeded_count + failed_count + cancelled_count + uploading_count + "
+            "staged_count + processing_count <= total_count",
             name="ck_upload_batch_counts_lte_total",
         ),
         Index(
@@ -126,6 +128,14 @@ class UploadBatch(SQLModel, table=True):
         default=0,
         sa_column=Column(Integer, nullable=False, server_default="0"),
     )
+    staged_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default="0"),
+    )
+    processing_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default="0"),
+    )
 
 
 class UploadBatchItem(SQLModel, table=True):
@@ -138,10 +148,34 @@ class UploadBatchItem(SQLModel, table=True):
         CheckConstraint("position >= 0", name="ck_upload_batch_item_position_nonnegative"),
         CheckConstraint("size_bytes >= 0", name="ck_upload_batch_item_size_nonnegative"),
         CheckConstraint("attempt_count >= 0", name="ck_upload_batch_item_attempts_nonnegative"),
+        CheckConstraint(
+            "processing_attempt_count >= 0",
+            name="ck_upload_batch_item_processing_attempts_nonnegative",
+        ),
+        CheckConstraint(
+            "content_sha256 IS NULL OR content_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_upload_batch_item_content_sha256_hex",
+        ),
         Index(
             "ix_upload_batch_item_batch_status_position",
             "batch_id",
             "status",
+            "position",
+        ),
+        Index(
+            "ix_upload_batch_item_processing_lease",
+            "status",
+            "worker_lease_expires_at",
+        ),
+        Index(
+            "ix_upload_batch_item_batch_content",
+            "batch_id",
+            "content_sha256",
+        ),
+        Index(
+            "ix_upload_batch_item_batch_updated_position",
+            "batch_id",
+            "updated_at",
             "position",
         ),
     )
@@ -180,6 +214,16 @@ class UploadBatchItem(SQLModel, table=True):
     attempt_count: int = Field(
         default=0,
         sa_column=Column(Integer, nullable=False, server_default="0"),
+    )
+    processing_attempt_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default="0"),
+    )
+    content_sha256: str | None = Field(default=None, max_length=64, nullable=True)
+    worker_lease_id: UUID | None = Field(default=None)
+    worker_lease_expires_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), nullable=True),
     )
     artifact_file_id: UUID | None = Field(
         default=None,

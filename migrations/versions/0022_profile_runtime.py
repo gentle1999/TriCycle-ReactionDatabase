@@ -27,8 +27,7 @@ def upgrade() -> None:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
     columns = {
-        column["name"]
-        for column in inspector.get_columns("mapped_reaction_thermodynamic_profile")
+        column["name"] for column in inspector.get_columns("mapped_reaction_thermodynamic_profile")
     }
     for column_name in _COLUMNS:
         if column_name not in columns:

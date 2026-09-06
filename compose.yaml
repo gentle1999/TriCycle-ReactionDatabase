@@ -155,6 +155,25 @@ services:
         condition: service_healthy
     stop_grace_period: 30s
 
+  upload-worker:
+    <<: *api-service
+    command:
+      - tricycle-upload-worker
+    restart: unless-stopped
+    environment:
+      # Background persistence may legitimately outlive the interactive API
+      # query budget. Keep the API's 15 s guard, but give the durable worker a
+      # separately configurable database statement budget.
+      TRICYCLE_QUERY_STATEMENT_TIMEOUT_MS: ${TRICYCLE_UPLOAD_WORKER_STATEMENT_TIMEOUT_MS:-120000}
+    healthcheck:
+      disable: true
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      rustfs:
+        condition: service_healthy
+    stop_grace_period: 30s
+
   frontend:
     image: ${TRICYCLE_FRONTEND_IMAGE:-tricycle-reaction-database-frontend:local}
     build:

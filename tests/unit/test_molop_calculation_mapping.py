@@ -120,9 +120,7 @@ def test_latest_molop_models_map_complete_da_fixture(
             record.frame.running_time_seconds is not None for record in records
         )
         if revision.running_time_seconds is not None:
-            frame_runtime_sum = sum(
-                record.frame.running_time_seconds or 0.0 for record in records
-            )
+            frame_runtime_sum = sum(record.frame.running_time_seconds or 0.0 for record in records)
             if abs(revision.running_time_seconds - frame_runtime_sum) > 1e-6:
                 file_runtime_differences.append(
                     (source_path.name, revision.running_time_seconds, frame_runtime_sum)

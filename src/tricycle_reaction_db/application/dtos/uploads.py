@@ -176,6 +176,8 @@ class UploadBatchView(BaseModel):
     failed_count: int = Field(ge=0)
     cancelled_count: int = Field(ge=0)
     uploading_count: int = Field(ge=0)
+    staged_count: int = Field(default=0, ge=0)
+    processing_count: int = Field(default=0, ge=0)
 
 
 class UploadBatchPage(BaseModel):
@@ -201,6 +203,8 @@ class UploadBatchItemView(BaseModel):
     media_type: str
     status: UploadBatchItemStatus
     attempt_count: int = Field(ge=0)
+    processing_attempt_count: int = Field(default=0, ge=0)
+    content_sha256: str | None = None
     artifact_file_id: UUID | None = None
     ingestion_status: ArtifactIngestionStatus | None = None
     ingestion_error_message: str | None = None

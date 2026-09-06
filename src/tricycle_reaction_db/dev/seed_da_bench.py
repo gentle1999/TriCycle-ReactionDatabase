@@ -724,6 +724,25 @@ def seed_da_bench_fixture(
             raise ValueError("RDKit could not parse seeded mapped reaction SMILES")
         canonical_mapped_smiles = rdChemReactions.ReactionToSmiles(definition, True)
         mapping_hash = sha256(canonical_mapped_smiles.encode("utf-8")).hexdigest()
+        # The RDKit reaction template is allowed to reorder atoms while
+        # serializing a component.  The manifest's source atom sequence,
+        # converted into the persisted Topology order above, is the
+        # coordinate-authoritative mapping and must be used for both the
+        # MappedReactionParticipant and its node geometries.  Omitting these
+        # bindings makes persist_mapped_reaction fall back to the RDKit
+        # template order, producing a different map-labelled topology even
+        # though the atom-map set is identical.
+        source_atom_maps_by_template = {
+            (side, declaration["participant_index"]): tuple(atom_maps)
+            for declaration, _persisted, side, atom_maps in participant_payloads
+        }
+        topology_ids_by_template = {
+            (side, declaration["participant_index"]): _required_id(
+                persisted.topology,
+                "MolecularTopology",
+            )
+            for declaration, persisted, side, _atom_maps in participant_payloads
+        }
         mapped_reaction = persist_mapped_reaction(
             session,
             reaction,
@@ -734,6 +753,8 @@ def seed_da_bench_fixture(
                 mapped_reaction_smiles=canonical_mapped_smiles,
                 mapping_hash=mapping_hash,
             ),
+            source_atom_maps_by_template=source_atom_maps_by_template,
+            topology_ids_by_template=topology_ids_by_template,
         )
         # A reaction declaration sees only participant Geometries with at
         # least one converged optimization.  Curated selectors below then

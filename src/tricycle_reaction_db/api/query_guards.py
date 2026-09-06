@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 
 from fastapi import FastAPI, Request, status
@@ -23,6 +24,8 @@ from tricycle_reaction_db.application.rate_limits import (
 from tricycle_reaction_db.application.services.authentication import AuthenticatedPrincipal
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.core.observability import RATE_LIMIT_DECISIONS, UPLOAD_OPERATIONS
+
+logger = logging.getLogger(__name__)
 
 _EXEMPT_PATHS = {
     "/docs",
@@ -221,9 +224,22 @@ def install_query_guards(application: FastAPI) -> None:
 
     @application.exception_handler(QueryStatementTimeout)
     async def query_timeout_error(
-        _request: Request,
+        request: Request,
         error: QueryStatementTimeout,
     ) -> JSONResponse:
+        # The public response intentionally contains no SQL or bound values.
+        # The route is safe, low-cardinality context for finding which
+        # interactive query needs an index/plan fix in server logs.
+        logger.warning(
+            "database statement timeout method=%s path=%s",
+            request.method,
+            request.url.path,
+            extra={
+                "query_error_code": error.code,
+                "query_method": request.method,
+                "query_path": request.url.path,
+            },
+        )
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={"detail": query_error_payload(error)},

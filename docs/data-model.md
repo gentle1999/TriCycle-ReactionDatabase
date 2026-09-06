@@ -131,9 +131,30 @@ feature。新增可翻转中心必须增加经过审查的规则和版本，不�
 ## 导入与解析状态
 
 浏览器上传、批量上传、显式 reparse 和本地 `tricycle-import-artifacts` CLI 共用同一个
-application upload service；CLI 只把本地路径作为字节来源。上传先创建 pending 的
-`ArtifactFile`，写入并核验 RustFS/S3 原始对象后转为 `available`，再解析
-`calculation_output`。对象、内容哈希、解析 revision 和科学事实都不可原地覆盖。
+application upload service；CLI 只把本地路径作为字节来源。浏览器批次采用服务端持久化队列：
+先写入 manifest，再逐文件把字节写入并核验 RustFS/S3，最后把 `UploadBatchItem` 推进到
+`staged`；独立的 `tricycle-upload-worker` 领取 staged 项并推进到 `processing`，调用
+`ArtifactUploadService.reparse`，再提交 `succeeded`/`failed`。MolOP 不在 HTTP 请求或浏览器
+生命周期内运行，因此刷新页面、切换路由、API 重启或 worker 重启都不会丢失已经 staged 的
+文件。对象、内容哈希、解析 revision 和科学事实都不可原地覆盖。
+
+上传批次条目状态的唯一流转为：
+
+```text
+queued -> uploading -> staged -> processing -> succeeded
+                                      \-> failed
+```
+
+`queued` 只表示 manifest 已登记，浏览器尚未把文件字节交给服务端；这类文件在浏览器刷新
+后必须重新选择，服务端不可能凭空取得本地文件。`UploadBatchItem.content_sha256` 在进入
+`uploading` 时由服务端计算并持久化。若进程恰好在 RustFS 写成功、条目关联提交前崩溃，
+worker 的 `recover_stale` 会按项目、文件大小、artifact kind 和该哈希找回可用对象并恢复
+为 `staged`，避免产生“对象已存在但队列卡住”的孤立状态。worker 领取使用数据库行锁、
+`SKIP LOCKED` 和带过期时间的 lease；心跳只延长当前 lease，过期结果不能覆盖新的领取者。
+
+批次上的 `uploading_count`、`staged_count`、`processing_count` 与三个终态计数共同构成
+进度，不再用一个“请求仍在处理”的计数猜测解析进度。前端按批次 `updated_at` 增量同步
+条目状态，避免一个条目在两次轮询之间跨越多个状态而永久停留在旧状态。
 
 一次解析创建一个 `ParseRevision`，尽可能保留所有可恢复 segment 和 frame。单个帧的
 归一化/持久化错误不会丢弃同一文件中已成功的帧；文件没有可恢复计算帧时，Artifact 仍保存，

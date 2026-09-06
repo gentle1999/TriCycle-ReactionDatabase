@@ -115,6 +115,8 @@ class UploadBatchStatus(StrEnum):
 class UploadBatchItemStatus(StrEnum):
     QUEUED = "queued"
     UPLOADING = "uploading"
+    STAGED = "staged"
+    PROCESSING = "processing"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"

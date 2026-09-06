@@ -4606,6 +4606,55 @@ class ArtifactUploadService:
         )
 
     @classmethod
+    async def stage(
+        cls,
+        *,
+        payload: bytes,
+        filename: str,
+        media_type: str,
+        artifact_kind: ArtifactKind,
+        project_id: UUID,
+        user_id: UUID,
+    ) -> ArtifactUploadResult:
+        """Persist bytes and an ingestion reservation without running MolOP.
+
+        Web queue requests must have a durable hand-off point.  Once this
+        method returns, the raw bytes are verified in RustFS, the immutable
+        ``ArtifactFile`` exists, and calculation outputs have a pending
+        ``ArtifactIngestion`` row.  Parsing is deliberately performed later by
+        the upload worker through :meth:`reparse`.
+        """
+
+        if not payload:
+            raise ArtifactUploadError("uploaded artifact is empty")
+        _require_upload_size(payload)
+        _require_decompressed_upload_size(payload, filename)
+        await AuthorizationService.require_project_permission(
+            user_id,
+            project_id,
+            ProjectPermission.ARTIFACT_UPLOAD,
+        )
+        prepared = await cls._prepare_upload(
+            payload=payload,
+            filename=filename,
+            media_type=media_type,
+            artifact_kind=artifact_kind,
+            project_id=project_id,
+            user_id=user_id,
+        )
+        if isinstance(prepared, ArtifactUploadResult):
+            return prepared
+        ingestion_id = _require_prepared_ingestion_id(prepared)
+        async with session_factory() as session:
+            return await session.run_sync(
+                lambda sync_session: _result(
+                    cast(Session, sync_session),
+                    ingestion_id,
+                    parse_revision_created=False,
+                )
+            )
+
+    @classmethod
     async def upload(
         cls,
         *,
@@ -4753,12 +4802,15 @@ class ArtifactUploadService:
             object_key = artifact.object_key
             await session.commit()
 
-        payload = await asyncio.to_thread(cls._load_payload, settings, object_key)
-        if len(payload) != expected_size or sha256(payload).hexdigest() != expected_sha256:
-            raise ArtifactUploadError("stored artifact bytes do not match database identity")
-        _require_upload_size(payload)
-
         try:
+            # Keep storage reads and identity validation inside the same
+            # failure boundary as MolOP parsing.  A worker crash or RustFS
+            # read failure must not leave the newly-created ingestion pending
+            # forever while the upload-batch item is already terminally failed.
+            payload = await asyncio.to_thread(cls._load_payload, settings, object_key)
+            if len(payload) != expected_size or sha256(payload).hexdigest() != expected_sha256:
+                raise ArtifactUploadError("stored artifact bytes do not match database identity")
+            _require_upload_size(payload)
             parsed = await _run_molop_file_pipeline(payload, filename)
         except Exception as error:
             parse_error = error

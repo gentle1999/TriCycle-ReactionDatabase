@@ -165,10 +165,37 @@ identity.
 
 Browser uploads, batch uploads, explicit reparse, and the local
 `tricycle-import-artifacts` CLI use the same application upload service. The
-CLI differs only by using local paths as its byte source. An upload creates a
-pending `ArtifactFile`, writes and verifies the RustFS/S3 object, marks it
-`available`, then parses a `calculation_output`. Object identity, content hash,
-parse revisions, and scientific facts are never overwritten in place.
+CLI differs only by using local paths as its byte source. Browser batches are a
+server-owned durable queue: the manifest is written first, each file is written
+and verified in RustFS/S3, and its `UploadBatchItem` becomes `staged`. An
+independent `tricycle-upload-worker` claims staged items, runs
+`ArtifactUploadService.reparse`, and commits `succeeded` or `failed`. MolOP is
+not owned by the HTTP request or browser lifecycle, so a page reload, route
+change, API restart, or worker restart cannot discard a staged file. Object
+identity, content hash, parse revisions, and scientific facts are never
+overwritten in place.
+
+The only upload-batch item state flow is:
+
+```text
+queued -> uploading -> staged -> processing -> succeeded
+                                      \-> failed
+```
+
+`queued` means only that the manifest exists; the browser has not yet handed
+the file bytes to the server. Such a file must be selected again after a page
+reload because the server cannot obtain a local file that it never received.
+The server persists `UploadBatchItem.content_sha256` when the item enters
+`uploading`. If a process dies after RustFS accepts the bytes but before the
+queue item is linked, `recover_stale` finds an available object by project,
+size, artifact kind, and hash and restores the item to `staged`. Worker claims
+use row locks, `SKIP LOCKED`, and expiring leases; a stale result cannot
+overwrite a newer lease holder.
+
+`uploading_count`, `staged_count`, `processing_count`, and the three terminal
+counts form the batch progress model. The frontend incrementally synchronizes
+items using the batch `updated_at` watermark so an item that crosses multiple
+states between polls cannot remain displayed in an obsolete state.
 
 One parse creates one `ParseRevision` and persists every recoverable segment
 and frame. A frame-level normalization or persistence error does not discard

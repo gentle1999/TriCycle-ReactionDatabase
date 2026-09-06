@@ -77,6 +77,12 @@ class Settings(BaseSettings):
     read_rate_limit_requests: int = Field(default=10_000, ge=1, le=1_000_000)
     upload_rate_limit_requests: int = Field(default=1_000, ge=1, le=1_000_000)
     upload_max_concurrency: int = Field(default=8, ge=1, le=128)
+    # Browser requests only stage bytes. A separate durable worker owns MolOP
+    # parsing so a page reload or API restart cannot discard accepted files.
+    upload_worker_poll_interval_seconds: float = Field(default=1.0, gt=0.05, le=300.0)
+    upload_worker_lease_seconds: int = Field(default=3_600, ge=60, le=86_400)
+    upload_client_lease_seconds: int = Field(default=900, ge=60, le=86_400)
+    upload_worker_concurrency: int = Field(default=2, ge=1, le=32)
     # MolOP 0.2.12 collects frame roles and source locators without implicitly
     # reconstructing molecular graphs. Keep evidence enabled so optimization
     # frames retain their initial/intermediate/terminal role during ingestion.

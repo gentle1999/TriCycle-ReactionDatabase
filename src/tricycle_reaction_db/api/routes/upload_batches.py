@@ -1,6 +1,7 @@
 """Authenticated durable upload-batch routes."""
 
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 from uuid import UUID
@@ -106,6 +107,7 @@ async def list_upload_batch_items(
     batch_id: UUID,
     principal: Principal,
     item_status: UploadBatchItemStatus | None = None,
+    updated_after: datetime | None = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> UploadBatchItemPage:
@@ -114,6 +116,7 @@ async def list_upload_batch_items(
             batch_id,
             user_id=principal.user_id,
             status=item_status,
+            updated_after=updated_after,
             limit=limit,
             offset=offset,
         )
@@ -236,7 +239,7 @@ async def upload_batch_files(
     client_file_ids: Annotated[list[UUID], Form()],
     files: Annotated[list[UploadFile], File()],
 ) -> list[UploadBatchItemView]:
-    """Upload a group of queue files and parse calculation outputs in one MolOP batch."""
+    """Stage a group of queue files; the durable worker performs parsing later."""
 
     settings = get_settings()
     if not files or len(files) != len(client_file_ids):

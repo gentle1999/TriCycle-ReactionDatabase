@@ -792,13 +792,14 @@ export const api = {
     ) as Promise<UploadBatch>,
   uploadBatchItems: (
     batchId: string,
-    options: { status?: string; limit?: number; offset?: number } = {},
+    options: { status?: string; updatedAfter?: string; limit?: number; offset?: number } = {},
     signal?: AbortSignal,
   ) => request<UploadBatchItemPage>(
     `/api/upload-batches/${encodeURIComponent(batchId)}/items?${new URLSearchParams({
       limit: String(options.limit ?? 100),
       offset: String(options.offset ?? 0),
       ...(options.status ? { item_status: options.status } : {}),
+      ...(options.updatedAfter ? { updated_after: options.updatedAfter } : {}),
     })}`,
     signal,
   ),

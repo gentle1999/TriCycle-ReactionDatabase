@@ -13,8 +13,8 @@ dependencies = [
     "fastmcp>=3.2,<4",
     "httpx>=0.28,<1",
     "molalchemy==0.0.7",
-    "molgr>=0.1.8",
-    "molop>=0.2.12",
+    "molgr>=0.1.9",
+    "molop>=0.2.14",
     "nexusx==6.1.2",
     "numpy>=2.2,<3",
     "pint>=0.25,<1",
@@ -35,6 +35,7 @@ dependencies = [
 
 [project.scripts]
 tricycle-api = "tricycle_reaction_db.__main__:main"
+tricycle-upload-worker = "tricycle_reaction_db.dev.upload_worker:main"
 tricycle-nexusx-services = "tricycle_reaction_db.api.run_services:main"
 tricycle-seed-da-bench = "tricycle_reaction_db.dev.seed_da_bench:main"
 tricycle-import-artifacts = "tricycle_reaction_db.dev.import_artifacts:main"

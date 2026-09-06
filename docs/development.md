@@ -462,6 +462,11 @@ writer endpoint 对应用呈现为同一个逻辑 engine，节点数量不会变
 | `TRICYCLE_READ_RATE_LIMIT_REQUESTS` | `10000` | 登录态、目录、详情、GraphQL 等只读请求数 |
 | `TRICYCLE_UPLOAD_RATE_LIMIT_REQUESTS` | `1000` | Artifact 上传、批量上传、验证和重解析请求数 |
 | `TRICYCLE_UPLOAD_MAX_CONCURRENCY` | `8` | 单个 API 进程内同时处理的上传请求数 |
+| `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` | `2` | 独立 upload-worker 同时运行的 MolOP 文件数 |
+| `TRICYCLE_UPLOAD_WORKER_LEASE_SECONDS` | `3600` | worker 处理 lease 的有效期；worker 用心跳续租，过期后可被重新领取 |
+| `TRICYCLE_UPLOAD_CLIENT_LEASE_SECONDS` | `900` | HTTP 上传 lease 的恢复阈值；请求中断后超过此时间可回到队列 |
+| `TRICYCLE_UPLOAD_WORKER_POLL_INTERVAL_SECONDS` | `1` | upload-worker 轮询 staged 项和过期 lease 的间隔 |
+| `TRICYCLE_UPLOAD_WORKER_STATEMENT_TIMEOUT_MS` | `120000` | 后台解析/持久化单条 PostgreSQL statement 的独立超时；交互 API 仍使用 `TRICYCLE_QUERY_STATEMENT_TIMEOUT_MS` |
 | `TRICYCLE_MOLECULE_QUERY_RATE_LIMIT_REQUESTS` | `10000` | 分子式、拓扑和几何只读查询的独立固定窗口请求数 |
 | `TRICYCLE_DEPICTION_RATE_LIMIT_REQUESTS` | `10000` | 分子 SVG/MOL/SDF 资源的独立固定窗口请求数 |
 | `TRICYCLE_QUERY_RATE_LIMIT_WINDOW_SECONDS` | `60` | 限流窗口秒数 |

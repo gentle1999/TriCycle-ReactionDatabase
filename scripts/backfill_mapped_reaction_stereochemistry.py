@@ -71,12 +71,15 @@ async def _build_plan() -> RepairPlan:
     errors: list[str] = []
 
     async with session_factory() as session:
-        participant_rows = (await session.exec(
-            select(MappedReactionParticipant).options(
-                selectinload(cast(Any, MappedReactionParticipant.logical_reaction_participant))
-                .selectinload(cast(Any, LogicalReactionParticipant.topology))
+        participant_rows = (
+            await session.exec(
+                select(MappedReactionParticipant).options(
+                    selectinload(
+                        cast(Any, MappedReactionParticipant.logical_reaction_participant)
+                    ).selectinload(cast(Any, LogicalReactionParticipant.topology))
+                )
             )
-        )).all()
+        ).all()
         expected_participants: dict[object, str] = {}
         for participant in participant_rows:
             try:
@@ -90,19 +93,19 @@ async def _build_plan() -> RepairPlan:
                 if expected != participant.mapped_smiles:
                     participant_updates.append((participant, expected))
             except Exception as exc:
-                errors.append(
-                    f"participant {participant.id}: {type(exc).__name__}: {exc}"
-                )
+                errors.append(f"participant {participant.id}: {type(exc).__name__}: {exc}")
 
-        node_rows = (await session.exec(
-            select(MappedReactionNodeGeometryMapping).options(
-                selectinload(
-                    cast(Any, MappedReactionNodeGeometryMapping.mapped_reaction_node_geometry)
+        node_rows = (
+            await session.exec(
+                select(MappedReactionNodeGeometryMapping).options(
+                    selectinload(
+                        cast(Any, MappedReactionNodeGeometryMapping.mapped_reaction_node_geometry)
+                    )
+                    .selectinload(cast(Any, MappedReactionNodeGeometry.geometry))
+                    .selectinload(cast(Any, Geometry.topology))
                 )
-                .selectinload(cast(Any, MappedReactionNodeGeometry.geometry))
-                .selectinload(cast(Any, Geometry.topology))
             )
-        )).all()
+        ).all()
         for mapping in node_rows:
             try:
                 expected = mapped_smiles_for_topology(
@@ -114,9 +117,11 @@ async def _build_plan() -> RepairPlan:
             except Exception as exc:
                 errors.append(f"node mapping {mapping.id}: {type(exc).__name__}: {exc}")
 
-        reaction_rows = (await session.exec(
-            select(MappedReaction).options(selectinload(cast(Any, MappedReaction.participants)))
-        )).all()
+        reaction_rows = (
+            await session.exec(
+                select(MappedReaction).options(selectinload(cast(Any, MappedReaction.participants)))
+            )
+        ).all()
         for mapped_reaction in reaction_rows:
             try:
                 expected_smiles = _expected_reaction_smiles(

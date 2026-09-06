@@ -28,3 +28,9 @@ services:
       bootstrap:
         condition: service_completed_successfully
     volumes: *compute-ca-volume
+
+  upload-worker:
+    depends_on: !override
+      bootstrap:
+        condition: service_completed_successfully
+    volumes: *compute-ca-volume
