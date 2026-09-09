@@ -541,7 +541,114 @@ make seed-da-bench
 
 ### 直接批量导入存量文件
 
-大量存量文件不需要经过浏览器或 HTTP API。`tricycle-import-artifacts` 在服务端进程内递归读取文件，直接调用 Artifact 入库服务，写入 PostgreSQL/RustFS，并按现有 MolOP 解析流程处理计算输出。指纹计算也采用有界的顺序释放流水线，不会先扫描并哈希完整目录后才开始解析。导入默认一次向解析流水线提供 128 个候选文件，实际并发槽位由 `TRICYCLE_MOLOP_BATCH_N_JOBS` 独立控制；任一文件结束后，候选池中的下一文件会立即补位。完成结果每 16 个进入一次持久化微批，文件解析、RustFS 写入和数据库持久化可以流水线重叠。本地磁盘流模式不把 HTTP 请求的 `max_batch_files` 或 `max_batch_bytes` 当作处理屏障，但仍执行单文件大小限制；远程上传仍受这些请求级限制保护。每个微批提交后立即追加逐文件检查点，内容 SHA-256 由 Artifact 唯一约束负责幂等去重。
+大量存量文件不需要经过浏览器或 HTTP API。`tricycle-import-artifacts` 在服务端进程内递归读取文件，直接调用 Artifact 入库服务，写入 PostgreSQL/RustFS，并按现有 MolOP 解析流程处理计算输出。指纹计算也采用有界的顺序释放流水线，不会先扫描并哈希完整目录后才开始解析。导入默认一次向解析流水线提供 64 个候选文件，实际并发槽位由 `TRICYCLE_MOLOP_BATCH_N_JOBS` 独立控制；任一文件结束后，候选池中的下一文件会立即补位。完成结果每 16 个进入一次持久化微批，文件解析、RustFS 写入和数据库持久化可以流水线重叠。准备阶段还会把 Artifact/ingestion 身份预约拆成有界事务，避免大批量身份锁耗尽 PostgreSQL 共享内存。本地磁盘流模式不把 HTTP 请求的 `max_batch_files` 或 `max_batch_bytes` 当作处理屏障，但仍执行单文件大小限制；远程上传仍受这些请求级限制保护。每个微批提交后立即追加并 `fsync` 逐文件检查点，内容 SHA-256 由 Artifact 唯一约束负责幂等去重。
+
+#### 文件流与进程池模型
+
+下面的时序图描述本地 `tricycle-import-artifacts` 的主路径。一个 pipeline window 内的文件任务会并发推进；图中用循环表示同一批中的每个文件，不表示这些文件串行执行。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant I as Import CLI
+    participant F as Fingerprint pool
+    participant Q as Candidate queue
+    participant U as ArtifactUploadService
+    participant R as RustFS
+    participant G as File-slot gate
+    participant P as File-local parser
+    participant W as Persistence consumer
+    participant D as PostgreSQL
+    participant C as JSONL checkpoint
+
+    Note over F: ThreadPoolExecutor，内部上限 32
+    Note over G,P: n_jobs 个文件槽位；每个文件使用一个 spawn ProcessPoolExecutor(max_workers=1)
+    Note over P: 子进程内 OMP/OPENBLAS/MKL 通常都设为 1
+
+    I->>F: 递归发现文件，计算 SHA-256
+    F->>Q: 放入候选队列
+    loop 每个 pipeline window
+        Q->>U: 提供候选文件窗口
+        Note right of Q: IMPORT_PIPELINE_WINDOW_FILES
+        loop 窗口内的每个文件（并发）
+            U->>R: 写入并校验原始对象
+            R-->>U: object ready
+            U->>G: 等待并获取文件槽位
+            G->>P: 启动单文件隔离子进程
+            P->>P: MolOP 解析 + frame 后处理
+            alt 正常完成
+                P-->>G: 返回 frames/diagnostics
+                G-->>U: 释放文件槽位
+                P-->>W: 放入有界结果队列
+            else 超时或解析失败
+                P-->>G: 抛出 timeout/error
+                G->>P: 仅终止当前文件子进程
+                G-->>U: 释放文件槽位
+                P-->>W: 放入该文件失败结果
+            end
+        end
+        W->>W: 累积完成结果
+        opt 达到 IMPORT_COMMIT_BATCH_FILES
+            W->>D: 写入完成结果微批
+            D-->>W: commit
+            W->>C: 追加状态并 fsync
+        end
+        U-->>Q: 槽位释放，继续取下一候选
+    end
+```
+
+图中的边界需要这样理解：
+
+- 指纹线程池只负责发现文件和读取 SHA-256，内部上限为 `32`；它不是 MolOP 解析池。`IMPORT_STREAM_QUEUE_SIZE` 只限制指纹结果到候选窗口之间的缓冲。
+- `TRICYCLE_MOLOP_BATCH_N_JOBS` 实际上是文件级 admission semaphore：最多允许多少个文件同时进入解析阶段。文件在等待槽位时不消耗单文件 parse timeout。
+- 文件获得槽位后，生产解析路径为该文件创建一个 `spawn` 的 `ProcessPoolExecutor(max_workers=1)`。因此 `n_jobs=16` 表示最多 16 个文件级子进程同时工作，不表示每个文件再创建 16 个子进程。超时只终止当前文件的子进程并释放槽位，其他文件继续运行。
+- 子进程内部的 OpenMP/BLAS native thread 由 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS` 和 `MKL_NUM_THREADS` 控制；推荐都设为 `1`。候选窗口和 native thread 数都不会替代文件级槽位。
+- 每个导入批次只有一个有界持久化消费者，结果队列和 `IMPORT_COMMIT_BATCH_FILES` 共同形成数据库写入背压。提交微批后才追加并 `fsync` checkpoint；单文件失败不会回滚已经提交的其他文件。
+
+浏览器或远程 API 路径不经过 Import CLI 的指纹线程池和本地候选队列：API 先把字节写入 RustFS 并将条目标记为 `staged`，独立 `upload-worker` 按 `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 领取任务，再进入同一套文件级解析槽位和单文件隔离进程。也就是说，`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 限制 durable 队列的活动文件数，`TRICYCLE_MOLOP_BATCH_N_JOBS` 限制解析进程的文件槽位，两者不是同一个参数，也不能简单相乘。
+
+#### 推荐的导入超参数
+
+先按运行场景选择起始组合。当前部署算力主机的吞吐基准以 16 个文件级 MolOP worker、每个 worker 使用 1 个 native thread 为起点；这不是所有机器的固定最优值，CPU 核数、可用内存、磁盘和 PostgreSQL 延迟不同都需要重新验证。
+
+| 场景 | `TRICYCLE_MOLOP_BATCH_N_JOBS` | `OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `MKL_NUM_THREADS` | `IMPORT_PIPELINE_WINDOW_FILES` | `IMPORT_STREAM_QUEUE_SIZE` | `IMPORT_COMMIT_BATCH_FILES` |
+| --- | ---: | --- | ---: | ---: | ---: |
+| 本地开发或低资源主机 | `2` | `1 / 1 / 1` | `16` | `16` | `8–16` |
+| 有足够 CPU/内存的部署算力主机（吞吐优先） | `16` | `1 / 1 / 1` | `64` | `64` | `16` |
+| 内存或数据库压力较大 | `4–8` | `1 / 1 / 1` | `32` | `32` | `8` |
+
+部署算力主机可以从下面的组合开始；`IMPORT_*` 是 `make import-artifacts` 的命令行变量，`TRICYCLE_*` 和 native thread 变量则应同时放入运行环境或 shell 环境：
+
+```bash
+IMPORT_MODE=deployment \
+OMP_NUM_THREADS=1 \
+OPENBLAS_NUM_THREADS=1 \
+MKL_NUM_THREADS=1 \
+TRICYCLE_MOLOP_BATCH_N_JOBS=16 \
+IMPORT_PIPELINE_WINDOW_FILES=64 \
+IMPORT_STREAM_QUEUE_SIZE=64 \
+IMPORT_COMMIT_BATCH_FILES=16 \
+IMPORT_MAX_TRANSIENT_RETRIES=3 \
+IMPORT_PROJECT_ID='<project-uuid>' \
+IMPORT_USER_ID='<user-uuid>' \
+IMPORT_ROOTS='/data/calculations /data/supplemental' \
+IMPORT_STATE_FILE=.tmp/artifact-import.jsonl \
+make import-artifacts
+```
+
+调参时按以下顺序处理：
+
+- 首先调 `TRICYCLE_MOLOP_BATCH_N_JOBS`，建议按 `2 → 4 → 8 → 16` 递增，每次使用同一批真实文件重新测量。近似的 CPU 压力是“文件 worker 数 × 每个 worker 的 native thread 数”；三个 OpenMP/BLAS 变量应保持为 `1`，不要通过把它们设大来代替文件级并发。生产环境必须使用正整数，不能使用 `-1`。
+- `IMPORT_PIPELINE_WINDOW_FILES` 是候选池，不是 worker 数；先取约 `4 × TRICYCLE_MOLOP_BATCH_N_JOBS`，并至少大于 worker 数。`IMPORT_STREAM_QUEUE_SIZE` 是发现/指纹阶段的缓冲，通常与候选池取相同值。增大这两个值只会增加预取和内存占用，不会增加解析并发；大文件或内存紧张时应优先减小它们。
+- 指纹阶段使用独立线程池，当前内部上限为 `32` 个 worker，没有对应的环境变量或 CLI 参数。若统计中的瓶颈在 fingerprint 阶段，应先检查磁盘和 SHA-256 读取开销，不要盲目增大 MolOP 解析并发。
+- `IMPORT_COMMIT_BATCH_FILES` 只控制一次持久化事务和检查点频率，不控制解析并发。`16` 是稳定起点；遇到锁竞争、statement timeout 或数据库内存压力时降到 `8`，只有数据库有余量且提交频率成为瓶颈时才尝试 `32`。
+- `IMPORT_MAX_TRANSIENT_RETRIES=3` 建议保持不变。它只用于死锁、序列化冲突、连接瞬断等瞬态错误；提高它不能修复持续性错误，只会延长失败恢复时间。
+- `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS=60` 是 10 MiB 文件的基准预算，并随源文件大小放大；它是异常文件隔离参数，不是提速参数。慢磁盘或大文件较多时提高，想更快跳过异常文件时降低，但应先确认失败率。
+- `TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE=true` 和 `TRICYCLE_MOLOP_PARALLEL_FRAME_PERSISTENCE=true` 建议保持开启。前者关系到 frame role/source locator 等解析证据，后者用于批量持久化和吞吐；不要为了短期速度关闭前者。
+
+浏览器和远程 API 上传使用独立的 durable `upload-worker`，参数不要与本地导入的 `IMPORT_*` 混用。推荐保持 `TRICYCLE_UPLOAD_MAX_CONCURRENCY=8`（只限制 HTTP 字节接收）、`TRICYCLE_UPLOAD_WORKER_CONCURRENCY=2`（同时处理的 durable 文件数）和 `TRICYCLE_UPLOAD_WORKER_STATEMENT_TIMEOUT_MS=120000`。专用算力主机可以把 `TRICYCLE_MOLOP_BATCH_N_JOBS` 调到 `16`，但 `upload-worker` 仍建议从 `2` 开始，并根据 CPU、内存和数据库写入延迟逐步增加；它们分别限制解析槽位和队列中的活动文件，不能简单相乘。
+
+`TRICYCLE_MAX_UPLOAD_BYTES=64 MiB` 是单文件上限，本地导入也会执行；`TRICYCLE_MAX_BATCH_FILES=64` 和 `TRICYCLE_MAX_BATCH_BYTES=512 MiB` 是 HTTP 批次保护，不是本地导入的吞吐参数。只有在专用内网压测或可信批量客户端中，并且反向代理 body limit、RustFS、PostgreSQL 都已验证有余量时，才临时提高批次上限到例如 `1024` 文件 / `1 GiB`；不要为普通公网 API 修改这些默认值。`TRICYCLE_UPLOAD_WORKER_LEASE_SECONDS=3600`、`TRICYCLE_UPLOAD_CLIENT_LEASE_SECONDS=900` 和轮询间隔 `1` 秒属于故障恢复参数，保持默认值即可。
 
 先启动 PostgreSQL、RustFS、完成 migration 和 development bootstrap，然后执行：
 
@@ -555,13 +662,17 @@ uv run tricycle-import-artifacts \
 参数说明：
 
 - 可以传入多个文件或目录；目录会递归扫描，符号链接不会展开。
-- `--pipeline-window-files` 控制一次交给解析流水线的候选文件数，默认 `128`；也可通过 `IMPORT_PIPELINE_WINDOW_FILES` 传给 `make import-artifacts`。该窗口应明显大于解析槽位数，以便槽位释放后立即补位。
+- 对 `calculation_output`，已知的 JSON/CSV/TSV/YAML/TOML、结构文件和 Markdown 旁车文件会自动跳过；未知扩展名仍会保留，以兼容不同量化软件。可用 `--include-suffix`（重复传入）建立本地扩展名白名单，或用 `--exclude-suffix` 增加排除项。
+- `--pipeline-window-files` 控制一次交给解析流水线的候选文件数，默认 `64`；也可通过 `IMPORT_PIPELINE_WINDOW_FILES` 传给 `make import-artifacts`。该窗口应明显大于解析槽位数，以便槽位释放后立即补位。
 - `--commit-batch-files` 控制已完成结果的持久化微批大小，默认 `16`；也可通过 `IMPORT_COMMIT_BATCH_FILES` 传给 `make import-artifacts`。它不限制候选池或解析并发。
-- `--stream-queue-size` 只控制文件发现/指纹阶段到流水线窗口之间的有界缓冲，默认 `128`；也可通过 `IMPORT_STREAM_QUEUE_SIZE` 传给 `make import-artifacts`。
+- `--stream-queue-size` 只控制文件发现/指纹阶段到流水线窗口之间的有界缓冲，默认 `64`；也可通过 `IMPORT_STREAM_QUEUE_SIZE` 传给 `make import-artifacts`。
+- 数据库死锁、序列化冲突、连接瞬断、statement timeout 和 `max_locks_per_transaction` 等瞬态资源错误会自动退避并把失败批次二分；默认每个文件最多重试 `3` 次。耗尽后只记录该文件失败，其他文件继续导入，下一次使用同一 `--state-file` 会再次尝试。
 - 默认导入 `calculation_output`，可用 `--artifact-kind input|workflow_manifest|auxiliary` 覆盖。
 - `--state-file` 是追加写入的 JSONL 检查点。重复执行会按路径、大小、mtime 和 SHA-256 跳过已成功文件；文件发生变化后会重新导入。
 - 使用 `--dry-run` 只扫描并输出统计，不写数据库或对象存储。
 - 生产环境必须显式提供 `--user-id`，该用户需要目标项目的 `artifact:upload` 权限。
+- Makefile 对应变量为 `IMPORT_INCLUDE_SUFFIXES`、`IMPORT_EXCLUDE_SUFFIXES` 和
+  `IMPORT_MAX_TRANSIENT_RETRIES`；前两个变量使用空格分隔的后缀列表。
 
 也可以使用 Makefile：
 

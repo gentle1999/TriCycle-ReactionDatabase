@@ -63,6 +63,7 @@ from tricycle_reaction_db.application.services.queries import (
     _enum_value,
     _frame_select,
     _frame_summary,
+    _logical_reaction_ids_for_topology,
     _reaction_topology_changed_expression,
     _required_uuid,
     _validate_range,
@@ -92,7 +93,6 @@ from tricycle_reaction_db.db.models import (
     CalculationProtocol,
     CalculationSegment,
     Geometry,
-    LogicalReactionParticipant,
     MappedReaction,
     MappedReactionNode,
     MappedReactionNodeGeometry,
@@ -589,21 +589,17 @@ class MolecularTopologyDetailQueryService(UseCaseService):  # type: ignore[misc]
                     )
                 ).scalar_one()
             )
+            topology_reaction_ids = _logical_reaction_ids_for_topology(topology_id).subquery()
             logical_reaction_count = int(
                 (
                     await session.execute(
-                        select(
-                            func.count(
-                                func.distinct(LogicalReactionParticipant.logical_reaction_id)
-                            )
-                        )
-                        .select_from(LogicalReactionParticipant)
+                        select(func.count())
+                        .select_from(topology_reaction_ids)
                         .where(
-                            col(LogicalReactionParticipant.topology_id) == topology_id,
                             logical_reaction_id_is_visible(
                                 scope,
-                                col(LogicalReactionParticipant.logical_reaction_id),
-                            ),
+                                topology_reaction_ids.c.logical_reaction_id,
+                            )
                         )
                     )
                 ).scalar_one()

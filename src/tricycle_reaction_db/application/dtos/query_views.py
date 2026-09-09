@@ -156,6 +156,7 @@ class GeometryEnergyView(QueryView):
     electronic_energy_hartree: EnergyHartree | None = None
     electronic_energy_source_frame_id: UUID | None = None
     electronic_energy_protocol_id: UUID | None = None
+    electronic_level: list[str | None] = Field(default_factory=list)
     charge: int | None = None
     multiplicity: int | None = None
     electronic_state_kind: str | None = None
@@ -164,6 +165,7 @@ class GeometryEnergyView(QueryView):
     thermochemistry_candidate_frame_ids: list[UUID]
     thermochemistry_source_frame_id: UUID | None = None
     thermochemistry_protocol_id: UUID | None = None
+    thermochemistry_level: list[str | None] = Field(default_factory=list)
     temperature_kelvin: float | None = None
     pressure_atm: float | None = None
     zpe_correction_hartree: EnergyHartree | None = None
@@ -297,6 +299,7 @@ class CalculationFrameSummary(QueryView):
     topology_id: UUID
     topology_derivation_id: UUID
     protocol_id: UUID | None = None
+    protocol_level: list[str | None] = Field(default_factory=list)
     canonical_isomeric_smiles: str | None = None
     charge: int
     multiplicity: int

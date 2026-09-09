@@ -18,6 +18,7 @@ from tricycle_reaction_db.application.services import (
     GeometryQueryService,
     LogicalReactionQueryService,
     MappedReactionQueryService,
+    MolecularTopologyDetailQueryService,
     ScientificArrayQueryService,
     TransitionStateInferenceQueryService,
 )
@@ -43,6 +44,7 @@ from tricycle_reaction_db.db.models import (
     ParseRevision,
     ScientificArray,
     ThermochemistryResult,
+    TransitionStateEndpoint,
     TransitionStateInference,
 )
 from tricycle_reaction_db.db.session import dispose_engine
@@ -60,6 +62,7 @@ from tricycle_reaction_db.domain.enums import (
     SelectedEnergyKind,
     SourceFormat,
     StorageStatus,
+    TransitionStateEndpointDirection,
     TransitionStateInferenceStatus,
 )
 from tricycle_reaction_db.domain.formulas import ELEMENT_COUNT_VECTOR_SIZE
@@ -810,6 +813,310 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
     finally:
         if sample is not None:
             with Session(engine) as session:
+                _delete_domain_sample(session, sample)
+        engine.dispose()
+        asyncio.run(dispose_engine())
+
+
+def test_endpoint_topology_resolves_logical_reactions(
+    development_query_principal: object,
+) -> None:
+    """A TS endpoint topology must be searchable as a reaction topology."""
+
+    del development_query_principal
+    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    sample: tuple[Any, ...] | None = None
+    endpoint_topology: MolecularTopology | None = None
+    endpoint_topology_id: UUID | None = None
+    endpoint: TransitionStateEndpoint | None = None
+    try:
+        with Session(engine, expire_on_commit=False) as session:
+            sample = _create_domain_sample(session)
+            inference, frame, *_rest = sample
+            formula = sample[-1]
+            assert isinstance(inference, TransitionStateInference)
+            assert isinstance(frame, CalculationFrame)
+            assert isinstance(formula, MolecularFormula)
+            assert formula.id is not None and frame.id is not None
+            endpoint_molecule = Chem.MolFromSmiles("[H][H]")
+            assert endpoint_molecule is not None
+
+            endpoint_topology = MolecularTopology(
+                id=uuid4(),
+                formula_id=formula.id,
+                formula=formula,
+                mol=endpoint_molecule,
+                canonical_isomeric_smiles="[H][H]",
+                graph_hash=_fixture_hash(f"domain-endpoint-topology:{uuid4()}"),
+                identity_schema_version="domain-filter-test-v1",
+                atom_count=2,
+                heavy_atom_count=0,
+                formal_charge=0,
+                radical_electron_count=0,
+                fragment_count=1,
+            )
+            assert endpoint_topology.id is not None
+            endpoint_topology_id = endpoint_topology.id
+            session.add(endpoint_topology)
+            session.flush()
+            endpoint = TransitionStateEndpoint(
+                id=uuid4(),
+                calculation_frame_id=frame.id,
+                topology_id=endpoint_topology.id,
+                direction=TransitionStateEndpointDirection.NEGATIVE,
+                atom_count=2,
+                displacement_ratio=0.1,
+                source_coordinates=np.array([[0.0, 0.0, 0.0], [0.69, 0.0, 0.0]], dtype=np.float64),
+                source_coordinate_hash=_fixture_hash(f"domain-endpoint:{uuid4()}"),
+                source_to_topology_atom_indices=[0, 1],
+                provenance={"fixture": "domain-filter-endpoint"},
+            )
+            session.add(endpoint)
+            session.commit()
+
+        assert endpoint_topology_id is not None
+        detail = asyncio.run(
+            MolecularTopologyDetailQueryService.get_topology(topology_id=endpoint_topology_id)
+        )
+        assert detail is not None
+        assert detail.logical_reaction_count == 1
+
+        reactions = asyncio.run(
+            LogicalReactionQueryService.list_logical_reactions(
+                topology_id=endpoint_topology_id,
+                limit=10,
+                offset=0,
+            )
+        )
+        assert reactions.page.total == 1
+        assert [item.id for item in reactions.items] == [sample[7].id]
+    finally:
+        with Session(engine) as session:
+            if endpoint is not None and endpoint.id is not None:
+                stored_endpoint = session.get(TransitionStateEndpoint, endpoint.id)
+                if stored_endpoint is not None:
+                    session.delete(stored_endpoint)
+                    session.flush()
+            if endpoint_topology is not None and endpoint_topology.id is not None:
+                stored_topology = session.get(MolecularTopology, endpoint_topology.id)
+                if stored_topology is not None:
+                    session.delete(stored_topology)
+                    session.flush()
+            if sample is not None:
+                _delete_domain_sample(session, sample)
+        engine.dispose()
+        asyncio.run(dispose_engine())
+
+
+def test_transition_state_node_topology_resolves_reactions(
+    development_query_principal: object,
+) -> None:
+    """A topology used only by a TS node must resolve both reaction views."""
+
+    del development_query_principal
+    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    sample: tuple[Any, ...] | None = None
+    transition_state_topology: MolecularTopology | None = None
+    transition_state_derivation: MolecularTopologyDerivation | None = None
+    transition_state_geometry: Geometry | None = None
+    transition_state_frame: CalculationFrame | None = None
+    transition_state_binding: MappedReactionNodeGeometry | None = None
+    try:
+        with Session(engine, expire_on_commit=False) as session:
+            sample = _create_domain_sample(session)
+            mapped_reaction = sample[6]
+            formula = sample[-1]
+            assert isinstance(mapped_reaction, MappedReaction)
+            assert isinstance(formula, MolecularFormula)
+            assert formula.id is not None
+
+            molecule = Chem.MolFromSmiles("[H][H]")
+            assert molecule is not None
+            transition_state_topology = MolecularTopology(
+                id=uuid4(),
+                formula_id=formula.id,
+                mol=molecule,
+                canonical_isomeric_smiles="[H][H]",
+                graph_hash=_fixture_hash(f"domain-ts-node-topology:{uuid4()}"),
+                identity_schema_version="domain-filter-test-v1",
+                atom_count=2,
+                heavy_atom_count=0,
+                formal_charge=0,
+                radical_electron_count=0,
+                fragment_count=1,
+            )
+            assert transition_state_topology.id is not None
+            transition_state_derivation = MolecularTopologyDerivation(
+                id=uuid4(),
+                topology_id=transition_state_topology.id,
+                reconstruction_method="test/domain-filter-ts-node",
+                reconstruction_version="1",
+                reconstruction_metadata={"fixture": "domain-filter-ts-node"},
+                provenance_hash=_fixture_hash(f"domain-ts-node-derivation:{uuid4()}"),
+            )
+            coordinates = np.array(
+                [[0.0, 0.0, 0.0], [0.74, 0.0, 0.0]],
+                dtype=np.float64,
+            )
+            geometry_molecule = Chem.Mol(molecule)
+            conformer = Chem.Conformer(2)
+            for atom_index, (x, y, z) in enumerate(coordinates):
+                conformer.SetAtomPosition(atom_index, (float(x), float(y), float(z)))
+            conformer.Set3D(True)
+            geometry_molecule.AddConformer(conformer, assignId=True)
+            transition_state_geometry = Geometry(
+                id=uuid4(),
+                topology_id=transition_state_topology.id,
+                mol=geometry_molecule,
+                internal_coordinates=coordinates,
+                internal_coordinate_distances_angstrom=[0.74],
+                internal_coordinate_angles_degrees=[0.0],
+                internal_coordinate_dihedrals_degrees=[0.0],
+                internal_coordinate_hash=_fixture_hash(f"domain-ts-node-internal:{uuid4()}"),
+                geometry_hash=_fixture_hash(f"domain-ts-node-geometry:{uuid4()}"),
+                canonicalization_version="domain-filter-test-v1",
+            )
+            session.add_all(
+                [
+                    transition_state_topology,
+                    transition_state_derivation,
+                    transition_state_geometry,
+                ]
+            )
+            session.flush()
+
+            sample_frame = sample[1]
+            sample_segment = sample[2]
+            sample_artifact = sample[10]
+            assert isinstance(sample_frame, CalculationFrame)
+            assert isinstance(sample_segment, CalculationSegment)
+            assert isinstance(sample_artifact, ArtifactFile)
+            assert (
+                sample_frame.parse_revision_id is not None
+                and sample_segment.id is not None
+                and transition_state_derivation.id is not None
+                and transition_state_geometry.id is not None
+            )
+            transition_state_frame = CalculationFrame(
+                id=uuid4(),
+                parse_revision_id=sample_frame.parse_revision_id,
+                segment_id=sample_segment.id,
+                frame_index=1,
+                file_frame_index=1,
+                frame_role=FrameRole.SINGLE_POINT,
+                source_start_byte=2,
+                source_end_byte=3,
+                source_start_line=3,
+                source_end_line=4,
+                source_block_sha256=sample_artifact.content_sha256,
+                geometry_id=transition_state_geometry.id,
+                topology_derivation_id=transition_state_derivation.id,
+                charge=0,
+                multiplicity=1,
+                geometry_assignment_kind=GeometryAssignmentKind.PARSED_EXACT,
+                observed_coordinates=coordinates,
+                observed_coordinate_hash=_fixture_hash(f"domain-ts-node-observed:{uuid4()}"),
+                observed_to_geometry_atom_indices=[0, 1],
+                observed_to_geometry_transform=np.eye(4, dtype=np.float64).reshape(-1).tolist(),
+                geometry_assignment_rmsd_angstrom=0.0,
+                geometry_assignment_max_abs_angstrom=0.0,
+                geometry_assignment_policy_version="domain-filter-test-v1",
+                electronic_total_energy_hartree=-1.1,
+                selected_energy_hartree=-1.1,
+                selected_energy_kind=SelectedEnergyKind.ELECTRONIC_TOTAL,
+                energy_selection_policy_version="domain-filter-test-v1",
+                frequency_count=1,
+                negative_frequency_count=1,
+                lowest_frequency_cm1=-100.0,
+            )
+            session.add(transition_state_frame)
+            session.flush()
+
+            node = (
+                session.execute(
+                    select(MappedReactionNode)
+                    .where(col(MappedReactionNode.mapped_reaction_id) == mapped_reaction.id)
+                    .where(col(MappedReactionNode.role) == MappedReactionNodeRole.TRANSITION_STATE)
+                )
+                .scalars()
+                .one()
+            )
+            assert node.id is not None and transition_state_geometry.id is not None
+            transition_state_binding = MappedReactionNodeGeometry(
+                mapped_reaction_node_id=node.id,
+                geometry_id=transition_state_geometry.id,
+                component_key="transition-state-only-topology",
+                component_index=0,
+            )
+            session.add(transition_state_binding)
+            session.commit()
+
+        assert transition_state_topology.id is not None
+        detail = asyncio.run(
+            MolecularTopologyDetailQueryService.get_topology(
+                topology_id=transition_state_topology.id,
+            )
+        )
+        assert detail is not None
+        assert detail.logical_reaction_count == 1
+
+        logical_page = asyncio.run(
+            LogicalReactionQueryService.list_logical_reactions(
+                topology_id=transition_state_topology.id,
+                limit=10,
+                offset=0,
+            )
+        )
+        assert logical_page.page.total == 1
+        assert [item.id for item in logical_page.items] == [sample[7].id]
+
+        mapped_page = asyncio.run(
+            MappedReactionQueryService.list_mapped_reactions(
+                topology_id=transition_state_topology.id,
+                node_role=MappedReactionNodeRole.TRANSITION_STATE.value,
+                limit=10,
+                offset=0,
+            )
+        )
+        assert mapped_page.page.total == 1
+        assert [item.id for item in mapped_page.items] == [sample[6].id]
+    finally:
+        with Session(engine) as session:
+            if transition_state_binding is not None and transition_state_binding.id is not None:
+                stored_binding = session.get(
+                    MappedReactionNodeGeometry,
+                    transition_state_binding.id,
+                )
+                if stored_binding is not None:
+                    session.delete(stored_binding)
+                    session.flush()
+            if transition_state_frame is not None and transition_state_frame.id is not None:
+                stored_frame = session.get(CalculationFrame, transition_state_frame.id)
+                if stored_frame is not None:
+                    session.delete(stored_frame)
+                    session.flush()
+            if transition_state_geometry is not None and transition_state_geometry.id is not None:
+                stored_geometry = session.get(Geometry, transition_state_geometry.id)
+                if stored_geometry is not None:
+                    session.delete(stored_geometry)
+                    session.flush()
+            if (
+                transition_state_derivation is not None
+                and transition_state_derivation.id is not None
+            ):
+                stored_derivation = session.get(
+                    MolecularTopologyDerivation,
+                    transition_state_derivation.id,
+                )
+                if stored_derivation is not None:
+                    session.delete(stored_derivation)
+                    session.flush()
+            if transition_state_topology is not None and transition_state_topology.id is not None:
+                stored_topology = session.get(MolecularTopology, transition_state_topology.id)
+                if stored_topology is not None:
+                    session.delete(stored_topology)
+                    session.flush()
+            if sample is not None:
                 _delete_domain_sample(session, sample)
         engine.dispose()
         asyncio.run(dispose_engine())

@@ -8,6 +8,7 @@ remain independently reusable molecular identities.
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Literal, cast
 from uuid import UUID
 
@@ -182,6 +183,36 @@ def _map_free_copy(molecule: Chem.Mol) -> Chem.Mol:
     return result
 
 
+@lru_cache(maxsize=4096)
+def _find_topology_matches_cached(
+    specific_binary: bytes,
+    general_binary: bytes,
+) -> tuple[tuple[int, ...], ...]:
+    """Run one stereo-aware match for a stable, map-free molecule pair."""
+
+    specific_graph = Chem.Mol(cast(Any, specific_binary))
+    general_graph = Chem.Mol(cast(Any, general_binary))
+    return _find_topology_matches_on_graphs(specific_graph, general_graph)
+
+
+def _find_topology_matches_on_graphs(
+    specific_graph: Chem.Mol,
+    general_graph: Chem.Mol,
+) -> tuple[tuple[int, ...], ...]:
+    """Run the uncached graph operation used by the compatibility fallback."""
+
+    if specific_graph.GetNumAtoms() != general_graph.GetNumAtoms():
+        return ()
+    if specific_graph.GetNumBonds() != general_graph.GetNumBonds():
+        return ()
+    matches = specific_graph.GetSubstructMatches(
+        general_graph,
+        useChirality=True,
+        uniquify=True,
+    )
+    return tuple(sorted(tuple(int(index) for index in match) for match in matches))
+
+
 def _is_assigned_atom_stereo(atom: Chem.Atom) -> bool:
     return atom.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
 
@@ -206,16 +237,16 @@ def find_topology_matches(
 
     specific_graph = _map_free_copy(specific)
     general_graph = _map_free_copy(general)
-    if specific_graph.GetNumAtoms() != general_graph.GetNumAtoms():
-        return ()
-    if specific_graph.GetNumBonds() != general_graph.GetNumBonds():
-        return ()
-    matches = specific_graph.GetSubstructMatches(
-        general_graph,
-        useChirality=True,
-        uniquify=True,
-    )
-    return tuple(sorted(tuple(int(index) for index in match) for match in matches))
+    try:
+        return _find_topology_matches_cached(
+            specific_graph.ToBinary(),
+            general_graph.ToBinary(),
+        )
+    except (RuntimeError, TypeError, ValueError):
+        # Keep the historical behavior for unusual/unserializable RDKit
+        # molecules. They are rare and should not make the cache a new source
+        # of ingestion failures.
+        return _find_topology_matches_on_graphs(specific_graph, general_graph)
 
 
 def find_topology_match(

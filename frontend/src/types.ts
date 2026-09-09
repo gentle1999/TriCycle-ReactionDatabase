@@ -118,6 +118,7 @@ export interface CalculationFrameSummary {
   negative_frequency_count: number | null;
   running_time_seconds: number | null;
   protocol_id?: string | null;
+  protocol_level: (string | null)[];
 }
 
 export interface GeometrySummary {
@@ -159,6 +160,7 @@ export interface GeometryEnergyView {
   electronic_energy_hartree: number | null;
   electronic_energy_source_frame_id: string | null;
   electronic_energy_protocol_id: string | null;
+  electronic_level: (string | null)[];
   charge: number | null;
   multiplicity: number | null;
   electronic_state_kind: string | null;
@@ -167,6 +169,7 @@ export interface GeometryEnergyView {
   thermochemistry_candidate_frame_ids: string[];
   thermochemistry_source_frame_id: string | null;
   thermochemistry_protocol_id: string | null;
+  thermochemistry_level: (string | null)[];
   temperature_kelvin: number | null;
   pressure_atm: number | null;
   zpe_correction_hartree: number | null;

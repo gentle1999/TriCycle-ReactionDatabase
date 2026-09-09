@@ -201,6 +201,18 @@ def _protocol_identity(protocol: CalculationProtocol | None) -> tuple[object, ..
     )
 
 
+def _level_view(level: tuple[object, ...] | None) -> list[str | None]:
+    if level is None:
+        return []
+    return [value if value is None or isinstance(value, str) else str(value) for value in level]
+
+
+def protocol_level_view(protocol: CalculationProtocol | None) -> list[str | None]:
+    """Return the serializable identity used to label one calculation frame."""
+
+    return _level_view(_protocol_identity(protocol))
+
+
 def geometry_energy_composite(
     geometry_id: UUID,
     candidates: Sequence[GeometryEnergyCandidate],
@@ -267,6 +279,12 @@ def geometry_energy_composite(
         electronic_source.frame.selected_energy_hartree if electronic_source is not None else None
     )
     thermochemistry = thermal_source.thermochemistry if thermal_source is not None else None
+    electronic_level = (
+        _protocol_identity(electronic_source.protocol) if electronic_source is not None else None
+    )
+    thermochemistry_level = (
+        _protocol_identity(thermal_source.protocol) if thermal_source is not None else None
+    )
 
     def corrected(correction: float | None) -> float | None:
         if electronic_energy is None or correction is None:
@@ -287,6 +305,7 @@ def geometry_energy_composite(
             if electronic_source is not None and electronic_source.protocol is not None
             else None
         ),
+        electronic_level=_level_view(electronic_level),
         charge=(electronic_source.frame.charge if electronic_source is not None else None),
         multiplicity=(
             electronic_source.frame.multiplicity if electronic_source is not None else None
@@ -311,6 +330,7 @@ def geometry_energy_composite(
             if thermal_source is not None and thermal_source.protocol is not None
             else None
         ),
+        thermochemistry_level=_level_view(thermochemistry_level),
         temperature_kelvin=(
             thermochemistry.temperature_kelvin if thermochemistry is not None else None
         ),
@@ -357,14 +377,8 @@ def geometry_energy_composite(
     )
     return GeometryEnergyComposite(
         view=view,
-        electronic_level=(
-            _protocol_identity(electronic_source.protocol)
-            if electronic_source is not None
-            else None
-        ),
-        thermochemistry_level=(
-            _protocol_identity(thermal_source.protocol) if thermal_source is not None else None
-        ),
+        electronic_level=electronic_level,
+        thermochemistry_level=thermochemistry_level,
     )
 
 
@@ -394,6 +408,7 @@ __all__ = [
     "GeometryEnergyComposite",
     "geometry_energy_composite",
     "geometry_energy_composites",
+    "protocol_level_view",
     "protocol_dominates",
     "protocol_level",
 ]

@@ -532,6 +532,7 @@ async function downloadExport(): Promise<void> {
     <ReactionAdvancedQueryModal
       :open="advancedQueryOpen"
       :project-id="currentProjectId"
+      :initial-filters="filters"
       @close="advancedQueryOpen = false"
       @apply="applyAdvancedFilter"
     />

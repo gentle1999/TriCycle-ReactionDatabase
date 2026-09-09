@@ -5,17 +5,19 @@ import { computed, defineAsyncComponent, ref, watch } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 
 import { api } from "@/api";
-import { formatDurationSeconds, formatEnergy, formatNumber, labelFor, shortId } from "@/format";
+import { formatDurationSeconds, formatEnergy, formatNumber, formatProtocolLevel, labelFor, shortId } from "@/format";
 import { withoutAccessState } from "@/routeAccessState";
 import type {
   LogicalReactionDetail,
   MappedReactionDetail,
   MappedReactionNode,
   MappedReactionNodeGeometry,
+  PageInfo,
 } from "@/types";
 
 import ChemDoodleGeometry3D from "./ChemDoodleGeometry3D.vue";
 import ChemDoodleMolecule from "./ChemDoodleMolecule.vue";
+import PaginationControls from "./PaginationControls.vue";
 import type { ReactionPotentialEnergyProfile } from "./ReactionPotentialEnergyDiagram.vue";
 
 const ReactionPotentialEnergyDiagram = defineAsyncComponent(() => import("./ReactionPotentialEnergyDiagram.vue"));
@@ -87,6 +89,32 @@ const selectedGeometryRows = computed(() => {
       ...row,
       geometries: [...row.geometries].sort((left, right) => left.coordinate_index - right.coordinate_index),
     }));
+});
+const GEOMETRY_PAGE_LIMIT = 6;
+const geometryPageOffset = ref(0);
+const selectedGeometryTotal = computed(() => selectedGeometryRows.value
+  .reduce((total, row) => total + row.geometries.length, 0));
+const selectedGeometryPage = computed<PageInfo>(() => ({
+  total: selectedGeometryTotal.value,
+  limit: GEOMETRY_PAGE_LIMIT,
+  offset: geometryPageOffset.value,
+}));
+const visibleSelectedGeometryRows = computed(() => {
+  let skip = geometryPageOffset.value;
+  let remaining = GEOMETRY_PAGE_LIMIT;
+  const rows: typeof selectedGeometryRows.value = [];
+  for (const row of selectedGeometryRows.value) {
+    if (remaining <= 0) break;
+    if (skip >= row.geometries.length) {
+      skip -= row.geometries.length;
+      continue;
+    }
+    const geometries = row.geometries.slice(skip, skip + remaining);
+    if (geometries.length) rows.push({ ...row, geometries });
+    remaining -= geometries.length;
+    skip = 0;
+  }
+  return rows;
 });
 const thermodynamics = useQuery({
   queryKey: computed(() => ["catalog", "mapped-reaction-thermodynamics", { id: props.mappedReaction?.id, projectId: props.projectId }]),
@@ -198,7 +226,31 @@ function mappedParticipantRole(logicalParticipantId: string, side: string): stri
   return logicalParticipantsById.value.get(logicalParticipantId)?.role ?? side;
 }
 
+function previousGeometryPage(): void {
+  geometryPageOffset.value = Math.max(0, geometryPageOffset.value - GEOMETRY_PAGE_LIMIT);
+}
+
+function nextGeometryPage(): void {
+  if (geometryPageOffset.value + GEOMETRY_PAGE_LIMIT < selectedGeometryTotal.value) {
+    geometryPageOffset.value += GEOMETRY_PAGE_LIMIT;
+  }
+}
+
+function jumpGeometryPage(offset: number): void {
+  const maxOffset = selectedGeometryTotal.value > 0
+    ? Math.floor((selectedGeometryTotal.value - 1) / GEOMETRY_PAGE_LIMIT) * GEOMETRY_PAGE_LIMIT
+    : 0;
+  geometryPageOffset.value = Math.max(0, Math.min(offset, maxOffset));
+}
+
 watch(orderedNodes, (nodes) => { activeNodeId.value = nodes[0]?.id ?? null; }, { immediate: true });
+watch(() => selectedNode.value?.id, () => { geometryPageOffset.value = 0; }, { immediate: true });
+watch(selectedGeometryTotal, (total) => {
+  const maxOffset = total > 0
+    ? Math.floor((total - 1) / GEOMETRY_PAGE_LIMIT) * GEOMETRY_PAGE_LIMIT
+    : 0;
+  geometryPageOffset.value = Math.min(geometryPageOffset.value, maxOffset);
+});
 </script>
 
 <template>
@@ -287,11 +339,12 @@ watch(orderedNodes, (nodes) => { activeNodeId.value = nodes[0]?.id ?? null; }, {
         <section v-if="selectedNode" class="node-detail">
           <header class="node-detail-header"><div><span class="eyebrow">Node / {{ selectedNode.node_key }}</span><h3>{{ labelFor(selectedNode.role) }}</h3></div><dl v-if="selectedNode.additive_properties" class="node-energy-summary"><div><dt>电子能</dt><dd>{{ formatEnergy(selectedNode.additive_properties.electronic_energy_hartree) }}</dd></div><div><dt>Gibbs</dt><dd>{{ formatEnergy(selectedNode.additive_properties.gibbs_free_energy_hartree) }}</dd></div></dl></header>
           <div class="geometry-component-list">
-            <section v-for="row in selectedGeometryRows" :key="row.key" class="geometry-component-row">
+            <section v-for="row in visibleSelectedGeometryRows" :key="row.key" class="geometry-component-row">
               <header class="geometry-component-row-header"><div><span class="eyebrow">Component {{ row.componentIndex + 1 }}</span><h4>{{ row.participantRole ? labelFor(row.participantRole) : row.componentKey }}</h4></div><code>{{ row.componentKey }}</code></header>
-              <div class="geometry-grid"><article v-for="(geometry, geometryIndex) in row.geometries" :key="geometry.id" class="geometry-item"><header><div><strong>{{ geometry.participant_role ? labelFor(geometry.participant_role) : geometry.component_key }}</strong><span>坐标 {{ geometryIndex + 1 }}</span></div><span v-if="geometry.is_primary" class="primary-tag">主构型</span><RouterLink class="geometry-direct-link" :to="{ name: 'geometry-detail', params: { geometryId: geometry.geometry_id }, query: navigationQuery }" title="查看几何构象" :aria-label="`查看几何构象 ${geometry.geometry_id}`"><ArrowUpRight :size="15" aria-hidden="true" /></RouterLink></header><ChemDoodleGeometry3D :geometry-id="geometry.geometry_id" :project-id="projectId ?? undefined" :label="geometry.canonical_isomeric_smiles ?? undefined" :height="220" /><code class="smiles-line">{{ geometry.canonical_isomeric_smiles ?? "SMILES 不可用" }}</code><dl class="property-grid"><div><dt>电子能 / Eh</dt><dd>{{ formatEnergy(geometry.energy_view.electronic_energy_hartree) }}</dd></div><div><dt>Gibbs / Eh</dt><dd>{{ formatEnergy(geometry.energy_view.gibbs_free_energy_hartree) }}</dd></div><div><dt>熵 / cal mol⁻¹ K⁻¹</dt><dd>{{ formatNumber(geometry.energy_view.entropy_cal_mol_k, 3) }}</dd></div></dl><div class="frame-links"><div v-for="calculation in geometry.calculations" :key="calculation.id" class="frame-link-item"><button type="button" @click="emit('openFrame', calculation.id)"><span>{{ labelFor(calculation.frame_role) }}</span><code>{{ formatEnergy(calculation.selected_energy_hartree) }}</code><code class="frame-link-runtime" :title="`逐帧计算用时：${formatDurationSeconds(calculation.running_time_seconds)}`">{{ formatDurationSeconds(calculation.running_time_seconds) }}</code><ChevronRight :size="15" aria-hidden="true" /></button><RouterLink :to="{ name: 'calculation-detail', params: { frameId: calculation.id }, query: navigationQuery }" title="在独立页面打开" :aria-label="`在独立页面打开计算帧 ${calculation.id}`"><ArrowUpRight :size="15" aria-hidden="true" /></RouterLink></div></div></article></div>
+              <div class="geometry-grid"><article v-for="geometry in row.geometries" :key="geometry.id" class="geometry-item"><header><div><strong>{{ geometry.participant_role ? labelFor(geometry.participant_role) : geometry.component_key }}</strong><span>坐标 {{ geometry.coordinate_index + 1 }}</span></div><span v-if="geometry.is_primary" class="primary-tag">主构型</span><RouterLink class="geometry-direct-link" :to="{ name: 'geometry-detail', params: { geometryId: geometry.geometry_id }, query: navigationQuery }" title="查看几何构象" :aria-label="`查看几何构象 ${geometry.geometry_id}`"><ArrowUpRight :size="15" aria-hidden="true" /></RouterLink></header><ChemDoodleGeometry3D :geometry-id="geometry.geometry_id" :project-id="projectId ?? undefined" :label="geometry.canonical_isomeric_smiles ?? undefined" :height="220" /><code class="smiles-line">{{ geometry.canonical_isomeric_smiles ?? "SMILES 不可用" }}</code><dl class="property-grid"><div><dt>电子能级</dt><dd :title="formatProtocolLevel(geometry.energy_view.electronic_level)">{{ formatProtocolLevel(geometry.energy_view.electronic_level) }}</dd></div><div><dt>热化学级别</dt><dd :title="formatProtocolLevel(geometry.energy_view.thermochemistry_level)">{{ formatProtocolLevel(geometry.energy_view.thermochemistry_level) }}</dd></div><div><dt>电子能 / Eh</dt><dd>{{ formatEnergy(geometry.energy_view.electronic_energy_hartree) }}</dd></div><div><dt>Gibbs / Eh</dt><dd>{{ formatEnergy(geometry.energy_view.gibbs_free_energy_hartree) }}</dd></div><div><dt>熵 / cal mol⁻¹ K⁻¹</dt><dd>{{ formatNumber(geometry.energy_view.entropy_cal_mol_k, 3) }}</dd></div></dl><div class="frame-links"><div v-for="calculation in geometry.calculations" :key="calculation.id" class="frame-link-item"><button type="button" @click="emit('openFrame', calculation.id)"><span>{{ labelFor(calculation.frame_role) }}</span><code>{{ formatEnergy(calculation.selected_energy_hartree) }}</code><code class="frame-link-level" :title="`计算级别：${formatProtocolLevel(calculation.protocol_level)}`">{{ formatProtocolLevel(calculation.protocol_level) }}</code><code class="frame-link-runtime" :title="`逐帧计算用时：${formatDurationSeconds(calculation.running_time_seconds)}`">{{ formatDurationSeconds(calculation.running_time_seconds) }}</code><ChevronRight :size="15" aria-hidden="true" /></button><RouterLink :to="{ name: 'calculation-detail', params: { frameId: calculation.id }, query: navigationQuery }" title="在独立页面打开" :aria-label="`在独立页面打开计算帧 ${calculation.id}`"><ArrowUpRight :size="15" aria-hidden="true" /></RouterLink></div></div></article></div>
             </section>
           </div>
+          <PaginationControls class="mapped-geometry-pagination" :page="selectedGeometryPage" label="节点几何构象分页" @previous="previousGeometryPage" @next="nextGeometryPage" @jump="jumpGeometryPage" />
         </section>
       </template>
     </section>

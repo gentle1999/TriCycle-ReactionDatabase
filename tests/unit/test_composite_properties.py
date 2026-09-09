@@ -5,6 +5,7 @@ import pytest
 from tricycle_reaction_db.application.services.geometry_energy import (
     GeometryEnergyCandidate,
     geometry_energy_composite,
+    protocol_level_view,
 )
 from tricycle_reaction_db.application.services.queries import (
     _aggregate_primary_coordinates,
@@ -75,6 +76,28 @@ def test_geometry_energy_prefers_higher_level_single_point_and_adds_thermal_corr
     assert composite.view.electronic_energy_hartree == -100.0
     assert composite.view.electronic_energy_source_frame_id == orca_frame.id
     assert composite.view.thermochemistry_source_frame_id == gaussian_frame.id
+    assert composite.view.electronic_level == [
+        "DFT",
+        "DFT",
+        None,
+        "wB97M-V",
+        "def2-TZVPP",
+        None,
+        None,
+        None,
+        None,
+    ]
+    assert composite.view.thermochemistry_level == [
+        "DFT",
+        "DFT",
+        None,
+        "B3LYP-GD3BJ",
+        "def2-SVP",
+        None,
+        None,
+        None,
+        None,
+    ]
     assert composite.view.gibbs_free_energy_hartree == pytest.approx(-99.95)
     assert composite.view.enthalpy_hartree == pytest.approx(-99.94)
     assert composite.view.entropy_cal_mol_k == pytest.approx(12.5)
@@ -112,3 +135,7 @@ def test_incomparable_protocols_produce_an_ambiguous_energy_view() -> None:
 
 def test_derived_energies_are_quantized_after_float_arithmetic() -> None:
     assert _complete_sum([-78.123457, -0.000001]) == -78.123458
+
+
+def test_protocol_level_view_is_empty_without_a_protocol() -> None:
+    assert protocol_level_view(None) == []

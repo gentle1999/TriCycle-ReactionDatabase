@@ -33,6 +33,8 @@ from tricycle_reaction_db.core.chemistry_config import GEOMETRY_MATCH_POLICY_VER
 from tricycle_reaction_db.core.units import radians_to_degrees
 from tricycle_reaction_db.db.models import (
     Geometry,
+    LogicalParticipantConcreteTopology,
+    LogicalReactionParticipant,
     MappedReaction,
     MappedReactionParticipant,
     MolecularFormula,
@@ -131,6 +133,26 @@ class GeometryPersistenceContext:
         default_factory=dict
     )
     mapped_reactions_by_id: dict[UUID, MappedReaction] = field(default_factory=dict)
+    # Reaction expansion visits the same logical reaction once per concrete
+    # topology.  Keep its stable participant/reaction lookups in this
+    # transaction instead of reloading the same rows for every visit.
+    mapped_reactions_by_logical_reaction: dict[UUID, tuple[MappedReaction, ...]] = field(
+        default_factory=dict
+    )
+    mapped_reaction_participants_by_reaction: dict[UUID, tuple[MappedReactionParticipant, ...]] = (
+        field(default_factory=dict)
+    )
+    memberships_by_concrete_topology: dict[UUID, tuple[LogicalParticipantConcreteTopology, ...]] = (
+        field(default_factory=dict)
+    )
+    # Mapping expansion validates many concrete reactions against the same
+    # logical reaction. Keep both lookup directions so that validation and
+    # target-topology construction do not issue one SELECT per participant.
+    logical_participants_by_logical_reaction: dict[UUID, tuple[LogicalReactionParticipant, ...]] = (
+        field(default_factory=dict)
+    )
+    logical_participants_by_id: dict[UUID, LogicalReactionParticipant] = field(default_factory=dict)
+    molecular_topologies_by_id: dict[UUID, MolecularTopology] = field(default_factory=dict)
     # A mapped reaction can be created after its endpoint Geometry rows were
     # committed in an earlier ingestion microbatch. Keep those reactions in
     # the batch context so the reconciliation barrier performs the reverse

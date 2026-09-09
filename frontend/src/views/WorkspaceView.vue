@@ -237,16 +237,25 @@ function closeArtifactPreview(): void {
   selectedArtifactId.value = null;
 }
 
-async function refreshAfterDelete(artifactId: string): Promise<void> {
-  if (selectedArtifactId.value === artifactId) closeArtifactPreview();
-  if (expandedArtifactId.value === artifactId) expandedArtifactId.value = null;
-  queryClient.removeQueries({ queryKey: ["catalog", "artifact-preview", { id: artifactId }] });
-  const projectId = currentProjectId.value;
-  if (!projectId) return;
+async function refreshAfterDelete(artifactIds: string[]): Promise<void> {
+  if (selectedArtifactId.value && artifactIds.includes(selectedArtifactId.value)) closeArtifactPreview();
+  if (expandedArtifactId.value && artifactIds.includes(expandedArtifactId.value)) expandedArtifactId.value = null;
+  for (const artifactId of artifactIds) {
+    queryClient.removeQueries({ queryKey: ["catalog", "artifact-preview", { id: artifactId }] });
+  }
   setArtifactPage(0, true);
   await Promise.all([
-    queryClient.invalidateQueries({ queryKey: ["catalog", "artifacts", { projectId }] }),
-    queryClient.invalidateQueries({ queryKey: ["catalog", "totals", { projectId }] }),
+    queryClient.invalidateQueries({ queryKey: ["catalog", "artifacts"] }),
+    queryClient.invalidateQueries({ queryKey: ["catalog", "totals"] }),
+    queryClient.invalidateQueries({ queryKey: ["catalog", "artifact-frames"] }),
+  ]);
+}
+
+async function refreshAfterReparse(): Promise<void> {
+  await Promise.all([
+    queryClient.invalidateQueries({ queryKey: ["catalog", "artifacts"] }),
+    queryClient.invalidateQueries({ queryKey: ["catalog", "totals"] }),
+    queryClient.invalidateQueries({ queryKey: ["catalog", "artifact-frames"] }),
   ]);
 }
 
@@ -346,6 +355,7 @@ function jumpArtifactPage(offset: number): void { setArtifactPage(offset); }
       @update-sort="updateArtifactSort"
       @preview="openArtifactPreview"
       @deleted="refreshAfterDelete"
+      @reparsed="refreshAfterReparse"
       @toggle-frames="toggleArtifactFrames"
       @open-frame="openFrame"
       @previous-page="previousArtifactPage"

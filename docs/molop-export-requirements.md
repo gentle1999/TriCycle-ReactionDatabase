@@ -249,12 +249,16 @@ MolOP 已提供 `method_family`、`method`、`reference_method`、`functional`�
 | --- | --- | --- |
 | `MOLREQ-090` | `method_family` 应使用稳定的粗粒度方法族 | 不把不稳定字段作为数据库协议唯一键 |
 | `MOLREQ-091` | `method` 应使用稳定的具体电子结构方法名 | 同一计算跨 segment 不产生无依据的别名漂移 |
-| `MOLREQ-092` | functional 应排除 R/U/RO spin 前缀和 dispersion 后缀 | spin、functional、dispersion 可独立查询 |
+| `MOLREQ-092` | 原始 MolOP functional 应排除 R/U/RO spin 前缀；数据库投影在存在 `dispersion_correction` 时统一补充 canonical dispersion 后缀 | `source_protocol` 保留 MolOP 原值；数据库 `functional` 与 `dispersion_model` 可分别查询且不产生别名漂移 |
 | `MOLREQ-093` | Gaussian 与 ORCA 应逐步统一规范化规则 | 等价协议得到等价通用字段 |
 | `MOLREQ-094` | 无法规范化时必须保留 raw token | 不得用错误规范值替代原始证据 |
 
 数据库当前必须保存 raw/protocol evidence，不得把这些仍可演进的规范字段单独作为不可变
-identity。
+identity。当前 `CalculationProtocol` 的 v2 投影规则为：`functional` 没有已知色散后缀而
+`dispersion_model` 存在时，登记为 `<functional>-<dispersion_model>`；若两者都带有已知
+色散项，则必须一致（`D3BJ` 与 `GD3BJ` 等跨程序别名会先统一），冲突直接使该导入失败。
+发生投影变化时，MolOP 原始协议保存在 `normalized_spec.source_protocol`，归一化后的协议
+保存在 `normalized_spec.protocol`。
 
 ## 7. 数据库端设计指南
 
@@ -295,7 +299,7 @@ MolOP 当前已实现：
 1. 依赖要求为 PyPI MolOP `>=0.2.12` 与 MolGR `>=0.1.8`。Gaussian 进程内导入直接消费 MolOP
    公共模型的 `model_dump(mode="python", exclude_none=False)` payload，不重复实现
    locator、状态判断、拓扑重建或模型校验。数据库侧只做字段裁剪、Quantity 单位归一化、
-   ndarray sidecar 摘要/转换和数据库 identity 绑定。可信 MolGR 图只重建 ring info；数据库不再
+   ndarray sidecar 摘要/转换、计算协议归一化和数据库 identity 绑定。可信 MolGR 图只重建 ring info；数据库不再
    `SanitizeMol`、补隐式氢、推断自由基或重排原子顺序。
 2. 已用 DA minimum、TS 和多 Link1 fixture 验证 9 个 segment、45 个 frame、227 个数组、
    4 个热化学结果、49 条 typed energy observation、14 个 molecular-orbital result、
@@ -308,7 +312,8 @@ MolOP 当前已实现：
 5. 验证 file/frame 分阶段导入在大优化轨迹下不会构造全帧 JSON，也不会把 ndarray 留在
    JSON 编码路径。
 6. 完成 ORCA admission 和 quarantine policy 的数据库测试。
-7. 将 model chemistry 进一步规范化视为 P2 演进，不阻塞当前 evidence-first 导入。
+7. 继续完善 Gaussian 与 ORCA 的 model-chemistry 交叉程序别名表和黄金样本，不改变已保留的
+   raw/protocol evidence。
 
 MolOP 当前少数 computed evidence 属性尚未进入 `model_dump()`（例如 file/frame
 diagnostics 和部分收敛摘要）。适配器只对这些明确列出的字段做最小属性回退；字段一旦进入

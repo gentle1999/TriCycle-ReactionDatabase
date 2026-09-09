@@ -17,6 +17,7 @@ from tricycle_reaction_db.domain.enums import StereoStatus, TopologySanitization
 from tricycle_reaction_db.ingestion.normalization import (
     StereoProjectionError,
     _canonical_isomeric_smiles_signature,
+    clear_inversion_labile_atom_chirality,
     ensure_serializable_double_bond_stereochemistry,
     infer_molgr_stereochemistry_from_3d,
     normalize_molecule,
@@ -230,6 +231,72 @@ def test_normalization_preserves_molgr_metal_unpaired_electrons() -> None:
     assert metal.GetIntProp(METAL_UNPAIRED_ELECTRONS_PROP) == 1
     assert oxygen.GetFormalCharge() == 1
     assert oxygen.GetNumRadicalElectrons() == 0
+
+
+def test_molgr_geometry_creation_clears_inversion_labile_atom_chirality() -> None:
+    molecule = Chem.MolFromSmiles("[C@H](F)(Cl)[S@+]([O-])[CH2]Br")
+    assert molecule is not None
+    source_sulfur = next(atom for atom in molecule.GetAtoms() if atom.GetSymbol() == "S")
+    source_carbon = molecule.GetAtomWithIdx(0)
+    assert source_sulfur.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
+    assert source_carbon.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
+
+    cleaned = clear_inversion_labile_atom_chirality(molecule)
+    cleaned_sulfur = next(atom for atom in cleaned.GetAtoms() if atom.GetSymbol() == "S")
+    assert cleaned_sulfur.GetChiralTag() is Chem.ChiralType.CHI_UNSPECIFIED
+    assert not cleaned_sulfur.HasProp("_CIPCode")
+    assert molecule.GetAtomWithIdx(source_sulfur.GetIdx()).GetChiralTag() != (
+        Chem.ChiralType.CHI_UNSPECIFIED
+    )
+    assert cleaned.GetAtomWithIdx(0).GetChiralTag() == source_carbon.GetChiralTag()
+
+    record = normalize_molecule(
+        molecule,
+        np.asarray(
+            (
+                (0.0, 0.0, 0.0),
+                (0.0, 1.2, 0.0),
+                (0.0, 0.0, 1.7),
+                (1.8, 0.0, 0.0),
+                (2.8, 0.8, 0.0),
+                (2.8, -0.6, 0.0),
+                (3.8, 0.0, 0.0),
+            ),
+            dtype=np.float64,
+        ),
+        charge=0,
+        multiplicity=2,
+        reconstruction_method="molgr/cpp",
+        reconstruction_version="test",
+    )
+
+    for graph in (record.topology.mol, record.geometry.mol):
+        sulfur = next(atom for atom in graph.GetAtoms() if atom.GetSymbol() == "S")
+        carbon = next(
+            atom
+            for atom in graph.GetAtoms()
+            if atom.GetAtomicNum() == 6 and atom.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
+        )
+        assert sulfur.GetChiralTag() is Chem.ChiralType.CHI_UNSPECIFIED
+        assert not sulfur.HasProp("_CIPCode")
+        assert carbon.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
+
+
+def test_molgr_3d_stereo_inference_clears_labile_atom_after_assignment() -> None:
+    molecule = Chem.MolFromSmiles("[C@H](F)(Cl)[S@+]([O-])[CH2]Br")
+    assert molecule is not None
+    assert AllChem.EmbedMolecule(molecule, randomSeed=17) == 0
+
+    normalized = normalize_molgr_stereochemistry(molecule)
+
+    sulfur = next(atom for atom in normalized.GetAtoms() if atom.GetSymbol() == "S")
+    carbon = next(
+        atom
+        for atom in normalized.GetAtoms()
+        if atom.GetAtomicNum() == 6 and atom.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
+    )
+    assert sulfur.GetChiralTag() is Chem.ChiralType.CHI_UNSPECIFIED
+    assert carbon.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
 
 
 def test_topology_identity_is_independent_of_source_atom_order() -> None:

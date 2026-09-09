@@ -9,9 +9,10 @@ complete atom mapping exists.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
+from sqlalchemy.orm.attributes import set_committed_value
 from sqlmodel import Session, col, select
 
 from tricycle_reaction_db.application.services._persistence import (
@@ -30,6 +31,7 @@ from tricycle_reaction_db.core.chemistry_config import (
 )
 from tricycle_reaction_db.db.models import (
     LogicalParticipantConcreteTopology,
+    LogicalReaction,
     LogicalReactionParticipant,
     MolecularTopology,
     MolecularTopologyAbstraction,
@@ -45,6 +47,38 @@ def _pending_entities(session: Session) -> tuple[object, ...]:
         *tuple(session.new),
         *tuple(session.info.get("_fast_pending_entities", ())),
     )
+
+
+def _membership_cache(
+    session: Session,
+) -> dict[UUID, dict[UUID, LogicalParticipantConcreteTopology]]:
+    """Cache positive membership lookups for the active database transaction."""
+
+    # Include the nested transaction identity: a savepoint rollback can remove
+    # a membership that was positive in the cache while the root transaction
+    # remains active.
+    transaction_marker = (
+        id(session.get_transaction()),
+        id(session.get_nested_transaction()),
+    )
+    cached_marker = session.info.get("_membership_cache_transaction_marker")
+    cache = session.info.setdefault("_membership_cache", {})
+    if cached_marker != transaction_marker:
+        cache.clear()
+        session.info["_membership_cache_transaction_marker"] = transaction_marker
+    return cast(dict[UUID, dict[UUID, LogicalParticipantConcreteTopology]], cache)
+
+
+def _cache_membership(
+    session: Session,
+    membership: LogicalParticipantConcreteTopology,
+) -> None:
+    logical_participant_id = membership.logical_reaction_participant_id
+    concrete_topology_id = membership.concrete_topology_id
+    if isinstance(logical_participant_id, UUID) and isinstance(concrete_topology_id, UUID):
+        _membership_cache(session).setdefault(concrete_topology_id, {})[logical_participant_id] = (
+            membership
+        )
 
 
 def _compatible_topology_candidate(
@@ -127,19 +161,25 @@ def persist_logical_participant_concrete_topology(
             concrete_topology_id,
         ),
     )
-    membership = session.exec(
-        select(LogicalParticipantConcreteTopology).where(
-            LogicalParticipantConcreteTopology.logical_reaction_participant_id
-            == logical_participant_id,
-            LogicalParticipantConcreteTopology.concrete_topology_id == concrete_topology_id,
-        )
-    ).first()
+    membership = (
+        _membership_cache(session).get(concrete_topology_id, {}).get(logical_participant_id)
+    )
+    if membership is None:
+        membership = session.exec(
+            select(LogicalParticipantConcreteTopology).where(
+                LogicalParticipantConcreteTopology.logical_reaction_participant_id
+                == logical_participant_id,
+                LogicalParticipantConcreteTopology.concrete_topology_id == concrete_topology_id,
+            )
+        ).first()
     if membership is None:
         membership = _find_pending_membership(
             session,
             logical_participant_id=logical_participant_id,
             concrete_topology_id=concrete_topology_id,
         )
+    if membership is not None:
+        _cache_membership(session, membership)
     metadata = _match_metadata(logical_topology, concrete_topology, matches)
     if match_metadata:
         metadata["caller_metadata"] = dict(match_metadata)
@@ -169,6 +209,7 @@ def persist_logical_participant_concrete_topology(
         match_metadata=metadata,
     )
     _flush_new_entity(session, membership, label="LogicalParticipantConcreteTopology")
+    _cache_membership(session, membership)
     return membership
 
 
@@ -272,15 +313,47 @@ def logical_participant_matches_for_concrete_topology(
         if _compatible_topology_candidate(participant.topology, concrete_topology):
             participants_by_id[participant_id] = participant
     rows = session.exec(
-        select(LogicalReactionParticipant)
-        .join(MolecularTopology)
+        select(
+            LogicalReactionParticipant,
+            LogicalReaction,
+            LogicalParticipantConcreteTopology,
+        )
+        .join(
+            MolecularTopology,
+            col(MolecularTopology.id) == col(LogicalReactionParticipant.topology_id),
+        )
+        .join(
+            LogicalReaction,
+            col(LogicalReaction.id) == col(LogicalReactionParticipant.logical_reaction_id),
+        )
+        .outerjoin(
+            LogicalParticipantConcreteTopology,
+            (
+                col(LogicalParticipantConcreteTopology.logical_reaction_participant_id)
+                == col(LogicalReactionParticipant.id)
+            )
+            & (
+                col(LogicalParticipantConcreteTopology.concrete_topology_id) == concrete_topology.id
+            ),
+        )
         .where(
             col(MolecularTopology.formula_id) == concrete_topology.formula_id,
             col(MolecularTopology.atom_count) == concrete_topology.atom_count,
             col(MolecularTopology.formal_charge) == concrete_topology.formal_charge,
         )
     ).all()
-    for participant in rows:
+    for participant, logical_reaction, membership in rows:
+        # The mapping expansion consumes ``participant.logical_reaction`` for
+        # every match.  Populate that relationship from this same set query so
+        # the access does not issue one lazy SELECT per participant.
+        set_committed_value(participant, "logical_reaction", logical_reaction)
+        if membership is not None:
+            set_committed_value(
+                membership,
+                "logical_reaction_participant",
+                participant,
+            )
+            _cache_membership(session, membership)
         participant_id = _require_id(participant, label="LogicalReactionParticipant")
         participants_by_id[participant_id] = participant
 

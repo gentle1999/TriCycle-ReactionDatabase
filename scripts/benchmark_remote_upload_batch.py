@@ -232,6 +232,7 @@ def _arguments() -> argparse.Namespace:
         help="real Gaussian/ORCA file or directory; synthetic repository fixtures are not allowed",
     )
     parser.add_argument("--selection-offset", type=int, default=0)
+    parser.add_argument("--persistence-batch-files", type=int, default=16)
     return parser.parse_args()
 
 
@@ -485,6 +486,7 @@ async def _run_batch(
     batch_size: int,
     n_jobs: int,
     selection_offset: int,
+    persistence_batch_files: int,
 ) -> dict[str, object]:
     nonce = uuid4().hex
     files, selected_sources = _load_batch_sources(
@@ -532,6 +534,7 @@ async def _run_batch(
             artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
             project_id=SYSTEM_PROJECT_ID,
             user_id=DEVELOPMENT_USER_ID,
+            persistence_batch_files=persistence_batch_files,
         )
         service_elapsed_seconds = perf_counter() - service_started
         cleanup_started = perf_counter()
@@ -602,6 +605,7 @@ async def _run_batch(
             if not item.succeeded and index < len(selected_sources)
         ],
         "n_jobs": n_jobs,
+        "persistence_batch_files": persistence_batch_files,
         "elapsed_seconds": round(service_elapsed_seconds, 3),
         "throughput_mb_per_second": round(
             sum(len(file.payload or b"") for file in files)
@@ -703,6 +707,7 @@ async def _run(arguments: argparse.Namespace) -> dict[str, object]:
             batch_size=batch_size,
             n_jobs=settings.molop_batch_n_jobs,
             selection_offset=arguments.selection_offset,
+            persistence_batch_files=arguments.persistence_batch_files,
         )
         for batch_size in arguments.batch_sizes
     ]
@@ -722,6 +727,7 @@ async def _run(arguments: argparse.Namespace) -> dict[str, object]:
         ),
         "n_jobs": settings.molop_batch_n_jobs,
         "batch_sizes": arguments.batch_sizes,
+        "persistence_batch_files": arguments.persistence_batch_files,
         "selection_offset": arguments.selection_offset,
         "succeeded": all(item["failed_count"] == 0 for item in results),
         "results": results,

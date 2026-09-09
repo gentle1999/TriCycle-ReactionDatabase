@@ -170,7 +170,7 @@ watch(() => props.open, (open) => {
     reset();
     void nextTick(() => dialog.value?.querySelector<HTMLInputElement>("input, select")?.focus());
   }
-});
+}, { immediate: true });
 watch(conditions, (nextConditions) => {
   for (const condition of nextConditions) scheduleValidation(condition);
 }, { deep: true });

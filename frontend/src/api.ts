@@ -598,6 +598,8 @@ export const api = {
   mappedReactions: (options: {
     projectId?: string;
     logicalReactionId?: string;
+    topologyId?: string;
+    nodeRole?: string;
     minimumActivationGibbsFreeEnergyKcalMol?: number;
     maximumActivationGibbsFreeEnergyKcalMol?: number;
     minimumReactionGibbsFreeEnergyKcalMol?: number;
@@ -612,6 +614,8 @@ export const api = {
         offset: String(options.offset ?? 0),
         ...(options.projectId ? { project_id: options.projectId } : {}),
         ...(options.logicalReactionId ? { logical_reaction_id: options.logicalReactionId } : {}),
+        ...(options.topologyId ? { topology_id: options.topologyId } : {}),
+        ...(options.nodeRole ? { node_role: options.nodeRole } : {}),
         ...(options.minimumActivationGibbsFreeEnergyKcalMol !== undefined ? { minimum_activation_gibbs_free_energy_kcal_mol: String(options.minimumActivationGibbsFreeEnergyKcalMol) } : {}),
         ...(options.maximumActivationGibbsFreeEnergyKcalMol !== undefined ? { maximum_activation_gibbs_free_energy_kcal_mol: String(options.maximumActivationGibbsFreeEnergyKcalMol) } : {}),
         ...(options.minimumReactionGibbsFreeEnergyKcalMol !== undefined ? { minimum_reaction_gibbs_free_energy_kcal_mol: String(options.minimumReactionGibbsFreeEnergyKcalMol) } : {}),
@@ -767,6 +771,13 @@ export const api = {
       `/api/artifacts/${encodeURIComponent(id)}/preview?max_bytes=131072`,
       signal,
     ),
+  reparseArtifact: (id: string, signal?: AbortSignal) =>
+    requestMutation<ArtifactUploadResult>(
+      `/api/artifacts/${encodeURIComponent(id)}/reparse`,
+      "POST",
+      undefined,
+      signal,
+    ) as Promise<ArtifactUploadResult>,
   deleteArtifact,
   uploadArtifact,
   uploadArtifacts,

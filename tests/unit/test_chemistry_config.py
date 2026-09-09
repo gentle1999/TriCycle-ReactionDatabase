@@ -44,5 +44,14 @@ def test_chemistry_policy_values_have_one_source_of_truth() -> None:
 
 def test_inversion_rule_registry_is_immutable_and_explicit() -> None:
     assert isinstance(INVERSION_LABILE_RULES, tuple)
-    assert tuple(rule.rule_id for rule in INVERSION_LABILE_RULES) == ("neutral-trivalent-nitrogen",)
-    assert tuple(rule.atom_smarts for rule in INVERSION_LABILE_RULES) == ("[N;X3;v3;+0]",)
+    assert INVERSION_STEREO_PROJECTION_POLICY_VERSION == "reaction-inversion-stereo-projection-v2"
+    assert tuple(rule.rule_id for rule in INVERSION_LABILE_RULES) == (
+        "trivalent-chalcogen-cation",
+        "neutral-trivalent-nitrogen-phosphorus-arsenic",
+        "trivalent-halogen-dication",
+    )
+    assert tuple(rule.atom_smarts for rule in INVERSION_LABILE_RULES) == (
+        "[#8,#16,#34;X3;v3;+1]",
+        "[#7,#15,#33;X3;v3;+0]",
+        "[#9,#17,#35,#53;X3;v3;+2]",
+    )

@@ -453,6 +453,7 @@ def _create_reaction(
         topology_ids_by_template=topology_ids_by_template,
         concrete_topology_ids_by_template=concrete_topology_ids_by_template,
         precomputed_mapped_smiles_by_template=precomputed_mapped_smiles_by_template,
+        topology_context=topology_context,
     )
     # A logical reaction may have been created after other concrete topology
     # rows were already persisted.  Expand those existing DAG members now
@@ -467,6 +468,7 @@ def _create_reaction(
         ensure_mapped_reactions_for_logical_reaction(
             session,
             logical_reaction,
+            topology_context=topology_context,
             reconciliation_cache=reconciliation_cache,
             refresh_thermodynamics=not defer_thermodynamic_refresh,
         )

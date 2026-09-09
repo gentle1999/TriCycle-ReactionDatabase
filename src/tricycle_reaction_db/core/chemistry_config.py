@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Final
 
 # Formula, topology, geometry, and calculation-protocol identity contracts.
-CALCULATION_PROTOCOL_VERSION: Final[str] = "calculation-protocol-v1"
+CALCULATION_PROTOCOL_VERSION: Final[str] = "calculation-protocol-v2"
 FORMULA_COMPOSITION_VERSION: Final[str] = "formula-composition-v1"
 TOPOLOGY_IDENTITY_VERSION: Final[str] = "topology-identity-v1"
 TOPOLOGY_SOURCE_ORDER_STEREO_IDENTITY_VERSION: Final[str] = (
@@ -49,13 +49,24 @@ class InversionLabileRule:
     atom_smarts: str
 
 
-INVERSION_STEREO_PROJECTION_POLICY_VERSION: Final[str] = "reaction-inversion-stereo-projection-v1"
+INVERSION_STEREO_PROJECTION_POLICY_VERSION: Final[str] = "reaction-inversion-stereo-projection-v2"
 
 # Keep this registry intentionally explicit.  Adding a new chemically
 # reversible centre must be a reviewed rule, rather than an accidental global
 # ``useChirality=False`` match.
 INVERSION_LABILE_RULES: Final[tuple[InversionLabileRule, ...]] = (
-    InversionLabileRule(rule_id="neutral-trivalent-nitrogen", atom_smarts="[N;X3;v3;+0]"),
+    InversionLabileRule(
+        rule_id="trivalent-chalcogen-cation",
+        atom_smarts="[#8,#16,#34;X3;v3;+1]",
+    ),
+    InversionLabileRule(
+        rule_id="neutral-trivalent-nitrogen-phosphorus-arsenic",
+        atom_smarts="[#7,#15,#33;X3;v3;+0]",
+    ),
+    InversionLabileRule(
+        rule_id="trivalent-halogen-dication",
+        atom_smarts="[#9,#17,#35,#53;X3;v3;+2]",
+    ),
 )
 
 

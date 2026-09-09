@@ -17,6 +17,7 @@ from tricycle_reaction_db.application.dtos import (
 )
 from tricycle_reaction_db.application.services.reactions import (
     _canonical_mapped_reaction_smiles,
+    _canonical_mapped_topology_identity,
     _mapped_reaction_from_smiles,
     _mapping_assignment_for_topology,
     mapped_reaction_concrete_identity,
@@ -283,6 +284,89 @@ def test_concrete_mapping_identity_collapses_symmetric_atom_assignments() -> Non
         participants=(participant((2, 3, 1)),),
     )
     assert first_identity == second_identity
+
+
+def test_canonical_mapped_topology_handles_highly_symmetric_topology() -> None:
+    """Canonicalization must not enumerate every self-graph automorphism."""
+
+    molecule = Chem.MolFromSmiles(".".join(["C"] * 12))
+    assert molecule is not None
+    topology = SimpleNamespace(
+        id=UUID("00000000-0000-0000-0000-000000000005"),
+        atom_count=12,
+        mol=molecule,
+    )
+
+    class _Session:
+        info: dict[str, object] = {}
+
+    session = _Session()
+    canonical = _canonical_mapped_topology_identity(
+        cast(Session, session),
+        topology,
+        tuple(range(12, 0, -1)),
+    )
+
+    assert '"schema_version":"mapped-topology-symmetry-v1"' in canonical
+    assert all(str(map_number) in canonical for map_number in range(1, 13))
+
+
+def test_canonical_mapped_topology_collapses_meso_symmetric_centers() -> None:
+    """Equivalent meso centers must not create a second mapping identity."""
+
+    molecule = Chem.MolFromSmiles("C[C@H](Br)[C@@H](C)Br")
+    assert molecule is not None
+    topology = SimpleNamespace(
+        id=UUID("00000000-0000-0000-0000-000000000007"),
+        atom_count=molecule.GetNumAtoms(),
+        mol=molecule,
+    )
+
+    class _Session:
+        info: dict[str, object] = {}
+
+    session = _Session()
+    first = _canonical_mapped_topology_identity(
+        cast(Session, session),
+        topology,
+        (1, 2, 3, 4, 5, 6),
+    )
+    second = _canonical_mapped_topology_identity(
+        cast(Session, session),
+        topology,
+        (1, 4, 6, 2, 5, 3),
+    )
+
+    assert first == second
+
+
+def test_canonical_mapped_topology_keeps_distinct_assignments_distinct() -> None:
+    """Canonicalization must only collapse assignments related by an automorphism."""
+
+    molecule = Chem.MolFromSmiles("CCC")
+    assert molecule is not None
+    topology = SimpleNamespace(
+        id=UUID("00000000-0000-0000-0000-000000000006"),
+        atom_count=3,
+        mol=molecule,
+    )
+
+    class _Session:
+        info: dict[str, object] = {}
+
+    session = _Session()
+    first = _canonical_mapped_topology_identity(
+        cast(Session, session),
+        topology,
+        (1, 2, 3),
+    )
+    second = _canonical_mapped_topology_identity(
+        cast(Session, session),
+        topology,
+        (1, 3, 2),
+    )
+
+    assert first != second
 
 
 @pytest.mark.parametrize(

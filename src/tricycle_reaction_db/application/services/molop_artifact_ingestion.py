@@ -50,7 +50,7 @@ from tricycle_reaction_db.application.services.calculations import (
 )
 from tricycle_reaction_db.application.services.catalog import persist_calculation_protocol
 from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics_persistence import (
-    refresh_mapped_reaction_thermodynamics,
+    refresh_mapped_reactions_thermodynamics,
 )
 from tricycle_reaction_db.application.services.molecular_geometry import (
     GEOMETRY_MATCH_POLICY_VERSION,
@@ -149,6 +149,12 @@ _GEOMETRY_CONTEXT_FIELDS = (
     "geometries_to_reconcile",
     "reaction_participants_by_topology",
     "mapped_reactions_by_id",
+    "mapped_reactions_by_logical_reaction",
+    "mapped_reaction_participants_by_reaction",
+    "memberships_by_concrete_topology",
+    "logical_participants_by_logical_reaction",
+    "logical_participants_by_id",
+    "molecular_topologies_by_id",
     "mapped_reactions_to_reconcile",
 )
 
@@ -828,6 +834,7 @@ def reconcile_molop_geometry_context(
     previous_autoflush = session.autoflush
     session.info["tricycle_fast_insert"] = False
     session.autoflush = True
+    processed_reaction_topology_ids: set[UUID] = set()
     try:
         for logical_reaction_id in sorted(logical_reaction_ids, key=str):
             logical_reaction = session.get(LogicalReaction, logical_reaction_id)
@@ -838,6 +845,7 @@ def reconcile_molop_geometry_context(
                     topology_context=context,
                     reconciliation_cache=reconciliation_cache,
                     refresh_thermodynamics=False,
+                    processed_topology_ids=processed_reaction_topology_ids,
                 )
     finally:
         session.autoflush = previous_autoflush
@@ -864,6 +872,7 @@ def reconcile_molop_geometry_context(
                 topology_context=context,
                 reconciliation_cache=reconciliation_cache,
                 refresh_thermodynamics=False,
+                skip_topology_ids=processed_reaction_topology_ids,
             )
     _attach_pending_entities(session)
     session.flush()
@@ -910,8 +919,10 @@ def reconcile_molop_geometry_context(
             reconciliation_cache.affected_reactions_by_id[mapped_reaction_id] = mapped_reaction
         _attach_pending_entities(session)
         session.flush()
-        for mapped_reaction in reconciliation_cache.affected_reactions_by_id.values():
-            refresh_mapped_reaction_thermodynamics(session, mapped_reaction)
+        refresh_mapped_reactions_thermodynamics(
+            session,
+            tuple(reconciliation_cache.affected_reactions_by_id.values()),
+        )
     finally:
         session.autoflush = previous_autoflush
 

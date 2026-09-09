@@ -23,6 +23,7 @@ from tricycle_reaction_db.dev.import_artifacts import (
     discover_files,
     file_fingerprint,
     import_files,
+    is_retryable_import_error,
     iter_batches,
 )
 from tricycle_reaction_db.domain.enums import ArtifactIngestionStatus, ArtifactKind, StorageStatus
@@ -42,6 +43,27 @@ def test_discover_files_recurses_deduplicates_and_ignores_symlinks(tmp_path: Pat
     candidates = discover_files([first, second, first / "a.log"])
 
     assert [candidate.path.name for candidate in candidates] == ["a.log", "b.log", "c.log"]
+
+
+def test_discover_files_excludes_calculation_sidecars_but_keeps_vendor_outputs(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "source.log").write_text("log", encoding="utf-8")
+    (tmp_path / "metadata.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "compressed-metadata.json.gz").write_bytes(b"metadata")
+    (tmp_path / "index.csv").write_text("id\n", encoding="utf-8")
+    (tmp_path / "vendor.output").write_text("vendor output", encoding="utf-8")
+
+    candidates = discover_files([tmp_path], artifact_kind=ArtifactKind.CALCULATION_OUTPUT)
+
+    assert [candidate.path.name for candidate in candidates] == ["source.log", "vendor.output"]
+
+
+def test_transient_import_error_classifier_distinguishes_parser_timeout() -> None:
+    assert is_retryable_import_error("psycopg.errors.OutOfMemory: max_locks_per_transaction")
+    assert is_retryable_import_error("deadlock detected")
+    assert not is_retryable_import_error("[molop_parse_timeout] parser exceeded its file budget")
+    assert not is_retryable_import_error("NO_VALID_ORGANIC_CANDIDATE")
 
 
 def test_iter_batches_obeys_file_and_byte_limits() -> None:
@@ -115,6 +137,35 @@ def test_import_state_keeps_partial_ingestion_retryable(tmp_path: Path) -> None:
         candidate.path,
         project_id=project_id,
         artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+        fingerprint=fingerprint,
+    )
+
+
+def test_import_state_ignores_only_an_unterminated_tail(tmp_path: Path) -> None:
+    source = tmp_path / "source.log"
+    source.write_text("payload", encoding="utf-8")
+    fingerprint = file_fingerprint(source)
+    state_path = tmp_path / "state.jsonl"
+    valid_record = {
+        "source": str(source.resolve()),
+        "status": "succeeded",
+        "project_id": "00000000-0000-7000-8000-000000000201",
+        "artifact_kind": ArtifactKind.INPUT.value,
+        "size_bytes": fingerprint.size_bytes,
+        "mtime_ns": fingerprint.mtime_ns,
+        "sha256": fingerprint.sha256,
+    }
+    state_path.write_text(
+        json.dumps(valid_record, sort_keys=True) + '\n{"source": "truncated', encoding="utf-8"
+    )
+
+    state = ImportState(state_path)
+
+    assert state_path.read_bytes().endswith(b"\n")
+    assert state.terminal(
+        source.resolve(),
+        project_id=UUID("00000000-0000-7000-8000-000000000201"),
+        artifact_kind=ArtifactKind.INPUT,
         fingerprint=fingerprint,
     )
 
@@ -314,6 +365,149 @@ def test_import_files_isolates_deterministic_batch_failures(monkeypatch, tmp_pat
         "good-a.log": "succeeded",
         "good-b.log": "succeeded",
     }
+
+
+def test_import_files_adaptively_splits_transient_batch_failures(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    sources = [tmp_path / f"file-{index}.log" for index in range(3)]
+    for source in sources:
+        source.write_text(source.name, encoding="utf-8")
+    calls: list[list[str]] = []
+
+    async def fake_upload_batch(**kwargs: object) -> ArtifactBatchUploadResult:
+        payloads = cast(list[ArtifactUploadPayload], kwargs["files"])
+        filenames = [payload.filename for payload in payloads]
+        calls.append(filenames)
+        if len(payloads) > 1:
+            raise RuntimeError("psycopg.errors.OutOfMemory: max_locks_per_transaction")
+        payload = payloads[0]
+        return ArtifactBatchUploadResult(
+            total_count=1,
+            succeeded_count=1,
+            failed_count=0,
+            source_frame_count=0,
+            transition_state_frame_count=0,
+            inferred_reaction_count=0,
+            items=[
+                ArtifactBatchUploadItem(
+                    filename=payload.filename,
+                    succeeded=True,
+                    result=ArtifactUploadResult(
+                        artifact_id=UUID("00000000-0000-7000-8000-000000000301"),
+                        artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+                        storage_status=StorageStatus.AVAILABLE,
+                        ingestion_status=ArtifactIngestionStatus.SUCCEEDED,
+                        inferred_reaction_count=0,
+                        inferences=[],
+                    ),
+                )
+            ],
+        )
+
+    monkeypatch.setattr(ArtifactUploadService, "upload_batch", fake_upload_batch)
+    monkeypatch.setattr(
+        "tricycle_reaction_db.dev.import_artifacts.get_settings",
+        lambda: Settings(_env_file=None, max_batch_files=10, max_batch_bytes=1024),
+    )
+    metrics = ImportMetrics()
+
+    summary = asyncio.run(
+        import_files(
+            discover_files(sources),
+            project_id=UUID("00000000-0000-7000-8000-000000000201"),
+            user_id=UUID("00000000-0000-7000-8000-000000000002"),
+            artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+            state=ImportState(None),
+            dry_run=False,
+            max_transient_retries=0,
+            transient_retry_backoff_seconds=0,
+            metrics=metrics,
+        )
+    )
+
+    assert summary.attempted == 3
+    assert summary.succeeded == 3
+    assert summary.failed == 0
+    assert calls == [
+        ["file-0.log", "file-1.log", "file-2.log"],
+        ["file-0.log"],
+        ["file-1.log", "file-2.log"],
+        ["file-1.log"],
+        ["file-2.log"],
+    ]
+    assert metrics.adaptive_batch_split_count == 2
+
+
+def test_import_files_retries_transient_result_without_counting_failed_attempt(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    source = tmp_path / "resource-error.log"
+    source.write_text("payload", encoding="utf-8")
+    state_path = tmp_path / "state.jsonl"
+    attempts = 0
+
+    async def fake_upload_batch(**kwargs: object) -> ArtifactBatchUploadResult:
+        nonlocal attempts
+        attempts += 1
+        payload = cast(list[ArtifactUploadPayload], kwargs["files"])[0]
+        succeeded = attempts > 1
+        status = ArtifactIngestionStatus.SUCCEEDED if succeeded else ArtifactIngestionStatus.FAILED
+        return ArtifactBatchUploadResult(
+            total_count=1,
+            succeeded_count=int(succeeded),
+            failed_count=int(not succeeded),
+            source_frame_count=0,
+            transition_state_frame_count=0,
+            inferred_reaction_count=0,
+            items=[
+                ArtifactBatchUploadItem(
+                    filename=payload.filename,
+                    succeeded=succeeded,
+                    error_code=None if succeeded else "database_resource_exhausted",
+                    error_message=None if succeeded else "out of shared memory",
+                    result=ArtifactUploadResult(
+                        artifact_id=UUID("00000000-0000-7000-8000-000000000301"),
+                        artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+                        storage_status=StorageStatus.AVAILABLE,
+                        ingestion_status=status,
+                        inferred_reaction_count=0,
+                        inferences=[],
+                    ),
+                )
+            ],
+        )
+
+    monkeypatch.setattr(ArtifactUploadService, "upload_batch", fake_upload_batch)
+    monkeypatch.setattr(
+        "tricycle_reaction_db.dev.import_artifacts.get_settings",
+        lambda: Settings(_env_file=None, max_batch_files=10, max_batch_bytes=1024),
+    )
+    metrics = ImportMetrics()
+
+    summary = asyncio.run(
+        import_files(
+            discover_files([source]),
+            project_id=UUID("00000000-0000-7000-8000-000000000201"),
+            user_id=UUID("00000000-0000-7000-8000-000000000002"),
+            artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+            state=ImportState(state_path),
+            dry_run=False,
+            max_transient_retries=1,
+            transient_retry_backoff_seconds=0,
+            metrics=metrics,
+        )
+    )
+
+    record = json.loads(state_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert attempts == 2
+    assert summary.attempted == 1
+    assert summary.succeeded == 1
+    assert summary.failed == 0
+    assert record["status"] == "succeeded"
+    assert metrics.transient_retry_count == 1
 
 
 def test_import_files_keeps_pipeline_window_independent_from_persistence_batch(

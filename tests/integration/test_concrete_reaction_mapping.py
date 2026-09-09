@@ -606,3 +606,58 @@ def test_inversion_projection_clears_n_related_ez_only() -> None:
         transaction.rollback()
         connection.close()
         engine.dispose()
+
+
+def test_inversion_projection_clears_sulfur_chirality() -> None:
+    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    connection = engine.connect()
+    transaction = connection.begin()
+    try:
+        with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
+            components: list[_ResolvedComponent] = []
+            for side, smiles in (
+                (
+                    LogicalReactionParticipantSide.REACTANT,
+                    "[CH3:1][S@+:2]([O-:3])[CH2:4][Cl:5]",
+                ),
+                (
+                    LogicalReactionParticipantSide.PRODUCT,
+                    "[CH3:1][S+:2]([O-:3])[CH2:4][Cl:5]",
+                ),
+            ):
+                molecule = Chem.MolFromSmiles(smiles)
+                assert molecule is not None
+                persisted = persist_molecular_topology(
+                    session,
+                    normalize_topology(
+                        molecule,
+                        add_hydrogens=False,
+                        reconstruction_method=f"tests/inversion-{side.value}",
+                        reconstruction_version="1",
+                    ),
+                )
+                components.append(
+                    _ResolvedComponent(
+                        side=side,
+                        template_index=0,
+                        formula=persisted.formula,
+                        topology=persisted.topology,
+                        topology_atom_map_numbers=[
+                            atom.GetAtomMapNum() for atom in molecule.GetAtoms()
+                        ],
+                    )
+                )
+
+            logical_components = _logicalize_components(session, components)
+            reactant = logical_components[0]
+            product = logical_components[1]
+            assert reactant.logical_topology is not None
+            assert product.logical_topology is not None
+            assert assigned_stereo_features(reactant.topology.mol)
+            assert assigned_stereo_features(reactant.logical_topology.mol) == ()
+            assert product.logical_topology.id == product.topology.id
+            assert reactant.logical_topology.id != reactant.topology.id
+    finally:
+        transaction.rollback()
+        connection.close()
+        engine.dispose()

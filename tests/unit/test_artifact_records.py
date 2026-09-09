@@ -1,5 +1,7 @@
 from hashlib import sha256
 
+import pytest
+
 from tricycle_reaction_db.application.dtos import ArtifactFileRecord
 from tricycle_reaction_db.domain.enums import (
     ArtifactKind,
@@ -10,6 +12,7 @@ from tricycle_reaction_db.domain.enums import (
 from tricycle_reaction_db.ingestion import (
     artifact_record_from_path,
     calculation_protocol_record,
+    normalize_functional_and_dispersion,
 )
 
 
@@ -89,3 +92,51 @@ def test_protocol_hash_is_independent_of_task_order_and_duplicates() -> None:
 
     assert first.protocol_hash == second.protocol_hash
     assert first.task_requests == second.task_requests == ["freq", "opt"]
+
+
+def test_functional_gets_the_canonical_dispersion_suffix() -> None:
+    functional, dispersion_model = normalize_functional_and_dispersion("B3LYP", "gd3bj")
+
+    assert functional == "B3LYP-GD3BJ"
+    assert dispersion_model == "GD3BJ"
+
+
+def test_functional_dispersion_aliases_are_canonicalized() -> None:
+    functional, dispersion_model = normalize_functional_and_dispersion(
+        "B3LYP-D3(BJ)",
+        "GD3BJ",
+    )
+
+    assert functional == "B3LYP-GD3BJ"
+    assert dispersion_model == "GD3BJ"
+
+
+def test_functional_dispersion_conflict_is_rejected() -> None:
+    with pytest.raises(ValueError, match="conflicts with dispersion_model"):
+        normalize_functional_and_dispersion("B3LYP-D4", "GD3BJ")
+
+
+def test_protocol_record_keeps_source_protocol_when_normalizing() -> None:
+    record = calculation_protocol_record(
+        qm_software=QMSoftware.GAUSSIAN,
+        qm_software_version="G16RevC.01",
+        method_family="DFT",
+        method="B3LYP",
+        functional="B3LYP",
+        basis_set="def2SVP",
+        dispersion_model="GD3BJ",
+        task_requests=["freq"],
+        normalized_spec={
+            "protocol": {
+                "functional": "B3LYP",
+                "dispersion_correction": "GD3BJ",
+                "raw_keywords": "#P Geom=AllCheck Freq",
+            }
+        },
+    )
+
+    assert record.functional == "B3LYP-GD3BJ"
+    assert record.dispersion_model == "GD3BJ"
+    assert record.normalized_spec["protocol"]["functional"] == "B3LYP-GD3BJ"
+    assert record.normalized_spec["source_protocol"]["functional"] == "B3LYP"
+    assert record.normalized_spec["source_protocol"]["raw_keywords"] == ("#P Geom=AllCheck Freq")

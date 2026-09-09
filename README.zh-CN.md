@@ -135,9 +135,9 @@ IMPORT_MODE=development \
 IMPORT_PROJECT_ID=<project-uuid> \
 IMPORT_ROOTS='/data/calculations /data/supplemental' \
 IMPORT_STATE_FILE=.tmp/artifact-import.jsonl \
-IMPORT_PIPELINE_WINDOW_FILES=128 \
+IMPORT_PIPELINE_WINDOW_FILES=64 \
 IMPORT_COMMIT_BATCH_FILES=16 \
-IMPORT_STREAM_QUEUE_SIZE=128 \
+IMPORT_STREAM_QUEUE_SIZE=64 \
 make import-artifacts
 ```
 
@@ -145,17 +145,22 @@ make import-artifacts
 calculation frame 的文件会以 `filtered` artifact 保留；一个文件或 frame 失败不会丢弃已解析的
 frame 或不相关文件。
 
-导入器刻意分离三种控制：
+导入器刻意分离四种控制：
 
 | 控制 | 默认值 | 作用 |
 | --- | ---: | --- |
 | `TRICYCLE_MOLOP_BATCH_N_JOBS` | `2` | 同时运行的文件级 MolOP worker 数 |
-| `IMPORT_PIPELINE_WINDOW_FILES` | `128` | 解析队列可用的候选文件数 |
+| `IMPORT_PIPELINE_WINDOW_FILES` | `64` | 解析队列可用的候选文件数 |
 | `IMPORT_COMMIT_BATCH_FILES` | `16` | 每个持久化/检查点微批中的完成文件数 |
+| `IMPORT_STREAM_QUEUE_SIZE` | `64` | 发现/指纹阶段的有界缓冲大小 |
 
 候选窗口应明显大于 worker 数，使结束或超时的 worker 立即获得下一个候选。不要用持久化微批
 大小限制解析并发。应限制 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS` 和 `MKL_NUM_THREADS`
 （提供的开发配置均为 `1`），避免嵌套 native thread 过度订阅。
+
+专用部署算力主机可先使用 `TRICYCLE_MOLOP_BATCH_N_JOBS=16`、native thread
+`1 / 1 / 1`、候选窗口/流队列 `64 / 64`、持久化微批 `16` 的吞吐优先组合；低资源开发主机
+保守地使用 `2` 个 worker。完整调参表以及浏览器/upload-worker 的独立设置见[开发环境：推荐的导入超参数](docs/development.md#推荐的导入超参数)。
 
 单文件 timeout 以 `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS` 作为 10 MiB 源文件基准；
 更大文件按体积获得比例更高的预算。超时文件独立失败并释放 worker 槽位。导入参数、重解析行为

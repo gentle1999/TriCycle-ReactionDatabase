@@ -62,6 +62,16 @@ export function formatEnergy(value: number | null | undefined): string {
   return formatNumber(value, 6);
 }
 
+export function formatProtocolLevel(
+  level: readonly (string | null)[] | null | undefined,
+): string {
+  if (!level?.length) return "未标注";
+  const method = level[3] || level[1] || level[2] || level[0] || "";
+  const basis = level[4] || "";
+  if (method && basis) return `${method}/${basis}`;
+  return method || basis || "未标注";
+}
+
 export function formatNumber(
   value: number | null | undefined,
   digits = 4,

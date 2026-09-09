@@ -78,6 +78,10 @@ class ReconciliationBatchCache:
         default_factory=dict
     )
     loaded_node_geometries: set[UUID] = field(default_factory=set)
+    # ``loaded_node_geometries`` may also describe a deliberately partial
+    # cache restored around a savepoint retry.  Only this set authorizes
+    # treating a cache miss as an authoritative negative lookup.
+    complete_node_geometries: set[UUID] = field(default_factory=set)
     mappings_by_node_geometry_id: dict[UUID, MappedReactionNodeGeometryMapping] = field(
         default_factory=dict
     )
@@ -253,11 +257,11 @@ def _find_or_create_node_geometry(
     )
 
     bindings: list[MappedReactionNodeGeometry] | None = None
-    cache_node_geometries_loaded = False
+    cache_node_geometries_complete = False
     existing = None
     if cache is not None:
         bindings = cache.node_geometries_by_node.setdefault(node_id, [])
-        cache_node_geometries_loaded = node_id in cache.loaded_node_geometries
+        cache_node_geometries_complete = node_id in cache.complete_node_geometries
         existing = next(
             (
                 binding
@@ -268,12 +272,11 @@ def _find_or_create_node_geometry(
             None,
         )
 
-    # The cache is allowed to be a positive fast path, but a miss is not proof
-    # that the row is absent.  A node can have been resolved before its
-    # geometry collection was hydrated, and a savepoint retry can restore only
-    # the rows that were visible at the snapshot.  Always ask PostgreSQL on a
-    # cache miss before allocating a new coordinate.
-    if existing is None:
+    # A cache miss is authoritative only after preload_reconciliation_context
+    # has loaded the complete collection for this node.  A partial cache can
+    # still be restored around a savepoint retry, so it must consult
+    # PostgreSQL before allocating a new coordinate.
+    if existing is None and not cache_node_geometries_complete:
         statement = select(MappedReactionNodeGeometry).where(
             MappedReactionNodeGeometry.mapped_reaction_node_id == node_id,
             MappedReactionNodeGeometry.geometry_id == geometry_id,
@@ -292,7 +295,7 @@ def _find_or_create_node_geometry(
     if existing is not None:
         return existing
 
-    if cache is not None and bindings is not None:
+    if cache is not None and bindings is not None and not cache_node_geometries_complete:
         # Keep unflushed fast-path bindings from the cache, and merge the
         # authoritative rows that are already visible in PostgreSQL.  This is
         # needed for coordinate allocation as well as identity lookup: the
@@ -372,7 +375,7 @@ def _find_or_create_node_geometry(
         # through an existing row is not: its cache contains only rows touched
         # by this context, so do not promote that partial list to a complete
         # cache merely because one new row was inserted.
-        if cache_node_geometries_loaded:
+        if cache_node_geometries_complete:
             cache.loaded_node_geometries.add(node_id)
         cache.new_node_geometry_ids.add(_require_id(binding, label="MappedReactionNodeGeometry"))
     return binding
@@ -983,6 +986,7 @@ def preload_reconciliation_context(
         if isinstance(node_geometry.id, UUID):
             node_geometry_ids.add(node_geometry.id)
     cache.loaded_node_geometries.update(node_ids)
+    cache.complete_node_geometries.update(node_ids)
     for node_geometry_id in node_geometry_ids:
         cache.loaded_mappings.add(node_geometry_id)
     if node_geometry_ids:
@@ -1010,7 +1014,6 @@ def reconcile_mapped_reaction_with_geometries(
     cache: ReconciliationBatchCache | None = None,
 ) -> ReactionGeometryReconciliationResult:
     """Backfill participant Geometries backed by converged optimizations."""
-
     mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
     participants = session.exec(
         select(MappedReactionParticipant).where(
@@ -1024,6 +1027,8 @@ def reconcile_mapped_reaction_with_geometries(
             # Rows inserted before the concrete-topology split are retained by
             # the migration and are still readable until their next rewrite.
             topology_id = participant.logical_reaction_participant.topology_id
+        if topology_id is None:
+            continue
         geometries = session.exec(
             select(Geometry).where(
                 Geometry.topology_id == topology_id,

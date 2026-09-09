@@ -359,10 +359,18 @@ TRICYCLE_RATE_LIMIT_KEY_PREFIX=reaction-database
 OMP_NUM_THREADS=1
 OPENBLAS_NUM_THREADS=1
 MKL_NUM_THREADS=1
+# Conservative generic deployment default; raise this only after measuring
+# the actual compute host and PostgreSQL/RustFS capacity.
 TRICYCLE_MOLOP_BATCH_N_JOBS=2
 # Baseline budget for a 10 MiB file; larger files scale proportionally.
 TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS=60
 ~~~
+
+#### 文件导入参数推荐
+
+上面的 `2` 是同时承载交互式 API、upload-worker 和导入任务时的保守起点。专用算力主机上，吞吐优先的第一组实验可以把 `TRICYCLE_MOLOP_BATCH_N_JOBS` 提高到 `16`，同时保持 `OMP_NUM_THREADS=1`、`OPENBLAS_NUM_THREADS=1` 和 `MKL_NUM_THREADS=1`；本地 `make import-artifacts` 再配合 `IMPORT_PIPELINE_WINDOW_FILES=64`、`IMPORT_STREAM_QUEUE_SIZE=64`、`IMPORT_COMMIT_BATCH_FILES=16` 和 `IMPORT_MAX_TRANSIENT_RETRIES=3`。内存或数据库压力较大时从 `4–8 / 32 / 32 / 8` 开始。每次只调整一组参数，并用同一批真实文件观察总耗时、内存峰值、数据库写入延迟和失败重试次数。
+
+`TRICYCLE_MOLOP_BATCH_N_JOBS` 是进程级文件解析槽位；三个 native thread 变量控制每个槽位内部的 OpenMP/BLAS 线程，不能用增大 native thread 数代替文件级并发。`IMPORT_*` 只属于宿主机直接导入命令，不会自动成为 Compose 服务环境变量。浏览器/远程上传仍建议从 `TRICYCLE_UPLOAD_WORKER_CONCURRENCY=2`、`TRICYCLE_UPLOAD_MAX_CONCURRENCY=8` 和 `TRICYCLE_UPLOAD_WORKER_STATEMENT_TIMEOUT_MS=120000` 开始。完整的场景表、HTTP 请求上限和调参边界见[开发环境：推荐的导入超参数](development.md#推荐的导入超参数)。
 
 Voyager 使用 NexusX 6.1.2 的 `ComposedErManager` member cluster/color。当前所有数据库实体
 属于同一个 PostgreSQL 逻辑 engine，因此配置中只有一个数据库 cluster；即使

@@ -2,6 +2,7 @@
 
 import json
 from collections import Counter
+from functools import lru_cache
 from hashlib import sha256
 from typing import Any
 
@@ -25,6 +26,7 @@ from tricycle_reaction_db.application.dtos.chemistry import (
 from tricycle_reaction_db.core.chemistry_config import (
     FORMULA_COMPOSITION_VERSION,
     GEOMETRY_CANONICALIZATION_VERSION,
+    INVERSION_LABILE_RULES,
     TOPOLOGY_DERIVATION_VERSION,
     TOPOLOGY_IDENTITY_VERSION,
     TOPOLOGY_SOURCE_ORDER_STEREO_IDENTITY_VERSION,
@@ -158,6 +160,61 @@ def _clear_bond_directions(mol: Chem.Mol) -> None:
 
     for bond in mol.GetBonds():  # type: ignore[no-untyped-call]
         bond.SetBondDir(Chem.BondDir.NONE)
+
+
+@lru_cache(maxsize=32)
+def _inversion_labile_rule_query(atom_smarts: str) -> Chem.Mol:
+    """Compile one configured inversion-labile atom query once per process."""
+
+    query = Chem.MolFromSmarts(atom_smarts)
+    if query is None:
+        raise ValueError(f"inversion-labile SMARTS could not be parsed: {atom_smarts}")
+    if query.GetNumAtoms() != 1:
+        raise ValueError(f"inversion-labile SMARTS must match one atom: {atom_smarts}")
+    return query
+
+
+def clear_inversion_labile_atom_chirality(mol: Chem.Mol) -> Chem.Mol:
+    """Clear atom chirality at the configured inversion-labile centres.
+
+    The returned molecule is a clone.  This operation is deliberately applied
+    only at the MolGR -> ingestion boundary, after coordinate-based stereo
+    inference has completed.  It therefore removes transient ``@``/``@@``
+    assignments from labile atoms without changing the source RDKit molecule
+    or unrelated atom and double-bond stereochemistry.
+    """
+
+    cleaned = Chem.Mol(mol)
+    # MolGR's fallback graph can intentionally be unsanitized.  SMARTS atom
+    # queries need RDKit's local valence/implicit-H cache, but updating that
+    # cache with ``strict=False`` does not perform graph sanitization or valence
+    # repair and therefore preserves the trusted MolGR graph contract.
+    cleaned.UpdatePropertyCache(strict=False)
+    labile_atom_indices: set[int] = set()
+    for rule in INVERSION_LABILE_RULES:
+        query = _inversion_labile_rule_query(rule.atom_smarts)
+        for match in cleaned.GetSubstructMatches(query, useChirality=False, uniquify=True):
+            if len(match) != 1:
+                raise ValueError(
+                    f"inversion-labile rule {rule.rule_id} must match one atom per result"
+                )
+            labile_atom_indices.add(int(match[0]))
+
+    for atom_index in labile_atom_indices:
+        atom = cleaned.GetAtomWithIdx(atom_index)
+        atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
+        # Remove cached atom stereo values as well as the tag.  Otherwise a
+        # downstream consumer can observe a stale CIP assignment even though
+        # the molecule no longer contains the corresponding chiral centre.
+        for property_name in (
+            "_CIPCode",
+            "_CIPRank",
+            "_ChiralityPossible",
+            "_StereochemDone",
+        ):
+            if atom.HasProp(property_name):
+                atom.ClearProp(property_name)
+    return cleaned
 
 
 def _copy_bond_directions(source: Chem.Mol, target: Chem.Mol) -> None:
@@ -578,6 +635,11 @@ def infer_molgr_stereochemistry_from_3d(mol: Chem.Mol) -> Chem.Mol:
     # become misleading as soon as atoms are reordered or reaction maps are
     # attached.  Freeze only BondStereo as the source-of-truth state.
     _clear_bond_directions(inferred)
+    # MolGR may assign a transient tetrahedral tag to an atom whose geometry
+    # can invert on the reaction timescale.  Do this after the coordinate pass;
+    # clearing it before AssignStereochemistryFrom3D would let the pass add it
+    # back immediately.
+    inferred = clear_inversion_labile_atom_chirality(inferred)
     inferred.SetBoolProp("_tricycle_molgr_stereo_normalized", True)
     return inferred
 
@@ -589,11 +651,13 @@ def normalize_molgr_stereochemistry(mol: Chem.Mol) -> Chem.Mol:
     :func:`infer_molgr_stereochemistry_from_3d`. Without a conformer, this
     function only preserves existing MolGR stereo and accepts direction-only
     graph input for compatibility with non-TS reaction representations. It is
-    never a substitute for endpoint coordinate inference.
+    never a substitute for endpoint coordinate inference. In either case,
+    configured inversion-labile atom chirality is removed before the graph is
+    handed to topology and geometry identity creation.
     """
 
     if mol.HasProp("_tricycle_molgr_stereo_normalized"):
-        return Chem.Mol(mol)
+        return clear_inversion_labile_atom_chirality(mol)
     if _has_single_3d_conformer(mol):
         return infer_molgr_stereochemistry_from_3d(mol)
 
@@ -641,6 +705,7 @@ def normalize_molgr_stereochemistry(mol: Chem.Mol) -> Chem.Mol:
         if stereo is not None:
             bond.SetStereo(stereo)
     _clear_bond_directions(normalized)
+    normalized = clear_inversion_labile_atom_chirality(normalized)
     normalized.SetBoolProp("_tricycle_molgr_stereo_normalized", True)
     return normalized
 
@@ -995,6 +1060,12 @@ def _normalized_topology_records(
     # lossless E/Z SMILES projection when one is available. If the projection
     # itself is not lossless, retain the trusted source graph and downgrade the
     # stereo status below instead of discarding the calculation frame.
+    # ``normalize_topology_with_mapping`` already performs this preparation for
+    # TS anchors.  Keep it here as well because ``normalize_molecule`` is also
+    # a public geometry-creation entry point and may receive frame.rdmol
+    # directly.
+    if preserve_stereochemistry:
+        mol = normalize_molgr_stereochemistry(mol)
     map_free_mol = _remove_atom_maps(mol)
     stereo_projection_error: StereoProjectionError | None = None
     source = Chem.Mol(map_free_mol)
@@ -1476,6 +1547,7 @@ __all__ = [
     "StereoProjectionError",
     "TOPOLOGY_IDENTITY_VERSION",
     "TOPOLOGY_DERIVATION_VERSION",
+    "clear_inversion_labile_atom_chirality",
     "ensure_serializable_double_bond_stereochemistry",
     "infer_molgr_stereochemistry_from_3d",
     "normalize_molecule",

@@ -96,9 +96,6 @@ def stereo_features_to_clear_for_atom_maps(
         return ()
 
     assigned = assigned_stereo_features(topology.mol)
-    assigned_atom_features = {
-        feature.index: feature for feature in assigned if feature.kind == "atom"
-    }
     assigned_bond_features = {
         feature.index: feature for feature in assigned if feature.kind == "bond"
     }
@@ -108,9 +105,12 @@ def stereo_features_to_clear_for_atom_maps(
         if atom_map not in labile_maps:
             continue
         atom = topology.mol.GetAtomWithIdx(atom_index)
-        atom_feature = assigned_atom_features.get(atom_index)
-        if atom_feature is not None:
-            selected_keys.add((atom_feature.kind, atom_feature.index))
+        # RDKit stores the stereochemical marker for a charge-separated
+        # sulfoxide representation ([S+]-[O-]) on the sulfur atom, not on the
+        # S-O single bond.  A matched inversion-labile atom therefore always
+        # clears its own assigned atom chirality directly.
+        if atom.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED:
+            selected_keys.add(("atom", atom_index))
 
         # A bond-centred feature is selected when the matched atom is either
         # the stereobond endpoint or the reference substituent attached to

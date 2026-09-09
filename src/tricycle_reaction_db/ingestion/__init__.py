@@ -3,6 +3,7 @@
 from tricycle_reaction_db.ingestion.artifacts import (
     artifact_record_from_path,
     calculation_protocol_record,
+    normalize_functional_and_dispersion,
 )
 from tricycle_reaction_db.ingestion.media_type import (
     detect_artifact_media_type,
@@ -26,6 +27,7 @@ from tricycle_reaction_db.ingestion.molop_calculations import (
 )
 from tricycle_reaction_db.ingestion.normalization import (
     StereoProjectionError,
+    clear_inversion_labile_atom_chirality,
     ensure_serializable_double_bond_stereochemistry,
     infer_molgr_stereochemistry_from_3d,
     normalize_molecule,
@@ -39,8 +41,10 @@ from tricycle_reaction_db.ingestion.normalization import (
 __all__ = [
     "artifact_record_from_path",
     "calculation_protocol_record",
+    "normalize_functional_and_dispersion",
     "configure_molecular_graph_reconstruction",
     "detect_artifact_media_type",
+    "clear_inversion_labile_atom_chirality",
     "ensure_serializable_double_bond_stereochemistry",
     "infer_molgr_stereochemistry_from_3d",
     "normalize_molgr_stereochemistry",

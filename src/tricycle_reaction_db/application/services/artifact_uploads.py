@@ -50,6 +50,7 @@ from tricycle_reaction_db.application.dtos import (
 from tricycle_reaction_db.application.services._persistence import (
     _acquire_identity_locks,
     _attach_pending_entities,
+    _bulk_insert_pending_entities,
     _fast_insert_enabled,
     _flush_new_entity,
     _new_entity,
@@ -67,7 +68,7 @@ from tricycle_reaction_db.application.services.catalog import (
     persist_artifact_file,
 )
 from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics_persistence import (
-    refresh_mapped_reaction_thermodynamics,
+    refresh_mapped_reactions_thermodynamics,
 )
 from tricycle_reaction_db.application.services.molecular_geometry import (
     GeometryAssignmentAmbiguityError,
@@ -237,6 +238,12 @@ class _ParsedChemFile:
 
     payload: dict[str, Any]
     source_segments: tuple[Any, ...]
+    source_frame_count: int
+
+    def __len__(self) -> int:
+        """Expose the original ChemFile cardinality after IPC slimming."""
+
+        return self.source_frame_count
 
     @property
     def schema_version(self) -> str:
@@ -1739,6 +1746,7 @@ def _parsed_artifact_from_chem_file(
         parsed_chem_file = _ParsedChemFile(
             payload=file_payload,
             source_segments=source_segments,
+            source_frame_count=len(chem_file),
         )
     return _ParsedArtifact(
         chem_file=parsed_chem_file,
@@ -3290,6 +3298,12 @@ _INFERENCE_CONTEXT_MUTABLE_FIELDS = (
     "topologies_to_resolve_reactions",
     "reaction_participants_by_topology",
     "mapped_reactions_by_id",
+    "mapped_reactions_by_logical_reaction",
+    "mapped_reaction_participants_by_reaction",
+    "memberships_by_concrete_topology",
+    "logical_participants_by_logical_reaction",
+    "logical_participants_by_id",
+    "molecular_topologies_by_id",
     "mapped_reactions_to_reconcile",
     "inferred_reaction_ids_by_key",
     "inferred_reaction_topology_records_by_key",
@@ -3300,6 +3314,7 @@ _RECONCILIATION_CACHE_MUTABLE_FIELDS = (
     "loaded_reaction_nodes",
     "node_geometries_by_node",
     "loaded_node_geometries",
+    "complete_node_geometries",
     "mappings_by_node_geometry_id",
     "loaded_mappings",
     "transition_state_paths_ready",
@@ -3371,6 +3386,7 @@ def _persist_inference_batch(
     tasks: list[_InferencePersistenceTask],
     *,
     topology_context: GeometryPersistenceContext | None,
+    defer_thermodynamic_refresh: bool = False,
 ) -> None:
     """Flush several new TS inferences together, with per-row fallback."""
 
@@ -3385,10 +3401,11 @@ def _persist_inference_batch(
                 tasks[0],
                 topology_context=topology_context,
             )
-            _refresh_inference_reaction_profiles(
-                session,
-                topology_context=topology_context,
-            )
+            if not defer_thermodynamic_refresh:
+                _refresh_inference_reaction_profiles(
+                    session,
+                    topology_context=topology_context,
+                )
             return
         context_snapshot = _snapshot_inference_context(topology_context)
         pending_snapshot = list(session.info.get("_fast_pending_entities", ()))
@@ -3407,10 +3424,11 @@ def _persist_inference_batch(
                     )
                 _attach_pending_entities(session)
                 session.flush()
-                _refresh_inference_reaction_profiles(
-                    session,
-                    topology_context=topology_context,
-                )
+                if not defer_thermodynamic_refresh:
+                    _refresh_inference_reaction_profiles(
+                        session,
+                        topology_context=topology_context,
+                    )
         except Exception:
             _restore_inference_context(topology_context, context_snapshot)
             if pending_snapshot:
@@ -3423,10 +3441,11 @@ def _persist_inference_batch(
                     task,
                     topology_context=topology_context,
                 )
-            _refresh_inference_reaction_profiles(
-                session,
-                topology_context=topology_context,
-            )
+            if not defer_thermodynamic_refresh:
+                _refresh_inference_reaction_profiles(
+                    session,
+                    topology_context=topology_context,
+                )
     finally:
         session.info["tricycle_bulk_insert_disabled"] = previous_bulk_insert_disabled
 
@@ -3447,9 +3466,9 @@ def _refresh_inference_reaction_profiles(
         return
     cache = topology_context.reconciliation_cache
     reactions = tuple(cache.affected_reactions_by_id.values())
+    refresh_mapped_reactions_thermodynamics(session, reactions)
     for mapped_reaction in reactions:
         mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
-        refresh_mapped_reaction_thermodynamics(session, mapped_reaction)
         cache.thermodynamics_refreshed_reactions.add(mapped_reaction_id)
     # New TS frames can add the same reaction in a later inference
     # microbatch, so retain only the dirty set for the current flush window.
@@ -3474,6 +3493,7 @@ def _persist_artifact_inferences_batch(
     deferred_items: list[_DeferredArtifactInferences],
     *,
     topology_context: GeometryPersistenceContext | None = None,
+    defer_thermodynamic_refresh: bool = False,
 ) -> None:
     pending_tasks: list[_InferencePersistenceTask] = []
 
@@ -3484,6 +3504,7 @@ def _persist_artifact_inferences_batch(
                 session,
                 pending_tasks,
                 topology_context=topology_context,
+                defer_thermodynamic_refresh=defer_thermodynamic_refresh,
             )
             pending_tasks = []
 
@@ -4062,28 +4083,37 @@ def _run_flush(session: SQLAlchemySession) -> dict[str, object]:
         typed_session.info["tricycle_fast_insert"] = previous_fast_insert
 
 
-def _run_flush_attached(session: SQLAlchemySession) -> None:
-    """Flush a persistence window while keeping ORM identities attached.
+def _run_flush_attached(session: SQLAlchemySession) -> dict[str, object]:
+    """Bulk-flush a persistence window and reattach its identity holders.
 
-    The bulk fast path deliberately detaches its client-ID rows after a flush.
-    That is efficient for one final transaction, but unsafe when the same
-    ``GeometryPersistenceContext`` survives a commit and the next window
-    loads an ORM instance with one of those identities.  Microbatch commits
-    use this attached path so cached shared identities remain session-owned.
+    The microbatch context remains live after this barrier, so rows inserted by
+    the Core fast path are attached again immediately.  ``make_transient_to_detached``
+    gives those rows persistent identity state without a lookup, preserving the
+    context's object graph while avoiding the ORM unit-of-work walk over every
+    frame/result row.
     """
 
     typed_session = cast(Session, session)
     pending = typed_session.info.pop("_fast_pending_entities", None)
     if not pending:
         typed_session.flush()
-        return
+        return {}
     previous_fast_insert = typed_session.info.get("tricycle_fast_insert", False)
-    typed_session.info["tricycle_fast_insert"] = False
+    typed_session.info["tricycle_fast_insert"] = True
     try:
-        typed_session.add_all(pending)
+        typed_session.info["_fast_pending_entities"] = pending
+        _bulk_insert_pending_entities(typed_session)
+    finally:
+        typed_session.info["tricycle_fast_insert"] = previous_fast_insert
+    # The bulk path leaves client-ID rows detached. Reattaching them uses the
+    # manufactured identity key and does not emit INSERT/SELECT statements.
+    typed_session.add_all(pending)
+    try:
         typed_session.flush()
     finally:
         typed_session.info["tricycle_fast_insert"] = previous_fast_insert
+    diagnostics = typed_session.info.get("_fast_bulk_insert_diagnostics")
+    return dict(diagnostics) if isinstance(diagnostics, dict) else {}
 
 
 def _run_disable_autoflush(session: SQLAlchemySession) -> None:
@@ -4164,6 +4194,7 @@ def _run_persist_deferred_inferences(
     *,
     deferred_inferences: list[_DeferredArtifactInferences],
     topology_context: GeometryPersistenceContext,
+    defer_thermodynamic_refresh: bool = False,
 ) -> None:
     typed_session = cast(Session, session)
     # In a persistence microbatch, reactions are created after Geometry rows
@@ -4179,6 +4210,7 @@ def _run_persist_deferred_inferences(
             typed_session,
             deferred_inferences,
             topology_context=topology_context,
+            defer_thermodynamic_refresh=defer_thermodynamic_refresh,
         )
     finally:
         typed_session.info["tricycle_fast_insert"] = previous_fast_insert
@@ -5028,126 +5060,134 @@ class ArtifactUploadService:
         if not candidates:
             return reservations, items
 
-        async with session_factory() as session:
-            previous_fast_insert = session.info.get("tricycle_fast_insert", False)
-            previous_autoflush = session.autoflush
-            session.info["tricycle_fast_insert"] = True
-            session.autoflush = False
-            try:
-                reservations_by_digest = await session.run_sync(
-                    partial(
-                        _run_prepare_pending_uploads,
-                        records=[record for _, _, _, record, _ in candidates],
-                    )
-                )
-                artifacts_by_digest = {
-                    digest: artifact
-                    for digest, (artifact, _retired, _check_existing) in (
-                        reservations_by_digest.items()
-                    )
-                }
-                ingestions_by_artifact_id: dict[UUID, tuple[ArtifactIngestion, bool]] = {}
-                if artifact_kind is ArtifactKind.CALCULATION_OUTPUT:
-                    started_by_artifact_id = {
-                        _require_id(
-                            artifacts_by_digest[record.content_sha256],
-                            label="ArtifactFile",
-                        ): started_at
-                        for _, _, _, record, started_at in candidates
-                    }
-                    ingestions_by_artifact_id = await session.run_sync(
+        # Preparation acquires one content lock per unique source and, for
+        # calculation outputs, one ingestion lock per artifact.  Keep this
+        # transaction bounded independently of the parser window so a large
+        # request cannot exhaust PostgreSQL's advisory-lock shared memory.
+        preparation_batch_size = PERSISTENCE_PRELOAD_BATCH_SIZE
+        for offset in range(0, len(candidates), preparation_batch_size):
+            candidate_batch = candidates[offset : offset + preparation_batch_size]
+            async with session_factory() as session:
+                previous_fast_insert = session.info.get("tricycle_fast_insert", False)
+                previous_autoflush = session.autoflush
+                session.info["tricycle_fast_insert"] = True
+                session.autoflush = False
+                try:
+                    reservations_by_digest = await session.run_sync(
                         partial(
-                            _run_create_pending_ingestions,
-                            artifacts=list(artifacts_by_digest.values()),
-                            started_by_artifact_id=started_by_artifact_id,
+                            _run_prepare_pending_uploads,
+                            records=[record for _, _, _, record, _ in candidate_batch],
                         )
                     )
-                for index, _file, inspected, record, started_at in candidates:
-                    artifact, retired_reservation, check_existing_object = reservations_by_digest[
-                        record.content_sha256
-                    ]
-                    artifact_id = _require_id(artifact, label="ArtifactFile")
-                    ingestion_id: UUID | None = None
-                    skip_parse = False
-                    force_new_revision = False
-                    ingestion_status: ArtifactIngestionStatus | None = None
+                    artifacts_by_digest = {
+                        digest: artifact
+                        for digest, (artifact, _retired, _check_existing) in (
+                            reservations_by_digest.items()
+                        )
+                    }
+                    ingestions_by_artifact_id: dict[UUID, tuple[ArtifactIngestion, bool]] = {}
                     if artifact_kind is ArtifactKind.CALCULATION_OUTPUT:
-                        ingestion, created = ingestions_by_artifact_id[artifact_id]
-                        ingestion_id = _require_id(ingestion, label="ArtifactIngestion")
-                        ingestion_status = ingestion.status
-                        retry_failed = (
-                            reparse_failed_ingestions
-                            and not created
-                            and ingestion.status
-                            in {
-                                ArtifactIngestionStatus.FAILED,
-                                ArtifactIngestionStatus.PARTIAL,
-                            }
+                        started_by_artifact_id = {
+                            _require_id(
+                                artifacts_by_digest[record.content_sha256],
+                                label="ArtifactFile",
+                            ): started_at
+                            for _, _, _, record, started_at in candidate_batch
+                        }
+                        ingestions_by_artifact_id = await session.run_sync(
+                            partial(
+                                _run_create_pending_ingestions,
+                                artifacts=list(artifacts_by_digest.values()),
+                                started_by_artifact_id=started_by_artifact_id,
+                            )
                         )
-                        if retry_failed:
-                            # Reopen the durable ingestion reservation. Existing
-                            # revisions, if any, are retained as provenance and
-                            # the parser result is written as a new revision.
-                            ingestion.status = ArtifactIngestionStatus.PENDING
-                            ingestion.started_at = started_at
-                            ingestion.completed_at = None
-                            ingestion.source_frame_count = None
-                            ingestion.transition_state_frame_count = None
-                            ingestion.error_code = None
-                            ingestion.error_message = None
-                            session.add(ingestion)
-                            ingestion_status = ArtifactIngestionStatus.PENDING
-                            force_new_revision = True
-                        skip_parse = (
-                            not created
-                            and not retry_failed
-                            and ingestion.status is not ArtifactIngestionStatus.PENDING
+                    for index, _file, inspected, record, started_at in candidate_batch:
+                        artifact, retired_reservation, check_existing_object = (
+                            reservations_by_digest[record.content_sha256]
                         )
-                    reservations[index] = _PreparedCalculationUpload(
-                        settings=settings,
-                        artifact_id=artifact_id,
-                        object_key=artifact.object_key,
-                        ingestion_id=ingestion_id,
-                        started_at=started_at,
-                        source=inspected.source,
-                        size_bytes=inspected.size_bytes,
-                        media_type=record.media_type,
-                        content_sha256=record.content_sha256,
-                        retired_reservation=retired_reservation,
-                        needs_storage=artifact.storage_status is not StorageStatus.AVAILABLE,
-                        check_existing_object=check_existing_object,
-                        skip_parse=skip_parse,
-                        force_new_revision=force_new_revision,
-                        ingestion_status=ingestion_status,
-                        duplicate_of=None,
-                    )
-                # Duplicate content identities reuse the first reservation and
-                # object key; no extra INSERT/UPDATE is needed for the sibling.
-                for index, first_index in duplicate_of.items():
-                    source = reservations[first_index]
-                    reservations[index] = _PreparedCalculationUpload(
-                        settings=source.settings,
-                        artifact_id=source.artifact_id,
-                        object_key=source.object_key,
-                        ingestion_id=source.ingestion_id,
-                        started_at=source.started_at,
-                        source=source.source,
-                        size_bytes=source.size_bytes,
-                        media_type=source.media_type,
-                        content_sha256=source.content_sha256,
-                        retired_reservation=None,
-                        needs_storage=False,
-                        check_existing_object=False,
-                        skip_parse=True,
-                        force_new_revision=False,
-                        ingestion_status=source.ingestion_status,
-                        duplicate_of=first_index,
-                    )
-                await session.run_sync(_run_flush)
-                await session.commit()
-            finally:
-                session.autoflush = previous_autoflush
-                session.info["tricycle_fast_insert"] = previous_fast_insert
+                        artifact_id = _require_id(artifact, label="ArtifactFile")
+                        ingestion_id: UUID | None = None
+                        skip_parse = False
+                        force_new_revision = False
+                        ingestion_status: ArtifactIngestionStatus | None = None
+                        if artifact_kind is ArtifactKind.CALCULATION_OUTPUT:
+                            ingestion, created = ingestions_by_artifact_id[artifact_id]
+                            ingestion_id = _require_id(ingestion, label="ArtifactIngestion")
+                            ingestion_status = ingestion.status
+                            retry_failed = (
+                                reparse_failed_ingestions
+                                and not created
+                                and ingestion.status
+                                in {
+                                    ArtifactIngestionStatus.FAILED,
+                                    ArtifactIngestionStatus.PARTIAL,
+                                }
+                            )
+                            if retry_failed:
+                                # Reopen the durable ingestion reservation. Existing
+                                # revisions, if any, are retained as provenance and
+                                # the parser result is written as a new revision.
+                                ingestion.status = ArtifactIngestionStatus.PENDING
+                                ingestion.started_at = started_at
+                                ingestion.completed_at = None
+                                ingestion.source_frame_count = None
+                                ingestion.transition_state_frame_count = None
+                                ingestion.error_code = None
+                                ingestion.error_message = None
+                                session.add(ingestion)
+                                ingestion_status = ArtifactIngestionStatus.PENDING
+                                force_new_revision = True
+                            skip_parse = (
+                                not created
+                                and not retry_failed
+                                and ingestion.status is not ArtifactIngestionStatus.PENDING
+                            )
+                        reservations[index] = _PreparedCalculationUpload(
+                            settings=settings,
+                            artifact_id=artifact_id,
+                            object_key=artifact.object_key,
+                            ingestion_id=ingestion_id,
+                            started_at=started_at,
+                            source=inspected.source,
+                            size_bytes=inspected.size_bytes,
+                            media_type=record.media_type,
+                            content_sha256=record.content_sha256,
+                            retired_reservation=retired_reservation,
+                            needs_storage=artifact.storage_status is not StorageStatus.AVAILABLE,
+                            check_existing_object=check_existing_object,
+                            skip_parse=skip_parse,
+                            force_new_revision=force_new_revision,
+                            ingestion_status=ingestion_status,
+                            duplicate_of=None,
+                        )
+                    await session.run_sync(_run_flush)
+                    await session.commit()
+                finally:
+                    session.autoflush = previous_autoflush
+                    session.info["tricycle_fast_insert"] = previous_fast_insert
+
+        # Duplicate content identities reuse the first reservation and object
+        # key; no extra INSERT/UPDATE or identity lock is needed for a sibling.
+        for index, first_index in duplicate_of.items():
+            source = reservations[first_index]
+            reservations[index] = _PreparedCalculationUpload(
+                settings=source.settings,
+                artifact_id=source.artifact_id,
+                object_key=source.object_key,
+                ingestion_id=source.ingestion_id,
+                started_at=source.started_at,
+                source=source.source,
+                size_bytes=source.size_bytes,
+                media_type=source.media_type,
+                content_sha256=source.content_sha256,
+                retired_reservation=None,
+                needs_storage=False,
+                check_existing_object=False,
+                skip_parse=True,
+                force_new_revision=False,
+                ingestion_status=source.ingestion_status,
+                duplicate_of=first_index,
+            )
         return reservations, items
 
     @staticmethod
@@ -5723,8 +5763,7 @@ class ArtifactUploadService:
                 # identities retained by ``geometry_context``.  Keeping this
                 # barrier attached prevents a later relationship cascade from
                 # trying to attach a second ORM instance for the same UUID.
-                await session.run_sync(_run_flush_attached)
-                bulk_diagnostics: dict[str, object] = {}
+                bulk_diagnostics = await session.run_sync(_run_flush_attached)
                 timings["persist_flush_initial_ms"] = (
                     timings.get("persist_flush_initial_ms", 0.0)
                     + (perf_counter() - flush_started) * 1000
@@ -5751,6 +5790,7 @@ class ArtifactUploadService:
                             _run_persist_deferred_inferences,
                             deferred_inferences=new_deferred,
                             topology_context=geometry_context,
+                            defer_thermodynamic_refresh=True,
                         )
                     )
                     timings["persist_deferred_inferences_ms"] = (

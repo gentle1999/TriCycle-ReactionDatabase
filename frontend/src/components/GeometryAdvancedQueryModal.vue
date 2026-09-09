@@ -11,6 +11,7 @@ import {
   geometryQueryFieldOptions,
   type GeometryQueryCondition,
   type GeometryQueryExpressionCondition,
+  type GeometryQueryExpression,
   type GeometryQueryField,
   type GeometryQueryFilters,
   type GeometryQueryLogicalOperator,
@@ -19,6 +20,7 @@ import {
 const props = defineProps<{
   open: boolean;
   projectId: string | null;
+  initialFilters?: GeometryQueryFilters | null;
 }>();
 
 const emit = defineEmits<{
@@ -39,6 +41,12 @@ interface ConditionValidationState {
 const validationStates = ref<Record<number, ConditionValidationState>>({});
 const validationTimers = new Map<number, number>();
 const validationControllers = new Map<number, AbortController>();
+
+function isExpressionCondition(
+  condition: GeometryQueryExpressionCondition | GeometryQueryExpression,
+): condition is GeometryQueryExpressionCondition {
+  return "field" in condition;
+}
 
 function clearConditionValidation(id: number): void {
   const timer = validationTimers.get(id);
@@ -119,10 +127,28 @@ function newCondition(field: GeometryQueryField = "topology_smiles"): GeometryQu
   return { id: nextConditionId.value++, field, value: initialValue(field), molfile: "", negated: false };
 }
 
+function conditionFromExpression(
+  expressionCondition: GeometryQueryExpressionCondition,
+): GeometryQueryCondition {
+  const condition = newCondition(expressionCondition.field);
+  condition.value = String(expressionCondition.value);
+  condition.negated = expressionCondition.negated === true;
+  return condition;
+}
+
+function initialExpressionConditions(): GeometryQueryCondition[] {
+  const expression = props.initialFilters?.filterExpression;
+  if (!expression || !expression.conditions.every(isExpressionCondition)) return [];
+  return expression.conditions.map(conditionFromExpression);
+}
+
 function reset(): void {
   for (const condition of conditions.value) clearConditionValidation(condition.id);
-  logicalOperator.value = "and";
-  conditions.value = [newCondition()];
+  nextConditionId.value = 1;
+  const expression = props.initialFilters?.filterExpression;
+  logicalOperator.value = expression?.operator ?? "and";
+  const initialConditions = initialExpressionConditions();
+  conditions.value = initialConditions.length ? initialConditions : [newCondition()];
   validationError.value = "";
 }
 
@@ -235,6 +261,7 @@ watch(
       void nextTick(() => dialog.value?.querySelector<HTMLSelectElement>("select")?.focus());
     }
   },
+  { immediate: true },
 );
 
 onMounted(() => window.addEventListener("keydown", onKeydown));

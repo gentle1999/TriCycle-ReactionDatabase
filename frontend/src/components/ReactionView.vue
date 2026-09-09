@@ -358,6 +358,7 @@ onBeforeUnmount(() => {
     <ReactionAdvancedQueryModal
       :open="advancedQueryOpen"
       :project-id="projectId"
+      :initial-filters="queryFilters"
       @close="advancedQueryOpen = false"
       @apply="applyAdvancedQuery"
     />

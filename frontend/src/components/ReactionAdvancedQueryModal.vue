@@ -12,6 +12,7 @@ import {
   reactionQueryFieldOptions,
   type ReactionQueryCondition,
   type ReactionQueryExpressionCondition,
+  type ReactionQueryExpression,
   type ReactionQueryField,
   type ReactionQueryFilters,
   type ReactionQueryLogicalOperator,
@@ -20,6 +21,7 @@ import {
 const props = defineProps<{
   open: boolean;
   projectId: string | null;
+  initialFilters?: ReactionQueryFilters;
 }>();
 
 const emit = defineEmits<{
@@ -41,6 +43,19 @@ interface ConditionValidationState {
 const validationStates = ref<Record<number, ConditionValidationState>>({});
 const validationTimers = new Map<number, number>();
 const validationControllers = new Map<number, AbortController>();
+
+function isExpressionCondition(
+  condition: ReactionQueryExpressionCondition | ReactionQueryExpression,
+): condition is ReactionQueryExpressionCondition {
+  return "field" in condition;
+}
+
+function datetimeLocalValue(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.valueOf())) return value.slice(0, 16);
+  const pad = (part: number): string => String(part).padStart(2, "0");
+  return `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())}T${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`;
+}
 
 function clearConditionValidation(id: number): void {
   const timer = validationTimers.get(id);
@@ -119,10 +134,42 @@ function newCondition(field: ReactionQueryField = "rxn_smarts"): ReactionQueryCo
   };
 }
 
+function conditionFromExpression(
+  expressionCondition: ReactionQueryExpressionCondition,
+): ReactionQueryCondition {
+  const condition = newCondition(expressionCondition.field);
+  const value = String(expressionCondition.value);
+  condition.negated = expressionCondition.negated === true;
+  if (fieldKind(condition) === "mol_block") {
+    condition.molfile = value;
+  } else if (fieldKind(condition) === "datetime") {
+    condition.value = datetimeLocalValue(value);
+  } else {
+    condition.value = value;
+  }
+  return condition;
+}
+
+function initialExpressionConditions(): ReactionQueryCondition[] {
+  const expression = props.initialFilters?.filterExpression;
+  if (expression && expression.conditions.every(isExpressionCondition)) {
+    return expression.conditions.map(conditionFromExpression);
+  }
+  // Statistics quick search stores its exact RXN condition as a flat field
+  // instead of an expression. Keep that condition editable as well.
+  if (props.initialFilters?.reactionSmarts) {
+    return [conditionFromExpression({ field: "rxn_smarts", value: props.initialFilters.reactionSmarts })];
+  }
+  return [];
+}
+
 function reset(): void {
   for (const condition of conditions.value) clearConditionValidation(condition.id);
-  logicalOperator.value = "and";
-  conditions.value = [newCondition()];
+  nextConditionId.value = 1;
+  const expression = props.initialFilters?.filterExpression;
+  logicalOperator.value = expression?.operator ?? "and";
+  const initialConditions = initialExpressionConditions();
+  conditions.value = initialConditions.length ? initialConditions : [newCondition()];
   validationError.value = "";
 }
 
@@ -260,6 +307,7 @@ watch(
       void nextTick(() => dialog.value?.querySelector<HTMLSelectElement>("select")?.focus());
     }
   },
+  { immediate: true },
 );
 
 onMounted(() => window.addEventListener("keydown", onKeydown));

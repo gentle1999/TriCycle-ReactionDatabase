@@ -581,8 +581,9 @@ endpoint 反推出这些 precursor；它们应通过后续 concrete topology 反
   → 生成 logical topology
 ```
 
-当前首条规则的 SMARTS 是 `[N;X3;v3;+0]`。规则必须是可扩展、可版本化的 registry，
-并明确匹配 SMARTS、适用条件、需要清除的 atom/bond stereo 以及 policy version。不得因为原子是 N
+当前登记的规则 SMARTS 是 `[#8,#16,#34;X3;v3;+1]`、`[#7,#15,#33;X3;v3;+0]` 和
+`[#9,#17,#35,#53;X3;v3;+2]`。规则必须是可扩展、可版本化的 registry，并明确匹配 SMARTS、
+适用条件、需要清除的 atom/bond stereo 以及 policy version。不得因为原子符合某一元素集合
 就全局清除该分子所有立体信息，也不得用全局 `useChirality=False` 替代选择性匹配。
 
 ### 9.4 LogicalReaction 的双向检索

@@ -290,7 +290,7 @@ onBeforeUnmount(() => {
       <GeometryDetailContent v-else-if="selectedGeometry" :geometry="selectedGeometry" :project-id="currentProjectId ?? undefined" @open-frame="openFrame" />
     </UiDrawer>
     <FrameDrawer :open="selectedFrameId !== null" :loading="frameLoading" :error="frameError" :frame="frame" :project-id="currentProjectId ?? undefined" @close="closeFrame" />
-    <GeometryAdvancedQueryModal :open="advancedQueryOpen" :project-id="currentProjectId" @close="advancedQueryOpen = false" @apply="applyAdvancedQuery" />
+    <GeometryAdvancedQueryModal :open="advancedQueryOpen" :project-id="currentProjectId" :initial-filters="advancedFilters" @close="advancedQueryOpen = false" @apply="applyAdvancedQuery" />
     </section>
   </main>
 </template>

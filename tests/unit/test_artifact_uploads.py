@@ -263,6 +263,16 @@ def test_source_evidence_does_not_disable_fast_ingestion(
     assert _fast_molop_ingestion_enabled()
 
 
+def test_slim_chem_file_retains_source_frame_count() -> None:
+    slim = upload_module._ParsedChemFile(
+        payload={},
+        source_segments=(),
+        source_frame_count=7,
+    )
+
+    assert len(slim) == 7
+
+
 def test_storage_pool_does_not_recycle_workers(monkeypatch: pytest.MonkeyPatch) -> None:
     """Avoid Python 3.12's max_tasks_per_child rollover deadlock for uploads."""
 

@@ -6,6 +6,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from hashlib import sha256
+from typing import Any, cast
 from uuid import UUID
 
 from rdkit import Chem
@@ -65,7 +66,7 @@ from tricycle_reaction_db.ingestion.normalization import (
 
 ParticipantIdentity = tuple[LogicalReactionParticipantSide, MolecularTopology, int]
 MappedReactionConcreteIdentity = tuple[
-    tuple[str, int, UUID, tuple[int, ...]],
+    tuple[str, int, UUID, str],
     ...,
 ]
 
@@ -493,27 +494,55 @@ def _resolve_topology_value(
     return topology
 
 
-def _canonical_atom_maps_for_topology(
+def _resolve_topology_value_from_context(
+    session: Session,
+    value: object,
+    topology_context: Any | None,
+) -> MolecularTopology:
+    """Resolve a topology from the ingestion cache before falling back to SQL."""
+
+    if isinstance(value, MolecularTopology):
+        return _resolve_topology_value(session, value)
+    if topology_context is not None and isinstance(value, UUID):
+        cached = topology_context.molecular_topologies_by_id.get(value)
+        if cached is not None:
+            return cast(MolecularTopology, cached)
+        for candidate in topology_context.topologies_by_identity.values():
+            if candidate.id == value:
+                topology_context.molecular_topologies_by_id[value] = candidate
+                return cast(MolecularTopology, candidate)
+        for persisted in topology_context.topologies.values():
+            candidate = persisted.topology
+            if candidate.id == value:
+                topology_context.molecular_topologies_by_id[value] = candidate
+                return cast(MolecularTopology, candidate)
+    return _resolve_topology_value(session, value)
+
+
+def _canonical_mapped_topology_identity(
     session: Session,
     topology: MolecularTopology,
     atom_maps: tuple[int, ...],
-) -> tuple[int, ...]:
-    """Canonicalize atom maps modulo connectivity-preserving automorphisms.
+) -> str:
+    """Canonicalize a mapped topology without enumerating graph automorphisms.
 
-    Mapping transfer can encounter a symmetric endpoint through different
-    source atom orders.  Those assignments can serialize to different mapped
-    SMILES even though they describe the same concrete component.  Stereo is
-    intentionally ignored while finding the automorphisms: the concrete
-    topology id already carries the strict stereo identity, while the
-    automorphism step only removes representation-level symmetry from the
-    atom-map assignment.
+    A symmetric endpoint can arrive in different source atom orders.  The
+    resulting atom-map tuples then differ only by exchanging atoms that are
+    indistinguishable in the connectivity graph.  Asking RDKit for symmetry
+    classes gives a bounded, deterministic quotient of those assignments;
+    sorting the maps inside each class removes the source-order artifact.
+
+    Chirality is intentionally excluded from the symmetry classes.  The
+    concrete topology id already carries the strict stereo identity, while
+    this identity only removes representation-level atom-map ambiguity (in
+    particular, the two equivalent centers of a meso product).
     """
 
     topology_id = _require_id(topology, label="MolecularTopology")
     if len(atom_maps) != topology.atom_count:
-        return atom_maps
-    cache: dict[tuple[UUID, tuple[int, ...]], tuple[int, ...]] = session.info.setdefault(
-        "_mapped_reaction_canonical_atom_maps", {}
+        raise ValueError("atom-map count must match MolecularTopology.atom_count")
+    cache: dict[tuple[UUID, tuple[int, ...]], str] = session.info.setdefault(
+        "_mapped_reaction_canonical_topology_identities", {}
     )
     cache_key = (topology_id, atom_maps)
     cached = cache.get(cache_key)
@@ -522,14 +551,30 @@ def _canonical_atom_maps_for_topology(
 
     molecule = Chem.Mol(topology.mol)
     for atom in molecule.GetAtoms():  # type: ignore[no-untyped-call]
+        # Atom-map labels are the values being canonicalized, not part of the
+        # graph whose symmetry classes are being computed.
         atom.SetAtomMapNum(0)
-    automorphisms = molecule.GetSubstructMatches(
+    symmetry_classes = Chem.CanonicalRankAtoms(
         molecule,
-        uniquify=False,
-        useChirality=False,
+        breakTies=False,
+        includeChirality=False,
+        includeIsotopes=True,
+        includeAtomMaps=False,
     )
-    candidates = tuple(tuple(atom_maps[index] for index in match) for match in automorphisms)
-    canonical = min(candidates) if candidates else atom_maps
+    maps_by_class: dict[int, list[int]] = {}
+    for symmetry_class, map_number in zip(symmetry_classes, atom_maps, strict=True):
+        maps_by_class.setdefault(int(symmetry_class), []).append(int(map_number))
+    canonical = json.dumps(
+        {
+            "schema_version": "mapped-topology-symmetry-v1",
+            "symmetry_classes": [
+                [symmetry_class, sorted(maps)]
+                for symmetry_class, maps in sorted(maps_by_class.items())
+            ],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     cache[cache_key] = canonical
     return canonical
 
@@ -539,6 +584,7 @@ def mapped_reaction_concrete_identity(
     mapped_reaction: MappedReaction,
     *,
     participants: Iterable[MappedReactionParticipant] | None = None,
+    topology_context: Any | None = None,
 ) -> MappedReactionConcreteIdentity | None:
     """Return the concrete identity of one complete mapped reaction.
 
@@ -550,21 +596,31 @@ def mapped_reaction_concrete_identity(
     the concrete topology of every participant together with the atom-map
     assignment on that topology.
 
-    The atom-map tuple is included deliberately: two different atom mappings
-    of the same concrete components can represent different reaction paths and
-    must remain separate.  The tuple is returned in template order-independent
-    form so it is stable for a logical reaction whose participants were loaded
-    in a different order.
+    The RDKit symmetry-class map signature is included deliberately: two
+    different atom mappings of the same concrete components can represent
+    different reaction paths and must remain separate unless their differences
+    are only exchanges inside connectivity-equivalent atom classes.  It is
+    returned in template order-independent form so it is stable for a logical
+    reaction whose participants were loaded in a different order.
     """
 
     mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
     if participants is None:
-        rows = tuple(
-            session.exec(
-                select(MappedReactionParticipant).where(
-                    MappedReactionParticipant.mapped_reaction_id == mapped_reaction_id
-                )
-            ).all()
+        cached_participants = (
+            topology_context.mapped_reaction_participants_by_reaction.get(mapped_reaction_id)
+            if topology_context is not None
+            else None
+        )
+        rows = (
+            tuple(cached_participants)
+            if cached_participants is not None
+            else tuple(
+                session.exec(
+                    select(MappedReactionParticipant).where(
+                        MappedReactionParticipant.mapped_reaction_id == mapped_reaction_id
+                    )
+                ).all()
+            )
         )
         rows += tuple(
             entity
@@ -578,18 +634,28 @@ def mapped_reaction_concrete_identity(
     else:
         rows = tuple(participants)
 
-    identities: list[tuple[str, int, UUID, tuple[int, ...]]] = []
+    identities: list[tuple[str, int, UUID, str]] = []
     template_keys: set[tuple[str, int]] = set()
     for participant in rows:
-        logical_participant = participant.logical_reaction_participant
-        if logical_participant is None:
-            logical_participant = session.get(
-                LogicalReactionParticipant,
-                participant.logical_reaction_participant_id,
+        concrete_topology_id = participant.concrete_topology_id
+        if concrete_topology_id is None:
+            logical_participant = (
+                topology_context.logical_participants_by_id.get(
+                    participant.logical_reaction_participant_id
+                )
+                if topology_context is not None
+                else None
             )
-        if logical_participant is None:
-            return None
-        concrete_topology_id = participant.concrete_topology_id or logical_participant.topology_id
+            if logical_participant is None:
+                logical_participant = participant.logical_reaction_participant
+            if logical_participant is None:
+                logical_participant = session.get(
+                    LogicalReactionParticipant,
+                    participant.logical_reaction_participant_id,
+                )
+            if logical_participant is None:
+                return None
+            concrete_topology_id = logical_participant.topology_id
         if concrete_topology_id is None:
             return None
         atom_maps = tuple(int(number) for number in participant.atom_map_numbers)
@@ -597,8 +663,18 @@ def mapped_reaction_concrete_identity(
             return None
         if len(set(atom_maps)) != len(atom_maps):
             return None
-        concrete_topology = _resolve_topology_value(session, concrete_topology_id)
-        atom_maps = _canonical_atom_maps_for_topology(session, concrete_topology, atom_maps)
+        concrete_topology = _resolve_topology_value_from_context(
+            session,
+            concrete_topology_id,
+            topology_context,
+        )
+        if len(atom_maps) != concrete_topology.atom_count:
+            return None
+        canonical_topology = _canonical_mapped_topology_identity(
+            session,
+            concrete_topology,
+            atom_maps,
+        )
         template_key = (participant.side.value, participant.template_index)
         if template_key in template_keys:
             return None
@@ -608,7 +684,7 @@ def mapped_reaction_concrete_identity(
                 participant.side.value,
                 participant.template_index,
                 concrete_topology_id,
-                atom_maps,
+                canonical_topology,
             )
         )
     if not identities:
@@ -635,7 +711,7 @@ def mapped_reaction_concrete_identity_for_templates(
     ):
         raise ValueError("concrete identity inputs must cover every logical participant")
 
-    identities: list[tuple[str, int, UUID, tuple[int, ...]]] = []
+    identities: list[tuple[str, int, UUID, str]] = []
     for side, template_index in sorted(
         expected_keys,
         key=lambda item: (item[0].value, item[1]),
@@ -649,13 +725,19 @@ def mapped_reaction_concrete_identity_for_templates(
             raise ValueError("concrete identity atom maps must be positive")
         if len(set(atom_maps)) != len(atom_maps):
             raise ValueError("concrete identity atom maps must be unique")
-        atom_maps = _canonical_atom_maps_for_topology(session, concrete_topology, atom_maps)
+        if len(atom_maps) != concrete_topology.atom_count:
+            raise ValueError("concrete identity atom-map count must match topology atom count")
+        canonical_topology = _canonical_mapped_topology_identity(
+            session,
+            concrete_topology,
+            atom_maps,
+        )
         identities.append(
             (
                 side.value,
                 template_index,
                 _require_id(concrete_topology, label="MolecularTopology"),
-                atom_maps,
+                canonical_topology,
             )
         )
     return tuple(identities)
@@ -667,6 +749,7 @@ def find_mapped_reaction_by_concrete_identity(
     identity: MappedReactionConcreteIdentity,
     *,
     refresh: bool = False,
+    topology_context: Any | None = None,
 ) -> MappedReaction | None:
     """Find a persisted or same-batch mapped reaction with one identity."""
 
@@ -678,12 +761,21 @@ def find_mapped_reaction_by_concrete_identity(
         index_by_reaction.pop(logical_reaction_id, None)
     index = index_by_reaction.get(logical_reaction_id)
     if index is None:
-        candidates = tuple(
-            session.exec(
-                select(MappedReaction).where(
-                    MappedReaction.logical_reaction_id == logical_reaction_id
-                )
-            ).all()
+        cached_candidates = (
+            topology_context.mapped_reactions_by_logical_reaction.get(logical_reaction_id)
+            if topology_context is not None
+            else None
+        )
+        candidates = (
+            tuple(cached_candidates)
+            if cached_candidates is not None
+            else tuple(
+                session.exec(
+                    select(MappedReaction).where(
+                        MappedReaction.logical_reaction_id == logical_reaction_id
+                    )
+                ).all()
+            )
         )
         candidates += tuple(
             entity
@@ -704,7 +796,18 @@ def find_mapped_reaction_by_concrete_identity(
             by_id.values(),
             key=lambda item: (item.mapping_hash, str(_require_id(item, label="MappedReaction"))),
         ):
-            candidate_identity = mapped_reaction_concrete_identity(session, candidate)
+            candidate_id = _require_id(candidate, label="MappedReaction")
+            candidate_participants = (
+                topology_context.mapped_reaction_participants_by_reaction.get(candidate_id)
+                if topology_context is not None
+                else None
+            )
+            candidate_identity = mapped_reaction_concrete_identity(
+                session,
+                candidate,
+                participants=candidate_participants,
+                topology_context=topology_context,
+            )
             if candidate_identity is not None:
                 index.setdefault(candidate_identity, candidate)
         index_by_reaction[logical_reaction_id] = index
@@ -714,6 +817,8 @@ def find_mapped_reaction_by_concrete_identity(
 def _register_mapped_reaction_concrete_identity(
     session: Session,
     mapped_reaction: MappedReaction,
+    *,
+    topology_context: Any | None = None,
 ) -> None:
     """Add a newly persisted mapping to the session-local identity index."""
 
@@ -723,7 +828,21 @@ def _register_mapped_reaction_concrete_identity(
         dict[MappedReactionConcreteIdentity, MappedReaction],
     ] = session.info.setdefault("_mapped_reaction_concrete_identity_index", {})
     index = index_by_reaction.setdefault(logical_reaction_id, {})
-    identity = mapped_reaction_concrete_identity(session, mapped_reaction)
+    mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
+    participants = (
+        topology_context.mapped_reaction_participants_by_reaction.get(mapped_reaction_id)
+        if topology_context is not None
+        else None
+    )
+    if participants is None and topology_context is not None:
+        participants = tuple(mapped_reaction.participants)
+        topology_context.mapped_reaction_participants_by_reaction[mapped_reaction_id] = participants
+    identity = mapped_reaction_concrete_identity(
+        session,
+        mapped_reaction,
+        participants=participants,
+        topology_context=topology_context,
+    )
     if identity is not None:
         index.setdefault(identity, mapped_reaction)
 
@@ -1195,6 +1314,7 @@ def persist_mapped_reaction(
     | None = None,
     precomputed_mapped_smiles_by_template: Mapping[tuple[LogicalReactionParticipantSide, int], str]
     | None = None,
+    topology_context: Any | None = None,
 ) -> MappedReaction:
     """Insert or reuse one explicit mapped reaction under a logical reaction."""
 
@@ -1288,6 +1408,7 @@ def persist_mapped_reaction(
                 reaction_id,
                 concrete_identity,
                 refresh=True,
+                topology_context=topology_context,
             )
             if existing_concrete is not None:
                 return existing_concrete
@@ -1326,7 +1447,11 @@ def persist_mapped_reaction(
                 mapped_smiles=precomputed_mapped_smiles_by_template[component_key],
                 concrete_topology=concrete_topologies_by_key[component_key],
             )
-        _register_mapped_reaction_concrete_identity(session, mapped_reaction)
+        _register_mapped_reaction_concrete_identity(
+            session,
+            mapped_reaction,
+            topology_context=topology_context,
+        )
         return mapped_reaction
 
     # A mapped reaction must preserve the atom sequence from the trusted

@@ -42,6 +42,16 @@ The topology presentation field retains its compatibility name
 `canonical_isomeric_smiles`, but stores explicit-H isomeric SMILES. Failure to
 emit a usable SMILES must not discard a valid binary graph or computation frame.
 
+## Calculation-Protocol Normalization
+
+MolOP protocol evidence remains available in the stored source segment. The
+database's calculation-protocol v2 projection canonicalizes dispersion aliases
+(`D3BJ` and `GD3BJ` are treated as the same correction), appends an available
+`dispersion_model` to a functional that lacks a known dispersion suffix, and
+rejects conflicting explicit suffixes. When the projection changes a protocol,
+the original value is retained in `normalized_spec.source_protocol` and the
+projected value is stored in `normalized_spec.protocol`.
+
 ## Upgrade Acceptance
 
 Pin a released MolOP/MolGR version, update `uv.lock`, and run parser, topology,

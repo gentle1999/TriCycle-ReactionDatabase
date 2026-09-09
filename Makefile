@@ -231,10 +231,13 @@ import-artifacts:
 		--project-id "$(IMPORT_PROJECT_ID)" \
 		$(if $(IMPORT_USER_ID),--user-id "$(IMPORT_USER_ID)",) \
 		$(if $(IMPORT_ARTIFACT_KIND),--artifact-kind "$(IMPORT_ARTIFACT_KIND)",) \
+		$(foreach suffix,$(IMPORT_INCLUDE_SUFFIXES),--include-suffix "$(suffix)") \
+		$(foreach suffix,$(IMPORT_EXCLUDE_SUFFIXES),--exclude-suffix "$(suffix)") \
 		$(if $(IMPORT_STATE_FILE),--state-file "$(IMPORT_STATE_FILE)",) \
 		$(if $(IMPORT_COMMIT_BATCH_FILES),--commit-batch-files "$(IMPORT_COMMIT_BATCH_FILES)",) \
 		$(if $(IMPORT_PIPELINE_WINDOW_FILES),--pipeline-window-files "$(IMPORT_PIPELINE_WINDOW_FILES)",) \
 		$(if $(IMPORT_STREAM_QUEUE_SIZE),--stream-queue-size "$(IMPORT_STREAM_QUEUE_SIZE)",) \
+		$(if $(IMPORT_MAX_TRANSIENT_RETRIES),--max-transient-retries "$(IMPORT_MAX_TRANSIENT_RETRIES)",) \
 		$(IMPORT_ROOTS)
 
 validate-da-bench-fixture:

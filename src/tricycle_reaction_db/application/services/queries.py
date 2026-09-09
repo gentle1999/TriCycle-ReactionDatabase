@@ -90,6 +90,7 @@ from tricycle_reaction_db.application.services.authorization import ProjectPermi
 from tricycle_reaction_db.application.services.geometry_energy import (
     GeometryEnergyComposite,
     geometry_energy_composites,
+    protocol_level_view,
 )
 from tricycle_reaction_db.application.services.query_visibility import (
     frame_id_is_visible,
@@ -133,6 +134,7 @@ from tricycle_reaction_db.db.models import (
     ScientificArrayAssignment,
     ThermochemistryResult,
     TransitionStateEndpoint,
+    TransitionStateInference,
     VibrationResult,
 )
 from tricycle_reaction_db.db.session import session_factory
@@ -149,6 +151,7 @@ from tricycle_reaction_db.domain.enums import (
     StereoStatus,
     StorageStatus,
     TopologySanitizationStatus,
+    TransitionStateInferenceStatus,
 )
 from tricycle_reaction_db.domain.fingerprints import (
     MORGAN_BFP_RADIUS,
@@ -180,6 +183,67 @@ def _validate_range(
 def _validate_nonnegative_integer(value: Any, *, name: str) -> None:
     if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
         raise ValueError(f"{name} must be a non-negative integer")
+
+
+def _logical_reaction_ids_for_topology(topology_id: UUID) -> Any:
+    """Return logical reactions using a topology in any persisted role.
+
+    A topology can be referenced directly by a logical participant, indirectly
+    as a concrete participant topology, or as one of the endpoint topologies
+    inferred from a transition-state calculation. The latter is the combined
+    pre/post topology shown by the topology page and is not a reaction
+    participant itself. A transition-state node topology is also a persisted
+    reaction usage, but it is connected through Geometry and
+    MappedReactionNodeGeometry rather than a participant row.
+    """
+
+    participant_reaction_ids: Any = select(
+        col(LogicalReactionParticipant.logical_reaction_id).label("logical_reaction_id")
+    ).where(
+        or_(
+            col(LogicalReactionParticipant.topology_id) == topology_id,
+            col(LogicalReactionParticipant.id).in_(
+                select(
+                    col(LogicalParticipantConcreteTopology.logical_reaction_participant_id)
+                ).where(col(LogicalParticipantConcreteTopology.concrete_topology_id) == topology_id)
+            ),
+        )
+    )
+    endpoint_reaction_ids: Any = (
+        select(col(TransitionStateInference.logical_reaction_id).label("logical_reaction_id"))
+        .select_from(TransitionStateInference)
+        .join(
+            TransitionStateEndpoint,
+            col(TransitionStateEndpoint.calculation_frame_id)
+            == col(TransitionStateInference.calculation_frame_id),
+        )
+        .where(
+            col(TransitionStateEndpoint.topology_id) == topology_id,
+            col(TransitionStateInference.status) == TransitionStateInferenceStatus.SUCCEEDED,
+            col(TransitionStateInference.logical_reaction_id).is_not(None),
+        )
+    )
+    transition_state_node_reaction_ids: Any = (
+        select(col(MappedReaction.logical_reaction_id).label("logical_reaction_id"))
+        .select_from(MappedReaction)
+        .join(
+            MappedReactionNode,
+            col(MappedReactionNode.mapped_reaction_id) == col(MappedReaction.id),
+        )
+        .join(
+            MappedReactionNodeGeometry,
+            col(MappedReactionNodeGeometry.mapped_reaction_node_id) == col(MappedReactionNode.id),
+        )
+        .join(Geometry, col(MappedReactionNodeGeometry.geometry_id) == col(Geometry.id))
+        .where(
+            col(Geometry.topology_id) == topology_id,
+            col(MappedReactionNode.role) == "transition_state",
+        )
+    )
+    return participant_reaction_ids.union(
+        endpoint_reaction_ids,
+        transition_state_node_reaction_ids,
+    )
 
 
 def reaction_smarts_from_mol_blocks(
@@ -803,6 +867,7 @@ def _frame_summary(
     artifact: ArtifactFile,
     geometry: Geometry,
     topology: MolecularTopology,
+    protocol: CalculationProtocol | None = None,
 ) -> CalculationFrameSummary:
     return CalculationFrameSummary(
         id=_required_uuid(frame.id, "CalculationFrame"),
@@ -818,6 +883,7 @@ def _frame_summary(
         topology_id=geometry.topology_id,
         topology_derivation_id=frame.topology_derivation_id,
         protocol_id=segment.protocol_id,
+        protocol_level=protocol_level_view(protocol),
         canonical_isomeric_smiles=topology.canonical_isomeric_smiles,
         charge=frame.charge,
         multiplicity=frame.multiplicity,
@@ -891,6 +957,7 @@ def _frame_select(*, lightweight: bool = False) -> Any:
             ArtifactFile,
             Geometry,
             MolecularTopology,
+            CalculationProtocol,
         )
         .join(
             CalculationSegment,
@@ -909,6 +976,10 @@ def _frame_select(*, lightweight: bool = False) -> Any:
             MolecularTopology,
             col(Geometry.topology_id) == col(MolecularTopology.id),
         )
+        .outerjoin(
+            CalculationProtocol,
+            col(CalculationSegment.protocol_id) == col(CalculationProtocol.id),
+        )
     )
     if lightweight:
         frame_orm = cast(Any, CalculationFrame)
@@ -917,6 +988,7 @@ def _frame_select(*, lightweight: bool = False) -> Any:
         artifact_orm = cast(Any, ArtifactFile)
         geometry_orm = cast(Any, Geometry)
         topology_orm = cast(Any, MolecularTopology)
+        protocol_orm = cast(Any, CalculationProtocol)
         statement = statement.options(
             load_only(
                 frame_orm.id,
@@ -947,6 +1019,18 @@ def _frame_select(*, lightweight: bool = False) -> Any:
             load_only(artifact_orm.id, artifact_orm.original_filename),
             load_only(geometry_orm.id, geometry_orm.topology_id),
             load_only(topology_orm.id, topology_orm.canonical_isomeric_smiles),
+            load_only(
+                protocol_orm.id,
+                protocol_orm.method_family,
+                protocol_orm.method,
+                protocol_orm.reference_method,
+                protocol_orm.functional,
+                protocol_orm.basis_set,
+                protocol_orm.auxiliary_basis_set,
+                protocol_orm.dispersion_model,
+                protocol_orm.solvation_model,
+                protocol_orm.solvent,
+            ),
         )
     return statement
 
@@ -1825,20 +1909,9 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
         scope = await query_visibility_scope(project_id=project_id)
         predicates: list[Any] = [logical_reaction_id_is_visible(scope, col(LogicalReaction.id))]
         if topology_id is not None:
-            reaction_ids = select(col(LogicalReactionParticipant.logical_reaction_id)).where(
-                or_(
-                    col(LogicalReactionParticipant.topology_id) == topology_id,
-                    col(LogicalReactionParticipant.id).in_(
-                        select(
-                            col(LogicalParticipantConcreteTopology.logical_reaction_participant_id)
-                        ).where(
-                            col(LogicalParticipantConcreteTopology.concrete_topology_id)
-                            == topology_id
-                        )
-                    ),
-                )
+            predicates.append(
+                col(LogicalReaction.id).in_(_logical_reaction_ids_for_topology(topology_id))
             )
-            predicates.append(col(LogicalReaction.id).in_(reaction_ids))
         if reaction_key is not None:
             predicates.append(col(LogicalReaction.reaction_key) == reaction_key)
         if label is not None:
@@ -2431,7 +2504,7 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
         if logical_reaction_id is not None:
             predicates.append(col(MappedReaction.logical_reaction_id) == logical_reaction_id)
         if topology_id is not None:
-            mapped_ids = (
+            mapped_ids: Any = (
                 select(col(MappedReactionParticipant.mapped_reaction_id))
                 .join(
                     LogicalReactionParticipant,
@@ -2445,6 +2518,23 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
                     )
                 )
             )
+            transition_state_node_mapped_ids = (
+                select(col(MappedReactionNode.mapped_reaction_id))
+                .join(
+                    MappedReactionNodeGeometry,
+                    col(MappedReactionNodeGeometry.mapped_reaction_node_id)
+                    == col(MappedReactionNode.id),
+                )
+                .join(
+                    Geometry,
+                    col(MappedReactionNodeGeometry.geometry_id) == col(Geometry.id),
+                )
+                .where(
+                    col(Geometry.topology_id) == topology_id,
+                    col(MappedReactionNode.role) == "transition_state",
+                )
+            )
+            mapped_ids = mapped_ids.union(transition_state_node_mapped_ids)
             predicates.append(col(MappedReaction.id).in_(mapped_ids))
         if geometry_id is not None:
             mapped_ids = (
@@ -2950,7 +3040,15 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
             thermochemistry,
         ) in calculation_rows:
             calculations_by_geometry[frame.geometry_id].append(
-                _frame_summary(frame, segment, revision, artifact, geometry, topology)
+                _frame_summary(
+                    frame,
+                    segment,
+                    revision,
+                    artifact,
+                    geometry,
+                    topology,
+                    protocol,
+                )
             )
             energy_rows.append((frame, protocol, thermochemistry))
         energy_composites = geometry_energy_composites(geometry_ids, energy_rows)
@@ -3274,7 +3372,7 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
             ).first()
             if row is None:
                 return None
-            frame, segment, revision, artifact, geometry, topology = row
+            frame, segment, revision, artifact, geometry, topology, protocol = row
             topology_derivation = (
                 await session.execute(
                     select(MolecularTopologyDerivation).where(
@@ -3282,17 +3380,6 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
                     )
                 )
             ).scalar_one()
-            protocol = (
-                (
-                    await session.execute(
-                        select(CalculationProtocol).where(
-                            col(CalculationProtocol.id) == segment.protocol_id
-                        )
-                    )
-                ).scalar_one_or_none()
-                if segment.protocol_id is not None
-                else None
-            )
             energy = (
                 await session.execute(
                     select(FrameEnergyResult).where(col(FrameEnergyResult.frame_id) == frame_id)
@@ -3362,7 +3449,15 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
                 .all()
             )
 
-        summary = _frame_summary(frame, segment, revision, artifact, geometry, topology)
+        summary = _frame_summary(
+            frame,
+            segment,
+            revision,
+            artifact,
+            geometry,
+            topology,
+            protocol,
+        )
         return CalculationFrameDetail(
             **summary.model_dump(),
             source_span=(

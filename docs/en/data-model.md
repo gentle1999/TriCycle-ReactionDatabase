@@ -137,7 +137,7 @@ Chemistry policies are code-owned and versioned in
 
 | Policy | Current value | Meaning |
 | --- | --- | --- |
-| `CALCULATION_PROTOCOL_VERSION` | `calculation-protocol-v1` | calculation-protocol identity |
+| `CALCULATION_PROTOCOL_VERSION` | `calculation-protocol-v2` | calculation-protocol identity; normalized functional/dispersion suffix |
 | `FORMULA_COMPOSITION_VERSION` | `formula-composition-v1` | formula/isotopic-composition identity |
 | `TOPOLOGY_IDENTITY_VERSION` | `topology-identity-v1` | strict molecular-graph identity |
 | `TOPOLOGY_SOURCE_ORDER_STEREO_IDENTITY_VERSION` | `topology-source-order-stereo-identity-v1` | source-order and stereo identity |
@@ -145,7 +145,7 @@ Chemistry policies are code-owned and versioned in
 | `GEOMETRY_CANONICALIZATION_VERSION` | `geometry-internal-coordinates-v1` | Geometry internal-coordinate identity |
 | `STEREO_ABSTRACTION_POLICY_VERSION` | `topology-stereo-abstraction-v1` | DAG edge and projection policy |
 | `STEREO_ABSTRACTION_MATCH_SCHEMA_VERSION` | `topology-stereo-abstraction-match-v1` | abstraction evidence format |
-| `INVERSION_STEREO_PROJECTION_POLICY_VERSION` | `reaction-inversion-stereo-projection-v1` | reaction-level dual-sided inversion projection |
+| `INVERSION_STEREO_PROJECTION_POLICY_VERSION` | `reaction-inversion-stereo-projection-v2` | reaction-level dual-sided inversion projection |
 | `LOGICAL_PARTICIPANT_CONCRETE_MATCH_POLICY_VERSION` | `logical-participant-concrete-match-v1` | logical-to-concrete participant matching |
 | `GEOMETRY_MATCH_POLICY_VERSION` | `geometry-internal-coordinate-match-v4` | Geometry matching policy |
 | `REACTION_GEOMETRY_LINK_METHOD` | `topology-identity` | reaction/Geometry linking method |
@@ -153,13 +153,13 @@ Chemistry policies are code-owned and versioned in
 | `GEOMETRY_ENERGY_POLICY_VERSION` | `geometry-energy-view-v1` | Geometry energy read model |
 | `MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION` | `mapped-reaction-thermodynamics-v1` | mapped-reaction thermodynamic projection |
 
-The only currently registered inversion-labile rule is
-`neutral-trivalent-nitrogen`, atom SMARTS `[N;X3;v3;+0]`. It is an atom rule,
-not a bond rule. After matching the atom, the service examines adjacent bonds
-and stereo reference atoms to find dependent C=N E/Z or other neighboring
-stereo features. Adding another reversible centre requires a reviewed rule and
-version; an environment variable must not silently change persisted chemical
-identity.
+The currently registered inversion-labile rules use three atom SMARTS patterns:
+`[#8,#16,#34;X3;v3;+1]`, `[#7,#15,#33;X3;v3;+0]`, and
+`[#9,#17,#35,#53;X3;v3;+2]`. They are atom rules, not bond rules. After
+matching an atom, the service examines adjacent bonds and stereo reference atoms
+to find dependent C=N E/Z or other neighboring stereo features. Adding or
+changing a reversible centre requires a reviewed rule and version; an
+environment variable must not silently change persisted chemical identity.
 
 ## Ingestion and Parse States
 
@@ -219,6 +219,13 @@ budget uses `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS` for 10 MiB and scales
 linearly with source size. A timeout stops only that file and frees its slot.
 Bound `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, and `MKL_NUM_THREADS`; file
 worker concurrency is not a native-thread limit.
+Calculation-output imports reject unambiguous JSON/CSV/structure sidecars before
+MolOP. Identity preparation and persistence use bounded transactions, and
+transient database resource failures back off, split the batch, and remain
+retryable in the state file.
+
+See [recommended import settings](development.md#recommended-import-settings) for
+low-resource and throughput-oriented starting profiles.
 
 ## TS Endpoint Inference and Reactions
 
@@ -279,13 +286,13 @@ strict mapped endpoints
   -> create/reuse LogicalReaction
 ```
 
-The only registered rule is `[N;X3;v3;+0]`, neutral trivalent nitrogen. The
-rule matches an **atom**, not a bond; after matching it, the service examines
-adjacent bonds, neighboring atoms, and double-bond stereo reference atoms. Thus
-an sp3 N in a product or TS can supply the labile atom map even when the
-corresponding reactant N is sp2, allowing the dependent C=N E/Z to be cleared.
-The rule is dual-sided and must not be applied only to a presumed reactant or
-product.
+The registered rules are the three patterns above. Each rule matches an
+**atom**, not a bond; after matching it, the service examines adjacent bonds,
+neighboring atoms, and double-bond stereo reference atoms. Thus a matching
+trivalent atom in a product or TS can supply the labile atom map even when the
+corresponding reactant atom has another valence state, allowing dependent
+neighboring E/Z to be cleared. The rules are dual-sided and must not be applied
+only to a presumed reactant or product.
 
 Projection clears only the selected atom chirality, dependent double-bond E/Z,
 and the adjacent single-bond directions used to serialize that E/Z. Unrelated

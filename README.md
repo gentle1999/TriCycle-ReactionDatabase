@@ -163,9 +163,9 @@ IMPORT_MODE=development \
 IMPORT_PROJECT_ID=<project-uuid> \
 IMPORT_ROOTS='/data/calculations /data/supplemental' \
 IMPORT_STATE_FILE=.tmp/artifact-import.jsonl \
-IMPORT_PIPELINE_WINDOW_FILES=128 \
+IMPORT_PIPELINE_WINDOW_FILES=64 \
 IMPORT_COMMIT_BATCH_FILES=16 \
-IMPORT_STREAM_QUEUE_SIZE=128 \
+IMPORT_STREAM_QUEUE_SIZE=64 \
 make import-artifacts
 ```
 
@@ -174,19 +174,27 @@ size, mtime, and SHA-256. Files that contain no recoverable calculation frames
 are retained as filtered artifacts; a failure in one file does not discard
 successfully parsed frames or unrelated files.
 
-The importer deliberately separates three controls:
+The importer deliberately separates four controls:
 
 | Control | Default | Purpose |
 | --- | --- | --- |
 | `TRICYCLE_MOLOP_BATCH_N_JOBS` | `2` | Number of concurrent file-level MolOP workers |
-| `IMPORT_PIPELINE_WINDOW_FILES` | `128` | Candidate files available to the parser queue |
+| `IMPORT_PIPELINE_WINDOW_FILES` | `64` | Candidate files available to the parser queue |
 | `IMPORT_COMMIT_BATCH_FILES` | `16` | Completed files per persistence/checkpoint microbatch |
+| `IMPORT_STREAM_QUEUE_SIZE` | `64` | Bounded discovery/fingerprinting buffer |
 
 Set the pipeline window appreciably above the worker count so a finished worker
 can immediately take the next queued file. Do not use the persistence microbatch
 size to limit parser concurrency. Keep `OMP_NUM_THREADS`,
 `OPENBLAS_NUM_THREADS`, and `MKL_NUM_THREADS` bounded (the supplied development
 configuration uses `1`) to avoid nested native-thread oversubscription.
+
+For a dedicated compute host, use `TRICYCLE_MOLOP_BATCH_N_JOBS=16`, native
+thread limits of `1 / 1 / 1`, a `64 / 64` pipeline/stream window, and a
+`16`-file persistence microbatch as the throughput-oriented starting point.
+Keep the conservative `2` worker setting on a low-resource development host;
+the full tuning table and the separate browser/upload-worker settings are in
+[Development: recommended import settings](docs/en/development.md#recommended-import-settings).
 
 The baseline file timeout is `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS` for a
 10 MiB source. Larger files receive a proportional allowance; a timed-out file

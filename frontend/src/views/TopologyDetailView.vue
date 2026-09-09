@@ -22,6 +22,7 @@ const navigationQuery = computed(() => withoutAccessState(route.query));
 const relatedPageLimit = 24;
 const geometryOffset = ref(0);
 const reactionOffset = ref(0);
+const transitionStateReactionOffset = ref(0);
 
 const topologyQuery = useQuery({
   queryKey: computed(() => ["topology-detail", topologyId.value]),
@@ -85,9 +86,39 @@ const reactionsQuery = usePaginatedQuery({
   staleTime: 60_000,
 });
 
+function transitionStateReactionPageQueryKey(offset: number) {
+  return ["topology-transition-state-reactions", {
+    topologyId: topologyId.value,
+    projectId: currentProjectId.value,
+    nodeRole: "transition_state",
+    limit: relatedPageLimit,
+    offset,
+  }] as const;
+}
+
+function fetchTransitionStateReactionPage(offset: number, signal: AbortSignal) {
+  return api.mappedReactions({
+    projectId: currentProjectId.value ?? undefined,
+    topologyId: topologyId.value ?? undefined,
+    nodeRole: "transition_state",
+    limit: relatedPageLimit,
+    offset,
+  }, signal);
+}
+
+const transitionStateReactionsQuery = usePaginatedQuery({
+  queryKey: computed(() => transitionStateReactionPageQueryKey(transitionStateReactionOffset.value)),
+  enabled: computed(() => topologyId.value !== null && currentProjectId.value !== null),
+  offset: transitionStateReactionOffset,
+  fetchPage: fetchTransitionStateReactionPage,
+  queryKeyForOffset: transitionStateReactionPageQueryKey,
+  staleTime: 60_000,
+});
+
 const topology = computed(() => topologyQuery.data.value ?? null);
 const geometries = computed(() => geometriesQuery.data.value?.items ?? []);
 const reactions = computed(() => reactionsQuery.data.value?.items ?? []);
+const transitionStateReactions = computed(() => transitionStateReactionsQuery.data.value?.items ?? []);
 const copiedSmiles = ref(false);
 const smilesCopyError = ref("");
 let smilesCopyResetTimer: number | null = null;
@@ -100,6 +131,11 @@ const reactionPage = computed(() => reactionsQuery.data.value?.page ?? {
   total: 0,
   limit: relatedPageLimit,
   offset: reactionOffset.value,
+});
+const transitionStateReactionPage = computed(() => transitionStateReactionsQuery.data.value?.page ?? {
+  total: 0,
+  limit: relatedPageLimit,
+  offset: transitionStateReactionOffset.value,
 });
 const detailError = computed(() => topologyQuery.error.value instanceof Error ? topologyQuery.error.value.message : "");
 
@@ -141,6 +177,7 @@ async function copyTopologySmiles(): Promise<void> {
 watch([currentProjectId, topologyId], () => {
   geometryOffset.value = 0;
   reactionOffset.value = 0;
+  transitionStateReactionOffset.value = 0;
 });
 
 function previousGeometryPage(): void {
@@ -169,6 +206,26 @@ function nextReactionPage(): void {
 
 function jumpReactionPage(offset: number): void {
   reactionOffset.value = offset;
+}
+
+function previousTransitionStateReactionPage(): void {
+  transitionStateReactionOffset.value = Math.max(
+    0,
+    transitionStateReactionOffset.value - transitionStateReactionPage.value.limit,
+  );
+}
+
+function nextTransitionStateReactionPage(): void {
+  if (
+    transitionStateReactionOffset.value + transitionStateReactionPage.value.limit
+    < transitionStateReactionPage.value.total
+  ) {
+    transitionStateReactionOffset.value += transitionStateReactionPage.value.limit;
+  }
+}
+
+function jumpTransitionStateReactionPage(offset: number): void {
+  transitionStateReactionOffset.value = offset;
 }
 
 function openGeometry(id: string): void {
@@ -271,6 +328,20 @@ onBeforeUnmount(() => {
           </RouterLink>
         </div>
         <PaginationControls :page="reactionPage" label="关联反应分页" @previous="previousReactionPage" @next="nextReactionPage" @jump="jumpReactionPage" />
+      </section>
+
+      <section class="entity-related-section">
+        <header><div><span class="eyebrow">MappedReaction · transition_state</span><h2>作为 TS 节点使用的映射反应</h2></div><span>{{ transitionStateReactionsQuery.data.value?.page.total ?? 0 }} 个</span></header>
+        <div v-if="transitionStateReactionsQuery.isLoading.value" class="entity-related-loading"><div class="loading-block is-wide"></div></div>
+        <div v-else-if="transitionStateReactionsQuery.error.value" class="compact-empty">TS 节点映射反应读取失败</div>
+        <div v-else-if="!transitionStateReactions.length" class="compact-empty">当前拓扑没有作为 TS 节点使用的映射反应</div>
+        <div v-else class="topology-reaction-list">
+          <RouterLink v-for="mappedReaction in transitionStateReactions" :key="mappedReaction.id" :to="{ name: 'mapped-reaction-detail', params: { mappedReactionId: mappedReaction.id }, query: navigationQuery }">
+            <span><strong>{{ mappedReaction.label || mappedReaction.mapped_reaction_key }}</strong><small>{{ mappedReaction.mapped_reaction_kind }} · {{ mappedReaction.mapped_reaction_smiles }}</small></span>
+            <code>{{ shortId(mappedReaction.id) }}</code><ArrowUpRight :size="15" aria-hidden="true" />
+          </RouterLink>
+        </div>
+        <PaginationControls :page="transitionStateReactionPage" label="TS 节点映射反应分页" @previous="previousTransitionStateReactionPage" @next="nextTransitionStateReactionPage" @jump="jumpTransitionStateReactionPage" />
       </section>
     </template>
   </main>

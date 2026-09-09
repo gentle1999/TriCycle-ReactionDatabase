@@ -106,7 +106,7 @@ abstraction policy、匹配 schema、原子对应和被抽象的 feature，便�
 
 | 配置 | 当前版本/值 | 语义 |
 | --- | --- | --- |
-| `CALCULATION_PROTOCOL_VERSION` | `calculation-protocol-v1` | 计算协议身份 |
+| `CALCULATION_PROTOCOL_VERSION` | `calculation-protocol-v2` | 计算协议身份；统一 functional 与 dispersion_model 的色散后缀 |
 | `FORMULA_COMPOSITION_VERSION` | `formula-composition-v1` | 分子式/同位素组成身份 |
 | `TOPOLOGY_IDENTITY_VERSION` | `topology-identity-v1` | 严格分子图身份 |
 | `TOPOLOGY_SOURCE_ORDER_STEREO_IDENTITY_VERSION` | `topology-source-order-stereo-identity-v1` | 源原子顺序与立体身份 |
@@ -114,7 +114,7 @@ abstraction policy、匹配 schema、原子对应和被抽象的 feature，便�
 | `GEOMETRY_CANONICALIZATION_VERSION` | `geometry-internal-coordinates-v1` | Geometry 内坐标身份 |
 | `STEREO_ABSTRACTION_POLICY_VERSION` | `topology-stereo-abstraction-v1` | DAG 边和抽象投影策略 |
 | `STEREO_ABSTRACTION_MATCH_SCHEMA_VERSION` | `topology-stereo-abstraction-match-v1` | 抽象匹配证据格式 |
-| `INVERSION_STEREO_PROJECTION_POLICY_VERSION` | `reaction-inversion-stereo-projection-v1` | 反应级双侧 inversion 投影 |
+| `INVERSION_STEREO_PROJECTION_POLICY_VERSION` | `reaction-inversion-stereo-projection-v2` | 反应级双侧 inversion 投影 |
 | `LOGICAL_PARTICIPANT_CONCRETE_MATCH_POLICY_VERSION` | `logical-participant-concrete-match-v1` | 逻辑组分到具体拓扑匹配 |
 | `GEOMETRY_MATCH_POLICY_VERSION` | `geometry-internal-coordinate-match-v4` | Geometry 匹配策略 |
 | `REACTION_GEOMETRY_LINK_METHOD` | `topology-identity` | 反应 Geometry 联系方法 |
@@ -122,11 +122,11 @@ abstraction policy、匹配 schema、原子对应和被抽象的 feature，便�
 | `GEOMETRY_ENERGY_POLICY_VERSION` | `geometry-energy-view-v1` | Geometry 能量派生视图 |
 | `MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION` | `mapped-reaction-thermodynamics-v1` | mapped reaction 热力学派生策略 |
 
-当前唯一登记的可翻转规则是 `neutral-trivalent-nitrogen`，原子 SMARTS 为
-`[N;X3;v3;+0]`。这是原子规则，不是键规则；规则匹配到原子后，再检查该原子所在的
-相邻键及其 stereo reference atom，从而找到受该中心影响的 C=N E/Z 或其他邻接 stereo
-feature。新增可翻转中心必须增加经过审查的规则和版本，不能通过环境变量静默改变持久化
-化学身份。
+当前登记的可翻转规则有三组原子 SMARTS：`[#8,#16,#34;X3;v3;+1]`、
+`[#7,#15,#33;X3;v3;+0]` 和 `[#9,#17,#35,#53;X3;v3;+2]`。这是原子规则，不是键规则；
+规则匹配到原子后，再检查该原子所在的相邻键及其 stereo reference atom，从而找到受该中心
+影响的 C=N E/Z 或其他邻接 stereo feature。新增或调整可翻转中心必须增加经过审查的规则
+和版本，不能通过环境变量静默改变持久化化学身份。
 
 ## 导入与解析状态
 
@@ -172,7 +172,11 @@ worker 的 `recover_stale` 会按项目、文件大小、artifact kind 和该哈
 数，以便任一文件完成或超时后立即接替下一个文件。单文件解析预算以
 `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS` 为 10 MiB 基准并随文件大小线性放大；超时只
 终止该文件任务并释放槽位。限制 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS` 和
-`MKL_NUM_THREADS`，而不是把文件并发误当作 native thread 限制。
+`MKL_NUM_THREADS`，而不是把文件并发误当作 native thread 限制。计算输出导入会在 MolOP
+之前排除明确的 JSON/CSV/结构等旁车文件；准备身份预约和持久化都使用有界事务，瞬态数据库
+资源错误会自动退避、拆批并在状态文件中保持可重试。
+
+具体的低资源与吞吐优先起始值见[文件导入超参数推荐](development.md#推荐的导入超参数)。
 
 ## TS 前后体推断和反应
 
@@ -224,10 +228,10 @@ strict mapped endpoints
   -> create/reuse LogicalReaction
 ```
 
-当前登记的可翻转规则只有 `[N;X3;v3;+0]`，即中性三价 N。规则匹配的是**原子**而不是键；
-匹配原子后检查其相邻键、相邻原子和 double-bond stereo reference atom。这样，后体或 TS 中
-的 sp3 N 可以提供 labile atom map，即使前体中的对应 N 已经是 sp2，也能清除该 map 依赖的
-C=N E/Z。该规则同时覆盖前体和后体，不能只按“前体”或“后体”单向判断。
+当前登记的可翻转规则是上述三组原子 SMARTS。规则匹配的是**原子**而不是键；匹配原子后
+检查其相邻键、相邻原子和 double-bond stereo reference atom。这样，后体或 TS 中符合规则
+的三价原子可以提供 labile atom map，即使前体中的对应原子处于另一种价态，也能清除该 map
+依赖的邻接 E/Z。规则同时覆盖前体和后体，不能只按“前体”或“后体”单向判断。
 
 投影时只清除命中的原子手性、相关双键 E/Z 及其书写所需的相邻单键方向；不相关的 E/Z、
 R/S、键连接、显式氢、形式电荷和自由基标记全部保留。没有完整 mapping 时不能跨端点传播
