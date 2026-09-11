@@ -171,8 +171,7 @@ export function useCatalogQueries(options: CatalogQueryOptions) {
   const artifacts = usePaginatedQuery({
     queryKey: computed(() => artifactPageQueryKey(options.artifactOffset.value)),
     enabled: computed(() =>
-      options.activeView.value === "artifacts" &&
-      options.projectId.value !== null,
+      options.activeView.value === "artifacts",
     ),
     offset: options.artifactOffset,
     fetchPage: fetchArtifactPage,
@@ -184,7 +183,7 @@ export function useCatalogQueries(options: CatalogQueryOptions) {
   const artifactPreview = useQuery({
     queryKey: computed(() => ["catalog", "artifact-preview", { id: options.artifactId.value, projectId: options.projectId.value }]),
     queryFn: ({ signal }) => api.artifactPreview(options.artifactId.value ?? "", { projectId: options.projectId.value ?? undefined }, signal),
-    enabled: computed(() => options.activeView.value === "artifacts" && options.artifactId.value !== null && options.projectId.value !== null),
+    enabled: computed(() => options.activeView.value === "artifacts" && options.artifactId.value !== null),
     staleTime: 60_000,
   });
 

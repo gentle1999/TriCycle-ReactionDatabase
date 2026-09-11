@@ -38,6 +38,7 @@ const projectScopedNames = new Set([
   "artifact-detail",
   "statistics",
 ]);
+const publicArtifactNames = new Set(["artifacts", "artifact-detail"]);
 const ACTIVE_PROJECT_STORAGE_KEY = "tricycle.activeProjectId";
 
 function preferredProjectId(user: Awaited<ReturnType<typeof api.currentUser>>): string | null {
@@ -86,6 +87,7 @@ export const router = createRouter({
 
 router.beforeEach(async (to) => {
   const routeName = String(to.name);
+  const isPublicArtifactRoute = publicArtifactNames.has(routeName);
   if (
     !protectedNames.has(routeName)
     && !to.meta.requiresAuth
@@ -99,6 +101,12 @@ router.beforeEach(async (to) => {
       staleTime: 60_000,
     });
   } catch (error) {
+    // The public Artifact catalog must be able to render after an outage
+    // redirect. Otherwise the guard asks for the same failed session query
+    // again and redirects the catalog to itself indefinitely.
+    if (isPublicArtifactRoute && to.name === "artifacts" && (
+      to.query.forbidden || to.query.login || to.query.unavailable
+    )) return true;
     const forbidden = error instanceof ApiError && error.status === 403;
     return {
       name: "artifacts",
@@ -131,6 +139,9 @@ router.beforeEach(async (to) => {
     }
     return true;
   }
+  // Artifact rows and public previews remain available to anonymous users;
+  // project-scoped routes continue through the authenticated branch below.
+  if (!user && isPublicArtifactRoute) return true;
   if (to.name === "reactions") {
     return { name: "artifacts", query: { login: "required", redirect: to.fullPath } };
   }

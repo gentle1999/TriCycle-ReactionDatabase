@@ -92,9 +92,7 @@ async def test_statistics_and_export_share_logical_reaction_filters(
                     mapped_reaction_key=f"analytics-filter-path-{suffix}-{index}",
                     mapped_reaction_kind=MappedReactionKind.OTHER,
                     mapped_reaction_smiles="[H:1][H:2]>>[H:1][H:2]",
-                    mapping_hash=hashlib.sha256(
-                        f"mapping:{suffix}:{index}".encode()
-                    ).hexdigest(),
+                    mapping_hash=hashlib.sha256(f"mapping:{suffix}:{index}".encode()).hexdigest(),
                 )
                 session.add(mapped_reaction)
                 await session.flush()

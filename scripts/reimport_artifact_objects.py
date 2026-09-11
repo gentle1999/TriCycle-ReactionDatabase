@@ -651,9 +651,7 @@ async def _run(args: argparse.Namespace) -> int:
                                     )
                                 totals["succeeded"] += 1
                                 totals["source_frames"] += item_result.source_frame_count or 0
-                                totals["ts_frames"] += (
-                                    item_result.transition_state_frame_count or 0
-                                )
+                                totals["ts_frames"] += item_result.transition_state_frame_count or 0
                                 totals["inferred_reactions"] += item_result.inferred_reaction_count
                                 _append_checkpoint(
                                     state_file,

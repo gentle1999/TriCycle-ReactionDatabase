@@ -766,7 +766,7 @@ test("artifact quick and advanced filters preserve filename semantics", async ({
 test("artifact rows link to a standalone detail page", async ({ page }, testInfo) => {
   const projectId = "00000000-0000-7000-8000-000000000201";
   const artifactPointer = await findArtifactWithMultipleFrames(page);
-  const response = await page.request.get(`/api/artifacts/${artifactPointer.id}`);
+  const response = await page.request.get(`/api/artifacts/${artifactPointer.id}?project_id=${projectId}`);
   expect(response.ok()).toBe(true);
   const artifact = await response.json() as {
     id: string;
@@ -1154,17 +1154,20 @@ test("mapped reaction shows every partial thermodynamic profile and level", asyn
 });
 
 test("V2000 M CHG records survive ChemDoodle rendering", async ({ page }) => {
+  const projectId = "00000000-0000-7000-8000-000000000201";
   await page.setViewportSize({ width: 1440, height: 960 });
   const target = await findLogicalReactionPage(page, "DA bench");
   const topologyId = target.reaction.reactant_topology_ids[0];
   if (!topologyId) throw new Error("DA fixture is missing its first reactant topology");
-  const molfileResponse = await page.request.get(`/api/depictions/topology/${topologyId}.mol`);
+  const molfileResponse = await page.request.get(
+    `/api/depictions/topology/${topologyId}.mol?project_id=${projectId}`,
+  );
   expect(molfileResponse.ok()).toBe(true);
   const molfile = await molfileResponse.text();
   expect(molfile).toContain("V2000");
   const chargedMolfile = molfile.replace("M  END", "M  CHG  2   1  -1   2   1\nM  END");
   expect(chargedMolfile).not.toBe(molfile);
-  await page.route(`**/api/depictions/topology/${topologyId}.mol`, async (route) => {
+  await page.route(`**/api/depictions/topology/${topologyId}.mol?*`, async (route) => {
     await route.fulfill({
       contentType: "chemical/x-mdl-molfile",
       body: chargedMolfile,
