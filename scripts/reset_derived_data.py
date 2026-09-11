@@ -126,21 +126,16 @@ async def _run(args: argparse.Namespace) -> int:
     expected_slugs = tuple(args.project_slugs or REQUIRED_PROJECT_SLUGS)
     async with session_factory() as session, session.begin():
         revision = str(
-            (
-                await session.execute(text("SELECT version_num FROM alembic_version"))
-            ).scalar_one()
+            (await session.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
         )
         if revision != EXPECTED_SCHEMA_HEAD:
-            raise RuntimeError(
-                f"database must be at {EXPECTED_SCHEMA_HEAD}, found {revision}"
-            )
+            raise RuntimeError(f"database must be at {EXPECTED_SCHEMA_HEAD}, found {revision}")
 
         projects = (
             await session.execute(text("SELECT slug, id, name FROM project ORDER BY slug"))
         ).all()
         project_by_slug = {
-            str(slug): (str(project_id), str(name))
-            for slug, project_id, name in projects
+            str(slug): (str(project_id), str(name)) for slug, project_id, name in projects
         }
         missing = [slug for slug in expected_slugs if slug not in project_by_slug]
         if missing:
@@ -152,26 +147,22 @@ async def _run(args: argparse.Namespace) -> int:
         )
 
         preserved_before = {
-            table_name: await _count(session, table_name)
-            for table_name in PRESERVED_TABLES
+            table_name: await _count(session, table_name) for table_name in PRESERVED_TABLES
         }
         derived_before = {
-            table_name: await _count(session, table_name)
-            for table_name in DERIVED_TABLES
+            table_name: await _count(session, table_name) for table_name in DERIVED_TABLES
         }
         quoted_tables = ", ".join(f'"{table_name}"' for table_name in DERIVED_TABLES)
         await session.execute(text(f"TRUNCATE TABLE {quoted_tables} RESTART IDENTITY CASCADE"))
         preserved_after = {
-            table_name: await _count(session, table_name)
-            for table_name in PRESERVED_TABLES
+            table_name: await _count(session, table_name) for table_name in PRESERVED_TABLES
         }
         if preserved_after != preserved_before:
             raise RuntimeError(
                 "the derived-table truncate changed a preserved table; transaction rolled back"
             )
         derived_after = {
-            table_name: await _count(session, table_name)
-            for table_name in DERIVED_TABLES
+            table_name: await _count(session, table_name) for table_name in DERIVED_TABLES
         }
         non_empty = {name: count for name, count in derived_after.items() if count}
         if non_empty:
@@ -187,9 +178,7 @@ async def _run(args: argparse.Namespace) -> int:
                     for slug in expected_slugs
                 },
                 "preserved_counts": preserved_before,
-                "cleared_counts": {
-                    name: count for name, count in derived_before.items() if count
-                },
+                "cleared_counts": {name: count for name, count in derived_before.items() if count},
                 "remaining_derived_rows": 0,
             },
             ensure_ascii=False,

@@ -99,9 +99,7 @@ def test_project_scope_uses_direct_project_ownership_for_derived_roots() -> None
         select(MolecularTopology.id).where(
             topology_id_is_visible(scope, col(MolecularTopology.id))
         ),
-        select(MolecularFormula.id).where(
-            formula_id_is_visible(scope, col(MolecularFormula.id))
-        ),
+        select(MolecularFormula.id).where(formula_id_is_visible(scope, col(MolecularFormula.id))),
     )
 
     for statement in statements:

@@ -169,9 +169,7 @@ class UploadBatchWorker:
                     limit=settings.upload_worker_concurrency,
                 )
                 if pending_jobs:
-                    await asyncio.gather(
-                        *(self._process_pending(job) for job in pending_jobs)
-                    )
+                    await asyncio.gather(*(self._process_pending(job) for job in pending_jobs))
                     continue
             except asyncio.CancelledError:
                 raise

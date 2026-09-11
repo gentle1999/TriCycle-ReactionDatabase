@@ -371,9 +371,7 @@ def downgrade() -> None:
             """
         )
     )
-    op.execute(
-        sa.text("DROP FUNCTION IF EXISTS reject_orphan_thermodynamic_profile_write()")
-    )
+    op.execute(sa.text("DROP FUNCTION IF EXISTS reject_orphan_thermodynamic_profile_write()"))
     op.execute(
         sa.text(
             """
@@ -399,8 +397,7 @@ def downgrade() -> None:
     )
     op.execute(
         sa.text(
-            "DROP TRIGGER IF EXISTS trg_calculation_protocol_project_owner "
-            "ON calculation_protocol"
+            "DROP TRIGGER IF EXISTS trg_calculation_protocol_project_owner ON calculation_protocol"
         )
     )
     for table_name in (

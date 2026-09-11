@@ -420,7 +420,8 @@ def downgrade() -> None:
     for table_name in (*_TRIGGER_TABLES, "molecular_formula"):
         trigger_name = (
             f"trg_{table_name}_project_immutable"
-            if table_name in {
+            if table_name
+            in {
                 "molecular_formula",
                 "molecular_topology",
                 "molecular_topology_abstraction",

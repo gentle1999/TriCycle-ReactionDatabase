@@ -139,9 +139,7 @@ class CalculationResultQueryService(UseCaseService):  # type: ignore[misc]
         """List frames that own at least one advanced result container."""
 
         scope = await query_visibility_scope(project_id=project_id)
-        predicates: list[Any] = [
-            frame_id_is_visible(scope, col(CalculationFrame.id))
-        ]
+        predicates: list[Any] = [frame_id_is_visible(scope, col(CalculationFrame.id))]
         if frame_id is not None:
             predicates.append(col(CalculationFrame.id) == frame_id)
         if artifact_file_id is not None:

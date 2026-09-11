@@ -657,9 +657,7 @@ def _register_topology_upstreams(
         session,
         topology,
         project_id=(
-            context.project_id
-            if context is not None
-            else getattr(topology, "project_id", None)
+            context.project_id if context is not None else getattr(topology, "project_id", None)
         ),
         abstraction_policy_version=STEREO_ABSTRACTION_POLICY_VERSION,
         candidate_topologies=candidates,

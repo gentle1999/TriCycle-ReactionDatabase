@@ -485,8 +485,7 @@ def test_advanced_results_and_derivation_queries_use_explicit_fixture(
         )
         derivation_detail = asyncio.run(
             MolecularTopologyDerivationQueryService.get_topology_derivation(
-                project_id=SYSTEM_PROJECT_ID,
-                derivation_id=derivation_id
+                project_id=SYSTEM_PROJECT_ID, derivation_id=derivation_id
             )
         )
         frame_detail = asyncio.run(

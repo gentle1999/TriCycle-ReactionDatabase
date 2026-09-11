@@ -587,9 +587,7 @@ async def authorization_sample() -> AsyncIterator[AuthorizationSample]:
                 private_source.derivation_id,
             }
         )
-        created_geometry_ids.update(
-            {shared_geometry_id, source_b.geometry_id, private_geometry_id}
-        )
+        created_geometry_ids.update({shared_geometry_id, source_b.geometry_id, private_geometry_id})
         assert private_topology.id is not None
         assert project_b_topology.id is not None
         created_topology_ids.update(
@@ -600,9 +598,7 @@ async def authorization_sample() -> AsyncIterator[AuthorizationSample]:
             and project_b_formula.id is not None
             and private_formula.id is not None
         )
-        created_formula_ids.update(
-            {shared_formula.id, project_b_formula.id, private_formula.id}
-        )
+        created_formula_ids.update({shared_formula.id, project_b_formula.id, private_formula.id})
         created_logical_reaction_ids.update(
             {shared_logical_reaction_id, private_logical_reaction_id}
         )
@@ -995,30 +991,48 @@ async def test_artifact_frame_geometry_and_array_visibility(
             )
             is None
         )
-        assert await get_geometry_sdf(
-            sample.shared_geometry_id,
-            project_id=sample.project_a_id,
-        ) is not None
-        assert await get_geometry_sdf(
-            sample.private_geometry_id,
-            project_id=sample.project_a_id,
-        ) is None
-        assert await get_geometry_xyz(
-            sample.shared_geometry_id,
-            project_id=sample.project_a_id,
-        ) is not None
-        assert await get_geometry_xyz(
-            sample.private_geometry_id,
-            project_id=sample.project_a_id,
-        ) is None
-        assert await get_geometry_dof_depiction(
-            sample.shared_geometry_id,
-            project_id=sample.project_a_id,
-        ) is not None
-        assert await get_geometry_dof_depiction(
-            sample.private_geometry_id,
-            project_id=sample.project_a_id,
-        ) is None
+        assert (
+            await get_geometry_sdf(
+                sample.shared_geometry_id,
+                project_id=sample.project_a_id,
+            )
+            is not None
+        )
+        assert (
+            await get_geometry_sdf(
+                sample.private_geometry_id,
+                project_id=sample.project_a_id,
+            )
+            is None
+        )
+        assert (
+            await get_geometry_xyz(
+                sample.shared_geometry_id,
+                project_id=sample.project_a_id,
+            )
+            is not None
+        )
+        assert (
+            await get_geometry_xyz(
+                sample.private_geometry_id,
+                project_id=sample.project_a_id,
+            )
+            is None
+        )
+        assert (
+            await get_geometry_dof_depiction(
+                sample.shared_geometry_id,
+                project_id=sample.project_a_id,
+            )
+            is not None
+        )
+        assert (
+            await get_geometry_dof_depiction(
+                sample.private_geometry_id,
+                project_id=sample.project_a_id,
+            )
+            is None
+        )
         with pytest.raises(ScientificArrayNotFoundError):
             await ScientificArrayContentService.load_npy(
                 sample.scientific_array_b_id,
@@ -1179,14 +1193,20 @@ async def test_private_and_missing_detail_ids_have_same_service_semantics(
     sample = authorization_sample
     missing = uuid4()
     async with _request_as(sample.principal):
-        assert await ArtifactQueryService.get_artifact(
-            artifact_id=sample.artifact_b_id,
-            project_id=sample.project_a_id,
-        ) is None
-        assert await ArtifactQueryService.get_artifact(
-            artifact_id=missing,
-            project_id=sample.project_a_id,
-        ) is None
+        assert (
+            await ArtifactQueryService.get_artifact(
+                artifact_id=sample.artifact_b_id,
+                project_id=sample.project_a_id,
+            )
+            is None
+        )
+        assert (
+            await ArtifactQueryService.get_artifact(
+                artifact_id=missing,
+                project_id=sample.project_a_id,
+            )
+            is None
+        )
         assert (
             await CalculationQueryService.get_calculation_frame(
                 frame_id=sample.frame_b_id,
@@ -1248,9 +1268,9 @@ async def test_rest_graphql_and_mcp_share_authorized_visibility(
             json={
                 "query": (
                     "{ MappedReactionQueryService { "
-                    "list_mapped_reactions(project_id: \""
+                    'list_mapped_reactions(project_id: "'
                     + str(sample.project_a_id)
-                    + "\", limit: 200, offset: 0) { items { id } } } }"
+                    + '", limit: 200, offset: 0) { items { id } } } }'
                 )
             },
         )
@@ -1308,9 +1328,9 @@ async def test_rest_graphql_and_mcp_share_authorized_visibility(
                 "app_name": "example-chemistry-database",
                 "query": (
                     "{ MappedReactionQueryService { "
-                    "list_mapped_reactions(project_id: \""
+                    'list_mapped_reactions(project_id: "'
                     + str(sample.project_a_id)
-                    + "\", limit: 200, offset: 0) { items { id } } } }"
+                    + '", limit: 200, offset: 0) { items { id } } } }'
                 ),
             },
         )

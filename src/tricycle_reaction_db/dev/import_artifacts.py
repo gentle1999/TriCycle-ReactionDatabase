@@ -208,9 +208,7 @@ def _normalize_name_globs(name_globs: Collection[str] | None) -> tuple[str, ...]
     if not name_globs:
         return ()
     return tuple(
-        pattern.casefold()
-        for pattern in (value.strip() for value in name_globs)
-        if pattern
+        pattern.casefold() for pattern in (value.strip() for value in name_globs) if pattern
     )
 
 

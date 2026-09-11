@@ -282,9 +282,7 @@ def _directory_prefixes(
             request["ContinuationToken"] = continuation_token
         response = store._client.list_objects_v2(**request)
         common_prefixes.update(
-            str(item["Prefix"])
-            for item in response.get("CommonPrefixes", [])
-            if item.get("Prefix")
+            str(item["Prefix"]) for item in response.get("CommonPrefixes", []) if item.get("Prefix")
         )
         has_direct_objects = has_direct_objects or bool(response.get("Contents"))
         if not response.get("IsTruncated"):
@@ -292,8 +290,7 @@ def _directory_prefixes(
         next_token = response.get("NextContinuationToken")
         if not next_token:
             raise RuntimeError(
-                "RustFS directory listing is truncated without a continuation token: "
-                f"{prefix}"
+                f"RustFS directory listing is truncated without a continuation token: {prefix}"
             )
         continuation_token = str(next_token)
     return common_prefixes, has_direct_objects
@@ -361,8 +358,7 @@ async def _build_storage_inventory(
         for offset in range(0, len(leaf_prefixes), batch_size):
             prefix_batch = leaf_prefixes[offset : offset + batch_size]
             prefix_groups = tuple(
-                tuple(prefix_batch[index : index + 4])
-                for index in range(0, len(prefix_batch), 4)
+                tuple(prefix_batch[index : index + 4]) for index in range(0, len(prefix_batch), 4)
             )
             pages = await asyncio.gather(*(list_one(prefixes) for prefixes in prefix_groups))
             for objects in pages:
@@ -713,9 +709,7 @@ async def _run(args: argparse.Namespace) -> int:
                                         else None
                                     ),
                                     inferred_reaction_count=(
-                                        item.result.inferred_reaction_count
-                                        if item.result
-                                        else 0
+                                        item.result.inferred_reaction_count if item.result else 0
                                     ),
                                     error_code=item.error_code,
                                     error_message=item.error_message,

@@ -1101,8 +1101,7 @@ class UploadBatchService:
         active_upload_item = (
             select(1)
             .where(
-                col(UploadBatchItem.artifact_file_id)
-                == col(ArtifactIngestion.artifact_file_id),
+                col(UploadBatchItem.artifact_file_id) == col(ArtifactIngestion.artifact_file_id),
                 col(UploadBatchItem.status).in_(
                     (
                         UploadBatchItemStatus.UPLOADING,

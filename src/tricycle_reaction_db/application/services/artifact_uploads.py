@@ -3791,13 +3791,10 @@ def _mark_ingestion_failed(
     ingestion = ingestion or session.get(ArtifactIngestion, ingestion_id)
     if ingestion is None:
         raise RuntimeError("artifact ingestion disappeared during parsing")
-    if (
-        expected_worker_lease_id is not None
-        and (
-            ingestion.worker_lease_id != expected_worker_lease_id
-            or ingestion.worker_lease_expires_at is None
-            or ingestion.worker_lease_expires_at <= datetime.now(UTC)
-        )
+    if expected_worker_lease_id is not None and (
+        ingestion.worker_lease_id != expected_worker_lease_id
+        or ingestion.worker_lease_expires_at is None
+        or ingestion.worker_lease_expires_at <= datetime.now(UTC)
     ):
         return False
     ingestion.status = ArtifactIngestionStatus.FAILED
@@ -5009,8 +5006,7 @@ class ArtifactUploadService:
                                 col(ArtifactIngestion.id) == resolved_ingestion_id,
                                 col(ArtifactIngestion.status) == ArtifactIngestionStatus.PENDING,
                                 col(ArtifactIngestion.worker_lease_id) == processing_lease_id,
-                                col(ArtifactIngestion.worker_lease_expires_at)
-                                > datetime.now(UTC),
+                                col(ArtifactIngestion.worker_lease_expires_at) > datetime.now(UTC),
                             )
                             .with_for_update()
                         )

@@ -103,9 +103,7 @@ def test_database_topology_reuses_identity_with_an_alternate_projection(monkeypa
     persisted = molecular_geometry.persist_molecular_topology(
         Session(),
         record,
-        context=GeometryPersistenceContext(
-            project_id=UUID("00000000-0000-7000-8000-000000000001")
-        ),
+        context=GeometryPersistenceContext(project_id=UUID("00000000-0000-7000-8000-000000000001")),
     )
 
     assert persisted.topology is topology

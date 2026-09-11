@@ -148,9 +148,7 @@ def persist_logical_participant_concrete_topology(
     if logical_reaction is None:
         logical_reaction = session.get(LogicalReaction, logical_participant.logical_reaction_id)
     if logical_reaction is None:  # pragma: no cover - protected by the FK
-        raise ConcreteTopologyMembershipError(
-            "logical participant has no owning LogicalReaction"
-        )
+        raise ConcreteTopologyMembershipError("logical participant has no owning LogicalReaction")
     if (
         logical_reaction.project_id is None
         or logical_topology.project_id is None

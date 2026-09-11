@@ -764,8 +764,7 @@ def find_mapped_reaction_by_concrete_identity(
                 *tuple(session.new),
                 *tuple(session.info.get("_fast_pending_entities", ())),
             )
-            if isinstance(entity, LogicalReaction)
-            and entity.id == logical_reaction_id
+            if isinstance(entity, LogicalReaction) and entity.id == logical_reaction_id
         ),
         None,
     )
@@ -817,8 +816,7 @@ def find_mapped_reaction_by_concrete_identity(
         by_id = {
             _require_id(candidate, label="MappedReaction"): candidate
             for candidate in candidates
-            if isinstance(candidate.id, UUID)
-            and candidate.project_id == project_id
+            if isinstance(candidate.id, UUID) and candidate.project_id == project_id
         }
         index = {}
         for candidate in sorted(

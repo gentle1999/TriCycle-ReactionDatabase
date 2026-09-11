@@ -322,13 +322,8 @@ def persist_stereo_abstraction(
     specific_project_id = getattr(specific_topology, "project_id", None)
     general_project_id = getattr(general_topology, "project_id", None)
     owner_project_id = specific_project_id if project_id is None else project_id
-    if (
-        specific_project_id != owner_project_id
-        or general_project_id != owner_project_id
-    ):
-        raise StereoAbstractionError(
-            "stereo abstraction endpoints must belong to the same project"
-        )
+    if specific_project_id != owner_project_id or general_project_id != owner_project_id:
+        raise StereoAbstractionError("stereo abstraction endpoints must belong to the same project")
     if specific_id == general_id:
         raise StereoAbstractionError("specific and general topology must be different")
     if not general_topology.is_stereo_abstraction_upstream:
@@ -488,9 +483,7 @@ def ensure_topology_upstreams(
             specific_topology,
             upstream,
             project_id=(
-                getattr(specific_topology, "project_id", None)
-                if project_id is None
-                else project_id
+                getattr(specific_topology, "project_id", None) if project_id is None else project_id
             ),
             abstraction_policy_version=abstraction_policy_version,
             abstraction_metadata=abstraction_metadata,

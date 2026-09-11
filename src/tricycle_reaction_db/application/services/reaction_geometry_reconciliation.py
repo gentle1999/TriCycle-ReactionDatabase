@@ -858,8 +858,7 @@ def reconcile_geometry_with_reactions(
                     )
                     .join(
                         MappedReaction,
-                        col(MappedReactionParticipant.mapped_reaction_id)
-                        == col(MappedReaction.id),
+                        col(MappedReactionParticipant.mapped_reaction_id) == col(MappedReaction.id),
                     )
                     .where(
                         col(MappedReaction.project_id) == project_id,
@@ -871,7 +870,7 @@ def reconcile_geometry_with_reactions(
                                 col(MappedReactionParticipant.concrete_topology_id).is_(None),
                                 col(LogicalReactionParticipant.topology_id) == geometry.topology_id,
                             ),
-                        )
+                        ),
                     )
                 ).all()
             )
@@ -887,8 +886,7 @@ def reconcile_geometry_with_reactions(
                 )
                 .join(
                     LogicalReaction,
-                    col(LogicalReactionParticipant.logical_reaction_id)
-                    == col(LogicalReaction.id),
+                    col(LogicalReactionParticipant.logical_reaction_id) == col(LogicalReaction.id),
                 )
                 .join(
                     MappedReaction,
@@ -903,7 +901,7 @@ def reconcile_geometry_with_reactions(
                             col(MappedReactionParticipant.concrete_topology_id).is_(None),
                             col(LogicalReactionParticipant.topology_id) == geometry.topology_id,
                         ),
-                    )
+                    ),
                 )
             ).all()
         )
@@ -1014,7 +1012,7 @@ def preload_reconciliation_context(
                     col(MappedReactionParticipant.concrete_topology_id).is_(None),
                     col(LogicalReactionParticipant.topology_id).in_(topology_ids),
                 ),
-            )
+            ),
         )
     ).all()
     for topology_id in topology_ids:

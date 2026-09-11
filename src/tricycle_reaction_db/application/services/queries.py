@@ -213,9 +213,7 @@ def _logical_reaction_ids_for_topology(topology_id: UUID, *, project_id: UUID) -
             or_(
                 col(LogicalReactionParticipant.topology_id) == topology_id,
                 col(LogicalReactionParticipant.id).in_(
-                    select(
-                        col(LogicalParticipantConcreteTopology.logical_reaction_participant_id)
-                    )
+                    select(col(LogicalParticipantConcreteTopology.logical_reaction_participant_id))
                     .select_from(LogicalParticipantConcreteTopology)
                     .join(
                         MolecularTopology,
@@ -555,13 +553,7 @@ def mapped_reaction_has_thermodynamic_profile(
         predicates.append(col(profile.activation_gibbs_free_energy_kcal_mol).is_not(None))
     if has_reaction_gibbs_free_energy:
         predicates.append(col(profile.reaction_gibbs_free_energy_kcal_mol).is_not(None))
-    return (
-        select(1)
-        .select_from(profile)
-        .where(*predicates)
-        .correlate(MappedReaction)
-        .exists()
-    )
+    return select(1).select_from(profile).where(*predicates).correlate(MappedReaction).exists()
 
 
 def _logical_reaction_query_leaf_predicate(
@@ -917,7 +909,8 @@ def _mapped_reaction_summary(
         float | None,
         float | None,
         float | None,
-    ] | None = None,
+    ]
+    | None = None,
     minimum_reaction_gibbs_free_energy_kcal_mol: float | None = None,
     maximum_reaction_gibbs_free_energy_kcal_mol: float | None = None,
 ) -> MappedReactionSummary:
@@ -941,18 +934,10 @@ def _mapped_reaction_summary(
         created_at=path.created_at,
         reaction_smarts_match=reaction_smarts_match,
         similarity_score=similarity_score,
-        minimum_activation_gibbs_free_energy_kcal_mol=(
-            thermodynamic_bounds[0]
-        ),
-        maximum_activation_gibbs_free_energy_kcal_mol=(
-            thermodynamic_bounds[1]
-        ),
-        minimum_reaction_gibbs_free_energy_kcal_mol=(
-            thermodynamic_bounds[2]
-        ),
-        maximum_reaction_gibbs_free_energy_kcal_mol=(
-            thermodynamic_bounds[3]
-        ),
+        minimum_activation_gibbs_free_energy_kcal_mol=(thermodynamic_bounds[0]),
+        maximum_activation_gibbs_free_energy_kcal_mol=(thermodynamic_bounds[1]),
+        minimum_reaction_gibbs_free_energy_kcal_mol=(thermodynamic_bounds[2]),
+        maximum_reaction_gibbs_free_energy_kcal_mol=(thermodynamic_bounds[3]),
     )
 
 
@@ -2596,9 +2581,7 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                                     MappedReactionThermodynamicProfile,
                                 ),
                             )
-                            .group_by(
-                                col(MappedReactionThermodynamicProfile.mapped_reaction_id)
-                            )
+                            .group_by(col(MappedReactionThermodynamicProfile.mapped_reaction_id))
                         )
                     ).all()
                     if isinstance(mapped_id, UUID)
@@ -3046,9 +3029,7 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
                                     MappedReactionThermodynamicProfile,
                                 ),
                             )
-                            .group_by(
-                                col(MappedReactionThermodynamicProfile.mapped_reaction_id)
-                            )
+                            .group_by(col(MappedReactionThermodynamicProfile.mapped_reaction_id))
                         )
                     ).all()
                     if isinstance(mapped_id, UUID)
@@ -3134,8 +3115,7 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
                         == col(concrete_topology.id),
                     )
                     .where(
-                        col(MappedReactionParticipant.mapped_reaction_id)
-                        == mapped_reaction_id,
+                        col(MappedReactionParticipant.mapped_reaction_id) == mapped_reaction_id,
                         topology_id_is_visible(
                             scope,
                             col(LogicalReactionParticipant.topology_id),
@@ -3696,14 +3676,16 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
                 # The project catalogue already maintains one frame count per
                 # visible Geometry.  Avoid joining every frame to its artifact
                 # merely to populate the catalogue totals panel.
-                total_statement = select(
-                    func.coalesce(func.sum(ProjectGeometryCatalog.frame_count), 0)
-                ).join(
-                    Geometry,
-                    col(Geometry.id) == col(ProjectGeometryCatalog.geometry_id),
-                ).where(
-                    col(ProjectGeometryCatalog.project_id) == scope.requested_project_id,
-                    col(Geometry.project_id) == scope.requested_project_id,
+                total_statement = (
+                    select(func.coalesce(func.sum(ProjectGeometryCatalog.frame_count), 0))
+                    .join(
+                        Geometry,
+                        col(Geometry.id) == col(ProjectGeometryCatalog.geometry_id),
+                    )
+                    .where(
+                        col(ProjectGeometryCatalog.project_id) == scope.requested_project_id,
+                        col(Geometry.project_id) == scope.requested_project_id,
+                    )
                 )
                 total = int((await session.execute(total_statement)).scalar_one())
             else:

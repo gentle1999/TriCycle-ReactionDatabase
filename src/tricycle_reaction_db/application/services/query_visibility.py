@@ -243,8 +243,7 @@ def visible_frame_ids(scope: QueryVisibilityScope) -> Any:
             .join(Geometry, col(CalculationFrame.geometry_id) == col(Geometry.id))
             .join(
                 MolecularTopologyDerivation,
-                col(CalculationFrame.topology_derivation_id)
-                == col(MolecularTopologyDerivation.id),
+                col(CalculationFrame.topology_derivation_id) == col(MolecularTopologyDerivation.id),
             )
             .where(
                 col(ArtifactFile.project_id) == scope.requested_project_id,
@@ -252,8 +251,7 @@ def visible_frame_ids(scope: QueryVisibilityScope) -> Any:
                 col(ArtifactIngestion.status) == ArtifactIngestionStatus.SUCCEEDED,
                 col(ParseRevision.status) == ParseStatus.SUCCEEDED,
                 col(Geometry.project_id) == scope.requested_project_id,
-                col(MolecularTopologyDerivation.project_id)
-                == scope.requested_project_id,
+                col(MolecularTopologyDerivation.project_id) == scope.requested_project_id,
                 col(CalculationFrame.geometry_id).is_not(None),
             )
         )
@@ -285,8 +283,7 @@ def visible_frame_ids(scope: QueryVisibilityScope) -> Any:
         )
         .join(
             MolecularTopologyDerivation,
-            col(CalculationFrame.topology_derivation_id)
-            == col(MolecularTopologyDerivation.id),
+            col(CalculationFrame.topology_derivation_id) == col(MolecularTopologyDerivation.id),
         )
         .where(
             scope.derived_artifact_predicate(),
@@ -340,8 +337,7 @@ def _visible_geometry_ids_from_frames(scope: QueryVisibilityScope) -> Any:
         )
         .join(
             MolecularTopologyDerivation,
-            col(CalculationFrame.topology_derivation_id)
-            == col(MolecularTopologyDerivation.id),
+            col(CalculationFrame.topology_derivation_id) == col(MolecularTopologyDerivation.id),
         )
         .where(
             scope.derived_artifact_predicate(),
@@ -704,9 +700,7 @@ def _has_source_project_outside(scope: QueryVisibilityScope, source_projects: An
     branches = getattr(source_projects, "selects", (source_projects,))
     return or_(
         *(
-            source.where(
-                source.selected_columns.project_id != scope.requested_project_id
-            ).exists()
+            source.where(source.selected_columns.project_id != scope.requested_project_id).exists()
             for source in branches
         )
     )
@@ -714,12 +708,7 @@ def _has_source_project_outside(scope: QueryVisibilityScope, source_projects: An
 
 def _has_multiple_source_projects(source_projects: Any) -> Any:
     project_rows = source_projects.subquery()
-    return (
-        select(func.count())
-        .select_from(project_rows)
-        .scalar_subquery()
-        > 1
-    )
+    return select(func.count()).select_from(project_rows).scalar_subquery() > 1
 
 
 def _source_project_isolation_predicate(
@@ -843,9 +832,7 @@ def derived_artifact_id_is_visible(scope: QueryVisibilityScope, artifact_id: Any
 
     if scope.unrestricted:
         return true()
-    return artifact_id.in_(
-        select(col(ArtifactFile.id)).where(scope.derived_artifact_predicate())
-    )
+    return artifact_id.in_(select(col(ArtifactFile.id)).where(scope.derived_artifact_predicate()))
 
 
 def parse_revision_id_is_visible(scope: QueryVisibilityScope, revision_id: Any) -> Any:
@@ -1298,11 +1285,13 @@ def formula_id_is_visible(scope: QueryVisibilityScope, formula_id: Any) -> Any:
             )
         )
     return formula_id.in_(
-        select(col(MolecularTopology.formula_id)).where(
+        select(col(MolecularTopology.formula_id))
+        .where(
             topology_id_is_visible(scope, col(MolecularTopology.id)),
             _derived_project_owner_is_visible(scope, col(MolecularTopology.project_id)),
             _derived_project_owner_is_visible(scope, col(MolecularFormula.project_id)),
-        ).join(
+        )
+        .join(
             MolecularFormula,
             col(MolecularFormula.id) == col(MolecularTopology.formula_id),
         )
@@ -1320,8 +1309,7 @@ def _mapped_reaction_ids_with_calculations(
         select(col(MappedReactionNode.mapped_reaction_id))
         .join(
             MappedReactionNodeGeometry,
-            col(MappedReactionNodeGeometry.mapped_reaction_node_id)
-            == col(MappedReactionNode.id),
+            col(MappedReactionNodeGeometry.mapped_reaction_node_id) == col(MappedReactionNode.id),
         )
         .join(
             Geometry,
@@ -1353,8 +1341,7 @@ def _mapped_reaction_ids_with_calculations(
         )
         .join(
             MolecularTopologyDerivation,
-            col(CalculationFrame.topology_derivation_id)
-            == col(MolecularTopologyDerivation.id),
+            col(CalculationFrame.topology_derivation_id) == col(MolecularTopologyDerivation.id),
         )
         .where(
             scope.derived_artifact_predicate(),
@@ -1525,13 +1512,18 @@ def _mapped_reaction_parent_source_isolation_predicate(
     if scope.requested_project_id is None:
         return true()
     mapped_reaction = aliased(MappedReaction, name="visibility_mapped_parent")
-    return select(1).select_from(mapped_reaction).where(
-        col(mapped_reaction.id) == mapped_reaction_id,
-        _logical_reaction_source_isolation_predicate(
-            scope,
-            col(mapped_reaction.logical_reaction_id),
-        ),
-    ).exists()
+    return (
+        select(1)
+        .select_from(mapped_reaction)
+        .where(
+            col(mapped_reaction.id) == mapped_reaction_id,
+            _logical_reaction_source_isolation_predicate(
+                scope,
+                col(mapped_reaction.logical_reaction_id),
+            ),
+        )
+        .exists()
+    )
 
 
 def _logical_reaction_project_boundary_is_valid(logical_reaction_id: Any) -> Any:
@@ -1588,8 +1580,7 @@ def _logical_reaction_project_boundary_is_valid(logical_reaction_id: Any) -> Any
         .select_from(membership)
         .join(
             membership_participant,
-            col(membership.logical_reaction_participant_id)
-            == col(membership_participant.id),
+            col(membership.logical_reaction_participant_id) == col(membership_participant.id),
         )
         .join(
             membership_logical,
@@ -1705,9 +1696,7 @@ def _mapped_reaction_project_boundary_is_valid(mapped_reaction_id: Any) -> Any:
                 col(mapped.project_id).is_(None),
                 col(participant_logical.project_id).is_(None),
                 col(mapped.project_id).is_distinct_from(col(participant_logical.project_id)),
-                col(participant_logical.id).is_distinct_from(
-                    col(mapped.logical_reaction_id)
-                ),
+                col(participant_logical.id).is_distinct_from(col(mapped.logical_reaction_id)),
                 col(abstract_topology.project_id).is_(None),
                 col(abstract_formula.project_id).is_(None),
                 col(mapped.project_id).is_distinct_from(col(abstract_topology.project_id)),
@@ -1719,9 +1708,7 @@ def _mapped_reaction_project_boundary_is_valid(mapped_reaction_id: Any) -> Any:
                     or_(
                         col(concrete_topology.project_id).is_(None),
                         col(concrete_formula.project_id).is_(None),
-                        col(mapped.project_id).is_distinct_from(
-                            col(concrete_topology.project_id)
-                        ),
+                        col(mapped.project_id).is_distinct_from(col(concrete_topology.project_id)),
                         col(concrete_topology.project_id).is_distinct_from(
                             col(concrete_formula.project_id)
                         ),
@@ -1781,9 +1768,7 @@ def _mapped_reaction_project_boundary_is_valid(mapped_reaction_id: Any) -> Any:
                     col(node_geometry.mapped_reaction_participant_id).is_not(None),
                     or_(
                         col(node_participant.id).is_(None),
-                        col(node_participant.mapped_reaction_id).is_distinct_from(
-                            col(mapped.id)
-                        ),
+                        col(node_participant.mapped_reaction_id).is_distinct_from(col(mapped.id)),
                     ),
                 ),
             ),
@@ -1819,9 +1804,7 @@ def _mapped_reaction_project_boundary_is_valid(mapped_reaction_id: Any) -> Any:
                     col(edge.transition_state_node_id).is_not(None),
                     or_(
                         col(transition_node.id).is_(None),
-                        col(transition_node.mapped_reaction_id).is_distinct_from(
-                            col(mapped.id)
-                        ),
+                        col(transition_node.mapped_reaction_id).is_distinct_from(col(mapped.id)),
                     ),
                 ),
             ),
