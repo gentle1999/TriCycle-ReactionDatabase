@@ -449,6 +449,7 @@ def test_real_da_subset_round_trips_manifest_reaction_path_and_frame_bindings(
                     cycloaddition_pattern="4+2",
                     reaction_hash=reaction_hash_for_participants(participant_identities),
                 ),
+                project_id=SYSTEM_PROJECT_ID,
             )
             reaction_participants = {}
             for declaration, persisted, side, _atom_maps in participant_payloads:

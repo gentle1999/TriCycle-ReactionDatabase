@@ -380,15 +380,12 @@ def _molecular_topology_by_id(
                     return None
                 topology_context.molecular_topologies_by_id[topology_id] = candidate
                 return cast(MolecularTopology, candidate)
-    topology = cast(
-        MolecularTopology | None,
-        session.exec(
-            select(MolecularTopology).where(
-                col(MolecularTopology.id) == topology_id,
-                col(MolecularTopology.project_id) == project_id,
-            )
-        ).first(),
-    )
+    topology = session.exec(
+        select(MolecularTopology).where(
+            col(MolecularTopology.id) == topology_id,
+            col(MolecularTopology.project_id) == project_id,
+        )
+    ).first()
     if topology is None:
         topology = next(
             (

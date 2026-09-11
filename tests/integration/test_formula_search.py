@@ -67,7 +67,10 @@ def _formula(hill_formula: str, vector: list[int], suffix: str) -> MolecularForm
 
 
 @pytest.fixture
-def inserted_formulas() -> Iterator[list[MolecularFormula]]:
+def inserted_formulas(
+    development_query_principal: object,
+) -> Iterator[list[MolecularFormula]]:
+    del development_query_principal
     engine = create_engine(get_settings().database_url, pool_pre_ping=True)
     formulas: list[MolecularFormula] = []
     for suffix, carbon, hydrogen in (("low", 6, 10), ("high", 8, 14), ("outside", 5, 20)):
@@ -146,11 +149,10 @@ async def test_formula_search_rest_endpoint_returns_filtered_page(
     try:
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.post(
-                "/api/formulas/search?limit=10",
+                f"/api/formulas/search?limit=10&project_id={SYSTEM_PROJECT_ID}",
                 json={
                     "minimum_counts": minimum_counts,
                     "maximum_counts": maximum_counts,
-                    "project_id": str(SYSTEM_PROJECT_ID),
                 },
             )
     finally:

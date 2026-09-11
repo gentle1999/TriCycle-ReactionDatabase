@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -262,13 +262,14 @@ def _protocol_selection_identity(protocol: CalculationProtocol | None) -> tuple[
         separators=(",", ":"),
         default=str,
     )
+    protocol_identity = _protocol_identity(protocol) or ()
     return (
         software,
         protocol.qm_software_version,
         protocol.spec_schema_version,
         tuple(protocol.task_requests),
         normalized_spec,
-        *_protocol_identity(protocol),
+        *protocol_identity,
     )
 
 
@@ -287,10 +288,19 @@ def protocol_level_view(protocol: CalculationProtocol | None) -> list[str | None
 def geometry_energy_composite(
     geometry_id: UUID,
     candidates: Sequence[GeometryEnergyCandidate],
+    *,
+    electronic_source_frame_id: UUID | None = None,
+    thermochemistry_source_frame_id: UUID | None = None,
 ) -> GeometryEnergyComposite:
     electronic_candidates = [
         candidate for candidate in candidates if candidate.frame.selected_energy_hartree is not None
     ]
+    if electronic_source_frame_id is not None:
+        electronic_candidates = [
+            candidate
+            for candidate in electronic_candidates
+            if candidate.frame.id == electronic_source_frame_id
+        ]
     electronic_status, electronic_source, electronic_candidate_ids = _select_candidate(
         electronic_candidates,
         context=lambda candidate: (
@@ -305,6 +315,12 @@ def geometry_energy_composite(
     thermal_candidates = [
         candidate for candidate in candidates if candidate.thermochemistry is not None
     ]
+    if thermochemistry_source_frame_id is not None:
+        thermal_candidates = [
+            candidate
+            for candidate in thermal_candidates
+            if candidate.frame.id == thermochemistry_source_frame_id
+        ]
     if electronic_source is not None:
         electronic_context = (
             electronic_source.frame.charge,
@@ -458,6 +474,8 @@ def geometry_energy_composites(
     rows: Iterable[
         tuple[CalculationFrame, CalculationProtocol | None, ThermochemistryResult | None]
     ],
+    *,
+    source_frame_ids_by_geometry: Mapping[UUID, tuple[UUID | None, UUID | None]] | None = None,
 ) -> dict[UUID, GeometryEnergyComposite]:
     candidates_by_geometry: dict[UUID, list[GeometryEnergyCandidate]] = defaultdict(list)
     for frame, protocol, thermochemistry in rows:
@@ -468,6 +486,16 @@ def geometry_energy_composites(
         geometry_id: geometry_energy_composite(
             geometry_id,
             candidates_by_geometry.get(geometry_id, []),
+            electronic_source_frame_id=(
+                source_frame_ids_by_geometry.get(geometry_id, (None, None))[0]
+                if source_frame_ids_by_geometry is not None
+                else None
+            ),
+            thermochemistry_source_frame_id=(
+                source_frame_ids_by_geometry.get(geometry_id, (None, None))[1]
+                if source_frame_ids_by_geometry is not None
+                else None
+            ),
         )
         for geometry_id in geometry_ids
     }

@@ -3023,6 +3023,7 @@ def persist_transition_state_endpoints_from_molop_frame(
     *,
     calculation_frame: CalculationFrame,
     source_frame: BaseCalcFrame[Any],
+    topology_context: GeometryPersistenceContext | None = None,
 ) -> None:
     """Persist MolOP's inferred pre/post-TS endpoints for a persisted TS frame."""
 
@@ -3060,6 +3061,7 @@ def persist_transition_state_endpoints_from_molop_frame(
             charge=int(source_frame.charge),
             multiplicity=int(source_frame.multiplicity),
         ),
+        topology_context=topology_context,
     )
 
 
@@ -4929,11 +4931,15 @@ class ArtifactUploadService:
                         started_at=started_at,
                     )
                 )
+            if ingestion is None:
+                raise ArtifactUploadError("artifact ingestion was not created")
             resolved_ingestion_id = _require_id(ingestion, label="ArtifactIngestion")
             processing_lease_id = ingestion.worker_lease_id
             had_parse_revision = (
                 await session.exec(
-                    select(ParseRevision.id).where(ParseRevision.artifact_file_id == artifact_id)
+                    select(ParseRevision.id).where(
+                        col(ParseRevision.artifact_file_id) == artifact_id
+                    )
                 )
             ).first() is not None
             filename = artifact.original_filename

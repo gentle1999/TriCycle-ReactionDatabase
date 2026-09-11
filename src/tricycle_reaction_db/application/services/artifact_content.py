@@ -9,6 +9,7 @@ from uuid import UUID
 
 from botocore.exceptions import BotoCoreError, ClientError
 from sqlalchemy import select
+from sqlmodel import col
 
 from tricycle_reaction_db.application.dtos import ArtifactPreview
 from tricycle_reaction_db.application.services.authorization import (
@@ -136,8 +137,8 @@ class ArtifactContentService:
         project_id: UUID,
     ) -> _ArtifactReference:
         async with session_factory() as session:
-            statement = select(ArtifactFile).where(ArtifactFile.id == artifact_id)
-            statement = statement.where(ArtifactFile.project_id == project_id)
+            statement = select(ArtifactFile).where(col(ArtifactFile.id) == artifact_id)
+            statement = statement.where(col(ArtifactFile.project_id) == project_id)
             artifact = (await session.execute(statement)).scalar_one_or_none()
         if (
             artifact is None

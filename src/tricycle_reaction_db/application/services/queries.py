@@ -3339,8 +3339,9 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
                     )
                 )
             ).one()
-            profile_bounds = tuple(
-                float(value) if value is not None else None for value in profile_bounds_row
+            profile_bounds = cast(
+                tuple[float | None, float | None, float | None, float | None],
+                tuple(float(value) if value is not None else None for value in profile_bounds_row),
             )
 
         mappings_by_geometry: dict[UUID, list[NodeGeometryMappingView]] = {

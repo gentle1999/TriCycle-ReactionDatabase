@@ -3,6 +3,7 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -48,6 +49,7 @@ from tricycle_reaction_db.application.services.authentication import (
 )
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
+    ArtifactIngestion,
     CalculationFrame,
     CalculationProtocol,
     CalculationSegment,
@@ -74,6 +76,7 @@ from tricycle_reaction_db.db.models import (
 )
 from tricycle_reaction_db.db.session import dispose_engine, session_factory
 from tricycle_reaction_db.domain.enums import (
+    ArtifactIngestionStatus,
     ArtifactKind,
     ArtifactResolutionStatus,
     ArtifactVisibility,
@@ -83,6 +86,7 @@ from tricycle_reaction_db.domain.enums import (
     ManifestArtifactRole,
     MappedReactionKind,
     MappedReactionNodeRole,
+    ParseStatus,
     ProjectRole,
     QMSoftware,
     ReactionClass,
@@ -229,6 +233,7 @@ async def _create_calculation_source(
     derivation: MolecularTopologyDerivation,
 ) -> CalculationSource:
     content_hash = _fixture_hash(f"authorization-artifact:{suffix}")
+    now = datetime.now(UTC)
     artifact = ArtifactFile(
         id=uuid4(),
         project_id=project_id,
@@ -259,6 +264,20 @@ async def _create_calculation_source(
         reconstruction_config_hash=_fixture_hash(f"authorization-reconstruction:{suffix}"),
         source_format=SourceFormat.GAUSSIAN_LOG,
         source_encoding="utf-8",
+        status=ParseStatus.SUCCEEDED,
+        record_sha256=content_hash,
+        started_at=now,
+        completed_at=now,
+    )
+    ingestion = ArtifactIngestion(
+        id=uuid4(),
+        artifact_file_id=artifact.id,
+        status=ArtifactIngestionStatus.SUCCEEDED,
+        parser_version="test-v1",
+        source_frame_count=1,
+        transition_state_frame_count=0,
+        started_at=now,
+        completed_at=now,
     )
     protocol = CalculationProtocol(
         project_id=project_id,
@@ -269,7 +288,7 @@ async def _create_calculation_source(
         task_requests=[],
         normalized_spec={"fixture": suffix},
     )
-    session.add_all([artifact, revision, protocol])  # type: ignore[attr-defined]
+    session.add_all([artifact, revision, protocol, ingestion])  # type: ignore[attr-defined]
     await session.flush()  # type: ignore[attr-defined]
     assert artifact.id is not None and revision.id is not None and protocol.id is not None
     segment = CalculationSegment(
@@ -1388,21 +1407,37 @@ async def test_core_content_routes_do_not_reveal_private_ids(
             params={"project_id": str(sample.project_b_id)},
         )
         private_geometry = await client.get(
-            f"/api/depictions/geometry/{sample.private_geometry_id}.sdf"
+            f"/api/depictions/geometry/{sample.private_geometry_id}.sdf",
+            params={"project_id": str(sample.project_b_id)},
         )
-        missing_geometry = await client.get(f"/api/depictions/geometry/{missing}.sdf")
+        missing_geometry = await client.get(
+            f"/api/depictions/geometry/{missing}.sdf",
+            params={"project_id": str(sample.project_b_id)},
+        )
         private_geometry_xyz = await client.get(
-            f"/api/depictions/geometry/{sample.private_geometry_id}.xyz"
+            f"/api/depictions/geometry/{sample.private_geometry_id}.xyz",
+            params={"project_id": str(sample.project_b_id)},
         )
-        missing_geometry_xyz = await client.get(f"/api/depictions/geometry/{missing}.xyz")
+        missing_geometry_xyz = await client.get(
+            f"/api/depictions/geometry/{missing}.xyz",
+            params={"project_id": str(sample.project_b_id)},
+        )
         private_geometry_svg = await client.get(
-            f"/api/depictions/geometry/{sample.private_geometry_id}.svg"
+            f"/api/depictions/geometry/{sample.private_geometry_id}.svg",
+            params={"project_id": str(sample.project_b_id)},
         )
-        missing_geometry_svg = await client.get(f"/api/depictions/geometry/{missing}.svg")
+        missing_geometry_svg = await client.get(
+            f"/api/depictions/geometry/{missing}.svg",
+            params={"project_id": str(sample.project_b_id)},
+        )
         participant_topology = await client.get(
-            f"/api/depictions/topology/{source_backed_participant_topology_id}.mol"
+            f"/api/depictions/topology/{source_backed_participant_topology_id}.mol",
+            params={"project_id": str(sample.project_a_id)},
         )
-        missing_topology = await client.get(f"/api/depictions/topology/{missing}.mol")
+        missing_topology = await client.get(
+            f"/api/depictions/topology/{missing}.mol",
+            params={"project_id": str(sample.project_a_id)},
+        )
 
     assert private_artifact.status_code == missing_artifact.status_code == 404
     assert private_artifact.json() == missing_artifact.json() == {"detail": "artifact not found"}
@@ -1490,7 +1525,9 @@ async def test_same_depiction_url_is_not_reused_across_authorization_contexts(
         return None
 
     monkeypatch.setattr(AuthenticationService, "authenticate_optional", authenticate_optional)
-    url = f"/api/depictions/geometry/{sample.shared_geometry_id}.sdf"
+    url = (
+        f"/api/depictions/geometry/{sample.shared_geometry_id}.sdf?project_id={sample.project_a_id}"
+    )
     async with AsyncClient(
         transport=ASGITransport(app=create_app()),
         base_url="http://test",
@@ -1585,31 +1622,31 @@ async def test_depiction_authorization_matrix_covers_all_roles_and_formats(
 
     monkeypatch.setattr(AuthenticationService, "authenticate_optional", authenticate_optional)
     visible_urls = [
-        f"/api/depictions/geometry/{sample.shared_geometry_id}.svg",
-        f"/api/depictions/geometry/{sample.shared_geometry_id}.sdf",
-        f"/api/depictions/geometry/{sample.shared_geometry_id}.xyz",
-        f"/api/depictions/topology/{source_backed_participant_topology_id}.svg",
-        f"/api/depictions/topology/{source_backed_participant_topology_id}.mol",
-        f"/api/depictions/calculation-frame/{ts_frame_id}/transition-state/negative.sdf",
-        f"/api/depictions/calculation-frame/{ts_frame_id}/transition-state/center.sdf",
-        f"/api/depictions/calculation-frame/{ts_frame_id}/transition-state/positive.sdf",
-        f"/api/depictions/calculation-frame/{ts_frame_id}/transition-state.svg",
+        f"/api/depictions/geometry/{sample.shared_geometry_id}.svg?project_id={sample.project_a_id}",
+        f"/api/depictions/geometry/{sample.shared_geometry_id}.sdf?project_id={sample.project_a_id}",
+        f"/api/depictions/geometry/{sample.shared_geometry_id}.xyz?project_id={sample.project_a_id}",
+        f"/api/depictions/topology/{source_backed_participant_topology_id}.svg?project_id={sample.project_a_id}",
+        f"/api/depictions/topology/{source_backed_participant_topology_id}.mol?project_id={sample.project_a_id}",
+        f"/api/depictions/calculation-frame/{ts_frame_id}/transition-state/negative.sdf?project_id={sample.project_a_id}",
+        f"/api/depictions/calculation-frame/{ts_frame_id}/transition-state/center.sdf?project_id={sample.project_a_id}",
+        f"/api/depictions/calculation-frame/{ts_frame_id}/transition-state/positive.sdf?project_id={sample.project_a_id}",
+        f"/api/depictions/calculation-frame/{ts_frame_id}/transition-state.svg?project_id={sample.project_a_id}",
     ]
     denied_urls = [
-        f"/api/depictions/geometry/{sample.private_geometry_id}.svg",
-        f"/api/depictions/geometry/{sample.private_geometry_id}.sdf",
-        f"/api/depictions/geometry/{sample.private_geometry_id}.xyz",
-        f"/api/depictions/topology/{private_participant_topology_id}.svg",
-        f"/api/depictions/topology/{private_participant_topology_id}.mol",
+        f"/api/depictions/geometry/{sample.private_geometry_id}.svg?project_id={sample.project_b_id}",
+        f"/api/depictions/geometry/{sample.private_geometry_id}.sdf?project_id={sample.project_b_id}",
+        f"/api/depictions/geometry/{sample.private_geometry_id}.xyz?project_id={sample.project_b_id}",
+        f"/api/depictions/topology/{private_participant_topology_id}.svg?project_id={sample.project_b_id}",
+        f"/api/depictions/topology/{private_participant_topology_id}.mol?project_id={sample.project_b_id}",
     ]
     missing = uuid4()
     missing_urls = [
-        f"/api/depictions/geometry/{missing}.svg",
-        f"/api/depictions/geometry/{missing}.sdf",
-        f"/api/depictions/geometry/{missing}.xyz",
-        f"/api/depictions/topology/{missing}.svg",
-        f"/api/depictions/topology/{missing}.mol",
-        f"/api/depictions/calculation-frame/{missing}/transition-state/center.sdf",
+        f"/api/depictions/geometry/{missing}.svg?project_id={sample.project_b_id}",
+        f"/api/depictions/geometry/{missing}.sdf?project_id={sample.project_b_id}",
+        f"/api/depictions/geometry/{missing}.xyz?project_id={sample.project_b_id}",
+        f"/api/depictions/topology/{missing}.svg?project_id={sample.project_b_id}",
+        f"/api/depictions/topology/{missing}.mol?project_id={sample.project_b_id}",
+        f"/api/depictions/calculation-frame/{missing}/transition-state/center.sdf?project_id={sample.project_a_id}",
     ]
 
     try:

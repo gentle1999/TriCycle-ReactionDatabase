@@ -255,7 +255,10 @@ def _add_visible_calculation_frames(
 
 
 @pytest.fixture
-def inserted_topologies() -> Iterator[dict[str, object]]:
+def inserted_topologies(
+    development_query_principal: object,
+) -> Iterator[dict[str, object]]:
+    del development_query_principal
     engine = create_engine(get_settings().database_url, pool_pre_ping=True)
     suffix = uuid4().hex
     ethanol_formula = _formula("C2H6O", {1: 6, 6: 2, 8: 1}, "ethanol")
@@ -616,10 +619,9 @@ async def test_topology_candidate_budget_uses_stable_rest_error(
     try:
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.post(
-                "/api/topologies/search?limit=1",
+                f"/api/topologies/search?limit=1&project_id={SYSTEM_PROJECT_ID}",
                 json={
                     "minimum_molecular_weight": 0,
-                    "project_id": str(SYSTEM_PROJECT_ID),
                 },
             )
     finally:
@@ -637,11 +639,10 @@ async def test_topology_search_rest_endpoint_uses_formula_join(
     try:
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.post(
-                "/api/topologies/search?limit=10",
+                f"/api/topologies/search?limit=10&project_id={SYSTEM_PROJECT_ID}",
                 json={
                     "formula_hill_formula": "C2H6O",
                     "smarts": "CO",
-                    "project_id": str(SYSTEM_PROJECT_ID),
                 },
             )
     finally:
@@ -664,13 +665,12 @@ async def test_topology_similarity_rest_endpoint_returns_ranked_scores(
     try:
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.post(
-                "/api/topologies/search?limit=10",
+                f"/api/topologies/search?limit=10&project_id={SYSTEM_PROJECT_ID}",
                 json={
                     "formula_hill_formula": "C2H6O",
                     "similarity_smiles": "CCO",
                     "similarity_metric": "dice",
                     "minimum_similarity": 0.99,
-                    "project_id": str(SYSTEM_PROJECT_ID),
                 },
             )
     finally:
@@ -694,6 +694,7 @@ async def test_nexusx_generated_topology_search_rest_and_graphql(
             rest_response = await client.post(
                 "/api/molecular_topology_query_service/search_topologies",
                 json={
+                    "project_id": str(SYSTEM_PROJECT_ID),
                     "formula_hill_formula": "C2H6O",
                     "similarity_smiles": "CCO",
                     "similarity_metric": "dice",

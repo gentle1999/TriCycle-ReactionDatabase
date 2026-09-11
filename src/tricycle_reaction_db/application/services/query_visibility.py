@@ -502,7 +502,7 @@ def _successful_source_project_ids_for_topology(topology_id: Any) -> Any:
     revision = aliased(ParseRevision, name="visibility_topology_geometry_revision")
     artifact = aliased(ArtifactFile, name="visibility_topology_geometry_artifact")
     ingestion = aliased(ArtifactIngestion, name="visibility_topology_geometry_ingestion")
-    geometry_projects = (
+    geometry_projects: Any = (
         select(col(artifact.project_id).label("project_id"))
         .select_from(geometry)
         .join(frame, col(frame.geometry_id) == col(geometry.id))
@@ -524,7 +524,7 @@ def _successful_source_project_ids_for_topology(topology_id: Any) -> Any:
         ArtifactIngestion,
         name="visibility_topology_endpoint_ingestion",
     )
-    endpoint_projects = (
+    endpoint_projects: Any = (
         select(col(endpoint_artifact.project_id).label("project_id"))
         .select_from(endpoint)
         .join(
@@ -565,7 +565,7 @@ def _successful_source_project_ids_for_mapped_reaction(mapped_reaction_id: Any) 
     revision = aliased(ParseRevision, name="visibility_mapped_revision")
     artifact = aliased(ArtifactFile, name="visibility_mapped_artifact")
     ingestion = aliased(ArtifactIngestion, name="visibility_mapped_ingestion")
-    calculation_projects = (
+    calculation_projects: Any = (
         select(col(artifact.project_id).label("project_id"))
         .select_from(node)
         .join(
@@ -590,7 +590,7 @@ def _successful_source_project_ids_for_mapped_reaction(mapped_reaction_id: Any) 
         ArtifactIngestion,
         name="visibility_mapped_inference_ingestion",
     )
-    inference_projects = (
+    inference_projects: Any = (
         select(col(inference_artifact.project_id).label("project_id"))
         .select_from(inference)
         .join(
@@ -628,7 +628,7 @@ def _successful_source_project_ids_for_logical_reaction(logical_reaction_id: Any
     revision = aliased(ParseRevision, name="visibility_logical_mapped_revision")
     artifact = aliased(ArtifactFile, name="visibility_logical_mapped_artifact")
     ingestion = aliased(ArtifactIngestion, name="visibility_logical_mapped_ingestion")
-    calculation_projects = (
+    calculation_projects: Any = (
         select(col(artifact.project_id).label("project_id"))
         .select_from(mapped_reaction)
         .join(
@@ -661,7 +661,7 @@ def _successful_source_project_ids_for_logical_reaction(logical_reaction_id: Any
         ArtifactIngestion,
         name="visibility_logical_inference_ingestion",
     )
-    inference_projects = (
+    inference_projects: Any = (
         select(col(inference_artifact.project_id).label("project_id"))
         .select_from(inference)
         .join(

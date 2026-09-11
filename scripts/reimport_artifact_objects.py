@@ -19,9 +19,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy import select
+from sqlmodel import col
 
 from tricycle_reaction_db.application.services.artifact_uploads import (
     ArtifactUploadPayload,
@@ -177,28 +179,28 @@ async def _load_artifacts(
 ) -> list[ArtifactObject]:
     statement = (
         select(
-            ArtifactFile.id,
-            ArtifactFile.project_id,
-            ArtifactFile.bucket,
-            ArtifactFile.object_key,
-            ArtifactFile.version_id,
-            ArtifactFile.content_sha256,
-            ArtifactFile.size_bytes,
-            ArtifactFile.original_filename,
-            ArtifactFile.media_type,
+            col(ArtifactFile.id),
+            col(ArtifactFile.project_id),
+            col(ArtifactFile.bucket),
+            col(ArtifactFile.object_key),
+            col(ArtifactFile.version_id),
+            col(ArtifactFile.content_sha256),
+            col(ArtifactFile.size_bytes),
+            col(ArtifactFile.original_filename),
+            col(ArtifactFile.media_type),
         )
         .where(
-            ArtifactFile.artifact_kind == ArtifactKind.CALCULATION_OUTPUT,
-            ArtifactFile.storage_status == StorageStatus.AVAILABLE,
+            col(ArtifactFile.artifact_kind) == ArtifactKind.CALCULATION_OUTPUT,
+            col(ArtifactFile.storage_status) == StorageStatus.AVAILABLE,
         )
-        .order_by(ArtifactFile.project_id, ArtifactFile.id)
+        .order_by(col(ArtifactFile.project_id), col(ArtifactFile.id))
     )
     if project_ids:
-        statement = statement.where(ArtifactFile.project_id.in_(project_ids))
+        statement = statement.where(col(ArtifactFile.project_id).in_(project_ids))
     if filename_contains:
-        statement = statement.where(ArtifactFile.original_filename.contains(filename_contains))
+        statement = statement.where(col(ArtifactFile.original_filename).contains(filename_contains))
     async with session_factory() as session:
-        rows = (await session.exec(statement)).all()
+        rows = (await session.execute(statement)).all()
     artifacts: list[ArtifactObject] = []
     for row in rows:
         (
@@ -231,9 +233,9 @@ async def _load_artifacts(
 
 
 async def _load_known_object_keys() -> set[tuple[str, str]]:
-    statement = select(ArtifactFile.bucket, ArtifactFile.content_sha256)
+    statement = select(col(ArtifactFile.bucket), col(ArtifactFile.content_sha256))
     async with session_factory() as session:
-        rows = (await session.exec(statement)).all()
+        rows = (await session.execute(statement)).all()
     return {(str(bucket), str(content_sha256).lower()) for bucket, content_sha256 in rows}
 
 
@@ -242,14 +244,14 @@ async def _load_partial_artifact_ids(artifact_ids: Sequence[UUID]) -> set[UUID]:
 
     if not artifact_ids:
         return set()
-    statement = select(ArtifactIngestion.artifact_file_id).where(
-        ArtifactIngestion.artifact_file_id.in_(artifact_ids),
-        ArtifactIngestion.status == ArtifactIngestionStatus.PARTIAL,
+    statement = select(col(ArtifactIngestion.artifact_file_id)).where(
+        col(ArtifactIngestion.artifact_file_id).in_(artifact_ids),
+        col(ArtifactIngestion.status) == ArtifactIngestionStatus.PARTIAL,
     )
     async with session_factory() as session:
         return {
             artifact_id
-            for artifact_id in (await session.exec(statement)).all()
+            for artifact_id in (await session.execute(statement)).scalars().all()
             if isinstance(artifact_id, UUID)
         }
 
@@ -280,7 +282,7 @@ def _directory_prefixes(
             request["Prefix"] = prefix
         if continuation_token is not None:
             request["ContinuationToken"] = continuation_token
-        response = store._client.list_objects_v2(**request)
+        response = cast(Any, store._client).list_objects_v2(**request)
         common_prefixes.update(
             str(item["Prefix"]) for item in response.get("CommonPrefixes", []) if item.get("Prefix")
         )
@@ -574,7 +576,7 @@ async def _run(args: argparse.Namespace) -> int:
 
     storage_settings = RustFSSettings()
     stores: dict[str, RustFSObjectStore] = {}
-    totals = {
+    totals: dict[str, Any] = {
         "catalogued": len(artifacts),
         "storage_objects": len(inventory),
         "inventory_digest": inventory_digest,
@@ -638,52 +640,54 @@ async def _run(args: argparse.Namespace) -> int:
                             reparse_failed_ingestions=True,
                         )
                         for artifact, item in zip(batch, result.items, strict=True):
-                            ingestion_status = item.result.ingestion_status if item.result else None
+                            item_result = item.result
+                            ingestion_status = (
+                                item_result.ingestion_status if item_result is not None else None
+                            )
                             if ingestion_status is ArtifactIngestionStatus.SUCCEEDED:
+                                if item_result is None:
+                                    raise RuntimeError(
+                                        "successful artifact batch item has no upload result"
+                                    )
                                 totals["succeeded"] += 1
-                                if item.result is not None:
-                                    totals["source_frames"] += item.result.source_frame_count or 0
-                                    totals["ts_frames"] += (
-                                        item.result.transition_state_frame_count or 0
-                                    )
-                                    totals["inferred_reactions"] += (
-                                        item.result.inferred_reaction_count
-                                    )
+                                totals["source_frames"] += item_result.source_frame_count or 0
+                                totals["ts_frames"] += (
+                                    item_result.transition_state_frame_count or 0
+                                )
+                                totals["inferred_reactions"] += item_result.inferred_reaction_count
                                 _append_checkpoint(
                                     state_file,
                                     artifact=artifact,
                                     status="succeeded",
                                     inventory_digest=inventory_digest,
-                                    ingestion_id=(
-                                        str(item.result.ingestion_id) if item.result else None
-                                    ),
-                                    parse_revision_id=(
-                                        str(item.result.parse_revision_id) if item.result else None
-                                    ),
-                                    inferred_reaction_count=(
-                                        item.result.inferred_reaction_count if item.result else 0
-                                    ),
+                                    ingestion_id=str(item_result.ingestion_id)
+                                    if item_result.ingestion_id
+                                    else None,
+                                    parse_revision_id=str(item_result.parse_revision_id)
+                                    if item_result.parse_revision_id
+                                    else None,
+                                    inferred_reaction_count=item_result.inferred_reaction_count,
                                 )
                             elif ingestion_status is ArtifactIngestionStatus.FILTERED:
                                 # A valid object without QM calculation frames is a
                                 # terminal filtered result, not a retryable failure.
+                                if item_result is None:
+                                    raise RuntimeError(
+                                        "filtered artifact batch item has no upload result"
+                                    )
                                 totals["filtered"] += 1
                                 _append_checkpoint(
                                     state_file,
                                     artifact=artifact,
                                     status="filtered",
                                     inventory_digest=inventory_digest,
-                                    ingestion_id=(
-                                        str(item.result.ingestion_id)
-                                        if item.result.ingestion_id
-                                        else None
-                                    ),
-                                    parse_revision_id=(
-                                        str(item.result.parse_revision_id)
-                                        if item.result.parse_revision_id
-                                        else None
-                                    ),
-                                    inferred_reaction_count=item.result.inferred_reaction_count,
+                                    ingestion_id=str(item_result.ingestion_id)
+                                    if item_result.ingestion_id
+                                    else None,
+                                    parse_revision_id=str(item_result.parse_revision_id)
+                                    if item_result.parse_revision_id
+                                    else None,
+                                    inferred_reaction_count=item_result.inferred_reaction_count,
                                     error_code=item.error_code,
                                     error_message=item.error_message,
                                 )
@@ -699,17 +703,17 @@ async def _run(args: argparse.Namespace) -> int:
                                     status="partial",
                                     inventory_digest=inventory_digest,
                                     ingestion_id=(
-                                        str(item.result.ingestion_id)
-                                        if item.result and item.result.ingestion_id
+                                        str(item_result.ingestion_id)
+                                        if item_result and item_result.ingestion_id
                                         else None
                                     ),
                                     parse_revision_id=(
-                                        str(item.result.parse_revision_id)
-                                        if item.result and item.result.parse_revision_id
+                                        str(item_result.parse_revision_id)
+                                        if item_result and item_result.parse_revision_id
                                         else None
                                     ),
                                     inferred_reaction_count=(
-                                        item.result.inferred_reaction_count if item.result else 0
+                                        item_result.inferred_reaction_count if item_result else 0
                                     ),
                                     error_code=item.error_code,
                                     error_message=item.error_message,

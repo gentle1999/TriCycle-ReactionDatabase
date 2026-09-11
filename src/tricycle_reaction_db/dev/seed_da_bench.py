@@ -15,7 +15,7 @@ from uuid import UUID
 from molop import AutoParser, molopconfig
 from rdkit.Chem import rdChemReactions
 from sqlalchemy import create_engine, func
-from sqlmodel import Session, select
+from sqlmodel import Session, col, select
 
 from tricycle_reaction_db.application.dtos import (
     LogicalReactionParticipantRecord,
@@ -79,6 +79,7 @@ from tricycle_reaction_db.application.services.molecular_geometry import Geometr
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
+    ArtifactIngestion,
     CalculationFrame,
     CalculationProtocol,
     CalculationSegment,
@@ -106,6 +107,7 @@ from tricycle_reaction_db.db.models import (
     WorkflowManifest,
 )
 from tricycle_reaction_db.domain.enums import (
+    ArtifactIngestionStatus,
     ArtifactKind,
     ElectronicStateSetKind,
     LogicalReactionParticipantRole,
@@ -371,6 +373,45 @@ def _persist_verified_artifact(
     return artifact
 
 
+def _persist_seed_ingestion(
+    session: Session,
+    artifact: ArtifactFile,
+    chem_file: Any,
+    *,
+    completed_at: Any,
+    revision: ParseRevision,
+) -> None:
+    """Record the successful parse state used by project-scoped read queries."""
+
+    artifact_id = _required_id(artifact, "ArtifactFile")
+    ingestion = session.exec(
+        select(ArtifactIngestion).where(
+            col(ArtifactIngestion.artifact_file_id) == artifact_id,
+        )
+    ).first()
+    if ingestion is None:
+        ingestion = ArtifactIngestion(
+            artifact_file_id=artifact_id,
+            parser_name="molop",
+            parser_version="da-bench-fixture-v3",
+        )
+    ingestion.status = ArtifactIngestionStatus.SUCCEEDED
+    ingestion.source_frame_count = len(chem_file)
+    ingestion.transition_state_frame_count = sum(frame.is_TS is True for frame in chem_file)
+    ingestion.started_at = completed_at
+    ingestion.completed_at = completed_at
+    ingestion.worker_lease_id = None
+    ingestion.worker_lease_expires_at = None
+    ingestion.error_code = None
+    ingestion.error_message = None
+    ingestion.parser_metadata = {
+        "source": "da-bench-minimal-seed",
+        "latest_parse_revision_id": str(_required_id(revision, "ParseRevision")),
+        "parse_completeness": "complete",
+    }
+    session.add(ingestion)
+
+
 def _row_counts(session: Session) -> dict[str, int]:
     return {
         "artifact_file": session.exec(select(func.count()).select_from(ArtifactFile)).one(),
@@ -566,7 +607,10 @@ def seed_da_bench_fixture(
         project_ids = {artifact.project_id for artifact in artifacts.values()}
         if len(project_ids) != 1:
             raise ValueError("DA benchmark artifacts must belong to one project")
-        geometry_context = GeometryPersistenceContext(project_id=next(iter(project_ids)))
+        project_id = next(iter(project_ids))
+        if project_id is None:
+            raise ValueError("DA benchmark artifacts must have a project owner")
+        geometry_context = GeometryPersistenceContext(project_id=project_id)
         persisted_participants = {}
         for declaration in workflow["participants"]:
             role = declaration["log_role"]
@@ -664,6 +708,7 @@ def seed_da_bench_fixture(
                             session,
                             calculation_frame=persisted_frame,
                             source_frame=frame,
+                            topology_context=geometry_context,
                         )
                     if record.status is not None:
                         persist_calculation_status_result(session, persisted_frame, record.status)
@@ -690,6 +735,13 @@ def seed_da_bench_fixture(
                     completed_at=completed_at,
                 ),
             )
+            _persist_seed_ingestion(
+                session,
+                artifact,
+                chem_file,
+                completed_at=completed_at,
+                revision=revision,
+            )
             frame_counts[log_role] = len(chem_file)
 
         participant_payloads = []
@@ -712,7 +764,7 @@ def seed_da_bench_fixture(
                 cycloaddition_pattern="4+2",
                 reaction_hash=reaction_hash_for_participants(identities),
             ),
-            project_id=geometry_context.project_id,
+            project_id=project_id,
         )
         reaction_participants = {}
         for declaration, persisted, side, _atom_maps in participant_payloads:
@@ -777,6 +829,7 @@ def seed_da_bench_fixture(
             participant.logical_reaction_participant_id: participant
             for participant in mapped_reaction.participants
         }
+        source_frame_ids_by_geometry: dict[UUID, tuple[UUID | None, UUID | None]] = {}
         nodes = {}
         for declaration in workflow["nodes"]:
             node = persist_mapped_reaction_node(
@@ -806,6 +859,34 @@ def seed_da_bench_fixture(
                         authority_selector["frame_index"],
                     )
                 ]
+                authority_frame_id = _required_id(authority_frame, "CalculationFrame")
+                thermochemistry_selector = component.get("thermochemistry_source")
+                thermochemistry_frame_id: UUID | None = None
+                if thermochemistry_selector is not None:
+                    thermochemistry_frame = selected_frames[
+                        (
+                            component["log_role"],
+                            thermochemistry_selector["segment_index"],
+                            thermochemistry_selector["frame_index"],
+                        )
+                    ]
+                    if thermochemistry_frame.geometry_id != authority_frame.geometry_id:
+                        raise ValueError(
+                            "DA benchmark thermochemistry source must use the authority Geometry"
+                        )
+                    thermochemistry_frame_id = _required_id(
+                        thermochemistry_frame,
+                        "CalculationFrame",
+                    )
+                source_frame_ids = (authority_frame_id, thermochemistry_frame_id)
+                geometry_source_frames = source_frame_ids_by_geometry.setdefault(
+                    _required_id(authority_frame.geometry, "Geometry"),
+                    source_frame_ids,
+                )
+                if geometry_source_frames != source_frame_ids:
+                    raise ValueError(
+                        "DA benchmark Geometry has conflicting thermodynamic source frames"
+                    )
                 topology_atom_maps = atom_maps_from_source_order(
                     authority_frame.geometry,
                     component["source_atom_map_numbers"],
@@ -851,7 +932,11 @@ def seed_da_bench_fixture(
         )
         # The edge identifies which transition-state node contributes the
         # activation profile, so refresh only after the complete path exists.
-        refresh_mapped_reaction_thermodynamics(session, mapped_reaction)
+        refresh_mapped_reaction_thermodynamics(
+            session,
+            mapped_reaction,
+            source_frame_ids_by_geometry=source_frame_ids_by_geometry,
+        )
         _remove_legacy_seed_manifest(
             session,
             store,

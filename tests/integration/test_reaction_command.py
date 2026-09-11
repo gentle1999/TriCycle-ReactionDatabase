@@ -29,13 +29,15 @@ from tricycle_reaction_db.application.services import (
     persist_mapped_reaction_node,
     persist_mapped_reaction_node_geometry,
     persist_mapped_reaction_node_geometry_mapping,
-    persist_molecular_geometry,
     persist_parse_revision,
     persist_thermochemistry_result,
 )
 from tricycle_reaction_db.application.services import reactions as reactions_module
 from tricycle_reaction_db.application.services.molecular_geometry import (
     GeometryPersistenceContext,
+)
+from tricycle_reaction_db.application.services.molecular_geometry import (
+    persist_molecular_geometry as _persist_molecular_geometry_impl,
 )
 from tricycle_reaction_db.application.services.molop_artifact_ingestion import (
     reconcile_molop_geometry_context,
@@ -96,6 +98,13 @@ def _project_scoped_reaction(
         GeometryPersistenceContext(project_id=SYSTEM_PROJECT_ID),
     )
     return _create_reaction_impl(session, command, **kwargs)
+
+
+def persist_molecular_geometry(session: Session, record: Any, **kwargs: Any) -> Any:
+    """Keep legacy geometry command fixtures inside an explicit project scope."""
+
+    kwargs.setdefault("context", GeometryPersistenceContext(project_id=SYSTEM_PROJECT_ID))
+    return _persist_molecular_geometry_impl(session, record, **kwargs)
 
 
 _create_reaction = _project_scoped_reaction

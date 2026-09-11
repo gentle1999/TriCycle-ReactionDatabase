@@ -26,6 +26,7 @@ from tricycle_reaction_db.application.services.reaction_geometry_policy import (
     geometry_has_thermodynamic_property_predicate,
 )
 from tricycle_reaction_db.core.config import get_settings
+from tricycle_reaction_db.core.units import HARTREE_PER_PARTICLE_TO_KCAL_PER_MOLE_FACTOR
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
     ArtifactIngestion,
@@ -38,6 +39,7 @@ from tricycle_reaction_db.db.models import (
     MappedReaction,
     MappedReactionNode,
     MappedReactionNodeGeometry,
+    MappedReactionThermodynamicProfile,
     MolecularFormula,
     MolecularTopology,
     MolecularTopologyDerivation,
@@ -57,6 +59,7 @@ from tricycle_reaction_db.domain.enums import (
     LogicalReactionParticipantSide,
     MappedReactionKind,
     MappedReactionNodeRole,
+    ParseStatus,
     QMSoftware,
     ScientificArrayKind,
     SelectedEnergyKind,
@@ -174,6 +177,9 @@ def _create_domain_sample(session: Session) -> tuple[Any, ...]:
         reconstruction_config_hash=_fixture_hash(f"domain-reconstruction:{suffix}"),
         source_format=SourceFormat.GAUSSIAN_LOG,
         source_encoding="utf-8",
+        status=ParseStatus.SUCCEEDED,
+        record_sha256=artifact.content_sha256,
+        completed_at=datetime.now(UTC),
     )
     protocol = CalculationProtocol(
         project_id=SYSTEM_PROJECT_ID,
@@ -279,6 +285,28 @@ def _create_domain_sample(session: Session) -> tuple[Any, ...]:
         minimum_reaction_gibbs_free_energy_kcal_mol=1.0,
         maximum_reaction_gibbs_free_energy_kcal_mol=1.0,
     )
+    profile_state = {"topologies": [{"geometry_id": str(geometry.id)}]}
+    profile = MappedReactionThermodynamicProfile(
+        id=uuid4(),
+        mapped_reaction_id=mapped_reaction.id,
+        policy_version="domain-filter-test-v1",
+        source_key_hash=_fixture_hash(f"domain-profile:{suffix}"),
+        electronic_level=["test"],
+        thermochemistry_level=["test"],
+        temperature_kelvin=298.15,
+        pressure_atm=1.0,
+        reactants=profile_state,
+        transition_state=None,
+        products=profile_state,
+        reactants_enthalpy_hartree=-10.0,
+        reactants_gibbs_free_energy_hartree=-10.0,
+        reactants_entropy_cal_mol_k=0.0,
+        products_enthalpy_hartree=-10.0,
+        products_gibbs_free_energy_hartree=(
+            -10.0 + 1.0 / HARTREE_PER_PARTICLE_TO_KCAL_PER_MOLE_FACTOR
+        ),
+        products_entropy_cal_mol_k=0.0,
+    )
     participants = [
         LogicalReactionParticipant(
             logical_reaction_id=logical_reaction.id,
@@ -295,7 +323,7 @@ def _create_domain_sample(session: Session) -> tuple[Any, ...]:
             stoichiometric_coefficient=1,
         ),
     ]
-    session.add_all([array, thermochemistry, mapped_reaction, *participants])
+    session.add_all([array, thermochemistry, mapped_reaction, profile, *participants])
     session.flush()
     assert mapped_reaction.id is not None
     node = MappedReactionNode(
@@ -1595,4 +1623,4 @@ def test_domain_filter_bounds_are_validated(
     message: str,
 ) -> None:
     with pytest.raises(ValueError, match=message):
-        asyncio.run(method(**parameters))
+        asyncio.run(method(project_id=SYSTEM_PROJECT_ID, **parameters))

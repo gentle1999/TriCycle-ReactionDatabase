@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 from uuid import UUID
@@ -89,6 +89,8 @@ def _runtime_for_geometry_ids(
 def _load_mapped_reaction_thermodynamics_input(
     session: Session,
     mapped_reaction: MappedReaction,
+    *,
+    source_frame_ids_by_geometry: Mapping[UUID, tuple[UUID | None, UUID | None]] | None = None,
 ) -> _MappedReactionThermodynamicsInput:
     """Load the source facts required to refresh one mapped reaction."""
 
@@ -207,7 +209,11 @@ def _load_mapped_reaction_thermodynamics_input(
         participant_rows=tuple(participant_rows),
         binding_rows=tuple(binding_rows),
         transition_state_node_ids=transition_state_node_ids,
-        composites=geometry_energy_composites(geometry_ids, calculation_rows),
+        composites=geometry_energy_composites(
+            geometry_ids,
+            calculation_rows,
+            source_frame_ids_by_geometry=source_frame_ids_by_geometry,
+        ),
         runtimes_by_geometry=runtimes_by_geometry,
     )
 
@@ -436,6 +442,7 @@ def refresh_mapped_reaction_thermodynamics(
     mapped_reaction: MappedReaction,
     *,
     _input: _MappedReactionThermodynamicsInput | None = None,
+    source_frame_ids_by_geometry: Mapping[UUID, tuple[UUID | None, UUID | None]] | None = None,
 ) -> MappedReactionThermodynamics:
     """Recompute and persist one mapping's profile after source facts change.
 
@@ -446,9 +453,12 @@ def refresh_mapped_reaction_thermodynamics(
 
     _attach_pending_entities(session)
     mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
+    if _input is not None and source_frame_ids_by_geometry is not None:
+        raise ValueError("cannot combine a prepared thermodynamics input with source frame IDs")
     refresh_input = _input or _load_mapped_reaction_thermodynamics_input(
         session,
         mapped_reaction,
+        source_frame_ids_by_geometry=source_frame_ids_by_geometry,
     )
     participant_rows = refresh_input.participant_rows
     binding_rows = refresh_input.binding_rows

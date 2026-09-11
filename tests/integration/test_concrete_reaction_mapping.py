@@ -146,6 +146,7 @@ def _mapped_reaction_fixture(
             label="concrete mapping test",
             reaction_hash=reaction_hash,
         ),
+        project_id=SYSTEM_PROJECT_ID,
     )
     for side in LogicalReactionParticipantSide:
         persist_logical_reaction_participant(
@@ -513,6 +514,11 @@ def test_geometry_arrival_uses_strict_topology_and_can_bind_new_mapping() -> Non
 
             persisted = persist_molecular_geometry(session, normalized)
             assert persisted.topology.id == target.id
+            ensure_mapped_reactions_for_concrete_topology(
+                session,
+                target,
+                refresh_thermodynamics=True,
+            )
             target_mappings = session.exec(
                 select(MappedReaction)
                 .where(MappedReaction.logical_reaction_id == source_mapping.logical_reaction_id)
