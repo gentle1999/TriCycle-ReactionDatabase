@@ -78,6 +78,26 @@ async def test_graphql_rejects_variables_with_standard_error_envelope() -> None:
 
 
 @pytest.mark.asyncio
+async def test_graphql_requires_project_scope_for_project_owned_queries() -> None:
+    transport = ASGITransport(app=create_app())
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/graphql",
+            json={
+                "query": (
+                    "{ MappedReactionQueryService { "
+                    "list_mapped_reactions(limit: 1) { items { id } } } }"
+                )
+            },
+        )
+
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["data"] is None
+    assert payload["errors"][0]["extensions"]["code"] == "project_scope_required"
+
+
+@pytest.mark.asyncio
 async def test_graphiql_is_development_only(monkeypatch: pytest.MonkeyPatch) -> None:
     transport = ASGITransport(app=create_app())
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -165,7 +185,8 @@ async def test_graphql_structure_budget_uses_stable_error_code() -> None:
     transport = ASGITransport(app=create_app())
     structure = "C" * 16_385
     query = (
-        "{ MappedReactionQueryService { list_mapped_reactions("
+        "{ MappedReactionQueryService { list_mapped_reactions(project_id: "
+        '"00000000-0000-7000-8000-000000000201", '
         f'similarity_reaction_smiles: "{structure}", limit: 1) '
         "{ page { total } } } }"
     )

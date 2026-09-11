@@ -59,8 +59,15 @@ class ScientificArrayContentService:
     """Load one deferred array deliberately and serialize it as NumPy NPY."""
 
     @classmethod
-    async def _load_array(cls, array_id: UUID) -> ScientificArray:
-        scope = await query_visibility_scope(ProjectPermission.ARTIFACT_DOWNLOAD)
+    async def _load_array(
+        cls,
+        array_id: UUID,
+        project_id: UUID,
+    ) -> ScientificArray:
+        scope = await query_visibility_scope(
+            ProjectPermission.ARTIFACT_DOWNLOAD,
+            project_id=project_id,
+        )
         async with session_factory() as session:
             row = (
                 await session.execute(
@@ -94,8 +101,9 @@ class ScientificArrayContentService:
         array_id: UUID,
         *,
         max_bytes: int,
+        project_id: UUID,
     ) -> ScientificArrayDownload:
-        array = await cls._load_array(array_id)
+        array = await cls._load_array(array_id, project_id=project_id)
         if array.array_nbytes > max_bytes:
             raise ScientificArrayPayloadTooLargeError(
                 f"array payload is {array.array_nbytes} bytes; limit is {max_bytes}"
@@ -119,8 +127,9 @@ class ScientificArrayContentService:
         array_id: UUID,
         *,
         max_elements: int,
+        project_id: UUID,
     ) -> ScientificArrayPreviewData:
-        array = await cls._load_array(array_id)
+        array = await cls._load_array(array_id, project_id=project_id)
         values = np.asarray(array.data).reshape(-1)
         preview_values = [_json_value(value) for value in values[:max_elements]]
         return ScientificArrayPreviewData(

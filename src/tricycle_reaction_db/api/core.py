@@ -67,6 +67,10 @@ from tricycle_reaction_db.domain.enums import (
 
 CoreLimit = Annotated[int, Query(ge=1, le=200)]
 CoreOffset = Annotated[int, Query(ge=0)]
+ProjectQueryId = Annotated[
+    UUID,
+    Query(description="The project scope for this project-owned query."),
+]
 PreviewBytes = Annotated[int, Query(ge=1024, le=512 * 1024)]
 ArrayPayloadBytes = Annotated[int, Query(ge=1, le=256 * 1024 * 1024)]
 ArrayPreviewElements = Annotated[int, Query(ge=1, le=4096)]
@@ -81,7 +85,7 @@ class ReactionThermodynamicAnalyticsQuery(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    project_id: UUID | None = None
+    project_id: UUID
     filter_expression: str | None = None
     has_activation_gibbs_free_energy: bool | None = None
     has_reaction_gibbs_free_energy: bool | None = None
@@ -127,12 +131,14 @@ router = APIRouter(prefix="/api", tags=["Core API"])
 
 @router.get("/topologies", response_model=list[MolecularTopologyCoreDTO])
 async def list_topologies(
+    project_id: ProjectQueryId,
     limit: CoreLimit = 50,
     offset: CoreOffset = 0,
 ) -> list[MolecularTopologyCoreDTO]:
     """List only topologies rooted in artifacts visible to this request."""
 
     page = await MolecularTopologyQueryService.list_visible_topologies(
+        project_id=project_id,
         limit=limit,
         offset=offset,
     )
@@ -167,6 +173,7 @@ async def list_topologies(
 @router.post("/formulas/search", response_model=MolecularFormulaPage)
 async def search_molecular_formulas(
     ranges: MolecularFormulaRangeQuery,
+    project_id: ProjectQueryId,
     limit: CoreLimit = 50,
     offset: CoreOffset = 0,
 ) -> MolecularFormulaPage:
@@ -177,6 +184,7 @@ async def search_molecular_formulas(
         await MolecularFormulaQueryService.search_formulas(
             minimum_counts=ranges.minimum_counts,
             maximum_counts=ranges.maximum_counts,
+            project_id=project_id,
             limit=limit,
             offset=offset,
         ),
@@ -186,7 +194,7 @@ async def search_molecular_formulas(
 @router.post("/topologies/search", response_model=MolecularTopologySearchPage)
 async def search_molecular_topologies(
     search: MolecularTopologySearchQuery,
-    project_id: UUID | None = None,
+    project_id: ProjectQueryId,
     limit: CoreLimit = 50,
     offset: CoreOffset = 0,
 ) -> MolecularTopologySearchPage:
@@ -205,9 +213,9 @@ async def search_molecular_topologies(
 
 @router.get("/artifacts", response_model=ArtifactPage)
 async def list_artifacts(
+    project_id: ProjectQueryId,
     artifact_id: UUID | None = None,
     artifact_kind: ArtifactKind | None = None,
-    project_id: UUID | None = None,
     content_sha256: str | None = None,
     storage_status: StorageStatus | None = None,
     ingestion_status: ArtifactIngestionStatus | None = None,
@@ -241,10 +249,16 @@ async def list_artifacts(
 
 
 @router.get("/artifacts/{artifact_id}", response_model=ArtifactSummary)
-async def get_artifact(artifact_id: UUID) -> ArtifactSummary:
+async def get_artifact(
+    artifact_id: UUID,
+    project_id: ProjectQueryId,
+) -> ArtifactSummary:
     result = cast(
         ArtifactSummary | None,
-        await ArtifactQueryService.get_artifact(artifact_id=artifact_id),
+        await ArtifactQueryService.get_artifact(
+            artifact_id=artifact_id,
+            project_id=project_id,
+        ),
     )
     return _require_result(result, "artifact")
 
@@ -253,6 +267,7 @@ async def get_artifact(artifact_id: UUID) -> ArtifactSummary:
 async def preview_artifact(
     artifact_id: UUID,
     principal: OptionalPrincipal,
+    project_id: ProjectQueryId,
     max_bytes: PreviewBytes = 128 * 1024,
 ) -> ArtifactPreview:
     try:
@@ -260,6 +275,7 @@ async def preview_artifact(
             artifact_id,
             max_bytes=max_bytes,
             user_id=principal.user_id if principal is not None else None,
+            project_id=project_id,
         )
     except (ArtifactNotFoundError, ArtifactForbiddenError) as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
@@ -278,11 +294,13 @@ async def preview_artifact(
 async def download_artifact(
     artifact_id: UUID,
     principal: OptionalPrincipal,
+    project_id: ProjectQueryId,
 ) -> StreamingResponse:
     try:
         download = await ArtifactContentService.download(
             artifact_id,
             user_id=principal.user_id if principal is not None else None,
+            project_id=project_id,
         )
     except (ArtifactNotFoundError, ArtifactForbiddenError) as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
@@ -311,7 +329,7 @@ async def download_artifact(
 
 @router.get("/logical-reactions", response_model=LogicalReactionPage)
 async def list_logical_reactions(
-    project_id: UUID | None = None,
+    project_id: ProjectQueryId,
     topology_id: UUID | None = None,
     reaction_key: str | None = None,
     reaction_hash: str | None = None,
@@ -381,7 +399,7 @@ async def list_logical_reactions(
 @router.get("/logical-reactions/{reaction_id}", response_model=LogicalReactionDetail)
 async def get_logical_reaction(
     reaction_id: UUID,
-    project_id: UUID | None = None,
+    project_id: ProjectQueryId,
 ) -> LogicalReactionDetail:
     result = cast(
         LogicalReactionDetail | None,
@@ -398,7 +416,7 @@ async def get_logical_reaction(
     response_model=MappedReactionThermodynamicStatistics,
 )
 async def get_mapped_reaction_thermodynamic_statistics(
-    project_id: UUID | None = None,
+    project_id: ProjectQueryId,
 ) -> MappedReactionThermodynamicStatistics:
     return await ReactionThermodynamicAnalyticsService.statistics(project_id=project_id)
 
@@ -426,7 +444,7 @@ async def query_mapped_reaction_thermodynamic_statistics(
     response_class=StreamingResponse,
 )
 async def export_mapped_reaction_thermodynamics(
-    project_id: UUID | None = None,
+    project_id: ProjectQueryId,
 ) -> StreamingResponse:
     stream = await ReactionThermodynamicAnalyticsService.export_csv(project_id=project_id)
     return StreamingResponse(
@@ -470,7 +488,7 @@ async def export_filtered_mapped_reaction_thermodynamics(
 @router.get("/mapped-reactions/{mapped_reaction_id}", response_model=MappedReactionDetail)
 async def get_mapped_reaction(
     mapped_reaction_id: UUID,
-    project_id: UUID | None = None,
+    project_id: ProjectQueryId,
 ) -> MappedReactionDetail:
     result = cast(
         MappedReactionDetail | None,
@@ -488,7 +506,7 @@ async def get_mapped_reaction(
 )
 async def get_mapped_reaction_thermodynamics(
     mapped_reaction_id: UUID,
-    project_id: UUID | None = None,
+    project_id: ProjectQueryId,
 ) -> MappedReactionThermodynamics:
     result = cast(
         MappedReactionThermodynamics | None,
@@ -502,7 +520,7 @@ async def get_mapped_reaction_thermodynamics(
 
 @router.get("/mapped-reactions", response_model=MappedReactionPage)
 async def list_mapped_reactions(
-    project_id: UUID | None = None,
+    project_id: ProjectQueryId,
     logical_reaction_id: UUID | None = None,
     topology_id: UUID | None = None,
     geometry_id: UUID | None = None,
@@ -560,7 +578,7 @@ async def list_mapped_reactions(
 )
 async def get_reaction_energy_profile(
     mapped_reaction_id: UUID,
-    project_id: UUID | None = None,
+    project_id: ProjectQueryId,
     energy_kind: str = "gibbs_free_energy_hartree",
     reference_node_id: UUID | None = None,
 ) -> ReactionEnergyProfile:
@@ -578,7 +596,7 @@ async def get_reaction_energy_profile(
 
 @router.get("/calculation-frames", response_model=CalculationFramePage)
 async def list_calculation_frames(
-    project_id: UUID | None = None,
+    project_id: ProjectQueryId,
     artifact_file_id: UUID | None = None,
     geometry_id: UUID | None = None,
     topology_id: UUID | None = None,
@@ -617,7 +635,7 @@ async def list_calculation_frames(
 @router.get("/calculation-frames/{frame_id}", response_model=CalculationFrameDetail)
 async def get_calculation_frame(
     frame_id: UUID,
-    project_id: UUID | None = None,
+    project_id: ProjectQueryId,
 ) -> CalculationFrameDetail:
     result = cast(
         CalculationFrameDetail | None,
@@ -633,12 +651,14 @@ async def get_calculation_frame(
 async def download_scientific_array(
     array_id: UUID,
     _principal: OptionalPrincipal,
+    project_id: ProjectQueryId,
     max_bytes: ArrayPayloadBytes = 32 * 1024 * 1024,
 ) -> Response:
     try:
         download = await ScientificArrayContentService.load_npy(
             array_id,
             max_bytes=max_bytes,
+            project_id=project_id,
         )
     except ScientificArrayNotFoundError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
@@ -665,12 +685,14 @@ async def download_scientific_array(
 async def preview_scientific_array(
     array_id: UUID,
     _principal: OptionalPrincipal,
+    project_id: ProjectQueryId,
     max_elements: ArrayPreviewElements = 512,
 ) -> ScientificArrayPreview:
     try:
         preview = await ScientificArrayContentService.preview(
             array_id,
             max_elements=max_elements,
+            project_id=project_id,
         )
     except ScientificArrayNotFoundError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error

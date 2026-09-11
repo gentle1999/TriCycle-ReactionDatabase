@@ -3,7 +3,7 @@ import { ChevronDown, Download, FileText, Network, Shapes } from "@lucide/vue";
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 
-import { api, apiUrl } from "@/api";
+import { api, scientificArrayDownloadUrl } from "@/api";
 import { formatBytes, formatDurationSeconds, formatEnergy, formatNumber, labelFor, shortId, statusTone } from "@/format";
 import { withoutAccessState } from "@/routeAccessState";
 import type { CalculationFrameDetail, ScientificArrayPreview } from "@/types";
@@ -93,7 +93,7 @@ function arrayPreviewData(id: string): ScientificArrayPreview | null {
 }
 
 function arrayDownloadUrl(id: string): string {
-  return apiUrl(`/api/scientific-arrays/${encodeURIComponent(id)}.npy`);
+  return scientificArrayDownloadUrl(id, props.projectId);
 }
 
 function arrayDisplayLabel(array: CalculationFrameDetail["scientific_arrays"][number]): string {
@@ -159,7 +159,11 @@ async function toggleArray(arrayId: string): Promise<void> {
   previewController = controller;
   arrayPreviewStates.value[arrayId] = { loading: true, data: null, error: "" };
   try {
-    const data = await api.scientificArrayPreview(arrayId, { maxElements: 512 }, controller.signal);
+    const data = await api.scientificArrayPreview(
+      arrayId,
+      { maxElements: 512, projectId: props.projectId },
+      controller.signal,
+    );
     if (!controller.signal.aborted) {
       arrayPreviewStates.value[arrayId] = { loading: false, data, error: "" };
     }

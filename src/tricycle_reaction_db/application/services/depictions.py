@@ -264,7 +264,7 @@ def draw_transition_state_mode_dof_svg(
 
 async def _get_topology_molecule(
     topology_id: UUID,
-    project_id: UUID | None = None,
+    project_id: UUID,
 ) -> Chem.Mol | None:
     scope = await query_visibility_scope(project_id=project_id)
     async with session_factory() as session:
@@ -280,7 +280,7 @@ async def _get_topology_molecule(
 
 async def _get_geometry_molecule(
     geometry_id: UUID,
-    project_id: UUID | None = None,
+    project_id: UUID,
 ) -> Chem.Mol | None:
     scope = await query_visibility_scope(project_id=project_id)
     async with session_factory() as session:
@@ -296,7 +296,7 @@ async def _get_geometry_molecule(
 
 async def get_topology_depiction(
     topology_id: UUID,
-    project_id: UUID | None = None,
+    project_id: UUID,
 ) -> str | None:
     """Load one visible topology and return an SVG depiction."""
 
@@ -308,7 +308,7 @@ async def get_topology_depiction(
 
 async def get_topology_molfile(
     topology_id: UUID,
-    project_id: UUID | None = None,
+    project_id: UUID,
 ) -> str | None:
     """Load one visible topology and return a ChemDoodle-compatible molfile."""
 
@@ -320,7 +320,7 @@ async def get_topology_molfile(
 
 async def get_geometry_sdf(
     geometry_id: UUID,
-    project_id: UUID | None = None,
+    project_id: UUID,
 ) -> str | None:
     """Load one stored Geometry.mol and preserve its conformer in an SDF record."""
 
@@ -332,7 +332,7 @@ async def get_geometry_sdf(
 
 async def _get_geometry_xyz_export(
     geometry_id: UUID,
-    project_id: UUID | None = None,
+    project_id: UUID,
 ) -> tuple[Chem.Mol, int, int] | None:
     """Load a visible Geometry and its persisted electronic state."""
 
@@ -354,7 +354,7 @@ async def _get_geometry_xyz_export(
 
 async def get_geometry_xyz(
     geometry_id: UUID,
-    project_id: UUID | None = None,
+    project_id: UUID,
 ) -> str | None:
     """Load one stored Geometry.mol and export its persisted electronic state."""
 
@@ -367,7 +367,7 @@ async def get_geometry_xyz(
 
 async def get_geometry_dof_depiction(
     geometry_id: UUID,
-    project_id: UUID | None = None,
+    project_id: UUID,
 ) -> str | None:
     """Load one visible Geometry and return a cacheable rdkit-dof SVG."""
 
@@ -387,7 +387,7 @@ _TRANSITION_STATE_ANCHORS: tuple[TransitionStateAnchor, ...] = (
 
 async def _get_transition_state_anchor_molecules(
     frame_id: UUID,
-    project_id: UUID | None = None,
+    project_id: UUID,
 ) -> dict[TransitionStateAnchor, tuple[Chem.Mol, int, int]] | None:
     """Load TS anchors in the original MolOP source atom order."""
 
@@ -418,7 +418,13 @@ async def _get_transition_state_anchor_molecules(
                     MolecularTopology,
                     col(TransitionStateEndpoint.topology_id) == col(MolecularTopology.id),
                 )
-                .where(col(TransitionStateEndpoint.calculation_frame_id) == frame_id)
+                .where(
+                    col(TransitionStateEndpoint.calculation_frame_id) == frame_id,
+                    topology_id_is_visible(
+                        scope,
+                        col(TransitionStateEndpoint.topology_id),
+                    ),
+                )
                 .options(undefer(cast(Any, TransitionStateEndpoint.source_coordinates)))
             )
         ).all()
@@ -523,7 +529,7 @@ def _interpolate_transition_state_mode_frames(
 
 async def get_transition_state_mode_dof_depiction(
     frame_id: UUID,
-    project_id: UUID | None = None,
+    project_id: UUID,
 ) -> str | None:
     """Return a looping rdkit-dof SMIL animation for a persisted TS imaginary mode."""
 
@@ -536,7 +542,7 @@ async def get_transition_state_mode_dof_depiction(
 async def get_transition_state_anchor_sdf(
     frame_id: UUID,
     anchor: Literal["negative", "center", "positive"],
-    project_id: UUID | None = None,
+    project_id: UUID,
 ) -> str | None:
     """Return one TS-mode anchor in the shared MolOP source coordinate frame."""
 

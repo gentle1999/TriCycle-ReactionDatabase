@@ -554,7 +554,7 @@ watch(
                 <button class="table-action" type="button" title="预览文件" aria-label="预览文件" :disabled="artifact.storage_status !== 'available'" @click.stop="emit('preview', artifact.id)">
                   <Eye :size="15" aria-hidden="true" />
                 </button>
-                <a class="table-action" :class="{ 'is-disabled': artifact.storage_status !== 'available' }" :href="artifactDownloadUrl(artifact.id)" :download="artifact.original_filename" title="下载文件" aria-label="下载文件" @click.stop>
+                <a class="table-action" :class="{ 'is-disabled': artifact.storage_status !== 'available' }" :href="artifactDownloadUrl(artifact.id, selectedProjectId ?? undefined)" :download="artifact.original_filename" title="下载文件" aria-label="下载文件" @click.stop>
                   <Download :size="15" aria-hidden="true" />
                 </a>
                 <button

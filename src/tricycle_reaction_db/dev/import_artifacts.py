@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fnmatch
 import json
 import mimetypes
 import os
@@ -201,12 +202,25 @@ def _normalize_suffixes(suffixes: Collection[str] | None) -> frozenset[str]:
     return frozenset(normalized)
 
 
+def _normalize_name_globs(name_globs: Collection[str] | None) -> tuple[str, ...]:
+    """Normalize case-insensitive basename globs used to exclude local files."""
+
+    if not name_globs:
+        return ()
+    return tuple(
+        pattern.casefold()
+        for pattern in (value.strip() for value in name_globs)
+        if pattern
+    )
+
+
 def is_importable_file(
     path: Path,
     *,
     artifact_kind: ArtifactKind,
     include_suffixes: Collection[str] | None = None,
     exclude_suffixes: Collection[str] | None = None,
+    exclude_name_globs: Collection[str] | None = None,
 ) -> bool:
     """Return whether ``path`` belongs in an import of ``artifact_kind``.
 
@@ -219,6 +233,9 @@ def is_importable_file(
     suffix = _normalized_suffix(path)
     includes = _normalize_suffixes(include_suffixes)
     excludes = _normalize_suffixes(exclude_suffixes)
+    name_globs = _normalize_name_globs(exclude_name_globs)
+    if any(fnmatch.fnmatchcase(path.name.casefold(), pattern) for pattern in name_globs):
+        return False
     if suffix in excludes:
         return False
     if includes:
@@ -235,6 +252,8 @@ def discover_files(
     artifact_kind: ArtifactKind | None = None,
     include_suffixes: Collection[str] | None = None,
     exclude_suffixes: Collection[str] | None = None,
+    exclude_name_globs: Collection[str] | None = None,
+    discovery_stats: dict[str, int] | None = None,
 ) -> list[ImportCandidate]:
     """Return regular files below roots in deterministic order.
 
@@ -252,13 +271,18 @@ def discover_files(
         for path in paths:
             if path.is_symlink() or not path.is_file():
                 continue
+            if discovery_stats is not None:
+                discovery_stats["scanned"] = discovery_stats.get("scanned", 0) + 1
             resolved = path.resolve()
             if artifact_kind is not None and not is_importable_file(
                 resolved,
                 artifact_kind=artifact_kind,
                 include_suffixes=include_suffixes,
                 exclude_suffixes=exclude_suffixes,
+                exclude_name_globs=exclude_name_globs,
             ):
+                if discovery_stats is not None:
+                    discovery_stats["excluded"] = discovery_stats.get("excluded", 0) + 1
                 continue
             stat = resolved.stat()
             candidates.setdefault(
@@ -982,6 +1006,15 @@ def _parser() -> argparse.ArgumentParser:
         help=("skip files with this suffix; may be repeated and may omit the leading dot"),
     )
     parser.add_argument(
+        "--exclude-name-glob",
+        action="append",
+        default=[],
+        help=(
+            "skip files whose basename matches this case-insensitive glob; may be repeated "
+            "(for example '*_xtb.out')"
+        ),
+    )
+    parser.add_argument(
         "--state-file",
         type=Path,
         help="append-only JSONL checkpoint file for resumable imports",
@@ -1039,23 +1072,21 @@ async def _run(args: argparse.Namespace) -> int:
     started_at = perf_counter()
     metrics = ImportMetrics()
     discover_started = perf_counter()
-    all_candidates = discover_files(args.roots)
-    candidates = [
-        candidate
-        for candidate in all_candidates
-        if is_importable_file(
-            candidate.path,
-            artifact_kind=artifact_kind,
-            include_suffixes=args.include_suffix,
-            exclude_suffixes=args.exclude_suffix,
-        )
-    ]
+    discovery_stats: dict[str, int] = {}
+    candidates = discover_files(
+        args.roots,
+        artifact_kind=artifact_kind,
+        include_suffixes=args.include_suffix,
+        exclude_suffixes=args.exclude_suffix,
+        exclude_name_globs=args.exclude_name_glob,
+        discovery_stats=discovery_stats,
+    )
     metrics.steps.append(
         {
             "phase": "discovery",
-            "scanned": len(all_candidates),
+            "scanned": discovery_stats.get("scanned", len(candidates)),
             "selected": len(candidates),
-            "excluded": len(all_candidates) - len(candidates),
+            "excluded": discovery_stats.get("excluded", 0),
         }
     )
     metrics.add_step_timing("discover", (perf_counter() - discover_started) * 1000)

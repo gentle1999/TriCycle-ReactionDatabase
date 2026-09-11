@@ -39,7 +39,13 @@ class _Paginator:
         self.pages = pages
         self.prefixes: list[str] = []
 
-    def paginate(self, *, Bucket: str, Prefix: str) -> list[dict[str, object]]:
+    def paginate(
+        self,
+        *,
+        Bucket: str,
+        Prefix: str,
+        PaginationConfig: dict[str, int] | None = None,
+    ) -> list[dict[str, object]]:
         self.prefixes.append(Prefix)
         return self.pages
 

@@ -39,6 +39,13 @@ from tricycle_reaction_db.db.models import (
 from tricycle_reaction_db.domain.enums import LogicalReactionParticipantSide
 
 
+def _require_project_owner(entity: Any, *, label: str) -> UUID:
+    project_id = getattr(entity, "project_id", None)
+    if not isinstance(project_id, UUID):
+        raise ValueError(f"{label} must have a project_id before reaction expansion")
+    return project_id
+
+
 def _source_participants(
     session: Session,
     mapped_reaction: MappedReaction,
@@ -48,6 +55,7 @@ def _source_participants(
     """Load participants explicitly when a fast-path reaction is detached."""
 
     mapped_reaction_id = mapped_reaction.id
+    project_id = _require_project_owner(mapped_reaction, label="MappedReaction")
     if isinstance(mapped_reaction_id, UUID) and topology_context is not None:
         cached = topology_context.mapped_reaction_participants_by_reaction.get(mapped_reaction_id)
         if cached is not None:
@@ -61,8 +69,14 @@ def _source_participants(
         return participants
     persisted = tuple(
         session.exec(
-            select(MappedReactionParticipant).where(
-                MappedReactionParticipant.mapped_reaction_id == mapped_reaction.id
+            select(MappedReactionParticipant)
+            .join(
+                MappedReaction,
+                col(MappedReactionParticipant.mapped_reaction_id) == col(MappedReaction.id),
+            )
+            .where(
+                col(MappedReactionParticipant.mapped_reaction_id) == mapped_reaction.id,
+                col(MappedReaction.project_id) == project_id,
             )
         ).all()
     )
@@ -90,6 +104,7 @@ def _mapped_reactions_for_logical_reaction(
     session: Session,
     logical_reaction_id: UUID,
     *,
+    project_id: UUID,
     topology_context: Any | None = None,
 ) -> tuple[MappedReaction, ...]:
     """Load mapped reactions, including rows deferred by fast insertion."""
@@ -97,10 +112,23 @@ def _mapped_reactions_for_logical_reaction(
     if topology_context is not None:
         cached = topology_context.mapped_reactions_by_logical_reaction.get(logical_reaction_id)
         if cached is not None:
-            return cast(tuple[MappedReaction, ...], cached)
+            return tuple(
+                mapped_reaction
+                for mapped_reaction in cast(tuple[MappedReaction, ...], cached)
+                if mapped_reaction.project_id == project_id
+            )
     persisted = tuple(
         session.exec(
-            select(MappedReaction).where(MappedReaction.logical_reaction_id == logical_reaction_id)
+            select(MappedReaction)
+            .join(
+                LogicalReaction,
+                col(MappedReaction.logical_reaction_id) == col(LogicalReaction.id),
+            )
+            .where(
+                col(MappedReaction.logical_reaction_id) == logical_reaction_id,
+                col(MappedReaction.project_id) == project_id,
+                col(LogicalReaction.project_id) == project_id,
+            )
         ).all()
     )
     pending = tuple(
@@ -109,7 +137,11 @@ def _mapped_reactions_for_logical_reaction(
             *tuple(session.new),
             *tuple(session.info.get("_fast_pending_entities", ())),
         )
-        if isinstance(entity, MappedReaction) and entity.logical_reaction_id == logical_reaction_id
+        if (
+            isinstance(entity, MappedReaction)
+            and entity.logical_reaction_id == logical_reaction_id
+            and entity.project_id == project_id
+        )
     )
     by_id = {
         _require_id(mapped_reaction, label="MappedReaction"): mapped_reaction
@@ -134,8 +166,14 @@ def _mapped_reactions_for_logical_reaction(
         }
         if mapped_reaction_ids:
             participant_rows = session.exec(
-                select(MappedReactionParticipant).where(
-                    col(MappedReactionParticipant.mapped_reaction_id).in_(mapped_reaction_ids)
+                select(MappedReactionParticipant)
+                .join(
+                    MappedReaction,
+                    col(MappedReactionParticipant.mapped_reaction_id) == col(MappedReaction.id),
+                )
+                .where(
+                    col(MappedReactionParticipant.mapped_reaction_id).in_(mapped_reaction_ids),
+                    col(MappedReaction.project_id) == project_id,
                 )
             ).all()
             participants_by_reaction: dict[UUID, list[MappedReactionParticipant]] = {
@@ -178,6 +216,7 @@ def _memberships_for_concrete_topology(
     session: Session,
     concrete_topology_id: UUID,
     *,
+    project_id: UUID,
     topology_context: Any | None = None,
 ) -> tuple[LogicalParticipantConcreteTopology, ...]:
     """Load concrete memberships, including fast-path rows not flushed yet."""
@@ -201,11 +240,23 @@ def _memberships_for_concrete_topology(
             LogicalReaction,
             col(LogicalReaction.id) == col(LogicalReactionParticipant.logical_reaction_id),
         )
-        .where(LogicalParticipantConcreteTopology.concrete_topology_id == concrete_topology_id)
+        .join(
+            MolecularTopology,
+            col(MolecularTopology.id)
+            == col(LogicalParticipantConcreteTopology.concrete_topology_id),
+        )
+        .where(
+            LogicalParticipantConcreteTopology.concrete_topology_id == concrete_topology_id,
+            col(MolecularTopology.project_id) == project_id,
+            col(MolecularTopology.project_id) == col(LogicalReaction.project_id),
+            col(LogicalReaction.project_id) == project_id,
+            col(MolecularTopology.project_id).is_not(None),
+        )
     ).all()
     persisted_entities: list[LogicalParticipantConcreteTopology] = []
     for membership, logical_participant, logical_reaction in persisted_rows:
-        # A concrete topology can be shared by many logical reactions.  Load
+        # A concrete topology can be shared by many logical reactions within
+        # one project. Load
         # the complete ownership chain in one query so expansion does not
         # trigger one participant SELECT and one reaction SELECT per member.
         set_committed_value(
@@ -246,6 +297,7 @@ def _logical_participants_for_reaction(
     session: Session,
     logical_reaction_id: UUID,
     *,
+    project_id: UUID,
     topology_context: Any | None = None,
 ) -> tuple[LogicalReactionParticipant, ...]:
     """Load one logical reaction's participants once per persistence batch."""
@@ -256,8 +308,14 @@ def _logical_participants_for_reaction(
             return cast(tuple[LogicalReactionParticipant, ...], cached)
     participants = tuple(
         session.exec(
-            select(LogicalReactionParticipant).where(
-                LogicalReactionParticipant.logical_reaction_id == logical_reaction_id
+            select(LogicalReactionParticipant)
+            .join(
+                LogicalReaction,
+                col(LogicalReactionParticipant.logical_reaction_id) == col(LogicalReaction.id),
+            )
+            .where(
+                col(LogicalReactionParticipant.logical_reaction_id) == logical_reaction_id,
+                col(LogicalReaction.project_id) == project_id,
             )
         ).all()
     )
@@ -305,6 +363,7 @@ def _molecular_topology_by_id(
     session: Session,
     topology_id: UUID,
     *,
+    project_id: UUID,
     topology_context: Any | None = None,
 ) -> MolecularTopology | None:
     """Resolve a topology through the batch cache before consulting SQL."""
@@ -312,12 +371,40 @@ def _molecular_topology_by_id(
     if topology_context is not None:
         cached = topology_context.molecular_topologies_by_id.get(topology_id)
         if cached is not None:
+            if cached.project_id != project_id:
+                return None
             return cast(MolecularTopology, cached)
         for candidate in topology_context.topologies_by_identity.values():
             if candidate.id == topology_id:
+                if candidate.project_id != project_id:
+                    return None
                 topology_context.molecular_topologies_by_id[topology_id] = candidate
                 return cast(MolecularTopology, candidate)
-    topology = cast(MolecularTopology | None, session.get(MolecularTopology, topology_id))
+    topology = cast(
+        MolecularTopology | None,
+        session.exec(
+            select(MolecularTopology).where(
+                col(MolecularTopology.id) == topology_id,
+                col(MolecularTopology.project_id) == project_id,
+            )
+        ).first(),
+    )
+    if topology is None:
+        topology = next(
+            (
+                entity
+                for entity in (
+                    *tuple(session.new),
+                    *tuple(session.info.get("_fast_pending_entities", ())),
+                )
+                if (
+                    isinstance(entity, MolecularTopology)
+                    and entity.id == topology_id
+                    and entity.project_id == project_id
+                )
+            ),
+            None,
+        )
     if topology is not None and topology_context is not None:
         topology_context.molecular_topologies_by_id[topology_id] = topology
     return topology
@@ -332,9 +419,11 @@ def _complete_mapped_reaction(
 ) -> bool:
     """Return whether one mapped reaction is safe to use as a transfer seed."""
 
+    project_id = _require_project_owner(mapped_reaction, label="MappedReaction")
     logical_participants = _logical_participants_for_reaction(
         session,
         mapped_reaction.logical_reaction_id,
+        project_id=project_id,
         topology_context=topology_context,
     )
     if len(source_participants) != len(logical_participants):
@@ -368,6 +457,7 @@ def _complete_mapped_reaction(
             concrete_topology = _molecular_topology_by_id(
                 session,
                 topology_id,
+                project_id=project_id,
                 topology_context=topology_context,
             )
         if concrete_topology is None:
@@ -415,9 +505,12 @@ def _target_topologies_for_source(
     *,
     selected_logical_participant_id: UUID,
     selected_concrete_topology: MolecularTopology,
+    project_id: UUID,
     topology_context: Any | None = None,
 ) -> dict[tuple[LogicalReactionParticipantSide, int], MolecularTopology]:
     target: dict[tuple[LogicalReactionParticipantSide, int], MolecularTopology] = {}
+    if selected_concrete_topology.project_id != project_id:
+        raise ValueError("selected concrete topology is outside the reaction project")
     for source_participant in source_participants:
         logical_participant = _logical_participant(
             session,
@@ -434,6 +527,7 @@ def _target_topologies_for_source(
             resolved_topology = _molecular_topology_by_id(
                 session,
                 source_participant.concrete_topology_id,
+                project_id=project_id,
                 topology_context=topology_context,
             )
             concrete_topology = (
@@ -449,6 +543,8 @@ def _target_topologies_for_source(
             # added.  The migration backfills normal rows, but this fallback
             # keeps manually repaired legacy rows readable.
             concrete_topology = logical_participant.topology
+        if concrete_topology.project_id != project_id:
+            raise ValueError("reaction mapping source topology crosses project boundary")
         target[(source_participant.side, source_participant.template_index)] = concrete_topology
     return target
 
@@ -497,6 +593,7 @@ def ensure_mapped_reactions_for_concrete_topology(
     """
 
     concrete_topology_id = _require_id(concrete_topology, label="MolecularTopology")
+    project_id = _require_project_owner(concrete_topology, label="MolecularTopology")
     if skip_topology_ids is not None and concrete_topology_id in skip_topology_ids:
         return ()
     ensured_memberships = ensure_concrete_topology_memberships(session, concrete_topology)
@@ -510,6 +607,7 @@ def ensure_mapped_reactions_for_concrete_topology(
     memberships = _memberships_for_concrete_topology(
         session,
         concrete_topology_id,
+        project_id=project_id,
         topology_context=topology_context,
     )
     created_or_reused: dict[UUID, MappedReaction] = {}
@@ -528,6 +626,7 @@ def ensure_mapped_reactions_for_concrete_topology(
         mapped_reactions = _mapped_reactions_for_logical_reaction(
             session,
             logical_reaction_id,
+            project_id=project_id,
             topology_context=topology_context,
         )
         for source_mapped_reaction in mapped_reactions:
@@ -555,6 +654,7 @@ def ensure_mapped_reactions_for_concrete_topology(
                 source_participants,
                 selected_logical_participant_id=logical_participant_id,
                 selected_concrete_topology=concrete_topology,
+                project_id=project_id,
                 topology_context=topology_context,
             )
             transferred = transfer_mapped_reaction_to_concrete_topologies(
@@ -676,10 +776,18 @@ def ensure_mapped_reactions_for_logical_reaction(
             session.info["tricycle_fast_insert"] = previous_fast_insert
 
     logical_reaction_id = _require_id(logical_reaction, label="LogicalReaction")
+    project_id = _require_project_owner(logical_reaction, label="LogicalReaction")
     participants = tuple(
         session.exec(
             select(LogicalReactionParticipant)
-            .where(LogicalReactionParticipant.logical_reaction_id == logical_reaction_id)
+            .join(
+                LogicalReaction,
+                col(LogicalReactionParticipant.logical_reaction_id) == col(LogicalReaction.id),
+            )
+            .where(
+                col(LogicalReactionParticipant.logical_reaction_id) == logical_reaction_id,
+                col(LogicalReaction.project_id) == project_id,
+            )
             .order_by(
                 col(LogicalReactionParticipant.side),
                 col(LogicalReactionParticipant.participant_index),
@@ -721,7 +829,14 @@ def ensure_mapped_reactions_for_logical_reaction(
                 col(LogicalReactionParticipant.id)
                 == col(LogicalParticipantConcreteTopology.logical_reaction_participant_id),
             )
-            .where(LogicalReactionParticipant.logical_reaction_id == logical_reaction_id)
+            .join(
+                LogicalReaction,
+                col(LogicalReactionParticipant.logical_reaction_id) == col(LogicalReaction.id),
+            )
+            .where(
+                col(LogicalReactionParticipant.logical_reaction_id) == logical_reaction_id,
+                col(LogicalReaction.project_id) == project_id,
+            )
         ).all()
     )
     pending_memberships = tuple(
@@ -760,6 +875,7 @@ def ensure_mapped_reactions_for_logical_reaction(
         for mapped_reaction in _mapped_reactions_for_logical_reaction(
             session,
             logical_reaction_id,
+            project_id=project_id,
             topology_context=topology_context,
         )
     }
@@ -771,7 +887,14 @@ def ensure_mapped_reactions_for_logical_reaction(
     while True:
         previous_count = len(known_ids)
         for concrete_topology_id in sorted(concrete_topology_ids, key=str):
-            concrete_topology = _resolve_topology_value(session, concrete_topology_id)
+            concrete_topology = _molecular_topology_by_id(
+                session,
+                concrete_topology_id,
+                project_id=project_id,
+                topology_context=topology_context,
+            )
+            if concrete_topology is None:
+                raise ValueError("reaction expansion topology crosses project boundary")
             materialized_reactions = ensure_mapped_reactions_for_concrete_topology(
                 session,
                 concrete_topology,

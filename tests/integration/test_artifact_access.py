@@ -80,17 +80,29 @@ async def test_public_artifact_is_anonymous_and_project_artifact_requires_member
             artifact_id = artifact.id
         assert artifact_id is not None
 
-        public_page = await ArtifactQueryService.list_artifacts(limit=200, offset=0)
+        public_page = await ArtifactQueryService.list_artifacts(
+            project_id=SYSTEM_PROJECT_ID,
+            limit=200,
+            offset=0,
+        )
         assert artifact_id in {item.id for item in public_page.items}
         direct_page = await ArtifactQueryService.list_artifacts(
+            project_id=SYSTEM_PROJECT_ID,
             artifact_id=artifact_id,
             limit=200,
             offset=0,
         )
         assert [item.id for item in direct_page.items] == [artifact_id]
-        preview = await ArtifactContentService.preview(artifact_id, max_bytes=4096)
+        preview = await ArtifactContentService.preview(
+            artifact_id,
+            max_bytes=4096,
+            project_id=SYSTEM_PROJECT_ID,
+        )
         assert preview.preview_text.encode() == payload
-        download = await ArtifactContentService.download(artifact_id)
+        download = await ArtifactContentService.download(
+            artifact_id,
+            project_id=SYSTEM_PROJECT_ID,
+        )
         assert b"".join(iter_artifact_download(download)) == payload
 
         async with session_factory() as session:
@@ -99,12 +111,23 @@ async def test_public_artifact_is_anonymous_and_project_artifact_requires_member
             persisted.visibility = ArtifactVisibility.PROJECT
             await session.commit()
 
-        anonymous_page = await ArtifactQueryService.list_artifacts(limit=200, offset=0)
+        anonymous_page = await ArtifactQueryService.list_artifacts(
+            project_id=SYSTEM_PROJECT_ID,
+            limit=200,
+            offset=0,
+        )
         assert artifact_id not in {item.id for item in anonymous_page.items}
         with pytest.raises(ArtifactNotFoundError, match="artifact not found"):
-            await ArtifactContentService.preview(artifact_id, max_bytes=4096)
+            await ArtifactContentService.preview(
+                artifact_id,
+                max_bytes=4096,
+                project_id=SYSTEM_PROJECT_ID,
+            )
         with pytest.raises(ArtifactNotFoundError, match="artifact not found"):
-            await ArtifactContentService.download(artifact_id)
+            await ArtifactContentService.download(
+                artifact_id,
+                project_id=SYSTEM_PROJECT_ID,
+            )
 
         principal = AuthenticatedPrincipal(
             user_id=DEVELOPMENT_USER_ID,
@@ -116,7 +139,11 @@ async def test_public_artifact_is_anonymous_and_project_artifact_requires_member
         )
         token = set_current_principal(principal)
         try:
-            authenticated_page = await ArtifactQueryService.list_artifacts(limit=200, offset=0)
+            authenticated_page = await ArtifactQueryService.list_artifacts(
+                project_id=SYSTEM_PROJECT_ID,
+                limit=200,
+                offset=0,
+            )
         finally:
             reset_current_principal(token)
         assert artifact_id in {item.id for item in authenticated_page.items}
@@ -124,6 +151,7 @@ async def test_public_artifact_is_anonymous_and_project_artifact_requires_member
             artifact_id,
             max_bytes=4096,
             user_id=DEVELOPMENT_USER_ID,
+            project_id=SYSTEM_PROJECT_ID,
         )
         assert member_preview.preview_text.encode() == payload
     finally:

@@ -63,6 +63,7 @@ def _formula(
     for atomic_number, count in counts.items():
         vector[atomic_number - 1] = count
     return MolecularFormula(
+        project_id=SYSTEM_PROJECT_ID,
         hill_formula=hill_formula,
         composition=[
             {"atomic_number": atomic_number, "isotope": 0, "count": count}
@@ -95,6 +96,7 @@ def _topology(formula: MolecularFormula, smiles: str, suffix: str) -> MolecularT
     Chem.AssignStereochemistry(molecule, cleanIt=True, force=True)
     display_molecule = Chem.RemoveHs(Chem.Mol(molecule))
     return MolecularTopology(
+        project_id=SYSTEM_PROJECT_ID,
         formula=formula,
         mol=molecule,
         canonical_isomeric_smiles=_explicit_h_smiles(smiles),
@@ -121,6 +123,7 @@ def _unsanitized_topology(
     graph = molecule.GetMol()
     error = "AtomValenceException: explicit valence 5 is greater than permitted"
     return MolecularTopology(
+        project_id=SYSTEM_PROJECT_ID,
         formula=formula,
         mol=graph,
         canonical_isomeric_smiles=Chem.MolToSmiles(graph, canonical=True),
@@ -195,6 +198,7 @@ def _add_visible_calculation_frames(
         coordinates[:, 0] = np.arange(topology.atom_count, dtype=np.float64)
         coordinate_hash = _sha256(f"topology-search-coordinates-{suffix}-{index}")
         derivation = MolecularTopologyDerivation(
+            project_id=SYSTEM_PROJECT_ID,
             topology=topology,
             reconstruction_method="test/topology-search",
             reconstruction_version="1",
@@ -202,6 +206,7 @@ def _add_visible_calculation_frames(
             provenance_hash=_sha256(f"topology-search-derivation-{suffix}-{index}"),
         )
         geometry = Geometry(
+            project_id=SYSTEM_PROJECT_ID,
             topology=topology,
             mol=Chem.Mol(topology.mol),
             internal_coordinates=coordinates,
@@ -347,6 +352,7 @@ def test_formula_prefilter_exact_smiles_and_substructure_counts(
                 formula_id=ethanol_formula.id,
                 smarts="CO",
             ).model_dump(),
+            project_id=SYSTEM_PROJECT_ID,
             limit=10,
             offset=0,
         )
@@ -360,6 +366,7 @@ def test_formula_prefilter_exact_smiles_and_substructure_counts(
     exact = asyncio.run(
         MolecularTopologyQueryService.search_topologies(
             **MolecularTopologySearchQuery(exact_smiles="CCO").model_dump(),
+            project_id=SYSTEM_PROJECT_ID,
             limit=10,
             offset=0,
         )
@@ -377,6 +384,7 @@ def test_formula_prefilter_exact_smiles_and_substructure_counts(
                 maximum_ring_count=1,
                 scaffold_smiles="c1ccccc1",
             ).model_dump(),
+            project_id=SYSTEM_PROJECT_ID,
             limit=10,
             offset=0,
         )
@@ -393,6 +401,7 @@ def test_formula_prefilter_exact_smiles_and_substructure_counts(
                 formula_hill_formula="C2H6O",
                 similarity_smiles="OCC",
             ).model_dump(),
+            project_id=SYSTEM_PROJECT_ID,
             limit=2,
             offset=0,
         )
@@ -412,6 +421,7 @@ def test_formula_prefilter_exact_smiles_and_substructure_counts(
                 similarity_smiles="CCO",
                 minimum_similarity=0.99,
             ).model_dump(),
+            project_id=SYSTEM_PROJECT_ID,
             limit=10,
             offset=0,
         )
@@ -424,6 +434,7 @@ def test_formula_prefilter_exact_smiles_and_substructure_counts(
                 similarity_metric="dice",
                 minimum_similarity=0.99,
             ).model_dump(),
+            project_id=SYSTEM_PROJECT_ID,
             limit=10,
             offset=0,
         )
@@ -444,6 +455,7 @@ def test_formula_prefilter_exact_smiles_and_substructure_counts(
                 smarts="[c]",
                 minimum_substructure_matches=6,
             ).model_dump(),
+            project_id=SYSTEM_PROJECT_ID,
             limit=10,
             offset=0,
         )
@@ -464,6 +476,7 @@ def test_unsanitized_topology_remains_available_to_smarts_search(
                 smarts="[#6]-[#1]",
                 sanitization_status=TopologySanitizationStatus.FAILED,
             ).model_dump(),
+            project_id=SYSTEM_PROJECT_ID,
             limit=10,
             offset=0,
         )
@@ -480,7 +493,12 @@ def test_unsanitized_topology_remains_available_to_smarts_search(
     assert topology.logp is None
     assert topology.tpsa is None
 
-    detail = asyncio.run(MolecularTopologyDetailQueryService.get_topology(topology_id=topology.id))
+    detail = asyncio.run(
+        MolecularTopologyDetailQueryService.get_topology(
+            topology_id=topology.id,
+            project_id=SYSTEM_PROJECT_ID,
+        )
+    )
     assert detail is not None
     assert detail.id == topology.id
     assert detail.sanitization_status == "failed"
@@ -499,6 +517,7 @@ def test_chiral_smarts_search_can_distinguish_enantiomers(
                 formula_hill_formula="C2H5FO",
                 smarts="C[C@H](O)F",
             ).model_dump(),
+            project_id=SYSTEM_PROJECT_ID,
             limit=10,
             offset=0,
         )
@@ -510,6 +529,7 @@ def test_chiral_smarts_search_can_distinguish_enantiomers(
                 smarts="C[C@H](O)F",
                 match_chirality=True,
             ).model_dump(),
+            project_id=SYSTEM_PROJECT_ID,
             limit=10,
             offset=0,
         )
@@ -538,6 +558,7 @@ def test_candidate_budget_limits_only_the_actual_topology_scan(
             asyncio.run(
                 MolecularTopologyQueryService.search_topologies(
                     **MolecularTopologySearchQuery(**unindexed_filter).model_dump(),
+                    project_id=SYSTEM_PROJECT_ID,
                     limit=1,
                     offset=0,
                 )
@@ -548,6 +569,7 @@ def test_candidate_budget_limits_only_the_actual_topology_scan(
     indexed_smarts = asyncio.run(
         MolecularTopologyQueryService.search_topologies(
             **MolecularTopologySearchQuery(smarts="[13CH3][Si]([CH3])([F])[Cl]").model_dump(),
+            project_id=SYSTEM_PROJECT_ID,
             limit=1,
             offset=0,
         )
@@ -560,6 +582,7 @@ def test_candidate_budget_limits_only_the_actual_topology_scan(
                 similarity_smiles=rare.canonical_isomeric_smiles,
                 minimum_similarity=1.0,
             ).model_dump(),
+            project_id=SYSTEM_PROJECT_ID,
             limit=1,
             offset=0,
         )
@@ -574,6 +597,7 @@ def test_candidate_budget_limits_only_the_actual_topology_scan(
             **MolecularTopologySearchQuery(
                 similarity_smiles=rare.canonical_isomeric_smiles,
             ).model_dump(),
+            project_id=SYSTEM_PROJECT_ID,
             limit=1,
             offset=0,
         )
@@ -593,7 +617,10 @@ async def test_topology_candidate_budget_uses_stable_rest_error(
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.post(
                 "/api/topologies/search?limit=1",
-                json={"minimum_molecular_weight": 0},
+                json={
+                    "minimum_molecular_weight": 0,
+                    "project_id": str(SYSTEM_PROJECT_ID),
+                },
             )
     finally:
         await dispose_engine()
@@ -611,7 +638,11 @@ async def test_topology_search_rest_endpoint_uses_formula_join(
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.post(
                 "/api/topologies/search?limit=10",
-                json={"formula_hill_formula": "C2H6O", "smarts": "CO"},
+                json={
+                    "formula_hill_formula": "C2H6O",
+                    "smarts": "CO",
+                    "project_id": str(SYSTEM_PROJECT_ID),
+                },
             )
     finally:
         await dispose_engine()
@@ -639,6 +670,7 @@ async def test_topology_similarity_rest_endpoint_returns_ranked_scores(
                     "similarity_smiles": "CCO",
                     "similarity_metric": "dice",
                     "minimum_similarity": 0.99,
+                    "project_id": str(SYSTEM_PROJECT_ID),
                 },
             )
     finally:
@@ -677,6 +709,7 @@ async def test_nexusx_generated_topology_search_rest_and_graphql(
                     {
                       MolecularTopologyQueryService {
                         search_topologies(
+                          project_id: "00000000-0000-7000-8000-000000000201"
                           formula_hill_formula: "C2H6O"
                           similarity_smiles: "CCO"
                           similarity_metric: dice

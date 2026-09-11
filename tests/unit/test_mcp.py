@@ -120,7 +120,8 @@ async def test_mcp_compose_query_uses_graphql_envelope() -> None:
 async def test_mcp_structure_budget_uses_same_error_code() -> None:
     structure = "C" * 16_385
     query = (
-        "{ MappedReactionQueryService { list_mapped_reactions("
+        "{ MappedReactionQueryService { list_mapped_reactions(project_id: "
+        '"00000000-0000-7000-8000-000000000201", '
         f'similarity_reaction_smiles: "{structure}", limit: 1) '
         "{ page { total } } } }"
     )
@@ -131,6 +132,23 @@ async def test_mcp_structure_budget_uses_same_error_code() -> None:
 
     assert result["data"] is None
     assert result["errors"][0]["extensions"]["code"] == "query_budget_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_mcp_requires_project_scope_for_project_owned_queries() -> None:
+    result = await _call(
+        "compose_query",
+        {
+            "app_name": "example-chemistry-database",
+            "query": (
+                "{ MappedReactionQueryService { "
+                "list_mapped_reactions(limit: 1) { items { id } } } }"
+            ),
+        },
+    )
+
+    assert result["data"] is None
+    assert result["errors"][0]["extensions"]["code"] == "project_scope_required"
 
 
 @pytest.mark.asyncio

@@ -16,35 +16,43 @@ from nexusx.use_case.compose_executor import (  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, Field
 
 from tricycle_reaction_db.api.nexusx import config, schema
+from tricycle_reaction_db.api.query_guards import (
+    project_scoped_use_case_methods,
+    validate_graphql_project_scope,
+)
 from tricycle_reaction_db.application.query_cost import (
     QueryBudgetExceeded,
+    QueryProjectScopeRequired,
     QueryStatementTimeout,
     graphql_error_result,
     normalize_graphql_query_errors,
     validate_graphql_query_budget,
 )
 from tricycle_reaction_db.core.config import get_settings
+from tricycle_reaction_db.domain.identity import SYSTEM_PROJECT_ID
+
+_DEFAULT_GRAPHQL_PROJECT_ID = str(SYSTEM_PROJECT_ID)
 
 DIRECT_PLAYGROUND_QUERY = """# 快速浏览：直接取得一个小型数组，不需要处理分页对象。
 # 点击 Execute Query 执行；右上角 Docs 可展开其他字段。
 # NexusX Compose 不支持 GraphQL variables，请将参数直接写在查询中。
 {
   GraphQLCatalogService {
-    list_artifacts(limit: 5) {
+    list_artifacts(project_id: \"__PROJECT_ID__\", limit: 5) {
       id
       original_filename
       artifact_kind
       size_bytes
     }
   }
-}"""
+}""".replace("__PROJECT_ID__", _DEFAULT_GRAPHQL_PROJECT_ID)
 
 PAGINATED_QUERY = """# 分页查询：items 是本页数据，page 给出总数、limit 和 offset。
 # 点击 Execute Query 执行；修改 limit/offset 后再次执行可继续翻页。
 # NexusX Compose 不支持 GraphQL variables，请将参数直接写在查询中。
 {
   ArtifactQueryService {
-    list_artifacts(limit: 5, offset: 0) {
+    list_artifacts(project_id: \"__PROJECT_ID__\", limit: 5, offset: 0) {
       items {
         id
         original_filename
@@ -58,7 +66,7 @@ PAGINATED_QUERY = """# 分页查询：items 是本页数据，page 给出总数�
       }
     }
   }
-}"""
+}""".replace("__PROJECT_ID__", _DEFAULT_GRAPHQL_PROJECT_ID)
 
 
 class GraphQLRequest(BaseModel):
@@ -81,6 +89,7 @@ def create_graphql_router(
     """Create one standard GraphQL transport for a NexusX compose schema."""
 
     graphql_router = APIRouter(prefix=prefix, tags=["GraphQL"])
+    scoped_methods = project_scoped_use_case_methods(app_config)
 
     @graphql_router.post("")
     async def graphql_endpoint(payload: GraphQLRequest) -> JSONResponse:
@@ -112,6 +121,13 @@ def create_graphql_router(
                         }
                     ],
                 },
+            )
+        try:
+            validate_graphql_project_scope(payload.query, scoped_methods)
+        except QueryProjectScopeRequired as error:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content=graphql_error_result(error),
             )
         if is_introspection_query(payload.query):
             result = compose_introspect(compose_schema, payload.query)

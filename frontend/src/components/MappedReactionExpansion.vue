@@ -297,7 +297,7 @@ watch(selectedGeometryTotal, (total) => {
       <div class="equation-side">
         <article v-for="participant in mappedReactants" :key="participant.id" class="molecule-item">
           <div class="molecule-caption"><span><strong>{{ labelFor(mappedParticipantRole(participant.logical_reaction_participant_id, participant.side)) }}</strong><small>{{ participant.mapped_smiles }}</small></span><RouterLink :to="{ name: 'topology-detail', params: { topologyId: participant.topology_id }, query: navigationQuery }" title="查看具体分子拓扑" :aria-label="`查看具体分子拓扑 ${participant.topology_id}`"><ArrowUpRight :size="15" aria-hidden="true" /></RouterLink></div>
-          <ChemDoodleMolecule :topology-id="participant.topology_id" :atom-map-numbers="participant.atom_map_numbers" :height="170" :label="participant.mapped_smiles" />
+          <ChemDoodleMolecule :topology-id="participant.topology_id" :project-id="projectId ?? undefined" :atom-map-numbers="participant.atom_map_numbers" :height="170" :label="participant.mapped_smiles" />
           <div class="mapped-topology-links">
             <span>具体拓扑</span><RouterLink :to="{ name: 'topology-detail', params: { topologyId: participant.topology_id }, query: navigationQuery }">{{ shortId(participant.topology_id) }}</RouterLink>
             <template v-if="participant.logical_topology_id !== participant.topology_id">
@@ -310,7 +310,7 @@ watch(selectedGeometryTotal, (total) => {
       <div class="equation-side is-product">
         <article v-for="participant in mappedProducts" :key="participant.id" class="molecule-item">
           <div class="molecule-caption"><span><strong>{{ labelFor(mappedParticipantRole(participant.logical_reaction_participant_id, participant.side)) }}</strong><small>{{ participant.mapped_smiles }}</small></span><RouterLink :to="{ name: 'topology-detail', params: { topologyId: participant.topology_id }, query: navigationQuery }" title="查看具体分子拓扑" :aria-label="`查看具体分子拓扑 ${participant.topology_id}`"><ArrowUpRight :size="15" aria-hidden="true" /></RouterLink></div>
-          <ChemDoodleMolecule :topology-id="participant.topology_id" :atom-map-numbers="participant.atom_map_numbers" :height="170" :label="participant.mapped_smiles" />
+          <ChemDoodleMolecule :topology-id="participant.topology_id" :project-id="projectId ?? undefined" :atom-map-numbers="participant.atom_map_numbers" :height="170" :label="participant.mapped_smiles" />
           <div class="mapped-topology-links">
             <span>具体拓扑</span><RouterLink :to="{ name: 'topology-detail', params: { topologyId: participant.topology_id }, query: navigationQuery }">{{ shortId(participant.topology_id) }}</RouterLink>
             <template v-if="participant.logical_topology_id !== participant.topology_id">

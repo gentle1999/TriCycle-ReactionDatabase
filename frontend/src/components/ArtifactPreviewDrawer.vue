@@ -11,12 +11,13 @@ const props = defineProps<{
   loading: boolean;
   error: string;
   preview: ArtifactPreview | null;
+  projectId?: string | null;
 }>();
 
 const emit = defineEmits<{ close: [] }>();
 const copied = ref(false);
 const downloadUrl = computed(() =>
-  props.preview ? artifactDownloadUrl(props.preview.id) : "#",
+  props.preview ? artifactDownloadUrl(props.preview.id, props.projectId ?? undefined) : "#",
 );
 
 async function copyPreview(): Promise<void> {

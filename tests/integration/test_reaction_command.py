@@ -1,6 +1,7 @@
 import os
 from datetime import UTC, datetime
 from hashlib import sha256
+from typing import Any
 
 import numpy as np
 import pytest
@@ -12,6 +13,7 @@ from tricycle_reaction_db.application.dtos import (
     CalculationFrameRecord,
     CalculationSegmentRecord,
     CreateReactionCommand,
+    CreateReactionResult,
     LogicalReactionParticipantRecord,
     MappedReactionNodeGeometryMappingRecord,
     MappedReactionNodeGeometryRecord,
@@ -38,7 +40,9 @@ from tricycle_reaction_db.application.services.molecular_geometry import (
 from tricycle_reaction_db.application.services.molop_artifact_ingestion import (
     reconcile_molop_geometry_context,
 )
-from tricycle_reaction_db.application.services.reaction_commands import _create_reaction
+from tricycle_reaction_db.application.services.reaction_commands import (
+    _create_reaction as _create_reaction_impl,
+)
 from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
     ReconciliationBatchCache,
 )
@@ -68,6 +72,7 @@ from tricycle_reaction_db.domain.enums import (
     SourceFormat,
     StorageStatus,
 )
+from tricycle_reaction_db.domain.identity import SYSTEM_PROJECT_ID
 from tricycle_reaction_db.ingestion import artifact_record_from_path, normalize_molecule
 
 pytestmark = [
@@ -77,6 +82,23 @@ pytestmark = [
         reason="set TRICYCLE_RUN_DATABASE_TESTS=1 to run database tests",
     ),
 ]
+
+
+def _project_scoped_reaction(
+    session: Session,
+    command: CreateReactionCommand,
+    **kwargs: Any,
+) -> CreateReactionResult:
+    """Keep the legacy command fixtures inside one explicit project scope."""
+
+    kwargs.setdefault(
+        "topology_context",
+        GeometryPersistenceContext(project_id=SYSTEM_PROJECT_ID),
+    )
+    return _create_reaction_impl(session, command, **kwargs)
+
+
+_create_reaction = _project_scoped_reaction
 
 
 def test_unmapped_reaction_creates_graph_only_topologies_idempotently() -> None:
@@ -812,7 +834,7 @@ def test_later_converged_frame_links_to_preexisting_reaction(tmp_path) -> None:
                 persisted.geometry.id
             }
 
-            deferred_context = GeometryPersistenceContext()
+            deferred_context = GeometryPersistenceContext(project_id=SYSTEM_PROJECT_ID)
             deferred_context.reconciliation_cache = ReconciliationBatchCache()
             deferred = _create_reaction(
                 session,

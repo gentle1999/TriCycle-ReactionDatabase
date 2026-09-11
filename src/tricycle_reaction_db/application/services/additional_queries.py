@@ -10,7 +10,7 @@ from molalchemy.rdkit.functions import dice_sml, mol_from_smiles, morganbv_fp, t
 from molalchemy.types import CString
 from nexusx import UseCaseService, query  # type: ignore[import-untyped]
 from rdkit import Chem
-from sqlalchemy import Text, and_, desc, func, literal, not_, or_, select, true
+from sqlalchemy import Text, and_, desc, func, literal, not_, or_, select
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.orm import defer
 from sqlmodel import col
@@ -69,15 +69,17 @@ from tricycle_reaction_db.application.services.queries import (
     _validate_range,
 )
 from tricycle_reaction_db.application.services.query_visibility import (
-    artifact_id_is_visible,
-    calculation_frame_is_visible,
     calculation_protocol_id_is_visible,
+    calculation_segment_id_is_visible,
+    derived_artifact_id_is_visible,
+    formula_id_is_visible,
     frame_id_is_visible,
     geometry_id_is_visible,
     logical_reaction_id_is_visible,
     mapped_reaction_id_is_visible,
     parse_revision_id_is_visible,
     query_visibility_scope,
+    thermodynamic_profile_is_visible,
     topology_id_is_visible,
     visible_parse_revision_ids,
 )
@@ -102,7 +104,6 @@ from tricycle_reaction_db.db.models import (
     MolecularTopologyDerivation,
     ParseRevision,
     ProjectGeometryCatalog,
-    ProjectGeometryCatalogCount,
     ScientificArray,
     ScientificArrayAssignment,
     ThermochemistryResult,
@@ -214,7 +215,7 @@ def _geometry_has_frequency_data_predicate(scope: Any, geometry_id: Any) -> Any:
         select(col(CalculationFrame.id))
         .where(
             col(CalculationFrame.geometry_id) == geometry_id,
-            calculation_frame_is_visible(scope, col(CalculationFrame.parse_revision_id)),
+            frame_id_is_visible(scope, col(CalculationFrame.id)),
             col(CalculationFrame.frequency_count).is_not(None),
         )
         .exists()
@@ -226,7 +227,7 @@ def _geometry_has_imaginary_frequency_predicate(scope: Any, geometry_id: Any) ->
         select(col(CalculationFrame.id))
         .where(
             col(CalculationFrame.geometry_id) == geometry_id,
-            calculation_frame_is_visible(scope, col(CalculationFrame.parse_revision_id)),
+            frame_id_is_visible(scope, col(CalculationFrame.id)),
             col(CalculationFrame.negative_frequency_count) > 0,
         )
         .exists()
@@ -535,9 +536,21 @@ class MolecularFormulaDetailQueryService(UseCaseService):  # type: ignore[misc]
     """Direct formula identity and topology-count queries."""
 
     @query  # type: ignore[untyped-decorator]
-    async def get_formula(cls, formula_id: UUID) -> MolecularFormulaDetail | None:
+    async def get_formula(
+        cls,
+        project_id: UUID,
+        formula_id: UUID,
+    ) -> MolecularFormulaDetail | None:
+        scope = await query_visibility_scope(project_id=project_id)
         async with session_factory() as session:
-            formula = await session.get(MolecularFormula, formula_id)
+            formula = (
+                await session.execute(
+                    select(MolecularFormula).where(
+                        col(MolecularFormula.id) == formula_id,
+                        formula_id_is_visible(scope, col(MolecularFormula.id)),
+                    )
+                )
+            ).scalar_one_or_none()
             if formula is None:
                 return None
             topology_count = int(
@@ -545,7 +558,10 @@ class MolecularFormulaDetailQueryService(UseCaseService):  # type: ignore[misc]
                     await session.execute(
                         select(func.count())
                         .select_from(MolecularTopology)
-                        .where(col(MolecularTopology.formula_id) == formula_id)
+                        .where(
+                            col(MolecularTopology.formula_id) == formula_id,
+                            topology_id_is_visible(scope, col(MolecularTopology.id)),
+                        )
                     )
                 ).scalar_one()
             )
@@ -565,8 +581,12 @@ class MolecularTopologyDetailQueryService(UseCaseService):  # type: ignore[misc]
     """Direct topology detail, including geometry and reaction usage counts."""
 
     @query  # type: ignore[untyped-decorator]
-    async def get_topology(cls, topology_id: UUID) -> MolecularTopologyDetail | None:
-        scope = await query_visibility_scope()
+    async def get_topology(
+        cls,
+        project_id: UUID,
+        topology_id: UUID,
+    ) -> MolecularTopologyDetail | None:
+        scope = await query_visibility_scope(project_id=project_id)
         async with session_factory() as session:
             topology = (
                 await session.execute(
@@ -589,7 +609,10 @@ class MolecularTopologyDetailQueryService(UseCaseService):  # type: ignore[misc]
                     )
                 ).scalar_one()
             )
-            topology_reaction_ids = _logical_reaction_ids_for_topology(topology_id).subquery()
+            topology_reaction_ids = _logical_reaction_ids_for_topology(
+                topology_id,
+                project_id=project_id,
+            ).subquery()
             logical_reaction_count = int(
                 (
                     await session.execute(
@@ -625,6 +648,7 @@ class MolecularTopologyDetailQueryService(UseCaseService):  # type: ignore[misc]
         search_page = cast(
             Any,
             await MolecularTopologyQueryService.search_topologies(
+                project_id=project_id,
                 topology_id=_required_uuid(topology.id, "MolecularTopology"),
                 limit=1,
                 offset=0,
@@ -651,6 +675,7 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def list_geometries(
         cls,
+        project_id: UUID,
         topology_id: UUID | None = None,
         geometry_hash: str | None = None,
         internal_coordinate_hash: str | None = None,
@@ -668,7 +693,6 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
         maximum_atom_count: int | None = None,
         limit: QueryLimit = 50,
         offset: QueryOffset = 0,
-        project_id: UUID | None = None,
         filter_expression: str | None = None,
         sort_by: str = "default",
         sort_direction: str = "asc",
@@ -726,7 +750,14 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
             raise ValueError("calculation_count sorting requires an authorized project scope")
         visibility_criterion = geometry_id_is_visible(scope, col(Geometry.id))
         uses_catalog_summary = scope.uses_project_geometry_catalog
-        listing_visibility_criterion = true() if uses_catalog_summary else visibility_criterion
+        listing_visibility_criterion = (
+            and_(
+                col(ProjectGeometryCatalog.project_id) == scope.requested_project_id,
+                col(Geometry.project_id) == scope.requested_project_id,
+            )
+            if uses_catalog_summary
+            else visibility_criterion
+        )
         predicates: list[Any] = []
         topology_predicates: list[Any] = []
         requires_geometry_count_join = False
@@ -876,21 +907,19 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                 topology_predicates.append(col(MolecularTopology.atom_count) >= minimum_atom_count)
             if maximum_atom_count is not None:
                 topology_predicates.append(col(MolecularTopology.atom_count) <= maximum_atom_count)
-        if uses_catalog_summary and not predicates and not topology_predicates:
-            count_statement = select(cast(Any, ProjectGeometryCatalogCount.geometry_count)).where(
-                col(ProjectGeometryCatalogCount.project_id) == scope.requested_project_id
-            )
-        elif uses_catalog_summary:
+        if uses_catalog_summary:
             count_statement = (
                 select(func.count())
                 .select_from(ProjectGeometryCatalog)
-                .where(col(ProjectGeometryCatalog.project_id) == scope.requested_project_id)
-            )
-            if requires_geometry_count_join or topology_predicates:
-                count_statement = count_statement.join(
+                .join(
                     Geometry,
                     col(ProjectGeometryCatalog.geometry_id) == col(Geometry.id),
                 )
+                .where(col(ProjectGeometryCatalog.project_id) == scope.requested_project_id)
+            )
+            count_statement = count_statement.where(
+                col(Geometry.project_id) == scope.requested_project_id
+            )
             if requires_topology_count_join or topology_predicates:
                 count_statement = count_statement.join(
                     MolecularTopology,
@@ -901,7 +930,7 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
             # Visibility for a Geometry is defined by at least one visible frame.
             # Counting those distinct geometry IDs avoids a second full Geometry scan.
             count_statement = select(func.count(func.distinct(CalculationFrame.geometry_id))).where(
-                calculation_frame_is_visible(scope, col(CalculationFrame.parse_revision_id))
+                frame_id_is_visible(scope, col(CalculationFrame.id))
             )
         else:
             # The topology join is only needed for structure/atom filters. For
@@ -923,10 +952,7 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
             .select_from(CalculationFrame)
             .where(
                 col(CalculationFrame.geometry_id) == col(Geometry.id),
-                calculation_frame_is_visible(
-                    scope,
-                    col(CalculationFrame.parse_revision_id),
-                ),
+                frame_id_is_visible(scope, col(CalculationFrame.id)),
             )
             .scalar_subquery()
             .label("calculation_count")
@@ -985,8 +1011,13 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                 # for deep pages.
                 thermodynamic_catalog = (
                     select(col(ProjectGeometryCatalog.geometry_id))
+                    .join(
+                        Geometry,
+                        col(Geometry.id) == col(ProjectGeometryCatalog.geometry_id),
+                    )
                     .where(
                         col(ProjectGeometryCatalog.project_id) == scope.requested_project_id,
+                        col(Geometry.project_id) == scope.requested_project_id,
                         col(ProjectGeometryCatalog.has_thermodynamic_property),
                     )
                     .order_by(
@@ -996,8 +1027,13 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                 )
                 non_thermodynamic_catalog = (
                     select(col(ProjectGeometryCatalog.geometry_id))
+                    .join(
+                        Geometry,
+                        col(Geometry.id) == col(ProjectGeometryCatalog.geometry_id),
+                    )
                     .where(
                         col(ProjectGeometryCatalog.project_id) == scope.requested_project_id,
+                        col(Geometry.project_id) == scope.requested_project_id,
                         ~col(ProjectGeometryCatalog.has_thermodynamic_property),
                     )
                     .order_by(
@@ -1010,9 +1046,14 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                         await session.execute(
                             select(func.count())
                             .select_from(ProjectGeometryCatalog)
+                            .join(
+                                Geometry,
+                                col(Geometry.id) == col(ProjectGeometryCatalog.geometry_id),
+                            )
                             .where(
                                 col(ProjectGeometryCatalog.project_id)
                                 == scope.requested_project_id,
+                                col(Geometry.project_id) == scope.requested_project_id,
                                 col(ProjectGeometryCatalog.has_thermodynamic_property),
                             )
                         )
@@ -1041,7 +1082,7 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                     rows = list((await session.execute(non_thermodynamic_statement)).all())
             elif fast_catalogue_page:
                 thermodynamic_geometry_ids = geometry_ids_with_thermodynamic_property(
-                    calculation_frame_is_visible(scope, col(CalculationFrame.parse_revision_id))
+                    frame_id_is_visible(scope, col(CalculationFrame.id))
                 ).distinct()
                 thermodynamic_total = int(
                     (
@@ -1276,8 +1317,8 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def get_geometry(
         cls,
+        project_id: UUID,
         geometry_id: UUID,
-        project_id: UUID | None = None,
     ) -> GeometryDetail | None:
         scope = await query_visibility_scope(project_id=project_id)
         async with session_factory() as session:
@@ -1406,6 +1447,7 @@ class CalculationProtocolQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def list_calculation_protocols(
         cls,
+        project_id: UUID,
         protocol_hash: str | None = None,
         qm_software: str | None = None,
         qm_software_version: str | None = None,
@@ -1417,7 +1459,7 @@ class CalculationProtocolQueryService(UseCaseService):  # type: ignore[misc]
         limit: QueryLimit = 50,
         offset: QueryOffset = 0,
     ) -> CalculationProtocolPage:
-        scope = await query_visibility_scope()
+        scope = await query_visibility_scope(project_id=project_id)
         predicates: list[Any] = [
             calculation_protocol_id_is_visible(scope, col(CalculationProtocol.id))
         ]
@@ -1450,8 +1492,12 @@ class CalculationProtocolQueryService(UseCaseService):  # type: ignore[misc]
         )
 
     @query  # type: ignore[untyped-decorator]
-    async def get_calculation_protocol(cls, protocol_id: UUID) -> CalculationProtocolDetail | None:
-        scope = await query_visibility_scope()
+    async def get_calculation_protocol(
+        cls,
+        project_id: UUID,
+        protocol_id: UUID,
+    ) -> CalculationProtocolDetail | None:
+        scope = await query_visibility_scope(project_id=project_id)
         async with session_factory() as session:
             protocol = (
                 await session.execute(
@@ -1495,14 +1541,15 @@ class ArtifactIngestionQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def list_artifact_ingestions(
         cls,
+        project_id: UUID,
         artifact_file_id: UUID | None = None,
         status: ArtifactIngestionStatus | None = None,
         limit: QueryLimit = 50,
         offset: QueryOffset = 0,
     ) -> ArtifactIngestionPage:
-        scope = await query_visibility_scope()
+        scope = await query_visibility_scope(project_id=project_id)
         predicates: list[Any] = [
-            artifact_id_is_visible(scope, col(ArtifactIngestion.artifact_file_id))
+            derived_artifact_id_is_visible(scope, col(ArtifactIngestion.artifact_file_id))
         ]
         if artifact_file_id is not None:
             predicates.append(col(ArtifactIngestion.artifact_file_id) == artifact_file_id)
@@ -1524,14 +1571,21 @@ class ArtifactIngestionQueryService(UseCaseService):  # type: ignore[misc]
         )
 
     @query  # type: ignore[untyped-decorator]
-    async def get_artifact_ingestion(cls, ingestion_id: UUID) -> ArtifactIngestionSummary | None:
-        scope = await query_visibility_scope()
+    async def get_artifact_ingestion(
+        cls,
+        project_id: UUID,
+        ingestion_id: UUID,
+    ) -> ArtifactIngestionSummary | None:
+        scope = await query_visibility_scope(project_id=project_id)
         async with session_factory() as session:
             row = (
                 await session.execute(
                     select(ArtifactIngestion).where(
                         col(ArtifactIngestion.id) == ingestion_id,
-                        artifact_id_is_visible(scope, col(ArtifactIngestion.artifact_file_id)),
+                        derived_artifact_id_is_visible(
+                            scope,
+                            col(ArtifactIngestion.artifact_file_id),
+                        ),
                     )
                 )
             ).scalar_one_or_none()
@@ -1544,13 +1598,14 @@ class ParseRevisionQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def list_parse_revisions(
         cls,
+        project_id: UUID,
         artifact_file_id: UUID | None = None,
         status: str | None = None,
         source_format: str | None = None,
         limit: QueryLimit = 50,
         offset: QueryOffset = 0,
     ) -> ParseRevisionPage:
-        scope = await query_visibility_scope()
+        scope = await query_visibility_scope(project_id=project_id)
         predicates: list[Any] = [parse_revision_id_is_visible(scope, col(ParseRevision.id))]
         if artifact_file_id is not None:
             predicates.append(col(ParseRevision.artifact_file_id) == artifact_file_id)
@@ -1574,8 +1629,12 @@ class ParseRevisionQueryService(UseCaseService):  # type: ignore[misc]
         )
 
     @query  # type: ignore[untyped-decorator]
-    async def get_parse_revision(cls, revision_id: UUID) -> ParseRevisionSummary | None:
-        scope = await query_visibility_scope()
+    async def get_parse_revision(
+        cls,
+        project_id: UUID,
+        revision_id: UUID,
+    ) -> ParseRevisionSummary | None:
+        scope = await query_visibility_scope(project_id=project_id)
         async with session_factory() as session:
             revision = (
                 await session.execute(
@@ -1594,6 +1653,7 @@ class CalculationSegmentQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def list_calculation_segments(
         cls,
+        project_id: UUID,
         parse_revision_id: UUID | None = None,
         protocol_id: UUID | None = None,
         termination_status: str | None = None,
@@ -1601,9 +1661,9 @@ class CalculationSegmentQueryService(UseCaseService):  # type: ignore[misc]
         limit: QueryLimit = 50,
         offset: QueryOffset = 0,
     ) -> CalculationSegmentPage:
-        scope = await query_visibility_scope()
+        scope = await query_visibility_scope(project_id=project_id)
         predicates: list[Any] = [
-            parse_revision_id_is_visible(scope, col(CalculationSegment.parse_revision_id))
+            calculation_segment_id_is_visible(scope, col(CalculationSegment.id))
         ]
         for field, value in (
             (CalculationSegment.parse_revision_id, parse_revision_id),
@@ -1631,16 +1691,18 @@ class CalculationSegmentQueryService(UseCaseService):  # type: ignore[misc]
         )
 
     @query  # type: ignore[untyped-decorator]
-    async def get_calculation_segment(cls, segment_id: UUID) -> CalculationSegmentSummary | None:
-        scope = await query_visibility_scope()
+    async def get_calculation_segment(
+        cls,
+        project_id: UUID,
+        segment_id: UUID,
+    ) -> CalculationSegmentSummary | None:
+        scope = await query_visibility_scope(project_id=project_id)
         async with session_factory() as session:
             segment = (
                 await session.execute(
                     select(CalculationSegment).where(
                         col(CalculationSegment.id) == segment_id,
-                        parse_revision_id_is_visible(
-                            scope, col(CalculationSegment.parse_revision_id)
-                        ),
+                        calculation_segment_id_is_visible(scope, col(CalculationSegment.id)),
                     )
                 )
             ).scalar_one_or_none()
@@ -1653,6 +1715,7 @@ class TransitionStateInferenceQueryService(UseCaseService):  # type: ignore[misc
     @query  # type: ignore[untyped-decorator]
     async def list_transition_state_inferences(
         cls,
+        project_id: UUID,
         artifact_ingestion_id: UUID | None = None,
         parse_revision_id: UUID | None = None,
         status: str | None = None,
@@ -1665,7 +1728,7 @@ class TransitionStateInferenceQueryService(UseCaseService):  # type: ignore[misc
         limit: QueryLimit = 50,
         offset: QueryOffset = 0,
     ) -> TransitionStateInferencePage:
-        scope = await query_visibility_scope()
+        scope = await query_visibility_scope(project_id=project_id)
         predicates: list[Any] = [
             parse_revision_id_is_visible(scope, col(TransitionStateInference.parse_revision_id))
         ]
@@ -1736,9 +1799,10 @@ class TransitionStateInferenceQueryService(UseCaseService):  # type: ignore[misc
     @query  # type: ignore[untyped-decorator]
     async def get_transition_state_inference(
         cls,
+        project_id: UUID,
         inference_id: UUID,
     ) -> TransitionStateInferenceSummary | None:
-        scope = await query_visibility_scope()
+        scope = await query_visibility_scope(project_id=project_id)
         async with session_factory() as session:
             inference = (
                 await session.execute(
@@ -1759,6 +1823,7 @@ class ScientificArrayQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def list_scientific_arrays(
         cls,
+        project_id: UUID,
         frame_id: UUID | None = None,
         kind: str | None = None,
         owner_kind: str | None = None,
@@ -1768,7 +1833,7 @@ class ScientificArrayQueryService(UseCaseService):  # type: ignore[misc]
         limit: QueryLimit = 100,
         offset: QueryOffset = 0,
     ) -> ScientificArrayPage:
-        scope = await query_visibility_scope()
+        scope = await query_visibility_scope(project_id=project_id)
         predicates: list[Any] = [frame_id_is_visible(scope, col(ScientificArray.frame_id))]
         if frame_id is not None:
             predicates.append(col(ScientificArray.frame_id) == frame_id)
@@ -1831,8 +1896,12 @@ class ScientificArrayQueryService(UseCaseService):  # type: ignore[misc]
         )
 
     @query  # type: ignore[untyped-decorator]
-    async def get_scientific_array(cls, array_id: UUID) -> ScientificArraySummary | None:
-        scope = await query_visibility_scope()
+    async def get_scientific_array(
+        cls,
+        project_id: UUID,
+        array_id: UUID,
+    ) -> ScientificArraySummary | None:
+        scope = await query_visibility_scope(project_id=project_id)
         async with session_factory() as session:
             row = (
                 await session.execute(
@@ -1857,20 +1926,23 @@ class ReactionEnergyQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def get_reaction_energy_profile(
         cls,
+        project_id: UUID,
         mapped_reaction_id: UUID,
-        project_id: UUID | None = None,
         energy_kind: str = "gibbs_free_energy_hartree",
         reference_node_id: UUID | None = None,
     ) -> ReactionEnergyProfile | None:
         if energy_kind not in REACTION_ENERGY_KINDS:
             choices = ", ".join(sorted(REACTION_ENERGY_KINDS))
             raise ValueError(f"unsupported energy_kind; expected one of: {choices}")
-        mapped_reaction_kwargs: dict[str, Any] = {"mapped_reaction_id": mapped_reaction_id}
-        if project_id is not None:
-            mapped_reaction_kwargs["project_id"] = project_id
+        scope = await query_visibility_scope(project_id=project_id)
+        if not scope.requested_project_permitted:
+            return None
         reaction = cast(
             Any,
-            await MappedReactionQueryService.get_mapped_reaction(**mapped_reaction_kwargs),
+            await MappedReactionQueryService.get_mapped_reaction(
+                mapped_reaction_id=mapped_reaction_id,
+                project_id=project_id,
+            ),
         )
         if reaction is None:
             return None
@@ -1959,8 +2031,8 @@ class ReactionEnergyQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def get_mapped_reaction_thermodynamics(
         cls,
+        project_id: UUID,
         mapped_reaction_id: UUID,
-        project_id: UUID | None = None,
     ) -> MappedReactionThermodynamics | None:
         """Return the materialized profiles for one mapped reaction.
 
@@ -1987,7 +2059,11 @@ class ReactionEnergyQueryService(UseCaseService):  # type: ignore[misc]
                         select(MappedReactionThermodynamicProfile)
                         .where(
                             col(MappedReactionThermodynamicProfile.mapped_reaction_id)
-                            == mapped_reaction_id
+                            == mapped_reaction_id,
+                            thermodynamic_profile_is_visible(
+                                scope,
+                                MappedReactionThermodynamicProfile,
+                            ),
                         )
                         .order_by(
                             col(MappedReactionThermodynamicProfile.electronic_level),

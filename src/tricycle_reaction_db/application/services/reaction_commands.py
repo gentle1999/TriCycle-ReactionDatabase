@@ -3,6 +3,7 @@
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from typing import cast
+from uuid import UUID
 
 from nexusx import UseCaseService, mutation  # type: ignore[import-untyped]
 from rdkit import __version__ as rdkit_version
@@ -18,10 +19,16 @@ from tricycle_reaction_db.application.dtos import (
     NormalizedTopologyRecord,
 )
 from tricycle_reaction_db.application.query_cost import enforce_structure_input_budget
-from tricycle_reaction_db.application.services._persistence import _require_id
+from tricycle_reaction_db.application.services._persistence import (
+    _project_owner_predicate,
+    _require_id,
+)
 from tricycle_reaction_db.application.services.audit import AuditService
 from tricycle_reaction_db.application.services.authentication import current_principal
-from tricycle_reaction_db.application.services.authorization import AuthorizationService
+from tricycle_reaction_db.application.services.authorization import (
+    AuthorizationService,
+    ProjectPermission,
+)
 from tricycle_reaction_db.application.services.molecular_geometry import (
     GeometryPersistenceContext,
     persist_molecular_topology,
@@ -83,6 +90,7 @@ def _resolve_components(
 ) -> tuple[list[_ResolvedComponent], int]:
     components: list[_ResolvedComponent] = []
     topologies_created = 0
+    project_id = topology_context.project_id if topology_context is not None else None
     if precomputed_topology_records is not None:
         for normalized in precomputed_topology_records:
             metadata = normalized.topology_derivation.reconstruction_metadata
@@ -104,6 +112,7 @@ def _resolve_components(
                         MolecularTopology.identity_schema_version
                         == normalized.topology.identity_schema_version,
                         MolecularTopology.graph_hash == normalized.topology.graph_hash,
+                        _project_owner_predicate(MolecularTopology.project_id, project_id),
                     )
                 ).first()
                 if include_creation_metadata
@@ -162,6 +171,7 @@ def _resolve_components(
                         MolecularTopology.identity_schema_version
                         == normalized.topology.identity_schema_version,
                         MolecularTopology.graph_hash == normalized.topology.graph_hash,
+                        _project_owner_predicate(MolecularTopology.project_id, project_id),
                     )
                 ).first()
                 if include_creation_metadata
@@ -319,6 +329,11 @@ def _create_reaction(
     reconciliation_cache: ReconciliationBatchCache | None = None,
     precomputed_topology_records: tuple[NormalizedTopologyRecord, ...] | None = None,
 ) -> CreateReactionResult:
+    project_id = topology_context.project_id if topology_context is not None else None
+    if not isinstance(project_id, UUID):
+        raise ValueError(
+            "project-scoped reaction creation requires a project-bound topology context"
+        )
     definition = (
         None
         if precomputed_topology_records is not None
@@ -344,7 +359,10 @@ def _create_reaction(
     reaction_hash = reaction_hash_for_participants(identities)
     automatic_label = _automatic_reaction_label(logical_components, reaction_hash)
     existing_logical = session.exec(
-        select(LogicalReaction).where(LogicalReaction.reaction_hash == reaction_hash)
+        select(LogicalReaction).where(
+            LogicalReaction.reaction_hash == reaction_hash,
+            _project_owner_predicate(LogicalReaction.project_id, project_id),
+        )
     ).first()
     logical_reaction = persist_logical_reaction(
         session,
@@ -355,6 +373,7 @@ def _create_reaction(
             cycloaddition_pattern=command.cycloaddition_pattern,
             reaction_hash=reaction_hash,
         ),
+        project_id=project_id,
     )
     logical_created = existing_logical is None
     for component in logical_components:
@@ -434,6 +453,7 @@ def _create_reaction(
                 MappedReaction.logical_reaction_id
                 == _require_id(logical_reaction, label="LogicalReaction"),
                 MappedReaction.mapping_hash == mapping_hash,
+                _project_owner_predicate(MappedReaction.project_id, project_id),
             )
         ).first()
         if include_creation_metadata
@@ -524,6 +544,7 @@ class ReactionCommandService(UseCaseService):  # type: ignore[misc]
     @mutation  # type: ignore[untyped-decorator]
     async def create_reaction(
         cls,
+        project_id: UUID,
         reaction: str,
         label: str | None = None,
         reaction_class: ReactionClass | None = None,
@@ -531,12 +552,17 @@ class ReactionCommandService(UseCaseService):  # type: ignore[misc]
         mapped_reaction_key: str | None = None,
         mapped_reaction_kind: MappedReactionKind = MappedReactionKind.CURATED,
     ) -> CreateReactionResult:
-        """Create or reuse a global reaction as a system curator."""
+        """Create or reuse a project-owned reaction as a system curator."""
 
         principal = current_principal()
         if principal is None:
             raise PermissionError("authenticated system curator is required")
         await AuthorizationService.require_system_curator(principal.user_id)
+        await AuthorizationService.require_project_permission(
+            principal.user_id,
+            project_id,
+            ProjectPermission.ARTIFACT_UPLOAD,
+        )
         enforce_structure_input_budget(
             {"reaction": reaction},
             maximum_characters=get_settings().structure_query_max_characters,
@@ -549,9 +575,14 @@ class ReactionCommandService(UseCaseService):  # type: ignore[misc]
             mapped_reaction_key=mapped_reaction_key,
             mapped_reaction_kind=mapped_reaction_kind,
         )
+        topology_context = GeometryPersistenceContext(project_id=project_id)
         async with session_factory() as session:
             result = await session.run_sync(
-                lambda sync_session: _create_reaction(cast(Session, sync_session), command)
+                lambda sync_session: _create_reaction(
+                    cast(Session, sync_session),
+                    command,
+                    topology_context=topology_context,
+                )
             )
             await session.commit()
         await AuditService.record(

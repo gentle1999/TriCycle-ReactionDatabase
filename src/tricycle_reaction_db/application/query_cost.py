@@ -43,7 +43,19 @@ class QueryStatementTimeout(RuntimeError):
         self.message = "database statement timeout exceeded"
 
 
-def query_error_payload(error: QueryBudgetExceeded | QueryStatementTimeout) -> dict[str, Any]:
+class QueryProjectScopeRequired(ValueError):
+    """A project-owned query was submitted without an explicit project scope."""
+
+    code = "project_scope_required"
+
+    def __init__(self) -> None:
+        super().__init__("project_id is required for project-owned queries")
+        self.message = "project_id is required for project-owned queries"
+
+
+def query_error_payload(
+    error: QueryBudgetExceeded | QueryStatementTimeout | QueryProjectScopeRequired,
+) -> dict[str, Any]:
     detail: dict[str, Any] = {
         "code": error.code,
         "message": error.message,
@@ -53,7 +65,9 @@ def query_error_payload(error: QueryBudgetExceeded | QueryStatementTimeout) -> d
     return detail
 
 
-def graphql_error_result(error: QueryBudgetExceeded | QueryStatementTimeout) -> dict[str, Any]:
+def graphql_error_result(
+    error: QueryBudgetExceeded | QueryStatementTimeout | QueryProjectScopeRequired,
+) -> dict[str, Any]:
     return {
         "data": None,
         "errors": [
@@ -247,6 +261,7 @@ class FixedWindowRateLimiter:
 __all__ = [
     "FixedWindowRateLimiter",
     "QueryBudgetExceeded",
+    "QueryProjectScopeRequired",
     "QueryRateLimitExceeded",
     "QueryStatementTimeout",
     "enforce_structure_input_budget",

@@ -21,6 +21,14 @@ snapshot is not mistaken for a current deployment instruction.
 | [Database entity relationship diagram](database-erd.md) | [数据库实体关系图](../database-erd.md) | Database boundaries, ERD, and integrity constraints |
 | [RDKit Mol database round-trip contract](rdkit-mol-roundtrip.md) | [RDKit Mol 对象数据库往返契约](../rdkit-mol-roundtrip.md) | RDKit binary Mol persistence boundary |
 
+## Active Refactor Plans
+
+These pages define implementation targets and acceptance gates, not current behavior.
+
+| English | 中文 | Purpose |
+| --- | --- | --- |
+| [Database architecture refactor plan](database-architecture-refactor-plan.md) | [数据库架构重构计划](../database-architecture-refactor-plan.md) | Recorded 2026-09-10; source authorization, selection, versions, constraints, refreshes, and capacity |
+
 ## Historical Records
 
 These pages retain their dates, decisions, and evidence. Check the current

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from botocore.exceptions import BotoCoreError, ClientError
+from sqlalchemy import select
 
 from tricycle_reaction_db.application.dtos import ArtifactPreview
 from tricycle_reaction_db.application.services.authorization import (
@@ -130,12 +131,18 @@ def iter_artifact_download(download: ArtifactDownload) -> Iterator[bytes]:
 
 class ArtifactContentService:
     @staticmethod
-    async def _reference(artifact_id: UUID) -> _ArtifactReference:
+    async def _reference(
+        artifact_id: UUID,
+        project_id: UUID,
+    ) -> _ArtifactReference:
         async with session_factory() as session:
-            artifact = await session.get(ArtifactFile, artifact_id)
+            statement = select(ArtifactFile).where(ArtifactFile.id == artifact_id)
+            statement = statement.where(ArtifactFile.project_id == project_id)
+            artifact = (await session.execute(statement)).scalar_one_or_none()
         if (
             artifact is None
             or artifact.id is None
+            or artifact.project_id is None
             or artifact.storage_status is StorageStatus.RETIRED
         ):
             raise ArtifactNotFoundError("artifact not found")
@@ -187,8 +194,9 @@ class ArtifactContentService:
         *,
         max_bytes: int,
         user_id: UUID | None = None,
+        project_id: UUID,
     ) -> ArtifactPreview:
-        reference = await cls._reference(artifact_id)
+        reference = await cls._reference(artifact_id, project_id=project_id)
         await cls._authorize(reference, user_id, ProjectPermission.ARTIFACT_READ)
         cls._ensure_available(reference)
         try:
@@ -202,8 +210,9 @@ class ArtifactContentService:
         artifact_id: UUID,
         *,
         user_id: UUID | None = None,
+        project_id: UUID,
     ) -> ArtifactDownload:
-        reference = await cls._reference(artifact_id)
+        reference = await cls._reference(artifact_id, project_id=project_id)
         await cls._authorize(reference, user_id, ProjectPermission.ARTIFACT_DOWNLOAD)
         cls._ensure_available(reference)
 

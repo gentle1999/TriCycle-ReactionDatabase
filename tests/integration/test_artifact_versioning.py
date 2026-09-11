@@ -71,6 +71,7 @@ async def test_versioned_upload_persists_and_downloads_the_exact_s3_version(
         download = await ArtifactContentService.download(
             artifact_id,
             user_id=DEVELOPMENT_USER_ID,
+            project_id=SYSTEM_PROJECT_ID,
         )
         assert download.bucket == bucket
         assert download.version_id == version_id

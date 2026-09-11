@@ -88,7 +88,6 @@ const artifactSort = ref<ArtifactSort>({ sortBy: "created_at", sortDirection: "d
 const queries = useCatalogQueries({
   projectId: currentProjectId,
   activeView,
-  user: currentUser,
   reactionOffset,
   reactionFilters,
   reactionSort,
@@ -364,6 +363,6 @@ function jumpArtifactPage(offset: number): void { setArtifactPage(offset); }
     />
 
     <FrameDrawer :open="selectedFrameId !== null" :loading="queries.frame.isLoading.value" :error="drawerError" :frame="selectedFrame" :project-id="currentProjectId ?? undefined" @close="closeFrame" />
-    <ArtifactPreviewDrawer :open="selectedArtifactId !== null" :loading="queries.artifactPreview.isLoading.value" :error="artifactPreviewError" :preview="artifactPreview" @close="closeArtifactPreview" />
+    <ArtifactPreviewDrawer :open="selectedArtifactId !== null" :loading="queries.artifactPreview.isLoading.value" :error="artifactPreviewError" :preview="artifactPreview" :project-id="currentProjectId" @close="closeArtifactPreview" />
   </main>
 </template>

@@ -15,11 +15,17 @@ from tricycle_reaction_db.application.dtos import NormalizedMoleculeRecord
 from tricycle_reaction_db.application.services import (
     persist_artifact_file,
     persist_calculation_protocol,
-    persist_molecular_geometry,
+)
+from tricycle_reaction_db.application.services.molecular_geometry import (
+    GeometryPersistenceContext,
+)
+from tricycle_reaction_db.application.services.molecular_geometry import (
+    persist_molecular_geometry as _persist_molecular_geometry_impl,
 )
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import ArtifactFile, CalculationProtocol, Geometry
 from tricycle_reaction_db.domain.enums import ArtifactKind, QMSoftware
+from tricycle_reaction_db.domain.identity import SYSTEM_PROJECT_ID
 from tricycle_reaction_db.ingestion import (
     artifact_record_from_path,
     calculation_protocol_record,
@@ -27,6 +33,13 @@ from tricycle_reaction_db.ingestion import (
 )
 
 pytestmark = pytest.mark.integration
+
+
+def persist_molecular_geometry(session: Session, record: Any, **kwargs: Any) -> Any:
+    """Keep legacy DA-bench fixtures inside an explicit project scope."""
+
+    kwargs.setdefault("context", GeometryPersistenceContext(project_id=SYSTEM_PROJECT_ID))
+    return _persist_molecular_geometry_impl(session, record, **kwargs)
 
 
 @pytest.fixture(scope="module")
@@ -126,6 +139,7 @@ def test_real_da_fixture_round_trips_through_core_business_models(
                     task_requests=["freq", "opt", "freq"],
                     normalized_spec={"fixture": "da-bench-minimal"},
                 ),
+                project_id=artifacts["transition_state"].project_id,
             )
             session.commit()
 

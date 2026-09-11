@@ -9,8 +9,9 @@ from tricycle_reaction_db.application.dtos import (
     MappedReactionNodeView,
     NodeAdditivePropertiesView,
 )
-from tricycle_reaction_db.application.services import ReactionEnergyQueryService
+from tricycle_reaction_db.application.services import ReactionEnergyQueryService, additional_queries
 from tricycle_reaction_db.application.services.queries import MappedReactionQueryService
+from tricycle_reaction_db.application.services.query_visibility import QueryVisibilityScope
 
 
 def _node(
@@ -40,6 +41,7 @@ def test_reaction_energy_profile_calculates_relative_energies_and_barriers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     mapped_reaction_id = uuid4()
+    project_id = uuid4()
     logical_reaction_id = uuid4()
     source = _node(node_key="reactants", node_index=0, role="reactant", energy=-100.0)
     product = _node(node_key="products", node_index=1, role="product", energy=-99.99)
@@ -73,18 +75,33 @@ def test_reaction_energy_profile_calculates_relative_energies_and_barriers(
 
     async def get_mapped_reaction(
         *,
+        project_id: object,
         mapped_reaction_id: object,
     ) -> MappedReactionDetail:
+        assert project_id == project_id_for_test
         assert mapped_reaction_id == reaction.id
         return reaction
+
+    project_id_for_test = project_id
 
     monkeypatch.setattr(
         MappedReactionQueryService,
         "get_mapped_reaction",
         staticmethod(get_mapped_reaction),
     )
+
+    async def authorized_scope(*, project_id: object) -> QueryVisibilityScope:
+        return QueryVisibilityScope(
+            principal=None,
+            project_ids=frozenset({project_id}),
+            requested_project_id=project_id,
+            requested_project_permitted=True,
+        )
+
+    monkeypatch.setattr(additional_queries, "query_visibility_scope", authorized_scope)
     profile = asyncio.run(
         ReactionEnergyQueryService.get_reaction_energy_profile(
+            project_id=project_id,
             mapped_reaction_id=mapped_reaction_id,
             energy_kind="gibbs_free_energy_hartree",
         )
@@ -104,6 +121,7 @@ def test_reaction_energy_profile_rejects_unknown_energy_kind() -> None:
     with pytest.raises(ValueError, match="unsupported energy_kind"):
         asyncio.run(
             ReactionEnergyQueryService.get_reaction_energy_profile(
+                project_id=uuid4(),
                 mapped_reaction_id=uuid4(),
                 energy_kind="not-an-energy",
             )

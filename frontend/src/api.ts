@@ -625,6 +625,7 @@ export const api = {
       signal,
     ),
   transitionStateInferences: (options: {
+    projectId?: string;
     artifactIngestionId?: string;
     parseRevisionId?: string;
     status?: string;
@@ -640,6 +641,7 @@ export const api = {
     requestJson<Page<TransitionStateInferenceSummary>>(
       "/api/transition_state_inference_query_service/list_transition_state_inferences",
       {
+        project_id: options.projectId ?? null,
         artifact_ingestion_id: options.artifactIngestionId ?? null,
         parse_revision_id: options.parseRevisionId ?? null,
         status: options.status ?? null,
@@ -655,6 +657,7 @@ export const api = {
       signal,
     ),
   parseRevisions: (options: {
+    projectId?: string;
     artifactFileId?: string;
     status?: string;
     sourceFormat?: string;
@@ -664,6 +667,7 @@ export const api = {
     requestJson<ParseRevisionPage>(
       "/api/parse_revision_query_service/list_parse_revisions",
       {
+        project_id: options.projectId ?? null,
         artifact_file_id: options.artifactFileId ?? null,
         status: options.status ?? null,
         source_format: options.sourceFormat ?? null,
@@ -695,9 +699,12 @@ export const api = {
       `/api/calculation-frames/${encodeURIComponent(id)}${options.projectId ? `?project_id=${encodeURIComponent(options.projectId)}` : ""}`,
       signal,
     ),
-  scientificArrayPreview: (id: string, options: { maxElements?: number } = {}, signal?: AbortSignal) =>
+  scientificArrayPreview: (id: string, options: { maxElements?: number; projectId?: string } = {}, signal?: AbortSignal) =>
     request<ScientificArrayPreview>(
-      `/api/scientific-arrays/${encodeURIComponent(id)}/preview?max_elements=${options.maxElements ?? 512}`,
+      `/api/scientific-arrays/${encodeURIComponent(id)}/preview?${new URLSearchParams({
+        max_elements: String(options.maxElements ?? 512),
+        ...(options.projectId ? { project_id: options.projectId } : {}),
+      })}`,
       signal,
     ),
   artifacts: (options: Partial<ArtifactSort> & { artifactId?: string; artifactKind?: string; contentSha256?: string; originalFilenameContains?: string; projectId?: string; storageStatus?: string; ingestionStatus?: string; limit?: number; offset?: number; cursor?: string } = {}, signal?: AbortSignal) =>
@@ -718,9 +725,9 @@ export const api = {
       })}`,
       signal,
     ),
-  artifact: (id: string, signal?: AbortSignal) =>
+  artifact: (id: string, options: { projectId?: string } = {}, signal?: AbortSignal) =>
     request<ArtifactSummary>(
-      `/api/artifacts/${encodeURIComponent(id)}`,
+      `/api/artifacts/${encodeURIComponent(id)}${options.projectId ? `?project_id=${encodeURIComponent(options.projectId)}` : ""}`,
       signal,
     ),
   geometries: (
@@ -760,15 +767,18 @@ export const api = {
       { geometry_id: id, project_id: options.projectId ?? null },
       signal,
     ),
-  topology: (id: string, signal?: AbortSignal) =>
+  topology: (id: string, options: { projectId?: string } = {}, signal?: AbortSignal) =>
     requestJson<MolecularTopologyDetail | null>(
       "/api/molecular_topology_detail_query_service/get_topology",
-      { topology_id: id },
+      { topology_id: id, project_id: options.projectId ?? null },
       signal,
     ),
-  artifactPreview: (id: string, signal?: AbortSignal) =>
+  artifactPreview: (id: string, options: { projectId?: string } = {}, signal?: AbortSignal) =>
     request<ArtifactPreview>(
-      `/api/artifacts/${encodeURIComponent(id)}/preview?max_bytes=131072`,
+      `/api/artifacts/${encodeURIComponent(id)}/preview?${new URLSearchParams({
+        max_bytes: "131072",
+        ...(options.projectId ? { project_id: options.projectId } : {}),
+      })}`,
       signal,
     ),
   reparseArtifact: (id: string, signal?: AbortSignal) =>
@@ -783,7 +793,7 @@ export const api = {
   uploadArtifacts,
   createUploadBatch: (payload: UploadBatchCreate, signal?: AbortSignal) =>
     requestJson<UploadBatch>("/api/upload-batches", payload, signal),
-  uploadBatches: (options: { projectId?: string; limit?: number; offset?: number } = {}, signal?: AbortSignal) =>
+  uploadBatches: (options: { projectId: string; limit?: number; offset?: number }, signal?: AbortSignal) =>
     request<UploadBatchPage>(
       `/api/upload-batches?${new URLSearchParams({
         limit: String(options.limit ?? 25),
@@ -792,8 +802,11 @@ export const api = {
       })}`,
       signal,
     ),
-  uploadBatch: (batchId: string, signal?: AbortSignal) =>
-    request<UploadBatch>(`/api/upload-batches/${encodeURIComponent(batchId)}`, signal),
+  uploadBatch: (batchId: string, projectId: string, signal?: AbortSignal) =>
+    request<UploadBatch>(
+      `/api/upload-batches/${encodeURIComponent(batchId)}?project_id=${encodeURIComponent(projectId)}`,
+      signal,
+    ),
   recoverUploadBatch: (batchId: string, signal?: AbortSignal) =>
     requestMutation<UploadBatch>(
       `/api/upload-batches/${encodeURIComponent(batchId)}/recover`,
@@ -803,12 +816,13 @@ export const api = {
     ) as Promise<UploadBatch>,
   uploadBatchItems: (
     batchId: string,
-    options: { status?: string; updatedAfter?: string; limit?: number; offset?: number } = {},
+    options: { projectId: string; status?: string; updatedAfter?: string; limit?: number; offset?: number },
     signal?: AbortSignal,
   ) => request<UploadBatchItemPage>(
     `/api/upload-batches/${encodeURIComponent(batchId)}/items?${new URLSearchParams({
       limit: String(options.limit ?? 100),
       offset: String(options.offset ?? 0),
+      project_id: options.projectId,
       ...(options.status ? { item_status: options.status } : {}),
       ...(options.updatedAfter ? { updated_after: options.updatedAfter } : {}),
     })}`,
@@ -846,16 +860,26 @@ export const api = {
   uploadBatchFiles,
 };
 
-export function artifactDownloadUrl(id: string): string {
-  return apiUrl(`/api/artifacts/${encodeURIComponent(id)}/download`);
+export function artifactDownloadUrl(id: string, projectId?: string): string {
+  return apiUrl(
+    `/api/artifacts/${encodeURIComponent(id)}/download${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`,
+  );
+}
+
+export function scientificArrayDownloadUrl(id: string, projectId?: string): string {
+  return apiUrl(
+    `/api/scientific-arrays/${encodeURIComponent(id)}.npy${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`,
+  );
 }
 
 export async function getTopologyMolfile(
   topologyId: string,
+  projectId?: string,
   signal?: AbortSignal,
 ): Promise<string> {
+  const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
   const response = await fetch(
-    apiUrl(`/api/depictions/topology/${encodeURIComponent(topologyId)}.mol`),
+    apiUrl(`/api/depictions/topology/${encodeURIComponent(topologyId)}.mol${query}`),
     { headers: { accept: "chemical/x-mdl-molfile" }, credentials: "include", signal },
   );
   if (!response.ok) {

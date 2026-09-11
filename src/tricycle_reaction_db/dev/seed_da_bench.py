@@ -75,6 +75,7 @@ from tricycle_reaction_db.application.services import (
 from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics_persistence import (
     refresh_mapped_reaction_thermodynamics,
 )
+from tricycle_reaction_db.application.services.molecular_geometry import GeometryPersistenceContext
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
@@ -562,11 +563,17 @@ def seed_da_bench_fixture(
             artifacts[role] = _persist_verified_artifact(
                 session, store, path, artifact_kind=ArtifactKind.CALCULATION_OUTPUT
             )
+        project_ids = {artifact.project_id for artifact in artifacts.values()}
+        if len(project_ids) != 1:
+            raise ValueError("DA benchmark artifacts must belong to one project")
+        geometry_context = GeometryPersistenceContext(project_id=next(iter(project_ids)))
         persisted_participants = {}
         for declaration in workflow["participants"]:
             role = declaration["log_role"]
             persisted_participants[role] = persist_molecular_geometry(
-                session, parsed_records[role][-1]
+                session,
+                parsed_records[role][-1],
+                context=geometry_context,
             )
         selected_frames: dict[tuple[str, int, int], CalculationFrame] = {}
         frame_counts: dict[str, int] = {}
@@ -593,7 +600,11 @@ def seed_da_bench_fixture(
             for source_segment in chem_file.source_segments:
                 protocol_record = protocol_record_from_molop_segment(source_segment)
                 protocol = (
-                    persist_calculation_protocol(session, protocol_record)
+                    persist_calculation_protocol(
+                        session,
+                        protocol_record,
+                        project_id=artifact.project_id,
+                    )
                     if protocol_record is not None
                     else None
                 )
@@ -615,6 +626,7 @@ def seed_da_bench_fixture(
                     persisted_molecule = persist_molecular_geometry(
                         session,
                         record.molecule,
+                        context=geometry_context,
                     )
                     geometry = persisted_molecule.geometry
                     persisted_frame = persist_calculation_frame(
@@ -700,6 +712,7 @@ def seed_da_bench_fixture(
                 cycloaddition_pattern="4+2",
                 reaction_hash=reaction_hash_for_participants(identities),
             ),
+            project_id=geometry_context.project_id,
         )
         reaction_participants = {}
         for declaration, persisted, side, _atom_maps in participant_payloads:

@@ -151,6 +151,7 @@ async def _create_topology_and_geometry(
     session: object,
     *,
     suffix: str,
+    project_id: UUID,
 ) -> tuple[MolecularFormula, MolecularTopology, MolecularTopologyDerivation, Geometry]:
     molecule = Chem.MolFromSmiles("[H][H]")
     assert molecule is not None
@@ -158,6 +159,7 @@ async def _create_topology_and_geometry(
     element_count_vector[0] = 2
     formula = MolecularFormula(
         id=uuid4(),
+        project_id=project_id,
         hill_formula="H2",
         composition=[{"atomic_number": 1, "isotope": 0, "count": 2}],
         atom_count=2,
@@ -167,6 +169,7 @@ async def _create_topology_and_geometry(
     assert formula.id is not None
     topology = MolecularTopology(
         id=uuid4(),
+        project_id=project_id,
         formula_id=formula.id,
         formula=formula,
         mol=molecule,
@@ -183,6 +186,7 @@ async def _create_topology_and_geometry(
     coordinates = np.array([[0.0, 0.0, 0.0], [0.74, 0.0, 0.0]], dtype=np.float64)
     derivation = MolecularTopologyDerivation(
         id=uuid4(),
+        project_id=project_id,
         topology_id=topology.id,
         topology=topology,
         reconstruction_method="test/authorization",
@@ -198,6 +202,7 @@ async def _create_topology_and_geometry(
     geometry_molecule.AddConformer(conformer, assignId=True)
     geometry = Geometry(
         id=uuid4(),
+        project_id=project_id,
         topology_id=topology.id,
         topology=topology,
         mol=geometry_molecule,
@@ -256,6 +261,7 @@ async def _create_calculation_source(
         source_encoding="utf-8",
     )
     protocol = CalculationProtocol(
+        project_id=project_id,
         protocol_hash=_fixture_hash(f"authorization-protocol:{suffix}"),
         qm_software=QMSoftware.OTHER,
         qm_software_version="test-v1",
@@ -407,13 +413,31 @@ async def authorization_sample() -> AsyncIterator[AuthorizationSample]:
             shared_topology,
             shared_derivation,
             shared_geometry,
-        ) = await _create_topology_and_geometry(session, suffix=f"{suffix}-shared")
+        ) = await _create_topology_and_geometry(
+            session,
+            project_id=project_a_id,
+            suffix=f"{suffix}-project-a",
+        )
+        (
+            project_b_formula,
+            project_b_topology,
+            project_b_derivation,
+            project_b_geometry,
+        ) = await _create_topology_and_geometry(
+            session,
+            project_id=project_b_id,
+            suffix=f"{suffix}-project-b",
+        )
         (
             private_formula,
             private_topology,
             private_derivation,
             private_geometry,
-        ) = await _create_topology_and_geometry(session, suffix=f"{suffix}-private")
+        ) = await _create_topology_and_geometry(
+            session,
+            project_id=project_b_id,
+            suffix=f"{suffix}-private",
+        )
         source_a = await _create_calculation_source(
             session,
             project_id=project_a_id,
@@ -427,8 +451,8 @@ async def authorization_sample() -> AsyncIterator[AuthorizationSample]:
             project_id=project_b_id,
             user_id=user_id,
             suffix=f"{suffix}-b",
-            geometry=shared_geometry,
-            derivation=shared_derivation,
+            geometry=project_b_geometry,
+            derivation=project_b_derivation,
         )
         private_source = await _create_calculation_source(
             session,
@@ -441,6 +465,7 @@ async def authorization_sample() -> AsyncIterator[AuthorizationSample]:
 
         shared_logical_reaction = LogicalReaction(
             id=uuid4(),
+            project_id=project_a_id,
             reaction_key=f"authorization-shared:{suffix}",
             label="Authorization shared reaction",
             reaction_hash=_fixture_hash(f"authorization-shared-logical:{suffix}"),
@@ -449,6 +474,7 @@ async def authorization_sample() -> AsyncIterator[AuthorizationSample]:
         shared_mapped_reaction = MappedReaction(
             logical_reaction_id=shared_logical_reaction.id,
             logical_reaction=shared_logical_reaction,
+            project_id=project_a_id,
             mapped_reaction_key="shared-path",
             label="Authorization shared mapped reaction",
             mapped_reaction_kind=MappedReactionKind.OTHER,
@@ -457,6 +483,7 @@ async def authorization_sample() -> AsyncIterator[AuthorizationSample]:
         )
         private_logical_reaction = LogicalReaction(
             id=uuid4(),
+            project_id=project_b_id,
             reaction_key=f"authorization-private:{suffix}",
             label="Authorization private reaction",
             reaction_hash=_fixture_hash(f"authorization-private-logical:{suffix}"),
@@ -465,6 +492,7 @@ async def authorization_sample() -> AsyncIterator[AuthorizationSample]:
         private_mapped_reaction = MappedReaction(
             logical_reaction_id=private_logical_reaction.id,
             logical_reaction=private_logical_reaction,
+            project_id=project_b_id,
             mapped_reaction_key="private-path",
             label="Authorization private mapped reaction",
             mapped_reaction_kind=MappedReactionKind.OTHER,
@@ -552,12 +580,29 @@ async def authorization_sample() -> AsyncIterator[AuthorizationSample]:
         created_protocol_ids.update(
             {source_a.protocol_id, source_b.protocol_id, private_source.protocol_id}
         )
-        created_derivation_ids.update({source_a.derivation_id, private_source.derivation_id})
-        created_geometry_ids.update({shared_geometry_id, private_geometry_id})
+        created_derivation_ids.update(
+            {
+                source_a.derivation_id,
+                source_b.derivation_id,
+                private_source.derivation_id,
+            }
+        )
+        created_geometry_ids.update(
+            {shared_geometry_id, source_b.geometry_id, private_geometry_id}
+        )
         assert private_topology.id is not None
-        created_topology_ids.update({shared_topology.id, private_topology.id})
-        assert shared_formula.id is not None and private_formula.id is not None
-        created_formula_ids.update({shared_formula.id, private_formula.id})
+        assert project_b_topology.id is not None
+        created_topology_ids.update(
+            {shared_topology.id, project_b_topology.id, private_topology.id}
+        )
+        assert (
+            shared_formula.id is not None
+            and project_b_formula.id is not None
+            and private_formula.id is not None
+        )
+        created_formula_ids.update(
+            {shared_formula.id, project_b_formula.id, private_formula.id}
+        )
         created_logical_reaction_ids.update(
             {shared_logical_reaction_id, private_logical_reaction_id}
         )
@@ -579,6 +624,7 @@ async def authorization_sample() -> AsyncIterator[AuthorizationSample]:
         source_less_logical_reaction_id = uuid4()
         source_less_logical_reaction = LogicalReaction(
             id=source_less_logical_reaction_id,
+            project_id=project_a_id,
             reaction_key=f"authorization-source-less:{suffix}",
             label="Authorization source-less reaction",
             reaction_class=ReactionClass.CYCLOADDITION,
@@ -587,6 +633,7 @@ async def authorization_sample() -> AsyncIterator[AuthorizationSample]:
         source_less_mapped_reaction = MappedReaction(
             logical_reaction_id=source_less_logical_reaction_id,
             logical_reaction=source_less_logical_reaction,
+            project_id=project_a_id,
             mapped_reaction_key="source-less-path",
             label="Authorization source-less mapped reaction",
             mapped_reaction_kind=MappedReactionKind.OTHER,
@@ -633,12 +680,12 @@ async def authorization_sample() -> AsyncIterator[AuthorizationSample]:
         await session.flush()
         assert manifest.id is not None
         manifest_id = manifest.id
-        target = await session.get(ArtifactFile, artifact_b_id)
+        target = await session.get(ArtifactFile, artifact_a_id)
         assert target is not None
         binding = ManifestArtifactBinding(
             workflow_manifest_id=manifest_id,
-            artifact_key="private-target",
-            artifact_file_id=artifact_b_id,
+            artifact_key="project-a-target",
+            artifact_file_id=artifact_a_id,
             expected_content_sha256=target.content_sha256,
             artifact_role=ManifestArtifactRole.SUPPORTING,
             reaction_key="authorization",
@@ -763,6 +810,7 @@ async def _participant_topology_source(
     *,
     logical_reaction_id: UUID,
     mapped_reaction_id: UUID,
+    project_id: UUID,
 ) -> AsyncIterator[UUID]:
     participant_id = uuid4()
     mapped_participant_id = uuid4()
@@ -772,6 +820,7 @@ async def _participant_topology_source(
         formula, topology, derivation, geometry = await _create_topology_and_geometry(
             session,
             suffix=f"participant-{uuid4().hex}",
+            project_id=project_id,
         )
         assert formula.id is not None and topology.id is not None
         formula_id = formula.id
@@ -862,6 +911,7 @@ async def source_backed_participant_topology_id(
     async with _participant_topology_source(
         logical_reaction_id=sample.shared_logical_reaction_id,
         mapped_reaction_id=sample.shared_mapped_reaction_id,
+        project_id=sample.project_a_id,
     ) as topology_id:
         yield topology_id
 
@@ -874,6 +924,7 @@ async def private_participant_topology_id(
     async with _participant_topology_source(
         logical_reaction_id=sample.private_logical_reaction_id,
         mapped_reaction_id=sample.private_mapped_reaction_id,
+        project_id=sample.project_b_id,
     ) as topology_id:
         yield topology_id
 
@@ -893,17 +944,36 @@ async def test_artifact_frame_geometry_and_array_visibility(
 ) -> None:
     sample = authorization_sample
     async with _request_as(sample.principal):
-        artifacts = await ArtifactQueryService.list_artifacts(limit=200, offset=0)
-        frames = await CalculationQueryService.list_calculation_frames(limit=200, offset=0)
-        geometries = await GeometryQueryService.list_geometries(limit=200, offset=0)
+        artifacts = await ArtifactQueryService.list_artifacts(
+            project_id=sample.project_a_id,
+            limit=200,
+            offset=0,
+        )
+        frames = await CalculationQueryService.list_calculation_frames(
+            project_id=sample.project_a_id,
+            limit=200,
+            offset=0,
+        )
+        geometries = await GeometryQueryService.list_geometries(
+            project_id=sample.project_a_id,
+            limit=200,
+            offset=0,
+        )
         arrays_a = await ScientificArrayQueryService.list_scientific_arrays(
-            frame_id=sample.frame_a_id, limit=200, offset=0
+            frame_id=sample.frame_a_id,
+            project_id=sample.project_a_id,
+            limit=200,
+            offset=0,
         )
         arrays_b = await ScientificArrayQueryService.list_scientific_arrays(
-            frame_id=sample.frame_b_id, limit=200, offset=0
+            frame_id=sample.frame_b_id,
+            project_id=sample.project_a_id,
+            limit=200,
+            offset=0,
         )
         shared_geometry = await GeometryQueryService.get_geometry(
-            geometry_id=sample.shared_geometry_id
+            geometry_id=sample.shared_geometry_id,
+            project_id=sample.project_a_id,
         )
 
         assert sample.artifact_a_id in {item.id for item in artifacts.items}
@@ -919,18 +989,41 @@ async def test_artifact_frame_geometry_and_array_visibility(
         assert sample.frame_a_id in {frame.id for frame in shared_geometry.frames}
         assert sample.frame_b_id not in {frame.id for frame in shared_geometry.frames}
         assert (
-            await GeometryQueryService.get_geometry(geometry_id=sample.private_geometry_id) is None
+            await GeometryQueryService.get_geometry(
+                geometry_id=sample.private_geometry_id,
+                project_id=sample.project_a_id,
+            )
+            is None
         )
-        assert await get_geometry_sdf(sample.shared_geometry_id) is not None
-        assert await get_geometry_sdf(sample.private_geometry_id) is None
-        assert await get_geometry_xyz(sample.shared_geometry_id) is not None
-        assert await get_geometry_xyz(sample.private_geometry_id) is None
-        assert await get_geometry_dof_depiction(sample.shared_geometry_id) is not None
-        assert await get_geometry_dof_depiction(sample.private_geometry_id) is None
+        assert await get_geometry_sdf(
+            sample.shared_geometry_id,
+            project_id=sample.project_a_id,
+        ) is not None
+        assert await get_geometry_sdf(
+            sample.private_geometry_id,
+            project_id=sample.project_a_id,
+        ) is None
+        assert await get_geometry_xyz(
+            sample.shared_geometry_id,
+            project_id=sample.project_a_id,
+        ) is not None
+        assert await get_geometry_xyz(
+            sample.private_geometry_id,
+            project_id=sample.project_a_id,
+        ) is None
+        assert await get_geometry_dof_depiction(
+            sample.shared_geometry_id,
+            project_id=sample.project_a_id,
+        ) is not None
+        assert await get_geometry_dof_depiction(
+            sample.private_geometry_id,
+            project_id=sample.project_a_id,
+        ) is None
         with pytest.raises(ScientificArrayNotFoundError):
             await ScientificArrayContentService.load_npy(
                 sample.scientific_array_b_id,
                 max_bytes=32 * 1024 * 1024,
+                project_id=sample.project_a_id,
             )
 
 
@@ -940,10 +1033,19 @@ async def test_reaction_visibility_filters_mixed_calculation_sources(
 ) -> None:
     sample = authorization_sample
     async with _request_as(sample.principal):
-        mapped = await MappedReactionQueryService.list_mapped_reactions(limit=200, offset=0)
-        logical = await LogicalReactionQueryService.list_logical_reactions(limit=200, offset=0)
+        mapped = await MappedReactionQueryService.list_mapped_reactions(
+            project_id=sample.project_a_id,
+            limit=200,
+            offset=0,
+        )
+        logical = await LogicalReactionQueryService.list_logical_reactions(
+            project_id=sample.project_a_id,
+            limit=200,
+            offset=0,
+        )
         detail = await MappedReactionQueryService.get_mapped_reaction(
-            mapped_reaction_id=sample.shared_mapped_reaction_id
+            mapped_reaction_id=sample.shared_mapped_reaction_id,
+            project_id=sample.project_a_id,
         )
 
         assert sample.shared_mapped_reaction_id in {item.id for item in mapped.items}
@@ -957,19 +1059,22 @@ async def test_reaction_visibility_filters_mixed_calculation_sources(
         assert sample.frame_b_id not in _reaction_frame_ids(detail)
         assert (
             await MappedReactionQueryService.get_mapped_reaction(
-                mapped_reaction_id=sample.private_mapped_reaction_id
+                mapped_reaction_id=sample.private_mapped_reaction_id,
+                project_id=sample.project_a_id,
             )
             is None
         )
         assert (
             await MappedReactionQueryService.get_mapped_reaction(
-                mapped_reaction_id=sample.source_less_mapped_reaction_id
+                mapped_reaction_id=sample.source_less_mapped_reaction_id,
+                project_id=sample.project_a_id,
             )
             is not None
         )
         assert (
             await LogicalReactionQueryService.get_logical_reaction(
-                logical_reaction_id=sample.source_less_logical_reaction_id
+                logical_reaction_id=sample.source_less_logical_reaction_id,
+                project_id=sample.project_a_id,
             )
             is not None
         )
@@ -990,9 +1095,18 @@ async def test_anonymous_public_artifact_list_and_detail_are_consistent(
         transport=ASGITransport(app=create_app()),
         base_url="http://test",
     ) as client:
-        artifacts = await client.get("/api/artifacts", params={"limit": 200})
-        public_detail = await client.get(f"/api/artifacts/{sample.public_artifact_id}")
-        private_detail = await client.get(f"/api/artifacts/{sample.artifact_b_id}")
+        artifacts = await client.get(
+            "/api/artifacts",
+            params={"project_id": str(sample.project_b_id), "limit": 200},
+        )
+        public_detail = await client.get(
+            f"/api/artifacts/{sample.public_artifact_id}",
+            params={"project_id": str(sample.project_b_id)},
+        )
+        private_detail = await client.get(
+            f"/api/artifacts/{sample.artifact_b_id}",
+            params={"project_id": str(sample.project_b_id)},
+        )
 
     assert artifacts.status_code == 200
     assert sample.public_artifact_id in {UUID(item["id"]) for item in artifacts.json()["items"]}
@@ -1011,25 +1125,31 @@ async def test_advanced_protocol_derivation_and_manifest_visibility(
     async with _request_as(sample.principal):
         results = await CalculationResultQueryService.list_calculation_results(
             artifact_file_id=sample.artifact_b_id,
+            project_id=sample.project_a_id,
             limit=200,
             offset=0,
         )
         derivation = await MolecularTopologyDerivationQueryService.get_topology_derivation(
-            derivation_id=sample.derivation_a_id
+            derivation_id=sample.derivation_a_id,
+            project_id=sample.project_a_id,
         )
         manifests = await WorkflowManifestQueryService.list_workflow_manifests(
             artifact_file_id=None,
+            project_id=sample.project_a_id,
             limit=200,
             offset=0,
         )
         manifest = await WorkflowManifestQueryService.get_workflow_manifest(
-            workflow_manifest_id=sample.manifest_id
+            workflow_manifest_id=sample.manifest_id,
+            project_id=sample.project_a_id,
         )
         binding = await WorkflowManifestQueryService.get_manifest_artifact_binding(
-            binding_id=sample.binding_id
+            binding_id=sample.binding_id,
+            project_id=sample.project_a_id,
         )
         reverse = await WorkflowManifestQueryService.list_manifest_artifact_bindings(
             artifact_file_id=sample.artifact_b_id,
+            project_id=sample.project_a_id,
             limit=200,
             offset=0,
         )
@@ -1040,14 +1160,15 @@ async def test_advanced_protocol_derivation_and_manifest_visibility(
         if sample.protocol_a_id is not None:
             assert (
                 await CalculationProtocolQueryService.get_calculation_protocol(
-                    protocol_id=sample.protocol_a_id
+                    protocol_id=sample.protocol_a_id,
+                    project_id=sample.project_a_id,
                 )
                 is not None
             )
         assert sample.manifest_id in {item.id for item in manifests.items}
         assert manifest is not None
-        assert manifest.artifact_bindings[0].artifact_file_id is None
-        assert binding is not None and binding.artifact_file_id is None
+        assert manifest.artifact_bindings[0].artifact_file_id == sample.artifact_a_id
+        assert binding is not None and binding.artifact_file_id == sample.artifact_a_id
         assert reverse.page.total == 0
 
 
@@ -1058,19 +1179,42 @@ async def test_private_and_missing_detail_ids_have_same_service_semantics(
     sample = authorization_sample
     missing = uuid4()
     async with _request_as(sample.principal):
-        assert await ArtifactQueryService.get_artifact(artifact_id=sample.artifact_b_id) is None
-        assert await ArtifactQueryService.get_artifact(artifact_id=missing) is None
+        assert await ArtifactQueryService.get_artifact(
+            artifact_id=sample.artifact_b_id,
+            project_id=sample.project_a_id,
+        ) is None
+        assert await ArtifactQueryService.get_artifact(
+            artifact_id=missing,
+            project_id=sample.project_a_id,
+        ) is None
         assert (
-            await CalculationQueryService.get_calculation_frame(frame_id=sample.frame_b_id) is None
-        )
-        assert await CalculationQueryService.get_calculation_frame(frame_id=missing) is None
-        assert (
-            await ScientificArrayQueryService.get_scientific_array(
-                array_id=sample.scientific_array_b_id
+            await CalculationQueryService.get_calculation_frame(
+                frame_id=sample.frame_b_id,
+                project_id=sample.project_a_id,
             )
             is None
         )
-        assert await ScientificArrayQueryService.get_scientific_array(array_id=missing) is None
+        assert (
+            await CalculationQueryService.get_calculation_frame(
+                frame_id=missing,
+                project_id=sample.project_a_id,
+            )
+            is None
+        )
+        assert (
+            await ScientificArrayQueryService.get_scientific_array(
+                array_id=sample.scientific_array_b_id,
+                project_id=sample.project_a_id,
+            )
+            is None
+        )
+        assert (
+            await ScientificArrayQueryService.get_scientific_array(
+                array_id=missing,
+                project_id=sample.project_a_id,
+            )
+            is None
+        )
 
 
 @pytest.mark.asyncio
@@ -1093,20 +1237,29 @@ async def test_rest_graphql_and_mcp_share_authorized_visibility(
     ) as client:
         rest = await client.post(
             "/api/mapped_reaction_query_service/list_mapped_reactions",
-            json={"limit": 200, "offset": 0},
+            json={
+                "project_id": str(sample.project_a_id),
+                "limit": 200,
+                "offset": 0,
+            },
         )
         graphql = await client.post(
             "/graphql",
             json={
                 "query": (
                     "{ MappedReactionQueryService { "
-                    "list_mapped_reactions(limit: 200, offset: 0) { items { id } } } }"
+                    "list_mapped_reactions(project_id: \""
+                    + str(sample.project_a_id)
+                    + "\", limit: 200, offset: 0) { items { id } } } }"
                 )
             },
         )
         private_rest = await client.post(
             "/api/mapped_reaction_query_service/get_mapped_reaction",
-            json={"mapped_reaction_id": str(sample.private_mapped_reaction_id)},
+            json={
+                "mapped_reaction_id": str(sample.private_mapped_reaction_id),
+                "project_id": str(sample.project_a_id),
+            },
         )
 
     assert rest.status_code == 200
@@ -1155,7 +1308,9 @@ async def test_rest_graphql_and_mcp_share_authorized_visibility(
                 "app_name": "example-chemistry-database",
                 "query": (
                     "{ MappedReactionQueryService { "
-                    "list_mapped_reactions(limit: 200, offset: 0) { items { id } } } }"
+                    "list_mapped_reactions(project_id: \""
+                    + str(sample.project_a_id)
+                    + "\", limit: 200, offset: 0) { items { id } } } }"
                 ),
             },
         )
@@ -1188,16 +1343,30 @@ async def test_core_content_routes_do_not_reveal_private_ids(
         base_url="http://test",
         headers={"Authorization": "Bearer authorization-test"},
     ) as client:
-        private_artifact = await client.get(f"/api/artifacts/{sample.artifact_b_id}/preview")
-        missing_artifact = await client.get(f"/api/artifacts/{missing}/preview")
+        private_artifact = await client.get(
+            f"/api/artifacts/{sample.artifact_b_id}/preview",
+            params={"project_id": str(sample.project_b_id)},
+        )
+        missing_artifact = await client.get(
+            f"/api/artifacts/{missing}/preview",
+            params={"project_id": str(sample.project_b_id)},
+        )
         private_array = await client.get(
-            f"/api/scientific-arrays/{sample.scientific_array_b_id}.npy"
+            f"/api/scientific-arrays/{sample.scientific_array_b_id}.npy",
+            params={"project_id": str(sample.project_b_id)},
         )
-        missing_array = await client.get(f"/api/scientific-arrays/{missing}.npy")
+        missing_array = await client.get(
+            f"/api/scientific-arrays/{missing}.npy",
+            params={"project_id": str(sample.project_b_id)},
+        )
         private_array_preview = await client.get(
-            f"/api/scientific-arrays/{sample.scientific_array_b_id}/preview"
+            f"/api/scientific-arrays/{sample.scientific_array_b_id}/preview",
+            params={"project_id": str(sample.project_b_id)},
         )
-        missing_array_preview = await client.get(f"/api/scientific-arrays/{missing}/preview")
+        missing_array_preview = await client.get(
+            f"/api/scientific-arrays/{missing}/preview",
+            params={"project_id": str(sample.project_b_id)},
+        )
         private_geometry = await client.get(
             f"/api/depictions/geometry/{sample.private_geometry_id}.sdf"
         )
@@ -1262,7 +1431,10 @@ async def test_core_topology_list_uses_the_shared_visibility_scope(
         base_url="http://test",
         headers={"Authorization": "Bearer authorization-test"},
     ) as client:
-        response = await client.get("/api/topologies", params={"limit": 200})
+        response = await client.get(
+            "/api/topologies",
+            params={"project_id": str(sample.project_a_id), "limit": 200},
+        )
 
     assert response.status_code == 200
     topology_ids = {UUID(item["id"]) for item in response.json()}

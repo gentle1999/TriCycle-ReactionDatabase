@@ -11,9 +11,11 @@ from tricycle_reaction_db.api.routes import graphql as graphql_module
 from tricycle_reaction_db.application.query_cost import (
     FixedWindowRateLimiter,
     QueryBudgetExceeded,
+    QueryProjectScopeRequired,
     validate_graphql_query_budget,
 )
 from tricycle_reaction_db.application.rate_limits import RateLimitBackendUnavailable
+from tricycle_reaction_db.application.services import MappedReactionQueryService
 
 
 class _UnavailableRateLimiter:
@@ -361,10 +363,36 @@ async def test_rest_structure_budget_uses_stable_error_code() -> None:
         transport=ASGITransport(app=create_app()),
         base_url="http://test",
     ) as client:
-        response = await client.post(
-            "/api/mapped_reaction_query_service/list_mapped_reactions",
-            json={"similarity_reaction_smiles": "C" * 16_385, "limit": 1},
-        )
+            response = await client.post(
+                "/api/mapped_reaction_query_service/list_mapped_reactions",
+                json={
+                    "project_id": "00000000-0000-7000-8000-000000000201",
+                    "similarity_reaction_smiles": "C" * 16_385,
+                    "limit": 1,
+                },
+            )
 
     assert response.status_code == 413
     assert response.json()["detail"]["code"] == "query_budget_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_rest_project_owned_query_requires_project_scope() -> None:
+    async with AsyncClient(
+        transport=ASGITransport(app=create_app()),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/mapped_reaction_query_service/list_mapped_reactions",
+            json={"limit": 1},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "project_id is required for project-owned queries"
+
+
+def test_project_visibility_scope_rejects_unscoped_service_queries() -> None:
+    with pytest.raises(QueryProjectScopeRequired, match="project_id is required"):
+        asyncio.run(
+            MappedReactionQueryService.list_mapped_reactions(project_id=None, limit=1)
+        )

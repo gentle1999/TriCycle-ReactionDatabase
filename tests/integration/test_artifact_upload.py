@@ -20,6 +20,7 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
     _persist_parsed_artifact,
     _persist_uploaded_artifact,
 )
+from tricycle_reaction_db.application.services.molecular_geometry import GeometryPersistenceContext
 from tricycle_reaction_db.application.services.reaction_commands import _create_reaction
 from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
     ReconciliationBatchCache,
@@ -207,6 +208,12 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
             assert "sampling_steps" not in inference.inference_settings
             assert inference.logical_reaction_id is not None
             assert inference.mapped_reaction_id is not None
+            logical_reaction = session.get(LogicalReaction, inference.logical_reaction_id)
+            mapped_reaction = session.get(MappedReaction, inference.mapped_reaction_id)
+            assert logical_reaction is not None
+            assert mapped_reaction is not None
+            assert logical_reaction.project_id == artifact.project_id
+            assert mapped_reaction.project_id == artifact.project_id
             ts_frame = session.exec(
                 select(CalculationFrame)
                 .where(
@@ -452,6 +459,7 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
                     reaction=inferred.reaction_smiles,
                     mapped_reaction_kind=MappedReactionKind.CURATED,
                 ),
+                topology_context=GeometryPersistenceContext(project_id=artifact.project_id),
             )
             assert curated.mapped_reaction_id == inference.mapped_reaction_id
 

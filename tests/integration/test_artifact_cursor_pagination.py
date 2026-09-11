@@ -90,6 +90,7 @@ async def test_artifact_keyset_first_page_skips_count_and_cursor_pages_skip_offs
     event.listen(engine.sync_engine, "before_cursor_execute", capture)
     try:
         first_page = await ArtifactQueryService.list_artifacts(
+            project_id=SYSTEM_PROJECT_ID,
             original_filename_contains=suffix,
             limit=1,
             offset=0,
@@ -112,6 +113,7 @@ async def test_artifact_keyset_first_page_skips_count_and_cursor_pages_skip_offs
         event.listen(engine.sync_engine, "before_cursor_execute", capture)
         try:
             page = await ArtifactQueryService.list_artifacts(
+                project_id=SYSTEM_PROJECT_ID,
                 original_filename_contains=suffix,
                 limit=1,
                 offset=offset,
@@ -138,6 +140,7 @@ async def test_artifact_offset_compatibility_path_keeps_exact_total(
     event.listen(engine.sync_engine, "before_cursor_execute", capture)
     try:
         page = await ArtifactQueryService.list_artifacts(
+            project_id=SYSTEM_PROJECT_ID,
             original_filename_contains=suffix,
             limit=10,
             offset=0,

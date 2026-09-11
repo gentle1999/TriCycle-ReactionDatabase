@@ -1,6 +1,7 @@
 """Database-backed tests for software-neutral Geometry reuse."""
 
 import os
+from typing import Any
 
 import numpy as np
 import pytest
@@ -11,12 +12,15 @@ from sqlmodel import Session
 from tricycle_reaction_db.application.services.molecular_geometry import (
     GEOMETRY_MATCH_POLICY_VERSION,
     GeometryPersistenceContext,
-    persist_molecular_geometry,
     preload_molecular_geometry_context,
+)
+from tricycle_reaction_db.application.services.molecular_geometry import (
+    persist_molecular_geometry as _persist_molecular_geometry_impl,
 )
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import Geometry
 from tricycle_reaction_db.domain.enums import GeometryAssignmentKind
+from tricycle_reaction_db.domain.identity import SYSTEM_PROJECT_ID
 from tricycle_reaction_db.ingestion import normalize_molecule
 
 pytestmark = [
@@ -26,6 +30,13 @@ pytestmark = [
         reason="set TRICYCLE_RUN_DATABASE_TESTS=1 to run database tests",
     ),
 ]
+
+
+def persist_molecular_geometry(session: Session, record: Any, **kwargs: Any) -> Any:
+    """Keep legacy geometry fixtures inside an explicit project scope."""
+
+    kwargs.setdefault("context", GeometryPersistenceContext(project_id=SYSTEM_PROJECT_ID))
+    return _persist_molecular_geometry_impl(session, record, **kwargs)
 
 
 def _database_internal_coordinate_match(
@@ -227,7 +238,7 @@ def test_preloaded_batch_reuses_pending_equivalent_geometry() -> None:
     try:
         with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
             session.info["tricycle_fast_insert"] = True
-            context = GeometryPersistenceContext()
+            context = GeometryPersistenceContext(project_id=SYSTEM_PROJECT_ID)
             preload_molecular_geometry_context(
                 session,
                 [(source, 8), (observation, 8)],
@@ -354,6 +365,7 @@ def test_ambiguous_geometry_match_selects_nearest_candidate() -> None:
             assert alternate_record.geometry.geometry_hash != observation.geometry.geometry_hash
             internal = np.array(alternate_record.geometry.internal_coordinates, copy=True)
             alternate = Geometry(
+                project_id=authority.topology.project_id,
                 topology_id=authority.topology.id,
                 topology=authority.topology,
                 mol=Chem.Mol(alternate_record.geometry.mol),

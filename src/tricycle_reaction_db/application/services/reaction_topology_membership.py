@@ -86,7 +86,8 @@ def _compatible_topology_candidate(
     concrete_topology: MolecularTopology,
 ) -> bool:
     return (
-        candidate.formula_id == concrete_topology.formula_id
+        candidate.project_id == concrete_topology.project_id
+        and candidate.formula_id == concrete_topology.formula_id
         and candidate.atom_count == concrete_topology.atom_count
         and candidate.formal_charge == concrete_topology.formal_charge
     )
@@ -143,6 +144,28 @@ def persist_logical_participant_concrete_topology(
     )
     concrete_topology_id = _require_id(concrete_topology, label="MolecularTopology")
     logical_topology = logical_participant.topology
+    logical_reaction = logical_participant.logical_reaction
+    if logical_reaction is None:
+        logical_reaction = session.get(LogicalReaction, logical_participant.logical_reaction_id)
+    if logical_reaction is None:  # pragma: no cover - protected by the FK
+        raise ConcreteTopologyMembershipError(
+            "logical participant has no owning LogicalReaction"
+        )
+    if (
+        logical_reaction.project_id is None
+        or logical_topology.project_id is None
+        or concrete_topology.project_id is None
+    ):
+        raise ConcreteTopologyMembershipError(
+            "concrete memberships require project-owned reaction and topology rows"
+        )
+    if (
+        logical_reaction.project_id != logical_topology.project_id
+        or logical_reaction.project_id != concrete_topology.project_id
+    ):
+        raise ConcreteTopologyMembershipError(
+            "logical participant and concrete topology must belong to the same project"
+        )
     if not _compatible_topology_candidate(logical_topology, concrete_topology):
         raise ConcreteTopologyMembershipError(
             "concrete topology differs in formula, atom count, or formal charge"
@@ -255,7 +278,12 @@ def concrete_topology_candidates_for_logical_participant(
     candidates_by_id: dict[UUID, MolecularTopology] = {
         root_id: logical_topology,
     }
-    for topology in specialized_topologies(session, logical_topology, include_general=True):
+    for topology in specialized_topologies(
+        session,
+        logical_topology,
+        project_id=logical_topology.project_id,
+        include_general=True,
+    ):
         topology_id = _require_id(topology, label="MolecularTopology")
         if _compatible_topology_candidate(topology, logical_topology):
             candidates_by_id[topology_id] = topology
@@ -311,7 +339,12 @@ def logical_participant_matches_for_concrete_topology(
     for participant in candidate_participants:
         participant_id = _require_id(participant, label="LogicalReactionParticipant")
         if _compatible_topology_candidate(participant.topology, concrete_topology):
-            participants_by_id[participant_id] = participant
+            logical_reaction = participant.logical_reaction
+            if (
+                logical_reaction is not None
+                and logical_reaction.project_id == concrete_topology.project_id
+            ):
+                participants_by_id[participant_id] = participant
     rows = session.exec(
         select(
             LogicalReactionParticipant,
@@ -340,6 +373,8 @@ def logical_participant_matches_for_concrete_topology(
             col(MolecularTopology.formula_id) == concrete_topology.formula_id,
             col(MolecularTopology.atom_count) == concrete_topology.atom_count,
             col(MolecularTopology.formal_charge) == concrete_topology.formal_charge,
+            col(MolecularTopology.project_id) == concrete_topology.project_id,
+            col(LogicalReaction.project_id) == concrete_topology.project_id,
         )
     ).all()
     for participant, logical_reaction, membership in rows:

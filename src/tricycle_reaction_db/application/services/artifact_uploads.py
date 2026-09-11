@@ -18,7 +18,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Mutable
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from hashlib import sha256
 from importlib.metadata import version
@@ -26,7 +26,7 @@ from pathlib import Path
 from queue import Empty, Queue
 from time import perf_counter
 from typing import Any, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import numpy as np
 from molop import AutoFileParser
@@ -167,6 +167,26 @@ class ArtifactUploadConflictError(ArtifactUploadError):
 
 class NoCalculationFramesError(ArtifactUploadError):
     """The source is not a QM calculation output accepted by the catalogue."""
+
+
+def _is_no_calculation_frames_message(message: str | None) -> bool:
+    """Recognize MolOP's parser-level no-frame outcome as a filter result."""
+
+    if not message:
+        return False
+    normalized = " ".join(message.lower().split())
+    return "reader returned a file model with no frames" in normalized
+
+
+def _parser_error_from_worker(message: str | None) -> ArtifactUploadError:
+    """Convert an isolated parser result into the correct durable outcome."""
+
+    normalized_message = message or "MolOP did not return a result for this input file"
+    if _is_no_calculation_frames_message(normalized_message):
+        return NoCalculationFramesError(
+            "source contains no QM calculation frames; artifact was filtered"
+        )
+    return ArtifactUploadError(normalized_message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -870,9 +890,7 @@ async def _run_molop_source_parser(
                 artifact_sha256,
             )
             if parsed is None:
-                raise ArtifactUploadError(
-                    error_message or "MolOP did not return a result for this input file"
-                )
+                raise _parser_error_from_worker(error_message)
             return parsed
         except Exception as error:
             if isinstance(error, ArtifactUploadError):
@@ -941,9 +959,7 @@ async def _run_isolated_molop_file(
                 artifact_sha256,
             )
             if parsed is None:
-                raise ArtifactUploadError(
-                    error_message or "MolOP did not return a result for this input file"
-                )
+                raise _parser_error_from_worker(error_message)
             return parsed
         except asyncio.CancelledError:
             # asyncio.timeout cancels this coroutine. A running synchronous
@@ -2642,6 +2658,7 @@ def _delete_reserved_object(
 async def _filter_artifact_without_calculation_frames(
     *,
     ingestion_id: UUID,
+    expected_worker_lease_id: UUID | None = None,
 ) -> ArtifactUploadResult:
     async with session_factory() as session:
         ingestion = await session.get(ArtifactIngestion, ingestion_id)
@@ -2659,6 +2676,7 @@ async def _filter_artifact_without_calculation_frames(
                 completed_at=datetime.now(UTC),
                 source_frame_count=0,
                 transition_state_frame_count=0,
+                expected_worker_lease_id=expected_worker_lease_id,
             )
         )
         await session.commit()
@@ -2751,6 +2769,10 @@ def _create_pending_ingestion(
             parser_version=MOLOP_VERSION,
             started_at=started_at,
         )
+        ingestion.worker_lease_id = uuid4()
+        ingestion.worker_lease_expires_at = started_at + timedelta(
+            seconds=get_settings().upload_worker_lease_seconds
+        )
         if session.info.get("tricycle_fast_insert", False):
             _prepare_new_entity(session, ingestion)
         else:
@@ -2760,11 +2782,16 @@ def _create_pending_ingestion(
         has_revision = session.exec(
             select(ParseRevision.id).where(ParseRevision.artifact_file_id == artifact_id)
         ).first()
-        if has_revision is None:
+        if ingestion.status is ArtifactIngestionStatus.PENDING or has_revision is None:
             ingestion.status = ArtifactIngestionStatus.PENDING
             ingestion.source_frame_count = None
             ingestion.transition_state_frame_count = None
+            ingestion.started_at = started_at
             ingestion.completed_at = None
+            ingestion.worker_lease_id = uuid4()
+            ingestion.worker_lease_expires_at = started_at + timedelta(
+                seconds=get_settings().upload_worker_lease_seconds
+            )
             ingestion.error_code = None
             ingestion.error_message = None
             session.add(ingestion)
@@ -2814,12 +2841,24 @@ def _create_pending_ingestions(
                 parser_version=MOLOP_VERSION,
                 started_at=started_by_artifact_id[artifact_id],
             )
+            ingestion.worker_lease_id = uuid4()
+            ingestion.worker_lease_expires_at = started_by_artifact_id[artifact_id] + timedelta(
+                seconds=get_settings().upload_worker_lease_seconds
+            )
             _prepare_new_entity(session, ingestion)
-        elif artifact_id not in artifacts_with_revisions:
+        elif (
+            ingestion.status is ArtifactIngestionStatus.PENDING
+            or artifact_id not in artifacts_with_revisions
+        ):
             ingestion.status = ArtifactIngestionStatus.PENDING
             ingestion.source_frame_count = None
             ingestion.transition_state_frame_count = None
+            ingestion.started_at = started_by_artifact_id[artifact_id]
             ingestion.completed_at = None
+            ingestion.worker_lease_id = uuid4()
+            ingestion.worker_lease_expires_at = started_by_artifact_id[artifact_id] + timedelta(
+                seconds=get_settings().upload_worker_lease_seconds
+            )
             ingestion.error_code = None
             ingestion.error_message = None
             session.add(ingestion)
@@ -3633,6 +3672,19 @@ def _persist_parsed_artifact(
             ).all()
             if isinstance(revision_id, UUID)
         }
+    # Single-file uploads and reparses do not arrive through the batch
+    # persistence coordinator, so they have no caller-owned geometry context.
+    # Reuse one project-bound context for both Formula/Topology/Geometry
+    # persistence and the deferred TS reaction inference.  Without this,
+    # reparsing a historical file rebuilt its frames but called
+    # ``create_reaction_in_session`` with ``project_id=None``; the new
+    # inference then reused the quarantined global reaction root instead of
+    # materializing a project-owned reaction.
+    active_geometry_context = geometry_context or GeometryPersistenceContext(
+        project_id=artifact.project_id
+    )
+    if active_geometry_context.project_id != artifact.project_id:
+        raise ValueError("GeometryPersistenceContext project does not match ArtifactFile project")
     persisted_artifact = persist_molop_calculation_artifact(
         session,
         artifact=artifact,
@@ -3649,7 +3701,7 @@ def _persist_parsed_artifact(
         parallel_frame_persistence=(
             _fast_molop_ingestion_enabled() and not existing_revision_ids and not force_new_revision
         ),
-        geometry_context=geometry_context,
+        geometry_context=active_geometry_context,
         preload_geometry_context=preload_geometry_context,
         defer_reconciliation=defer_reconciliation,
         parse_diagnostics=list(parsed.parse_diagnostics),
@@ -3671,7 +3723,11 @@ def _persist_parsed_artifact(
         defer_revision_local_flush=deferred_inferences is not None,
     )
     if deferred_inferences is None:
-        _persist_artifact_inferences(session, inference_work)
+        _persist_artifact_inferences(
+            session,
+            inference_work,
+            topology_context=active_geometry_context,
+        )
     else:
         deferred_inferences.append(inference_work)
 
@@ -3698,6 +3754,8 @@ def _persist_parsed_artifact(
     ingestion.source_frame_count = parsed.source_frame_count
     ingestion.transition_state_frame_count = len(parsed.inferences)
     ingestion.completed_at = completed_at
+    ingestion.worker_lease_id = None
+    ingestion.worker_lease_expires_at = None
     ingestion.error_code = None
     ingestion.error_message = None
     ingestion.parser_metadata = {
@@ -3728,12 +3786,24 @@ def _mark_ingestion_failed(
     source_frame_count: int | None = None,
     transition_state_frame_count: int | None = None,
     error_metadata: dict[str, Any] | None = None,
-) -> None:
+    expected_worker_lease_id: UUID | None = None,
+) -> bool:
     ingestion = ingestion or session.get(ArtifactIngestion, ingestion_id)
     if ingestion is None:
         raise RuntimeError("artifact ingestion disappeared during parsing")
+    if (
+        expected_worker_lease_id is not None
+        and (
+            ingestion.worker_lease_id != expected_worker_lease_id
+            or ingestion.worker_lease_expires_at is None
+            or ingestion.worker_lease_expires_at <= datetime.now(UTC)
+        )
+    ):
+        return False
     ingestion.status = ArtifactIngestionStatus.FAILED
     ingestion.completed_at = completed_at
+    ingestion.worker_lease_id = None
+    ingestion.worker_lease_expires_at = None
     if isinstance(error, GeometryAssignmentAmbiguityError):
         error_code = error.error_code
         ingestion.parser_metadata = {
@@ -3758,6 +3828,7 @@ def _mark_ingestion_failed(
     if transition_state_frame_count is not None:
         ingestion.transition_state_frame_count = transition_state_frame_count
     session.add(ingestion)
+    return True
 
 
 def _mark_ingestion_filtered(
@@ -3770,8 +3841,10 @@ def _mark_ingestion_filtered(
     ingestion: ArtifactIngestion | None = None,
     source_frame_count: int = 0,
     transition_state_frame_count: int = 0,
-) -> None:
-    _mark_ingestion_failed(
+    error_metadata: dict[str, Any] | None = None,
+    expected_worker_lease_id: UUID | None = None,
+) -> bool:
+    marked = _mark_ingestion_failed(
         session,
         ingestion_id=ingestion_id,
         error=error,
@@ -3780,12 +3853,17 @@ def _mark_ingestion_filtered(
         ingestion=ingestion,
         source_frame_count=source_frame_count,
         transition_state_frame_count=transition_state_frame_count,
+        error_metadata=error_metadata,
+        expected_worker_lease_id=expected_worker_lease_id,
     )
+    if not marked:
+        return False
     resolved = ingestion or session.get(ArtifactIngestion, ingestion_id)
     if resolved is None:
         raise RuntimeError("artifact ingestion disappeared while marking it filtered")
     resolved.status = ArtifactIngestionStatus.FILTERED
     session.add(resolved)
+    return True
 
 
 def _result(
@@ -3903,6 +3981,8 @@ def _batch_results(
             ingestion.source_frame_count = completion.source_frame_count
             ingestion.transition_state_frame_count = completion.transition_state_frame_count
             ingestion.completed_at = completion.completed_at
+            ingestion.worker_lease_id = None
+            ingestion.worker_lease_expires_at = None
             ingestion.error_code = None
             ingestion.error_message = None
             ingestion.parser_metadata = {
@@ -4001,6 +4081,7 @@ def _run_mark_ingestion_failed(
     source_frame_count: int | None = None,
     transition_state_frame_count: int | None = None,
     error_metadata: dict[str, Any] | None = None,
+    expected_worker_lease_id: UUID | None = None,
 ) -> None:
     _mark_ingestion_failed(
         cast(Session, session),
@@ -4012,6 +4093,7 @@ def _run_mark_ingestion_failed(
         source_frame_count=source_frame_count,
         transition_state_frame_count=transition_state_frame_count,
         error_metadata=error_metadata,
+        expected_worker_lease_id=expected_worker_lease_id,
     )
 
 
@@ -4025,6 +4107,8 @@ def _run_mark_ingestion_filtered(
     ingestion: ArtifactIngestion | None = None,
     source_frame_count: int = 0,
     transition_state_frame_count: int = 0,
+    error_metadata: dict[str, Any] | None = None,
+    expected_worker_lease_id: UUID | None = None,
 ) -> None:
     _mark_ingestion_filtered(
         cast(Session, session),
@@ -4035,6 +4119,8 @@ def _run_mark_ingestion_filtered(
         ingestion=ingestion,
         source_frame_count=source_frame_count,
         transition_state_frame_count=transition_state_frame_count,
+        error_metadata=error_metadata,
+        expected_worker_lease_id=expected_worker_lease_id,
     )
 
 
@@ -4797,8 +4883,18 @@ class ArtifactUploadService:
         *,
         artifact_id: UUID,
         user_id: UUID,
+        ingestion_id: UUID | None = None,
+        ingestion_lease_id: UUID | None = None,
     ) -> ArtifactUploadResult:
-        """Parse a stored calculation artifact with the current parser identity."""
+        """Parse a stored calculation artifact with the current parser identity.
+
+        ``ingestion_id`` and ``ingestion_lease_id`` are used only by the
+        compatibility recovery worker.  They prevent a late result from an
+        abandoned parser from overwriting a newer retry.
+        """
+
+        if (ingestion_id is None) != (ingestion_lease_id is None):
+            raise ArtifactUploadError("ingestion recovery requires both id and lease")
 
         started_at = datetime.now(UTC)
         async with session_factory() as session:
@@ -4812,16 +4908,32 @@ class ArtifactUploadService:
             )
             if artifact.artifact_kind is not ArtifactKind.CALCULATION_OUTPUT:
                 raise ArtifactUploadError("only calculation output artifacts can be reparsed")
-            if artifact.storage_status is not StorageStatus.AVAILABLE:
-                raise ArtifactUploadError("artifact bytes are not available for reparse")
-            ingestion, _ = await session.run_sync(
-                lambda sync_session: _create_pending_ingestion(
-                    cast(Session, sync_session),
-                    artifact=artifact,
-                    started_at=started_at,
+            if ingestion_id is not None and ingestion_lease_id is not None:
+                ingestion = (
+                    await session.exec(
+                        select(ArtifactIngestion)
+                        .where(
+                            col(ArtifactIngestion.id) == ingestion_id,
+                            col(ArtifactIngestion.artifact_file_id) == artifact_id,
+                            col(ArtifactIngestion.status) == ArtifactIngestionStatus.PENDING,
+                            col(ArtifactIngestion.worker_lease_id) == ingestion_lease_id,
+                            col(ArtifactIngestion.worker_lease_expires_at) > started_at,
+                        )
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if ingestion is None:
+                    raise ArtifactUploadError("pending ingestion recovery lease is no longer valid")
+            else:
+                ingestion, _ = await session.run_sync(
+                    lambda sync_session: _create_pending_ingestion(
+                        cast(Session, sync_session),
+                        artifact=artifact,
+                        started_at=started_at,
+                    )
                 )
-            )
-            ingestion_id = _require_id(ingestion, label="ArtifactIngestion")
+            resolved_ingestion_id = _require_id(ingestion, label="ArtifactIngestion")
+            processing_lease_id = ingestion.worker_lease_id
             had_parse_revision = (
                 await session.exec(
                     select(ParseRevision.id).where(ParseRevision.artifact_file_id == artifact_id)
@@ -4832,9 +4944,28 @@ class ArtifactUploadService:
             expected_size = artifact.size_bytes
             settings = RustFSSettings().model_copy(update={"bucket": artifact.bucket})
             object_key = artifact.object_key
+            storage_status = artifact.storage_status
             await session.commit()
 
         try:
+            if storage_status is StorageStatus.PENDING:
+                stored = await asyncio.to_thread(cls._head_payload, settings, object_key)
+                if stored.size != expected_size or (
+                    stored.sha256 is not None and stored.sha256 != expected_sha256
+                ):
+                    raise ArtifactUploadError(
+                        "stored artifact metadata does not match database identity"
+                    )
+                async with session_factory() as session:
+                    await session.run_sync(
+                        lambda sync_session: _mark_upload_available(
+                            cast(Session, sync_session),
+                            artifact_id=artifact_id,
+                            object_key=object_key,
+                            stored=stored,
+                        )
+                    )
+                    await session.commit()
             # Keep storage reads and identity validation inside the same
             # failure boundary as MolOP parsing.  A worker crash or RustFS
             # read failure must not leave the newly-created ingestion pending
@@ -4846,16 +4977,17 @@ class ArtifactUploadService:
             parsed = await _run_molop_file_pipeline(payload, filename)
         except Exception as error:
             parse_error = error
-            if not had_parse_revision:
+            if processing_lease_id is not None or not had_parse_revision:
                 async with session_factory() as session:
                     await session.run_sync(
                         lambda sync_session: _mark_ingestion_failed(
                             cast(Session, sync_session),
-                            ingestion_id=ingestion_id,
+                            ingestion_id=resolved_ingestion_id,
                             error=parse_error,
                             error_code=getattr(parse_error, "error_code", "molop_reparse_failed"),
                             completed_at=datetime.now(UTC),
                             error_metadata=_parse_failure_metadata(parse_error),
+                            expected_worker_lease_id=processing_lease_id,
                         )
                     )
                     await session.commit()
@@ -4863,15 +4995,34 @@ class ArtifactUploadService:
 
         if parsed.source_frame_count == 0 and not had_parse_revision:
             return await _filter_artifact_without_calculation_frames(
-                ingestion_id=ingestion_id,
+                ingestion_id=resolved_ingestion_id,
+                expected_worker_lease_id=processing_lease_id,
             )
 
         try:
             async with session_factory() as session:
+                if processing_lease_id is not None:
+                    current_ingestion = (
+                        await session.exec(
+                            select(ArtifactIngestion)
+                            .where(
+                                col(ArtifactIngestion.id) == resolved_ingestion_id,
+                                col(ArtifactIngestion.status) == ArtifactIngestionStatus.PENDING,
+                                col(ArtifactIngestion.worker_lease_id) == processing_lease_id,
+                                col(ArtifactIngestion.worker_lease_expires_at)
+                                > datetime.now(UTC),
+                            )
+                            .with_for_update()
+                        )
+                    ).one_or_none()
+                    if current_ingestion is None:
+                        raise ArtifactUploadError(
+                            "pending ingestion recovery lease is no longer valid"
+                        )
                 parse_revision_id, parse_revision_created = await session.run_sync(
                     lambda sync_session: _persist_parsed_artifact(
                         cast(Session, sync_session),
-                        ingestion_id=ingestion_id,
+                        ingestion_id=resolved_ingestion_id,
                         parsed=parsed,
                         started_at=started_at,
                         completed_at=datetime.now(UTC),
@@ -4882,19 +5033,19 @@ class ArtifactUploadService:
                 return await session.run_sync(
                     lambda sync_session: _result(
                         cast(Session, sync_session),
-                        ingestion_id,
+                        resolved_ingestion_id,
                         parse_revision_id=parse_revision_id,
                         parse_revision_created=parse_revision_created,
                     )
                 )
         except Exception as error:
             persistence_error = error
-            if not had_parse_revision:
+            if processing_lease_id is not None or not had_parse_revision:
                 async with session_factory() as session:
                     await session.run_sync(
                         lambda sync_session: _mark_ingestion_failed(
                             cast(Session, sync_session),
-                            ingestion_id=ingestion_id,
+                            ingestion_id=resolved_ingestion_id,
                             error=persistence_error,
                             error_code=getattr(
                                 persistence_error,
@@ -4908,10 +5059,34 @@ class ArtifactUploadService:
                                 persistence_error,
                                 parsed=parsed,
                             ),
+                            expected_worker_lease_id=processing_lease_id,
                         )
                     )
                     await session.commit()
             raise ArtifactUploadError(str(error) or type(error).__name__) from error
+
+    @classmethod
+    async def fail_pending_ingestion(
+        cls,
+        *,
+        ingestion_id: UUID,
+        lease_id: UUID,
+        error: Exception,
+    ) -> None:
+        """Record a recovery precondition failure without stealing a new lease."""
+
+        async with session_factory() as session:
+            await session.run_sync(
+                lambda sync_session: _mark_ingestion_failed(
+                    cast(Session, sync_session),
+                    ingestion_id=ingestion_id,
+                    error=error,
+                    error_code=getattr(error, "error_code", "pending_ingestion_recovery_failed"),
+                    completed_at=datetime.now(UTC),
+                    expected_worker_lease_id=lease_id,
+                )
+            )
+            await session.commit()
 
     @classmethod
     async def validate(
@@ -5134,6 +5309,10 @@ class ArtifactUploadService:
                                 ingestion.transition_state_frame_count = None
                                 ingestion.error_code = None
                                 ingestion.error_message = None
+                                ingestion.worker_lease_id = uuid4()
+                                ingestion.worker_lease_expires_at = started_at + timedelta(
+                                    seconds=get_settings().upload_worker_lease_seconds
+                                )
                                 session.add(ingestion)
                                 ingestion_status = ArtifactIngestionStatus.PENDING
                                 force_new_revision = True
@@ -5522,6 +5701,8 @@ class ArtifactUploadService:
                 )
             if isinstance(parsed, Exception):
                 parse_errors_by_index[original_index] = parsed
+                if isinstance(parsed, NoCalculationFramesError):
+                    no_frame_indices.add(original_index)
                 return
             if parsed.source_frame_count == 0:
                 no_frame_error = NoCalculationFramesError(
@@ -5563,7 +5744,7 @@ class ArtifactUploadService:
                 persistence_ingestions_by_id.update(batch_ingestions)
                 persistence_revision_ids_by_artifact_id.update(batch_revision_ids)
                 await session.run_sync(_run_disable_autoflush)
-                geometry_context = GeometryPersistenceContext()
+                geometry_context = GeometryPersistenceContext(project_id=project_id)
                 deferred_inferences: list[_DeferredArtifactInferences] = []
                 persist_preload_elapsed_ms += (perf_counter() - preload_started) * 1000
 
@@ -6217,6 +6398,13 @@ class ArtifactUploadService:
     def _load_payload(settings: RustFSSettings, object_key: str) -> bytes:
         with RustFSObjectStore(settings) as store:
             return store.get_bytes(object_key)
+
+    @staticmethod
+    def _head_payload(settings: RustFSSettings, object_key: str) -> Any:
+        """Read object metadata while recovering a pre-queue reservation."""
+
+        with RustFSObjectStore(settings) as store:
+            return store.head(object_key)
 
 
 _ORIGINAL_PREPARE_UPLOAD = cast(

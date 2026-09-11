@@ -31,6 +31,7 @@ from tricycle_reaction_db.db.models.calculations import (
     VibrationResult,
 )
 from tricycle_reaction_db.db.models.chemistry import (
+    DerivedDataIsolationQuarantine,
     Geometry,
     MolecularFormula,
     MolecularTopology,
@@ -90,6 +91,7 @@ __all__ = [
     "CalculationSegment",
     "CalculationStatusResult",
     "ChargeSpinPopulationResult",
+    "DerivedDataIsolationQuarantine",
     "EnergyObservation",
     "ElectronicConfiguration",
     "ElectronicState",

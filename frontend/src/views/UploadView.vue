@@ -385,7 +385,8 @@ async function refreshRecentBatches(): Promise<void> {
 
 async function refreshBatch(): Promise<void> {
   if (!batch.value) return;
-  batch.value = await api.uploadBatch(batch.value.id);
+  if (!selectedProjectId.value) return;
+  batch.value = await api.uploadBatch(batch.value.id, selectedProjectId.value);
 }
 
 async function pollUploadProgress(): Promise<void> {
@@ -418,7 +419,9 @@ async function pollUploadProgress(): Promise<void> {
 
 async function refreshRemoteItems(): Promise<void> {
   if (!remoteMode.value || !batch.value) return;
+  if (!selectedProjectId.value) return;
   const page = await api.uploadBatchItems(batch.value.id, {
+    projectId: selectedProjectId.value,
     status: statusFilter.value === "all" ? undefined : statusFilter.value,
     limit: PAGE_SIZE,
     offset: queuePage.value * PAGE_SIZE,
@@ -429,10 +432,12 @@ async function refreshRemoteItems(): Promise<void> {
 
 async function refreshLocalItems(updatedAfter: string | null = null): Promise<void> {
   if (!batch.value || remoteMode.value) return;
+  if (!selectedProjectId.value) return;
   const localTasks = new Map(tasks.value.map((task) => [task.clientFileId, task]));
   let offset = 0;
   while (true) {
     const page = await api.uploadBatchItems(batch.value.id, {
+      projectId: selectedProjectId.value,
       ...(updatedAfter ? { updatedAfter } : {}),
       limit: 200,
       offset,
@@ -451,7 +456,8 @@ async function openBatch(batchId: string): Promise<void> {
   queueError.value = "";
   queueRunId += 1;
   try {
-    batch.value = await api.uploadBatch(batchId);
+    if (!selectedProjectId.value) throw new Error("请选择项目");
+    batch.value = await api.uploadBatch(batchId, selectedProjectId.value);
     selectedProjectId.value = batch.value.project_id;
     artifactKind.value = batch.value.artifact_kind;
     remoteMode.value = true;
@@ -488,9 +494,14 @@ async function openBatch(batchId: string): Promise<void> {
 }
 
 async function fetchAllBatchItems(batchId: string): Promise<UploadBatchItem[]> {
+  if (!selectedProjectId.value) return [];
   const items: UploadBatchItem[] = [];
   while (true) {
-    const page = await api.uploadBatchItems(batchId, { limit: 200, offset: items.length });
+    const page = await api.uploadBatchItems(batchId, {
+      projectId: selectedProjectId.value,
+      limit: 200,
+      offset: items.length,
+    });
     items.push(...page.items);
     if (items.length >= page.total) return items;
   }

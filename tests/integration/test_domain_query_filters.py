@@ -89,6 +89,7 @@ def _create_domain_sample(session: Session) -> tuple[Any, ...]:
     vector[0] = 2
     formula = MolecularFormula(
         id=uuid4(),
+        project_id=SYSTEM_PROJECT_ID,
         hill_formula="H2",
         composition=[{"atomic_number": 1, "isotope": 0, "count": 2}],
         atom_count=2,
@@ -98,6 +99,7 @@ def _create_domain_sample(session: Session) -> tuple[Any, ...]:
     assert formula.id is not None
     topology = MolecularTopology(
         id=uuid4(),
+        project_id=SYSTEM_PROJECT_ID,
         formula_id=formula.id,
         formula=formula,
         mol=molecule,
@@ -120,6 +122,7 @@ def _create_domain_sample(session: Session) -> tuple[Any, ...]:
     geometry_molecule.AddConformer(conformer, assignId=True)
     derivation = MolecularTopologyDerivation(
         id=uuid4(),
+        project_id=SYSTEM_PROJECT_ID,
         topology_id=topology.id,
         topology=topology,
         reconstruction_method="test/domain-filter",
@@ -129,6 +132,7 @@ def _create_domain_sample(session: Session) -> tuple[Any, ...]:
     )
     geometry = Geometry(
         id=uuid4(),
+        project_id=SYSTEM_PROJECT_ID,
         topology_id=topology.id,
         topology=topology,
         mol=geometry_molecule,
@@ -172,6 +176,7 @@ def _create_domain_sample(session: Session) -> tuple[Any, ...]:
         source_encoding="utf-8",
     )
     protocol = CalculationProtocol(
+        project_id=SYSTEM_PROJECT_ID,
         id=uuid4(),
         protocol_hash=_fixture_hash(f"domain-protocol:{suffix}"),
         qm_software=QMSoftware.OTHER,
@@ -255,6 +260,7 @@ def _create_domain_sample(session: Session) -> tuple[Any, ...]:
     )
     logical_reaction = LogicalReaction(
         id=uuid4(),
+        project_id=SYSTEM_PROJECT_ID,
         reaction_key=f"domain-filter:{suffix}",
         label=f"Domain filter {suffix}",
         reaction_hash=_fixture_hash(f"domain-logical:{suffix}"),
@@ -262,6 +268,7 @@ def _create_domain_sample(session: Session) -> tuple[Any, ...]:
     assert logical_reaction.id is not None
     mapped_reaction = MappedReaction(
         id=uuid4(),
+        project_id=SYSTEM_PROJECT_ID,
         logical_reaction_id=logical_reaction.id,
         logical_reaction=logical_reaction,
         mapped_reaction_key="domain-filter-path",
@@ -455,6 +462,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
 
         inference_page = asyncio.run(
             TransitionStateInferenceQueryService.list_transition_state_inferences(
+                project_id=SYSTEM_PROJECT_ID,
                 logical_reaction_id=logical_reaction.id,
                 mapped_reaction_id=mapped_reaction.id,
                 calculation_frame_id=frame.id,
@@ -470,6 +478,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
 
         inference_unchanged_page = asyncio.run(
             TransitionStateInferenceQueryService.list_transition_state_inferences(
+                project_id=SYSTEM_PROJECT_ID,
                 logical_reaction_id=logical_reaction.id,
                 reactant_product_changed=False,
                 limit=1,
@@ -479,6 +488,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         assert inference_unchanged_page.page.total == 1
         inference_changed_page = asyncio.run(
             TransitionStateInferenceQueryService.list_transition_state_inferences(
+                project_id=SYSTEM_PROJECT_ID,
                 logical_reaction_id=logical_reaction.id,
                 reactant_product_changed=True,
                 limit=1,
@@ -489,6 +499,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
 
         frame_page = asyncio.run(
             CalculationQueryService.list_calculation_frames(
+                project_id=SYSTEM_PROJECT_ID,
                 geometry_id=geometry.id,
                 protocol_id=protocol.id,
                 segment_index=segment.segment_index,
@@ -513,6 +524,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
 
         array_page = asyncio.run(
             ScientificArrayQueryService.list_scientific_arrays(
+                project_id=SYSTEM_PROJECT_ID,
                 frame_id=frame.id,
                 kind=str(array.kind),
                 dtype=array.dtype,
@@ -527,6 +539,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
 
         geometry_page = asyncio.run(
             GeometryQueryService.list_geometries(
+                project_id=SYSTEM_PROJECT_ID,
                 topology_id=topology.id,
                 geometry_hash=geometry.geometry_hash,
                 topology_derivation_id=frame.topology_derivation_id,
@@ -543,13 +556,19 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         assert geometry_page.items[0].is_transition_state is True
         assert geometry_page.items[0].imaginary_frequency_status == "present"
 
-        geometry_detail = asyncio.run(GeometryQueryService.get_geometry(geometry_id=geometry.id))
+        geometry_detail = asyncio.run(
+            GeometryQueryService.get_geometry(
+                project_id=SYSTEM_PROJECT_ID,
+                geometry_id=geometry.id,
+            )
+        )
         assert geometry_detail is not None
         assert geometry_detail.is_transition_state is True
         assert geometry_detail.imaginary_frequency_status == "present"
 
         geometry_and_page = asyncio.run(
             GeometryQueryService.list_geometries(
+                project_id=SYSTEM_PROJECT_ID,
                 filter_expression=json.dumps(
                     {
                         "operator": "and",
@@ -573,6 +592,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
 
         geometry_or_page = asyncio.run(
             GeometryQueryService.list_geometries(
+                project_id=SYSTEM_PROJECT_ID,
                 filter_expression=json.dumps(
                     {
                         "operator": "or",
@@ -591,6 +611,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
 
         geometry_not_page = asyncio.run(
             GeometryQueryService.list_geometries(
+                project_id=SYSTEM_PROJECT_ID,
                 filter_expression=json.dumps(
                     {
                         "operator": "and",
@@ -613,6 +634,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
 
         mapped_page = asyncio.run(
             MappedReactionQueryService.list_mapped_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 logical_reaction_id=logical_reaction.id,
                 mapping_hash=mapped_reaction.mapping_hash,
                 label=mapped_reaction.label,
@@ -632,6 +654,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         assert mapped_page.items[0].reactant_product_changed is False
         mapped_changed_page = asyncio.run(
             MappedReactionQueryService.list_mapped_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 logical_reaction_id=logical_reaction.id,
                 reactant_product_changed=True,
                 limit=1,
@@ -643,6 +666,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         reaction_gibbs = mapped_reaction.minimum_reaction_gibbs_free_energy_kcal_mol
         mapped_reaction_gibbs_page = asyncio.run(
             MappedReactionQueryService.list_mapped_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 minimum_reaction_gibbs_free_energy_kcal_mol=reaction_gibbs - 0.01,
                 maximum_reaction_gibbs_free_energy_kcal_mol=reaction_gibbs + 0.01,
                 limit=1,
@@ -654,6 +678,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
 
         mapped_second_page = asyncio.run(
             MappedReactionQueryService.list_mapped_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 mapping_hash=mapped_reaction.mapping_hash,
                 node_role=MappedReactionNodeRole.TRANSITION_STATE.value,
                 limit=1,
@@ -678,7 +703,10 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
             session.add(node)
             session.commit()
         non_transition_state_detail = asyncio.run(
-            GeometryQueryService.get_geometry(geometry_id=geometry.id)
+            GeometryQueryService.get_geometry(
+                project_id=SYSTEM_PROJECT_ID,
+                geometry_id=geometry.id,
+            )
         )
         assert non_transition_state_detail is not None
         assert non_transition_state_detail.is_transition_state is False
@@ -686,6 +714,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
 
         logical_page = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 reaction_hash=logical_reaction.reaction_hash,
                 label=logical_reaction.label,
                 created_after=logical_reaction.created_at,
@@ -699,6 +728,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         assert logical_page.items[0].reactant_product_changed is False
         logical_min_mapped_page = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 reaction_hash=logical_reaction.reaction_hash,
                 minimum_mapped_reaction_count=1,
                 limit=1,
@@ -709,6 +739,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         assert [item.id for item in logical_min_mapped_page.items] == [logical_reaction.id]
         logical_zero_mapped_page = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 reaction_hash=logical_reaction.reaction_hash,
                 maximum_mapped_reaction_count=0,
                 limit=1,
@@ -718,6 +749,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         assert logical_zero_mapped_page.page.total == 0
         logical_count_expression_page = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 filter_expression=json.dumps(
                     {
                         "operator": "and",
@@ -734,6 +766,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         assert logical_count_expression_page.page.total == 1
         logical_changed_page = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 reaction_hash=logical_reaction.reaction_hash,
                 reactant_product_changed=True,
                 limit=1,
@@ -758,6 +791,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
             session.commit()
         logical_stoichiometry_page = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 reaction_hash=logical_reaction.reaction_hash,
                 reactant_product_changed=True,
                 limit=1,
@@ -767,6 +801,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         assert logical_stoichiometry_page.page.total == 1
         logical_expression_page = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 filter_expression=json.dumps(
                     {
                         "operator": "and",
@@ -783,6 +818,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         assert logical_expression_page.page.total == 1
         logical_reaction_gibbs_page = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 minimum_reaction_gibbs_free_energy_kcal_mol=reaction_gibbs - 0.01,
                 maximum_reaction_gibbs_free_energy_kcal_mol=reaction_gibbs + 0.01,
                 limit=1,
@@ -793,6 +829,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         assert [item.id for item in logical_reaction_gibbs_page.items] == [logical_reaction.id]
         logical_has_reaction_gibbs_page = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 reaction_hash=logical_reaction.reaction_hash,
                 has_reaction_gibbs_free_energy=True,
                 limit=1,
@@ -803,6 +840,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         assert [item.id for item in logical_has_reaction_gibbs_page.items] == [logical_reaction.id]
         logical_has_activation_gibbs_page = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 reaction_hash=logical_reaction.reaction_hash,
                 has_activation_gibbs_free_energy=True,
                 limit=1,
@@ -823,7 +861,6 @@ def test_endpoint_topology_resolves_logical_reactions(
 ) -> None:
     """A TS endpoint topology must be searchable as a reaction topology."""
 
-    del development_query_principal
     engine = create_engine(get_settings().database_url, pool_pre_ping=True)
     sample: tuple[Any, ...] | None = None
     endpoint_topology: MolecularTopology | None = None
@@ -843,6 +880,7 @@ def test_endpoint_topology_resolves_logical_reactions(
 
             endpoint_topology = MolecularTopology(
                 id=uuid4(),
+                project_id=SYSTEM_PROJECT_ID,
                 formula_id=formula.id,
                 formula=formula,
                 mol=endpoint_molecule,
@@ -876,13 +914,17 @@ def test_endpoint_topology_resolves_logical_reactions(
 
         assert endpoint_topology_id is not None
         detail = asyncio.run(
-            MolecularTopologyDetailQueryService.get_topology(topology_id=endpoint_topology_id)
+            MolecularTopologyDetailQueryService.get_topology(
+                project_id=SYSTEM_PROJECT_ID,
+                topology_id=endpoint_topology_id,
+            )
         )
         assert detail is not None
         assert detail.logical_reaction_count == 1
 
         reactions = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 topology_id=endpoint_topology_id,
                 limit=10,
                 offset=0,
@@ -913,7 +955,6 @@ def test_transition_state_node_topology_resolves_reactions(
 ) -> None:
     """A topology used only by a TS node must resolve both reaction views."""
 
-    del development_query_principal
     engine = create_engine(get_settings().database_url, pool_pre_ping=True)
     sample: tuple[Any, ...] | None = None
     transition_state_topology: MolecularTopology | None = None
@@ -934,6 +975,7 @@ def test_transition_state_node_topology_resolves_reactions(
             assert molecule is not None
             transition_state_topology = MolecularTopology(
                 id=uuid4(),
+                project_id=SYSTEM_PROJECT_ID,
                 formula_id=formula.id,
                 mol=molecule,
                 canonical_isomeric_smiles="[H][H]",
@@ -948,6 +990,7 @@ def test_transition_state_node_topology_resolves_reactions(
             assert transition_state_topology.id is not None
             transition_state_derivation = MolecularTopologyDerivation(
                 id=uuid4(),
+                project_id=SYSTEM_PROJECT_ID,
                 topology_id=transition_state_topology.id,
                 reconstruction_method="test/domain-filter-ts-node",
                 reconstruction_version="1",
@@ -966,6 +1009,7 @@ def test_transition_state_node_topology_resolves_reactions(
             geometry_molecule.AddConformer(conformer, assignId=True)
             transition_state_geometry = Geometry(
                 id=uuid4(),
+                project_id=SYSTEM_PROJECT_ID,
                 topology_id=transition_state_topology.id,
                 mol=geometry_molecule,
                 internal_coordinates=coordinates,
@@ -1054,6 +1098,7 @@ def test_transition_state_node_topology_resolves_reactions(
         assert transition_state_topology.id is not None
         detail = asyncio.run(
             MolecularTopologyDetailQueryService.get_topology(
+                project_id=SYSTEM_PROJECT_ID,
                 topology_id=transition_state_topology.id,
             )
         )
@@ -1062,6 +1107,7 @@ def test_transition_state_node_topology_resolves_reactions(
 
         logical_page = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 topology_id=transition_state_topology.id,
                 limit=10,
                 offset=0,
@@ -1072,6 +1118,7 @@ def test_transition_state_node_topology_resolves_reactions(
 
         mapped_page = asyncio.run(
             MappedReactionQueryService.list_mapped_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 topology_id=transition_state_topology.id,
                 node_role=MappedReactionNodeRole.TRANSITION_STATE.value,
                 limit=10,
@@ -1138,6 +1185,7 @@ def test_logical_reactions_are_grouped_by_reactant_set_across_pages(
             vector[0] = 2
             formula = MolecularFormula(
                 id=uuid4(),
+                project_id=SYSTEM_PROJECT_ID,
                 hill_formula="H2",
                 composition=[{"atomic_number": 1, "isotope": 0, "count": 2}],
                 atom_count=2,
@@ -1147,6 +1195,7 @@ def test_logical_reactions_are_grouped_by_reactant_set_across_pages(
             assert formula.id is not None
             topology = MolecularTopology(
                 id=uuid4(),
+                project_id=SYSTEM_PROJECT_ID,
                 formula_id=formula.id,
                 formula=formula,
                 mol=molecule,
@@ -1167,12 +1216,14 @@ def test_logical_reactions_are_grouped_by_reactant_set_across_pages(
             for index in range(3):
                 logical = LogicalReaction(
                     id=uuid4(),
+                    project_id=SYSTEM_PROJECT_ID,
                     reaction_key=f"grouped:{suffix}:{index}",
                     label=f"Grouped reaction {index}",
                     reaction_hash=_fixture_hash(f"grouped-logical:{suffix}:{index}"),
                 )
                 assert logical.id is not None
                 mapped = MappedReaction(
+                    project_id=SYSTEM_PROJECT_ID,
                     logical_reaction_id=logical.id,
                     logical_reaction=logical,
                     mapped_reaction_key="source-less",
@@ -1220,6 +1271,7 @@ def test_logical_reactions_are_grouped_by_reactant_set_across_pages(
         page_size = 2
         first_page = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 limit=page_size,
                 offset=0,
             )
@@ -1228,6 +1280,7 @@ def test_logical_reactions_are_grouped_by_reactant_set_across_pages(
         for page_offset in range(page_size, first_page.page.total, page_size):
             page = asyncio.run(
                 LogicalReactionQueryService.list_logical_reactions(
+                    project_id=SYSTEM_PROJECT_ID,
                     limit=page_size,
                     offset=page_offset,
                 )
@@ -1312,6 +1365,7 @@ def test_protocol_version_family_and_solvation_filters_compose(
                 + 1
             )
             protocol = CalculationProtocol(
+                project_id=SYSTEM_PROJECT_ID,
                 protocol_hash=hashlib.sha256(suffix.encode()).hexdigest(),
                 qm_software=QMSoftware.OTHER,
                 qm_software_version=f"query-test-{suffix}",
@@ -1341,6 +1395,7 @@ def test_protocol_version_family_and_solvation_filters_compose(
 
         page = asyncio.run(
             CalculationProtocolQueryService.list_calculation_protocols(
+                project_id=SYSTEM_PROJECT_ID,
                 qm_software_version=protocol.qm_software_version,
                 method_family=protocol.method_family,
                 solvation_model=protocol.solvation_model,

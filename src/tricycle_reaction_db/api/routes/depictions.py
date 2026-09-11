@@ -1,6 +1,6 @@
 """Molecular representation routes derived from stored topology graphs."""
 
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -22,6 +22,10 @@ from tricycle_reaction_db.application.services.depictions import (
 )
 
 router = APIRouter(tags=["molecular representations"])
+ProjectQueryId = Annotated[
+    UUID,
+    Query(description="The project scope for this project-owned depiction."),
+]
 
 
 class RepresentationConversionRequest(BaseModel):
@@ -268,7 +272,7 @@ async def reaction_depiction(
 )
 async def transition_state_mode_dof_depiction(
     frame_id: UUID,
-    project_id: UUID | None = None,
+    project_id: ProjectQueryId,
 ) -> Response:
     svg = await get_transition_state_mode_dof_depiction(frame_id, project_id=project_id)
     if svg is None:
@@ -295,7 +299,7 @@ async def transition_state_mode_dof_depiction(
 async def transition_state_anchor_sdf(
     frame_id: UUID,
     anchor: Literal["negative", "center", "positive"],
-    project_id: UUID | None = None,
+    project_id: ProjectQueryId,
 ) -> Response:
     sdf = await get_transition_state_anchor_sdf(frame_id, anchor, project_id=project_id)
     if sdf is None:
@@ -321,7 +325,7 @@ async def transition_state_anchor_sdf(
 )
 async def geometry_depiction(
     geometry_id: UUID,
-    project_id: UUID | None = None,
+    project_id: ProjectQueryId,
 ) -> Response:
     svg = await get_geometry_dof_depiction(geometry_id, project_id=project_id)
     if svg is None:
@@ -345,7 +349,7 @@ async def geometry_depiction(
 )
 async def geometry_sdf(
     geometry_id: UUID,
-    project_id: UUID | None = None,
+    project_id: ProjectQueryId,
 ) -> Response:
     sdf = await get_geometry_sdf(geometry_id, project_id=project_id)
     if sdf is None:
@@ -371,7 +375,7 @@ async def geometry_sdf(
 )
 async def geometry_xyz(
     geometry_id: UUID,
-    project_id: UUID | None = None,
+    project_id: ProjectQueryId,
 ) -> Response:
     xyz = await get_geometry_xyz(geometry_id, project_id=project_id)
     if xyz is None:
@@ -395,8 +399,11 @@ async def geometry_xyz(
     "/api/depictions/topology/{topology_id}.svg",
     response_class=Response,
 )
-async def topology_depiction(topology_id: UUID) -> Response:
-    svg = await get_topology_depiction(topology_id)
+async def topology_depiction(
+    topology_id: UUID,
+    project_id: ProjectQueryId,
+) -> Response:
+    svg = await get_topology_depiction(topology_id, project_id=project_id)
     if svg is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -413,8 +420,11 @@ async def topology_depiction(topology_id: UUID) -> Response:
     "/api/depictions/topology/{topology_id}.mol",
     response_class=Response,
 )
-async def topology_molfile(topology_id: UUID) -> Response:
-    molfile = await get_topology_molfile(topology_id)
+async def topology_molfile(
+    topology_id: UUID,
+    project_id: ProjectQueryId,
+) -> Response:
+    molfile = await get_topology_molfile(topology_id, project_id=project_id)
     if molfile is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

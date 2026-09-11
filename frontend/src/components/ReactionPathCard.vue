@@ -62,6 +62,7 @@ onBeforeUnmount(() => observer?.disconnect());
             v-for="topologyId in reactants.slice(0, 2)"
             :key="topologyId"
             :topology-id="topologyId"
+            :project-id="projectId ?? undefined"
             :height="112"
             :label="`底物拓扑 ${topologyId}`"
           />
@@ -88,6 +89,7 @@ onBeforeUnmount(() => observer?.disconnect());
             v-for="topologyId in products.slice(0, 2)"
             :key="topologyId"
             :topology-id="topologyId"
+            :project-id="projectId ?? undefined"
             :height="112"
             :label="`产物拓扑 ${topologyId}`"
           />

@@ -85,9 +85,19 @@ async def test_artifact_removal_retires_catalogue_and_deletes_object() -> None:
         with RustFSObjectStore(RustFSSettings()) as store:
             assert object_key is not None
             assert not store.exists(object_key)
-        assert await ArtifactQueryService.get_artifact(artifact_id=artifact_id) is None
+        assert (
+            await ArtifactQueryService.get_artifact(
+                project_id=SYSTEM_PROJECT_ID,
+                artifact_id=artifact_id,
+            )
+            is None
+        )
         with pytest.raises(ArtifactNotFoundError, match="artifact not found"):
-            await ArtifactContentService.preview(artifact_id, max_bytes=4096)
+            await ArtifactContentService.preview(
+                artifact_id,
+                max_bytes=4096,
+                project_id=SYSTEM_PROJECT_ID,
+            )
         restored = await ArtifactUploadService.upload(
             payload=payload,
             filename="remove-me-again.txt",
@@ -98,7 +108,10 @@ async def test_artifact_removal_retires_catalogue_and_deletes_object() -> None:
         )
         assert restored.artifact_id == artifact_id
         assert restored.storage_status is StorageStatus.AVAILABLE
-        restored_summary = await ArtifactQueryService.get_artifact(artifact_id=artifact_id)
+        restored_summary = await ArtifactQueryService.get_artifact(
+            project_id=SYSTEM_PROJECT_ID,
+            artifact_id=artifact_id,
+        )
         assert restored_summary is not None
         assert restored_summary.original_filename == "renamed-before-removal.txt"
         async with session_factory() as session:

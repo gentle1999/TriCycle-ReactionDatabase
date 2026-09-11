@@ -483,7 +483,13 @@ def persist_molop_calculation_artifact(
         )
         frames_by_file_index: dict[int, CalculationFrame] = {}
         array_counts: dict[str, int] = {}
-        active_geometry_context = geometry_context or GeometryPersistenceContext()
+        active_geometry_context = geometry_context or GeometryPersistenceContext(
+            project_id=artifact.project_id
+        )
+        if active_geometry_context.project_id != artifact.project_id:
+            raise ValueError(
+                "GeometryPersistenceContext project does not match ArtifactFile project"
+            )
         if preload_geometry_context:
             preload_snapshot = _snapshot_geometry_context(active_geometry_context)
             pending_snapshot = list(session.info.get("_fast_pending_entities", ()))
@@ -535,7 +541,11 @@ def persist_molop_calculation_artifact(
                 else None
             )
             protocol = (
-                persist_calculation_protocol(session, protocol_record)
+                persist_calculation_protocol(
+                    session,
+                    protocol_record,
+                    project_id=artifact.project_id,
+                )
                 if protocol_record is not None
                 else None
             )
@@ -801,11 +811,15 @@ def reconcile_molop_geometry_context(
 ) -> None:
     """Reconcile all geometries from a batch after their rows are flushed."""
 
+    project_id = context.project_id
+    if not isinstance(project_id, UUID):
+        raise ValueError("MolOP reconciliation requires a project-owned Geometry context")
     _attach_pending_entities(session)
     session.flush()
     reconcilable_ids = reconcilable_geometry_ids(
         session,
         set(context.geometries_to_reconcile),
+        project_id=project_id,
     )
     # Deferred TS inference may already have populated path/node identities in
     # this cache before participant reconciliation.  Reuse it so those rows
@@ -838,7 +852,7 @@ def reconcile_molop_geometry_context(
     try:
         for logical_reaction_id in sorted(logical_reaction_ids, key=str):
             logical_reaction = session.get(LogicalReaction, logical_reaction_id)
-            if logical_reaction is not None:
+            if logical_reaction is not None and logical_reaction.project_id == project_id:
                 ensure_mapped_reactions_for_logical_reaction(
                     session,
                     logical_reaction,
@@ -865,7 +879,7 @@ def reconcile_molop_geometry_context(
                 ),
                 None,
             )
-        if topology is not None:
+        if topology is not None and topology.project_id == project_id:
             ensure_mapped_reactions_for_concrete_topology(
                 session,
                 topology,
@@ -884,6 +898,7 @@ def reconcile_molop_geometry_context(
             for geometry in context.geometries_to_reconcile.values()
             if geometry.id in reconcilable_ids
         },
+        project_id=project_id,
         participants_by_topology=context.reaction_participants_by_topology,
         mapped_reactions_by_id=context.mapped_reactions_by_id,
         cache=reconciliation_cache,

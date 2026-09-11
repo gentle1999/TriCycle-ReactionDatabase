@@ -82,6 +82,10 @@ class Settings(BaseSettings):
     upload_worker_poll_interval_seconds: float = Field(default=1.0, gt=0.05, le=300.0)
     upload_worker_lease_seconds: int = Field(default=3_600, ge=60, le=86_400)
     upload_client_lease_seconds: int = Field(default=900, ge=60, le=86_400)
+    # A synchronous/legacy importer has no UploadBatch row to wake the worker.
+    # Only pending ingestions older than this grace period are considered
+    # orphaned, which leaves a long-running parser enough time to finish.
+    upload_pending_recovery_seconds: int = Field(default=900, ge=60, le=86_400)
     upload_worker_concurrency: int = Field(default=2, ge=1, le=32)
     # MolOP 0.2.12 collects frame roles and source locators without implicitly
     # reconstructing molecular graphs. Keep evidence enabled so optimization

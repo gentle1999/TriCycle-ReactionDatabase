@@ -40,7 +40,6 @@ from tricycle_reaction_db.application.services.queries import (
     _required_uuid,
 )
 from tricycle_reaction_db.application.services.query_visibility import (
-    calculation_frame_is_visible,
     frame_id_is_visible,
     query_visibility_scope,
 )
@@ -128,6 +127,7 @@ class CalculationResultQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def list_calculation_results(
         cls,
+        project_id: UUID,
         frame_id: UUID | None = None,
         artifact_file_id: UUID | None = None,
         geometry_id: UUID | None = None,
@@ -138,9 +138,9 @@ class CalculationResultQueryService(UseCaseService):  # type: ignore[misc]
     ) -> CalculationResultPage:
         """List frames that own at least one advanced result container."""
 
-        scope = await query_visibility_scope()
+        scope = await query_visibility_scope(project_id=project_id)
         predicates: list[Any] = [
-            calculation_frame_is_visible(scope, col(CalculationFrame.parse_revision_id))
+            frame_id_is_visible(scope, col(CalculationFrame.id))
         ]
         if frame_id is not None:
             predicates.append(col(CalculationFrame.id) == frame_id)
@@ -192,11 +192,12 @@ class CalculationResultQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def get_calculation_results(
         cls,
+        project_id: UUID,
         frame_id: UUID,
     ) -> CalculationResultDetail | None:
         """Return all normalized advanced results and array metadata for one frame."""
 
-        scope = await query_visibility_scope()
+        scope = await query_visibility_scope(project_id=project_id)
         async with session_factory() as session:
             frame_row = (
                 await session.execute(

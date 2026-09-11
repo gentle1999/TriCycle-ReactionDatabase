@@ -164,10 +164,20 @@ class ArtifactFile(SQLModel, table=True):
 
 
 class CalculationProtocol(SQLModel, table=True):
-    """Canonical, content-addressed calculation protocol."""
+    """Canonical calculation protocol owned by exactly one project.
+
+    The protocol hash is only an identity within a project.  RustFS bytes are
+    the sole globally reusable cache; parsed protocol metadata must not be
+    shared across project boundaries.
+    """
 
     __tablename__ = "calculation_protocol"  # pyright: ignore[reportAssignmentType]
     __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "protocol_hash",
+            name="uq_calculation_protocol_project_hash",
+        ),
         CheckConstraint(
             f"protocol_hash ~ '{_HASH_PATTERN}'",
             name="ck_calculation_protocol_hash_hex",
@@ -176,7 +186,17 @@ class CalculationProtocol(SQLModel, table=True):
 
     id: UUID | None = uuid_primary_key_field()
     created_at: datetime | None = created_at_field()
-    protocol_hash: str = Field(max_length=64, unique=True, nullable=False)
+    # Nullable is retained only to represent legacy rows that could not be
+    # assigned to one source project during the migration.  New writes are
+    # rejected by the database trigger and by ``persist_calculation_protocol``.
+    project_id: UUID | None = Field(
+        default=None,
+        foreign_key="project.id",
+        ondelete="RESTRICT",
+        index=True,
+        nullable=True,
+    )
+    protocol_hash: str = Field(max_length=64, nullable=False)
     spec_schema_version: str = Field(
         default=CALCULATION_PROTOCOL_VERSION,
         sa_column=Column(
@@ -214,6 +234,7 @@ class CalculationProtocol(SQLModel, table=True):
         back_populates="protocol",
         passive_deletes="all",
     )
+    project: Optional["Project"] = Relationship(back_populates="calculation_protocols")
 
 
 __all__ = ["ArtifactFile", "CalculationProtocol"]

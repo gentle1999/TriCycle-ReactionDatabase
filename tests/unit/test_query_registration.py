@@ -6,6 +6,7 @@ from tricycle_reaction_db.api.app import create_app
 from tricycle_reaction_db.api.nexusx import schema
 from tricycle_reaction_db.application.dtos import MolecularTopologySearchQuery
 from tricycle_reaction_db.application.services import CalculationResultQueryService
+from tricycle_reaction_db.domain.identity import SYSTEM_PROJECT_ID
 
 
 def test_nexusx_registers_complete_read_query_surface() -> None:
@@ -78,5 +79,6 @@ def test_advanced_result_kind_is_validated_before_query_execution() -> None:
         asyncio.run(
             CalculationResultQueryService.list_calculation_results(
                 result_kind="unknown",
+                project_id=SYSTEM_PROJECT_ID,
             )
         )

@@ -42,6 +42,9 @@ from tricycle_reaction_db.application.services import (
     persist_scientific_array_assignment,
     persist_thermochemistry_result,
 )
+from tricycle_reaction_db.application.services.molecular_geometry import (
+    GeometryPersistenceContext,
+)
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
@@ -65,6 +68,7 @@ from tricycle_reaction_db.domain.enums import (
     StorageStatus,
     TerminationStatus,
 )
+from tricycle_reaction_db.domain.identity import SYSTEM_PROJECT_ID
 from tricycle_reaction_db.ingestion import (
     artifact_record_from_path,
     calculation_protocol_record,
@@ -147,8 +151,14 @@ def test_calculation_facts_round_trip_through_relationships(tmp_path) -> None:
                     task_requests=["opt", "freq"],
                     normalized_spec={"fixture": "relationship-probe"},
                 ),
+                project_id=artifact.project_id,
             )
-            persisted_molecule = persist_molecular_geometry(session, molecule_record)
+            project_context = GeometryPersistenceContext(project_id=SYSTEM_PROJECT_ID)
+            persisted_molecule = persist_molecular_geometry(
+                session,
+                molecule_record,
+                context=project_context,
+            )
             geometry = persisted_molecule.geometry
             topology_derivation = persisted_molecule.topology_derivation
             alternate_derivation = persist_molecular_geometry(
@@ -162,6 +172,7 @@ def test_calculation_facts_round_trip_through_relationships(tmp_path) -> None:
                     reconstruction_version="v2",
                     reconstruction_metadata={"source": "alternate"},
                 ),
+                context=project_context,
             )
             assert alternate_derivation.topology.id == persisted_molecule.topology.id
             assert alternate_derivation.geometry.id == geometry.id
@@ -493,8 +504,13 @@ def test_postgresql_checks_reject_invalid_calculation_facts(tmp_path) -> None:
                     normalized_spec={"fixture": "database-check-probe"},
                     task_requests=["opt"],
                 ),
+                project_id=artifact.project_id,
             )
-            persisted_molecule = persist_molecular_geometry(session, molecule_record)
+            persisted_molecule = persist_molecular_geometry(
+                session,
+                molecule_record,
+                context=GeometryPersistenceContext(project_id=SYSTEM_PROJECT_ID),
+            )
             geometry = persisted_molecule.geometry
             topology_derivation = persisted_molecule.topology_derivation
             revision = persist_parse_revision(

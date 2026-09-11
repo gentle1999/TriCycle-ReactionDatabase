@@ -17,6 +17,7 @@ from tricycle_reaction_db.db.models import (
 )
 from tricycle_reaction_db.db.session import session_factory
 from tricycle_reaction_db.domain.enums import MappedReactionKind
+from tricycle_reaction_db.domain.identity import SYSTEM_PROJECT_ID
 
 pytestmark = [
     pytest.mark.integration,
@@ -32,8 +33,12 @@ async def test_statistics_and_export_cover_the_same_visible_profiles(
     development_query_principal: object,
 ) -> None:
     del development_query_principal
-    statistics = await ReactionThermodynamicAnalyticsService.statistics()
-    export_stream = await ReactionThermodynamicAnalyticsService.export_csv()
+    statistics = await ReactionThermodynamicAnalyticsService.statistics(
+        project_id=SYSTEM_PROJECT_ID,
+    )
+    export_stream = await ReactionThermodynamicAnalyticsService.export_csv(
+        project_id=SYSTEM_PROJECT_ID,
+    )
     payload = "".join([chunk async for chunk in export_stream])
     rows = list(csv.DictReader(io.StringIO(payload)))
 
@@ -58,6 +63,7 @@ async def test_statistics_and_export_share_logical_reaction_filters(
         for index in range(2):
             digest = hashlib.sha256(f"analytics-filter:{suffix}:{index}".encode()).hexdigest()
             logical_reaction = LogicalReaction(
+                project_id=SYSTEM_PROJECT_ID,
                 reaction_key=f"analytics-filter-{suffix}-{index}",
                 reaction_hash=digest,
             )
@@ -67,6 +73,7 @@ async def test_statistics_and_export_share_logical_reaction_filters(
             logical_reaction_ids.append(logical_reaction.id)
             mapped_reaction = MappedReaction(
                 logical_reaction_id=logical_reaction.id,
+                project_id=SYSTEM_PROJECT_ID,
                 mapped_reaction_key=f"analytics-filter-path-{suffix}-{index}",
                 mapped_reaction_kind=MappedReactionKind.OTHER,
                 mapped_reaction_smiles="[H:1][H:2]>>[H:1][H:2]",
@@ -113,9 +120,11 @@ async def test_statistics_and_export_share_logical_reaction_filters(
         )
 
         statistics = await ReactionThermodynamicAnalyticsService.statistics(
+            project_id=SYSTEM_PROJECT_ID,
             filter_expression=filter_expression,
         )
         export_stream = await ReactionThermodynamicAnalyticsService.export_csv(
+            project_id=SYSTEM_PROJECT_ID,
             filter_expression=filter_expression,
         )
         rows = list(csv.DictReader(io.StringIO("".join([chunk async for chunk in export_stream]))))

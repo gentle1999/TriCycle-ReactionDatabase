@@ -29,6 +29,7 @@ from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics im
 )
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
+    ArtifactIngestion,
     CalculationFrame,
     CalculationProtocol,
     CalculationSegment,
@@ -43,7 +44,12 @@ from tricycle_reaction_db.db.models import (
     ParseRevision,
     ThermochemistryResult,
 )
-from tricycle_reaction_db.domain.enums import MappedReactionNodeRole
+from tricycle_reaction_db.domain.enums import (
+    ArtifactIngestionStatus,
+    MappedReactionNodeRole,
+    ParseStatus,
+    StorageStatus,
+)
 
 
 @dataclass(slots=True)
@@ -131,6 +137,18 @@ def _load_mapped_reaction_thermodynamics_input(
                 CalculationSegment,
                 col(CalculationFrame.segment_id) == col(CalculationSegment.id),
             )
+            .join(
+                ParseRevision,
+                col(CalculationFrame.parse_revision_id) == col(ParseRevision.id),
+            )
+            .join(
+                ArtifactFile,
+                col(ParseRevision.artifact_file_id) == col(ArtifactFile.id),
+            )
+            .join(
+                ArtifactIngestion,
+                col(ArtifactIngestion.artifact_file_id) == col(ArtifactFile.id),
+            )
             .outerjoin(
                 CalculationProtocol,
                 col(CalculationSegment.protocol_id) == col(CalculationProtocol.id),
@@ -139,7 +157,12 @@ def _load_mapped_reaction_thermodynamics_input(
                 ThermochemistryResult,
                 col(ThermochemistryResult.frame_id) == col(CalculationFrame.id),
             )
-            .where(col(CalculationFrame.geometry_id).in_(geometry_ids))
+            .where(
+                col(CalculationFrame.geometry_id).in_(geometry_ids),
+                col(ParseRevision.status) == ParseStatus.SUCCEEDED,
+                col(ArtifactIngestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+                col(ArtifactFile.storage_status) != StorageStatus.RETIRED,
+            )
         ).all()
 
     runtimes_by_geometry: dict[UUID, dict[UUID, tuple[int, float | None]]] = {}
@@ -159,7 +182,16 @@ def _load_mapped_reaction_thermodynamics_input(
                 ArtifactFile,
                 col(ParseRevision.artifact_file_id) == col(ArtifactFile.id),
             )
-            .where(col(CalculationFrame.geometry_id).in_(geometry_ids))
+            .join(
+                ArtifactIngestion,
+                col(ArtifactIngestion.artifact_file_id) == col(ArtifactFile.id),
+            )
+            .where(
+                col(CalculationFrame.geometry_id).in_(geometry_ids),
+                col(ParseRevision.status) == ParseStatus.SUCCEEDED,
+                col(ArtifactIngestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+                col(ArtifactFile.storage_status) != StorageStatus.RETIRED,
+            )
         ).all()
         for geometry_id, artifact_id, revision_number, running_time in runtime_rows:
             if geometry_id is None or artifact_id is None:
@@ -660,6 +692,18 @@ def refresh_mapped_reactions_thermodynamics(
                 CalculationSegment,
                 col(CalculationFrame.segment_id) == col(CalculationSegment.id),
             )
+            .join(
+                ParseRevision,
+                col(CalculationFrame.parse_revision_id) == col(ParseRevision.id),
+            )
+            .join(
+                ArtifactFile,
+                col(ParseRevision.artifact_file_id) == col(ArtifactFile.id),
+            )
+            .join(
+                ArtifactIngestion,
+                col(ArtifactIngestion.artifact_file_id) == col(ArtifactFile.id),
+            )
             .outerjoin(
                 CalculationProtocol,
                 col(CalculationSegment.protocol_id) == col(CalculationProtocol.id),
@@ -668,7 +712,12 @@ def refresh_mapped_reactions_thermodynamics(
                 ThermochemistryResult,
                 col(ThermochemistryResult.frame_id) == col(CalculationFrame.id),
             )
-            .where(col(CalculationFrame.geometry_id).in_(geometry_ids))
+            .where(
+                col(CalculationFrame.geometry_id).in_(geometry_ids),
+                col(ParseRevision.status) == ParseStatus.SUCCEEDED,
+                col(ArtifactIngestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+                col(ArtifactFile.storage_status) != StorageStatus.RETIRED,
+            )
         ).all()
 
     runtimes_by_geometry: dict[UUID, dict[UUID, tuple[int, float | None]]] = {}
@@ -688,7 +737,16 @@ def refresh_mapped_reactions_thermodynamics(
                 ArtifactFile,
                 col(ParseRevision.artifact_file_id) == col(ArtifactFile.id),
             )
-            .where(col(CalculationFrame.geometry_id).in_(geometry_ids))
+            .join(
+                ArtifactIngestion,
+                col(ArtifactIngestion.artifact_file_id) == col(ArtifactFile.id),
+            )
+            .where(
+                col(CalculationFrame.geometry_id).in_(geometry_ids),
+                col(ParseRevision.status) == ParseStatus.SUCCEEDED,
+                col(ArtifactIngestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+                col(ArtifactFile.storage_status) != StorageStatus.RETIRED,
+            )
         ).all()
         for geometry_id, artifact_id, revision_number, running_time in runtime_rows:
             if geometry_id is None or artifact_id is None:

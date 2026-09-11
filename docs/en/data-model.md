@@ -369,10 +369,12 @@ mapped SMILES. Within one LogicalReaction, `(logical_reaction_id,
 mapping_hash)` is the strict text identity; the same canonical mapped text must
 not create a second mapped-reaction row.
 
-A template-derived mapped reaction shares the source mapped reaction's TS and
-endpoint evidence and reusable Geometry links, while retaining its own mapped
-reaction, participant, and node rows. It does not invent or duplicate new
-calculation facts.
+A template-derived mapped reaction may reuse the source mapped reaction's TS,
+endpoint evidence, and Geometry links only within the same project, while
+retaining its own mapped-reaction, participant, and node rows. A different
+project must materialize its own derived rows from an authorized `ArtifactFile`;
+TS/endpoint/Geometry/reaction rows never cross that project boundary, and the
+process does not invent or duplicate new calculation facts.
 
 ### Bidirectional Geometry/reaction binding
 
@@ -413,12 +415,22 @@ rows and may group the results by `LogicalReaction` for presentation.
 
 ## Queries, Visibility, and Derived Values
 
-All artifact, frame, geometry, topology, reaction, and inference reads enforce
-project visibility. Large Geometry lists use the project geometry catalog and
-inexpensive predicates such as elemental composition before structural,
-frequency, or thermochemical conditions. Pagination is deterministic, supports
-explicit sort fields and direction, and the UI prefetches adjacent pages while
-showing an in-progress state.
+Except for immutable `ArtifactFile`, all frame, geometry, topology, reaction,
+inference, formula, and thermodynamic reads require an explicit `project_id` and
+the current authenticated user's permission on that project. Missing or
+unauthorized scope fails closed (the API rejects the scope and service queries
+return no object/rows). The user boundary comes from the authenticated principal,
+never from a client-supplied user id. Equal content, graph, or reaction hashes
+never make a derived row reusable across users or projects. The only exception is
+raw `ArtifactFile`, which may reference one RustFS cache object from multiple
+projects; its catalog row is still project-filtered and public reads do not expose
+parse status or other derived metadata. Large Geometry lists use the project
+geometry catalog and inexpensive predicates such as elemental composition before
+structural, frequency, or thermochemical conditions. Pagination is deterministic,
+supports explicit sort fields and direction, and the UI prefetches adjacent pages
+while showing an in-progress state. Historical roots without one unambiguous owner
+are recorded in the isolation quarantine and excluded from ordinary project
+queries.
 
 RDKit binary Mol, reaction, and fingerprints are query projections, not the
 authoritative graph or geometry identity. `GeometryEnergyView` and reaction

@@ -2,7 +2,7 @@ import { computed, type ComputedRef, type Ref } from "vue";
 import { useQuery } from "@tanstack/vue-query";
 
 import { api } from "@/api";
-import type { CalculationFrameSummary, CurrentUser, Page } from "@/types";
+import type { CalculationFrameSummary, Page } from "@/types";
 import type { ArtifactSort } from "@/artifactQuery";
 import type { ReactionQueryFilters, ReactionSort } from "@/reactionQuery";
 
@@ -13,7 +13,6 @@ export type CatalogView = "reactions" | "frames" | "artifacts";
 interface CatalogQueryOptions {
   projectId: Ref<string | null>;
   activeView: ComputedRef<CatalogView>;
-  user: ComputedRef<CurrentUser | null>;
   reactionOffset: Ref<number>;
   reactionFilters: Ref<ReactionQueryFilters>;
   reactionSort: Ref<ReactionSort>;
@@ -73,7 +72,9 @@ export function useCatalogQueries(options: CatalogQueryOptions) {
         projectId
           ? api.geometries({ projectId, thermodynamicOnly: false, limit: 1, offset: 0 }, signal).then((page) => page.page.total).catch(() => null)
           : Promise.resolve(null),
-        api.artifacts({ projectId, limit: 1, offset: 0 }, signal).then((page) => page.page.total).catch(() => null),
+        projectId
+          ? api.artifacts({ projectId, limit: 1, offset: 0 }, signal).then((page) => page.page.total).catch(() => null)
+          : Promise.resolve(null),
         projectId
           ? api.frames({ projectId, limit: 1, offset: 0 }, signal).then((page) => page.page.total).catch(() => null)
           : Promise.resolve(null),
@@ -86,7 +87,7 @@ export function useCatalogQueries(options: CatalogQueryOptions) {
         frames: pageTotals[4],
       };
     },
-    enabled: computed(() => options.projectId.value !== null || options.user.value === null),
+    enabled: computed(() => options.projectId.value !== null),
     staleTime: 30_000,
   });
 
@@ -171,7 +172,7 @@ export function useCatalogQueries(options: CatalogQueryOptions) {
     queryKey: computed(() => artifactPageQueryKey(options.artifactOffset.value)),
     enabled: computed(() =>
       options.activeView.value === "artifacts" &&
-      (options.user.value === null || options.projectId.value !== null),
+      options.projectId.value !== null,
     ),
     offset: options.artifactOffset,
     fetchPage: fetchArtifactPage,
@@ -181,9 +182,9 @@ export function useCatalogQueries(options: CatalogQueryOptions) {
   });
 
   const artifactPreview = useQuery({
-    queryKey: computed(() => ["catalog", "artifact-preview", { id: options.artifactId.value }]),
-    queryFn: ({ signal }) => api.artifactPreview(options.artifactId.value ?? "", signal),
-    enabled: computed(() => options.activeView.value === "artifacts" && options.artifactId.value !== null),
+    queryKey: computed(() => ["catalog", "artifact-preview", { id: options.artifactId.value, projectId: options.projectId.value }]),
+    queryFn: ({ signal }) => api.artifactPreview(options.artifactId.value ?? "", { projectId: options.projectId.value ?? undefined }, signal),
+    enabled: computed(() => options.activeView.value === "artifacts" && options.artifactId.value !== null && options.projectId.value !== null),
     staleTime: 60_000,
   });
 

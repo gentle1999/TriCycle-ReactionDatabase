@@ -139,6 +139,7 @@ function participantRole(participant: LogicalReactionParticipant): string {
               <header><strong>{{ participantRole(participant) }}</strong><RouterLink :to="{ name: 'topology-detail', params: { topologyId: participant.topology_id }, query: navigationQuery }" :aria-label="`查看逻辑拓扑 ${participant.topology_id}`"><ArrowUpRight :size="15" aria-hidden="true" /></RouterLink></header>
               <ChemDoodleMolecule
                 :topology-id="participant.topology_id"
+                :project-id="currentProjectId ?? undefined"
                 :height="180"
                 :label="participant.canonical_isomeric_smiles ?? `逻辑拓扑 ${participant.topology_id}`"
               />
@@ -152,6 +153,7 @@ function participantRole(participant: LogicalReactionParticipant): string {
               <header><strong>{{ participantRole(participant) }}</strong><RouterLink :to="{ name: 'topology-detail', params: { topologyId: participant.topology_id }, query: navigationQuery }" :aria-label="`查看逻辑拓扑 ${participant.topology_id}`"><ArrowUpRight :size="15" aria-hidden="true" /></RouterLink></header>
               <ChemDoodleMolecule
                 :topology-id="participant.topology_id"
+                :project-id="currentProjectId ?? undefined"
                 :height="180"
                 :label="participant.canonical_isomeric_smiles ?? `逻辑拓扑 ${participant.topology_id}`"
               />

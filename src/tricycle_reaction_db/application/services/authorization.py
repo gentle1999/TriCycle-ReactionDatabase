@@ -274,6 +274,36 @@ class AuthorizationService:
             }
 
     @classmethod
+    async def has_project_permission(
+        cls,
+        user_id: UUID,
+        project_id: UUID,
+        permission: ProjectPermission,
+    ) -> bool:
+        """Check one requested project without loading every accessible project.
+
+        Project-scoped query endpoints already receive the target project ID.
+        Loading the user's complete project set for each endpoint adds work
+        unrelated to the result and becomes noticeable for users with many
+        projects.  Keep the same organization/project-role predicate, but let
+        PostgreSQL answer a single indexed existence check.
+        """
+
+        async with session_factory() as session:
+            accessible_project = (
+                select(1)
+                .select_from(Project)
+                .join(Organization, col(Project.organization_id) == col(Organization.id))
+                .where(
+                    col(Project.id) == project_id,
+                    col(Project.status) == ProjectStatus.ACTIVE,
+                    col(Organization.status) == OrganizationStatus.ACTIVE,
+                    cls.project_permission_predicate(user_id, col(Project.id), permission),
+                )
+            )
+            return bool((await session.exec(select(exists(accessible_project)))).one())
+
+    @classmethod
     async def require_project_permission(
         cls,
         user_id: UUID,

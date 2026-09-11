@@ -59,6 +59,20 @@ def test_discover_files_excludes_calculation_sidecars_but_keeps_vendor_outputs(
     assert [candidate.path.name for candidate in candidates] == ["source.log", "vendor.output"]
 
 
+def test_discover_files_can_exclude_calculation_basename_globs(tmp_path: Path) -> None:
+    (tmp_path / "r0_conf0_opt_xtb.out").write_text("xtb", encoding="utf-8")
+    (tmp_path / "r0_sp_orca.out").write_text("orca", encoding="utf-8")
+    (tmp_path / "g16.log").write_text("g16", encoding="utf-8")
+
+    candidates = discover_files(
+        [tmp_path],
+        artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+        exclude_name_globs=["*_XTB.OUT"],
+    )
+
+    assert [candidate.path.name for candidate in candidates] == ["g16.log", "r0_sp_orca.out"]
+
+
 def test_transient_import_error_classifier_distinguishes_parser_timeout() -> None:
     assert is_retryable_import_error("psycopg.errors.OutOfMemory: max_locks_per_transaction")
     assert is_retryable_import_error("deadlock detected")

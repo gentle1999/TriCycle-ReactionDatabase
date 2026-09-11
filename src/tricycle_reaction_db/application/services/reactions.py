@@ -30,6 +30,7 @@ from tricycle_reaction_db.application.services._persistence import (
     _attach_pending_entities,
     _flush_new_entity,
     _new_entity,
+    _project_owner_predicate,
     _require_id,
 )
 from tricycle_reaction_db.application.services.reaction_geometry_policy import (
@@ -373,8 +374,8 @@ def _ensure_manifest_mutable(manifest: WorkflowManifest) -> None:
 
 
 def _ensure_reaction_mutable(reaction: LogicalReaction) -> None:
-    # Logical reactions are global aggregates. A manifest is optional provenance,
-    # not the owner of later mappings, nodes, geometries, or calculations.
+    # Logical reactions are project-owned aggregates. A manifest is optional
+    # provenance, not the owner of later mappings, nodes, geometries, or calculations.
     return None
 
 
@@ -750,8 +751,33 @@ def find_mapped_reaction_by_concrete_identity(
     *,
     refresh: bool = False,
     topology_context: Any | None = None,
+    project_id: UUID,
 ) -> MappedReaction | None:
     """Find a persisted or same-batch mapped reaction with one identity."""
+
+    if not isinstance(project_id, UUID):
+        raise ValueError("mapped reaction identity lookup requires project_id")
+    pending_logical_reaction = next(
+        (
+            entity
+            for entity in (
+                *tuple(session.new),
+                *tuple(session.info.get("_fast_pending_entities", ())),
+            )
+            if isinstance(entity, LogicalReaction)
+            and entity.id == logical_reaction_id
+        ),
+        None,
+    )
+    logical_project_id = (
+        pending_logical_reaction.project_id
+        if pending_logical_reaction is not None
+        else session.exec(
+            select(LogicalReaction.project_id).where(LogicalReaction.id == logical_reaction_id)
+        ).first()
+    )
+    if logical_project_id != project_id:
+        raise ValueError("mapped reaction identity lookup crossed the logical reaction project")
 
     index_by_reaction: dict[
         UUID,
@@ -772,7 +798,8 @@ def find_mapped_reaction_by_concrete_identity(
             else tuple(
                 session.exec(
                     select(MappedReaction).where(
-                        MappedReaction.logical_reaction_id == logical_reaction_id
+                        MappedReaction.logical_reaction_id == logical_reaction_id,
+                        MappedReaction.project_id == project_id,
                     )
                 ).all()
             )
@@ -785,11 +812,13 @@ def find_mapped_reaction_by_concrete_identity(
             )
             if isinstance(entity, MappedReaction)
             and entity.logical_reaction_id == logical_reaction_id
+            and entity.project_id == project_id
         )
         by_id = {
             _require_id(candidate, label="MappedReaction"): candidate
             for candidate in candidates
             if isinstance(candidate.id, UUID)
+            and candidate.project_id == project_id
         }
         index = {}
         for candidate in sorted(
@@ -1032,6 +1061,9 @@ def persist_workflow_manifest(
     """Insert or reuse one immutable manifest revision and its source artifact."""
 
     artifact_file_id = _require_id(artifact_file, label="ArtifactFile")
+    project_id = artifact_file.project_id
+    if not isinstance(project_id, UUID):
+        raise ValueError("WorkflowManifest requires a project-owned ArtifactFile")
     if artifact_file.artifact_kind is not ArtifactKind.WORKFLOW_MANIFEST:
         raise ValueError("WorkflowManifest requires a workflow_manifest ArtifactFile")
     if artifact_file.content_sha256 != record.payload_sha256:
@@ -1054,6 +1086,13 @@ def persist_workflow_manifest(
             raise ValueError("a manifest can only supersede a revision in the same series")
         if record.revision != supersedes.revision + 1:
             raise ValueError("manifest revisions must advance their predecessor by exactly one")
+        predecessor_project_id = session.exec(
+            select(ArtifactFile.project_id).where(
+                ArtifactFile.id == supersedes.artifact_file_id,
+            )
+        ).first()
+        if predecessor_project_id != project_id:
+            raise ValueError("a manifest revision cannot supersede another project's manifest")
 
     _acquire_identity_locks(
         session,
@@ -1067,6 +1106,13 @@ def persist_workflow_manifest(
         )
     ).first()
     if manifest is not None:
+        existing_project_id = session.exec(
+            select(ArtifactFile.project_id).where(
+                ArtifactFile.id == manifest.artifact_file_id,
+            )
+        ).first()
+        if existing_project_id != project_id:
+            raise ValueError("WorkflowManifest identity already belongs to another project")
         if manifest.artifact_file_id != artifact_file_id:
             raise ValueError("WorkflowManifest identity resolved to a different artifact")
         if manifest.supersedes_id != supersedes_id:
@@ -1096,6 +1142,13 @@ def persist_manifest_artifact_binding(
 
     manifest_id = _require_id(workflow_manifest, label="WorkflowManifest")
     _ensure_manifest_mutable(workflow_manifest)
+    manifest_project_id = session.exec(
+        select(ArtifactFile.project_id).where(
+            ArtifactFile.id == workflow_manifest.artifact_file_id,
+        )
+    ).first()
+    if not isinstance(manifest_project_id, UUID):
+        raise ValueError("ManifestArtifactBinding requires a project-owned manifest")
     artifact_file_id = (
         _require_id(artifact_file, label="ArtifactFile") if artifact_file is not None else None
     )
@@ -1107,6 +1160,8 @@ def persist_manifest_artifact_binding(
     if record.resolution_status is ArtifactResolutionStatus.RESOLVED and artifact_file is None:
         raise ValueError("a resolved artifact binding requires an ArtifactFile")
     if artifact_file is not None:
+        if artifact_file.project_id != manifest_project_id:
+            raise ValueError("manifest bindings cannot reference another project's ArtifactFile")
         if artifact_file.artifact_kind is not ArtifactKind.CALCULATION_OUTPUT:
             raise ValueError("calculation bindings require calculation_output artifacts")
         if record.expected_content_sha256 != artifact_file.content_sha256:
@@ -1163,12 +1218,19 @@ def persist_manifest_artifact_binding(
 def persist_logical_reaction(
     session: Session,
     record: LogicalReactionRecord,
+    *,
+    project_id: UUID,
 ) -> LogicalReaction:
-    """Insert or reuse a topology-defined logical reaction globally."""
+    """Insert or reuse a topology-defined logical reaction in one project."""
 
-    _acquire_identity_locks(session, ("logical_reaction", record.reaction_hash))
+    if not isinstance(project_id, UUID):
+        raise ValueError("project-scoped reaction persistence requires project_id")
+    _acquire_identity_locks(session, ("logical_reaction", project_id, record.reaction_hash))
     reaction = session.exec(
-        select(LogicalReaction).where(LogicalReaction.reaction_hash == record.reaction_hash)
+        select(LogicalReaction).where(
+            LogicalReaction.reaction_hash == record.reaction_hash,
+            LogicalReaction.project_id == project_id,
+        )
     ).first()
     if reaction is not None:
         # Automatic endpoint inference leaves the class unset. A later curator
@@ -1177,7 +1239,12 @@ def persist_logical_reaction(
             reaction.reaction_class = record.reaction_class
             session.flush()
         return reaction
-    reaction = _new_entity(session, LogicalReaction, **record.model_dump())
+    reaction = _new_entity(
+        session,
+        LogicalReaction,
+        project_id=project_id,
+        **record.model_dump(),
+    )
     _flush_new_entity(session, reaction, label="LogicalReaction")
     return reaction
 
@@ -1194,6 +1261,8 @@ def persist_logical_reaction_participant(
 
     reaction_id = _require_id(reaction, label="LogicalReaction")
     topology_id = _require_id(topology, label="MolecularTopology")
+    if reaction.project_id != topology.project_id:
+        raise ValueError("LogicalReaction and participant topology must share a project")
 
     _acquire_identity_locks(
         session,
@@ -1319,6 +1388,9 @@ def persist_mapped_reaction(
     """Insert or reuse one explicit mapped reaction under a logical reaction."""
 
     reaction_id = _require_id(reaction, label="LogicalReaction")
+    project_id = reaction.project_id
+    if not isinstance(project_id, UUID):
+        raise ValueError("project-scoped mapped reaction persistence requires project_id")
     if precomputed_mapped_smiles_by_template is not None:
         if source_atom_maps_by_template is None or topology_ids_by_template is None:
             raise ValueError(
@@ -1381,10 +1453,15 @@ def persist_mapped_reaction(
                 if concrete_topology_ids_by_template is not None
                 else participant.topology_id
             )
-            concrete_topologies_by_key[component_key] = _resolve_topology_value(
+            concrete_topology = _resolve_topology_value(
                 session,
                 concrete_topology_value,
             )
+            if concrete_topology.project_id != project_id:
+                raise ValueError(
+                    "mapped reaction concrete topology must belong to the logical reaction project"
+                )
+            concrete_topologies_by_key[component_key] = concrete_topology
 
         # The text hash above remains the strict mapped-SMILES identity, but
         # it cannot distinguish a new physical mapping from a different
@@ -1409,6 +1486,7 @@ def persist_mapped_reaction(
                 concrete_identity,
                 refresh=True,
                 topology_context=topology_context,
+                project_id=project_id,
             )
             if existing_concrete is not None:
                 return existing_concrete
@@ -1421,6 +1499,7 @@ def persist_mapped_reaction(
             select(MappedReaction).where(
                 MappedReaction.logical_reaction_id == reaction_id,
                 MappedReaction.mapping_hash == record.mapping_hash,
+                _project_owner_predicate(MappedReaction.project_id, project_id),
             )
         )
         mapped_reaction = mapped_reaction_result.first()
@@ -1429,6 +1508,7 @@ def persist_mapped_reaction(
                 session,
                 MappedReaction,
                 logical_reaction=reaction,
+                project_id=project_id,
                 **record.model_dump(),
             )
             _flush_new_entity(session, mapped_reaction, label="MappedReaction")
@@ -1503,12 +1583,17 @@ def persist_mapped_reaction(
         select(MappedReaction).where(
             MappedReaction.logical_reaction_id == reaction_id,
             MappedReaction.mapping_hash == record.mapping_hash,
+            _project_owner_predicate(MappedReaction.project_id, project_id),
         )
     )
     mapped_reaction = mapped_reaction_result.first()
     if mapped_reaction is None:
         mapped_reaction = _new_entity(
-            session, MappedReaction, logical_reaction=reaction, **record.model_dump()
+            session,
+            MappedReaction,
+            logical_reaction=reaction,
+            project_id=project_id,
+            **record.model_dump(),
         )
         _flush_new_entity(session, mapped_reaction, label="MappedReaction")
 
@@ -1534,6 +1619,13 @@ def persist_mapped_reaction(
                 if expected_concrete_topology_value is not None
                 else None
             )
+            if (
+                expected_concrete_topology is not None
+                and expected_concrete_topology.project_id != project_id
+            ):
+                raise ValueError(
+                    "mapped reaction concrete topology must belong to the logical reaction project"
+                )
             for participant in unused:
                 if (
                     expected_topology_id is not None
@@ -1586,8 +1678,15 @@ def persist_mapped_reaction_participant(
 ) -> MappedReactionParticipant:
     mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
     logical_participant_id = _require_id(logical_participant, label="LogicalReactionParticipant")
+    project_id = mapped_reaction.project_id
+    if not isinstance(project_id, UUID):
+        raise ValueError("project-scoped mapped participant persistence requires project_id")
     if logical_participant.logical_reaction_id != mapped_reaction.logical_reaction_id:
         raise ValueError("mapped participant must belong to the same LogicalReaction")
+    if logical_participant.logical_reaction.project_id != project_id:
+        raise ValueError(
+            "mapped participant logical reaction must share the mapped reaction project"
+        )
     if (
         concrete_topology is not None
         and concrete_topology_id is not None
@@ -1602,6 +1701,10 @@ def persist_mapped_reaction_participant(
         )
     if concrete_topology is None:
         raise ValueError("mapped participant requires a concrete MolecularTopology")
+    if concrete_topology.project_id != project_id:
+        raise ValueError(
+            "mapped participant concrete topology must share the mapped reaction project"
+        )
     concrete_topology_id = _require_id(concrete_topology, label="MolecularTopology")
     from tricycle_reaction_db.application.services.reaction_topology_membership import (
         persist_logical_participant_concrete_topology,
@@ -1767,6 +1870,11 @@ def persist_mapped_reaction_node_geometry(
 
     node_id = _require_id(node, label="MappedReactionNode")
     geometry_id = _require_id(geometry, label="Geometry")
+    mapped_reaction = node.mapped_reaction
+    if not isinstance(mapped_reaction.project_id, UUID):
+        raise ValueError("mapped reaction node Geometry requires a project-owned reaction")
+    if geometry.project_id != mapped_reaction.project_id:
+        raise ValueError("mapped reaction node Geometry crosses the project boundary")
     if mapped_reaction_participant is not None:
         if not thermodynamic_property_verified:
             require_geometry_reaction_endpoint_eligibility(session, geometry)

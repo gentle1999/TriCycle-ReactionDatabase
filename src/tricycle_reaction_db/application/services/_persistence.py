@@ -126,6 +126,12 @@ def _fast_insert_enabled(session: Session) -> bool:
     return bool(session.info.get("tricycle_fast_insert", False))
 
 
+def _project_owner_predicate(column: Any, project_id: UUID | None) -> Any:
+    """Match one project owner, treating NULL as the quarantined namespace."""
+
+    return column.is_(None) if project_id is None else column == project_id
+
+
 def _new_entity[EntityT](
     session: Session,
     entity_type: type[EntityT],
@@ -319,7 +325,18 @@ def _bulk_insert_pending_entities(session: Session) -> None:
     group_started = perf_counter()
     grouped: dict[type[Any], list[Any]] = {}
     transient_entities: list[Any] = []
+    seen_entity_objects: set[int] = set()
     for entity in pending:
+        # A deferred flush may be requested more than once for the same
+        # revision-local object (for example when a geometry is refined after
+        # its initial identity was resolved).  Core INSERT has no ORM identity
+        # map to collapse those repeated references, so keep one row per
+        # object.  Build rows after this pass so the surviving object carries
+        # its final in-memory values.
+        object_identity = id(entity)
+        if object_identity in seen_entity_objects:
+            continue
+        seen_entity_objects.add(object_identity)
         state = sa_inspect(entity)
         state_name = (
             "transient"
@@ -509,6 +526,7 @@ __all__ = [
     "_assert_record_matches",
     "_fast_insert_enabled",
     "_new_entity",
+    "_project_owner_predicate",
     "_flush_new_entity",
     "_flush_shared_entity",
     "_identity_lock_id",

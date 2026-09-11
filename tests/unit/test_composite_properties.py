@@ -133,6 +133,66 @@ def test_incomparable_protocols_produce_an_ambiguous_energy_view() -> None:
     }
 
 
+def test_same_score_unknown_protocols_are_not_collapsed_to_first_frame() -> None:
+    geometry_id = uuid4()
+    first_protocol = _protocol("UNREGISTERED-FUNCTIONAL-A", "def2-SVP", software="gaussian")
+    second_protocol = _protocol("UNREGISTERED-FUNCTIONAL-B", "def2-SVP", software="gaussian")
+    first_frame = _frame(geometry_id, -100.0)
+    second_frame = _frame(geometry_id, -101.0)
+
+    composite = geometry_energy_composite(
+        geometry_id,
+        [
+            GeometryEnergyCandidate(first_frame, first_protocol, None),
+            GeometryEnergyCandidate(second_frame, second_protocol, None),
+        ],
+    )
+
+    assert composite.view.electronic_selection_status == "ambiguous"
+    assert composite.view.electronic_energy_hartree is None
+    assert set(composite.view.electronic_candidate_frame_ids) == {
+        first_frame.id,
+        second_frame.id,
+    }
+
+
+def test_same_protocol_conflicting_values_are_ambiguous() -> None:
+    geometry_id = uuid4()
+    protocol = _protocol("B3LYP", "def2-SVP", software="gaussian")
+    first_frame = _frame(geometry_id, -100.0)
+    second_frame = _frame(geometry_id, -100.01)
+
+    composite = geometry_energy_composite(
+        geometry_id,
+        [
+            GeometryEnergyCandidate(first_frame, protocol, None),
+            GeometryEnergyCandidate(second_frame, protocol, None),
+        ],
+    )
+
+    assert composite.view.electronic_selection_status == "ambiguous"
+    assert composite.view.electronic_energy_hartree is None
+
+
+def test_protocol_version_difference_is_not_equivalent() -> None:
+    geometry_id = uuid4()
+    first_protocol = _protocol("B3LYP", "def2-SVP", software="gaussian")
+    second_protocol = first_protocol.model_copy(update={"qm_software_version": "different"})
+    first_frame = _frame(geometry_id, -100.0)
+    second_frame = _frame(geometry_id, -100.0)
+
+    composite = geometry_energy_composite(
+        geometry_id,
+        [
+            GeometryEnergyCandidate(first_frame, first_protocol, None),
+            GeometryEnergyCandidate(second_frame, second_protocol, None),
+        ],
+    )
+
+    assert composite.view.electronic_selection_status == "ambiguous"
+    assert composite.view.electronic_energy_hartree is None
+
+
 def test_derived_energies_are_quantized_after_float_arithmetic() -> None:
     assert _complete_sum([-78.123457, -0.000001]) == -78.123458
 

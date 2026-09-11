@@ -5,16 +5,22 @@
 > Current physical-schema reference. The Chinese counterpart contains the full
 > ERD and table-by-table inventory; SQL identifiers are identical in both pages.
 >
-> Current schema: Alembic `0028_restore_mapped_text_id`. The ORM inventory contains
-> 63 tables, 756 columns, 93 foreign keys, 77 UNIQUE constraints, 198 CHECK constraints,
-> and 158 indexes.
+> Current schema: Alembic `0037_project_owned_calculation_protocol`. The ORM inventory contains
+> 64 tables, 778 columns, 101 foreign keys, 77 UNIQUE constraints, 202 CHECK constraints,
+> and 171 indexes.
 
 ## Storage Boundaries
 
 PostgreSQL holds authorization, object locators, content hashes, parse revisions,
 calculation facts, chemistry identity, reaction paths, and audit state. RustFS/S3
 holds original bytes only. The database does not store a second mutable copy of
-an artifact payload.
+an artifact payload. Immutable `ArtifactFile` is the only cross-user/project
+sharing boundary; parsing, frames, chemistry identities, reactions, and derived
+edges follow its project ownership. Historical derived rows without one
+unambiguous owner are kept in the quarantine ledger and excluded from ordinary
+project queries. Every derived query also requires an explicit `project_id` and
+the current authenticated user's permission on that project; only the raw
+`ArtifactFile` object is an intentional cross-project cache boundary.
 
 ```text
 ArtifactFile -> ParseRevision -> CalculationSegment -> CalculationFrame -> Geometry

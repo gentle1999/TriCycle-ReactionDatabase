@@ -36,6 +36,10 @@ from tricycle_reaction_db.domain.enums import UploadBatchItemStatus
 
 router = APIRouter(prefix="/api/upload-batches", tags=["artifact upload queues"])
 Principal = Annotated[AuthenticatedPrincipal, Depends(get_authenticated_principal)]
+ProjectQueryId = Annotated[
+    UUID,
+    Query(description="The project scope for this project-owned upload query."),
+]
 UPLOAD_PREFLIGHT_HEADERS = {"X-Upload-Rejection-Stage": "preflight"}
 
 
@@ -69,7 +73,7 @@ async def create_upload_batch(payload: UploadBatchCreate, principal: Principal) 
 @router.get("", response_model=UploadBatchPage)
 async def list_upload_batches(
     principal: Principal,
-    project_id: UUID | None = None,
+    project_id: ProjectQueryId,
     limit: Annotated[int, Query(ge=1, le=100)] = 25,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> UploadBatchPage:
@@ -82,9 +86,17 @@ async def list_upload_batches(
 
 
 @router.get("/{batch_id}", response_model=UploadBatchView)
-async def get_upload_batch(batch_id: UUID, principal: Principal) -> UploadBatchView:
+async def get_upload_batch(
+    batch_id: UUID,
+    principal: Principal,
+    project_id: ProjectQueryId,
+) -> UploadBatchView:
     try:
-        return await UploadBatchService.get(batch_id, user_id=principal.user_id)
+        return await UploadBatchService.get(
+            batch_id,
+            user_id=principal.user_id,
+            project_id=project_id,
+        )
     except UploadBatchNotFoundError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
 
@@ -106,6 +118,7 @@ async def recover_upload_batch(batch_id: UUID, principal: Principal) -> UploadBa
 async def list_upload_batch_items(
     batch_id: UUID,
     principal: Principal,
+    project_id: ProjectQueryId,
     item_status: UploadBatchItemStatus | None = None,
     updated_after: datetime | None = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
@@ -115,6 +128,7 @@ async def list_upload_batch_items(
         return await UploadBatchService.list_items(
             batch_id,
             user_id=principal.user_id,
+            project_id=project_id,
             status=item_status,
             updated_after=updated_after,
             limit=limit,

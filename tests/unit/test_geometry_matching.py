@@ -7,6 +7,7 @@ from rdkit import Chem
 
 from tricycle_reaction_db.application.services import molecular_geometry
 from tricycle_reaction_db.application.services.molecular_geometry import (
+    GeometryPersistenceContext,
     _coordinate_alignment,
     _nearest_geometry_candidate,
 )
@@ -99,7 +100,13 @@ def test_database_topology_reuses_identity_with_an_alternate_projection(monkeypa
 
     monkeypatch.setattr(molecular_geometry, "_acquire_identity_locks", lambda *_args: None)
 
-    persisted = molecular_geometry.persist_molecular_topology(Session(), record)
+    persisted = molecular_geometry.persist_molecular_topology(
+        Session(),
+        record,
+        context=GeometryPersistenceContext(
+            project_id=UUID("00000000-0000-7000-8000-000000000001")
+        ),
+    )
 
     assert persisted.topology is topology
     assert persisted.topology.id == topology_id

@@ -293,9 +293,10 @@ concrete topology 都必须匹配同一个抽象 topology，再组合两条对�
 `LogicalReaction` 下按 `(logical_reaction_id, mapping_hash)` 做严格文本幂等；相同 canonical
 mapped text 不允许重复形成两条 mapped reaction。
 
-由 template 派生的 mapped reaction 共享源 mapped reaction 已有的 TS/端点证据和可复用
-Geometry 联系，但保留自己的 mapped reaction、participant 和 node 记录。它不会复制或伪造
-新的计算事实。
+由 template 派生的 mapped reaction 只能在同一项目内共享源 mapped reaction 已有的 TS/端点
+证据和 Geometry 联系，同时保留自己的 mapped reaction、participant 和 node 记录。跨项目时
+必须从获得授权的 `ArtifactFile` 重新物化本项目的派生行；TS、端点、Geometry 和 reaction
+关系不得跨项目连接，也不会复制或伪造新的计算事实。
 
 ### Geometry 与反应的双向绑定
 
@@ -328,7 +329,13 @@ RDKit 表示可解析、canonical text 与 `mapping_hash` 一致、两侧 mappin
 
 ## 查询、可见性和派生值
 
-所有 Artifact、Frame、Geometry、Topology、Reaction 和 Inference 查询均经项目可见性过滤。
+除不可变 `ArtifactFile` 外，所有 Frame、Geometry、Topology、Reaction、Inference、Formula
+和热力学查询都必须同时带显式 `project_id`，并用当前认证用户在该项目上的权限缩小结果集；
+缺少项目范围或无权访问时 fail closed（API 返回范围错误，服务查询返回空结果/无对象）。
+查询中的用户范围来自当前认证主体，而不是客户端传入的 user id。相同内容 hash、图 hash
+或 reaction hash 不能使派生行跨用户/项目复用。无法唯一归属的历史派生行进入隔离台账，
+不返回给普通项目查询。唯一例外是原始 `ArtifactFile`：它可以作为 RustFS 对象缓存由多个
+项目引用，但引用行仍按 project_id 过滤，且公共读取不带出解析、状态或其他派生元数据。
 大规模 Geometry 列表先使用项目几何目录和元素组成等低成本谓词缩小候选，再执行结构、频率
 或热化学条件；分页使用确定性排序与页缓存。列表 API 支持明确的排序字段和方向，前端在
 请求期间显示查询状态并预取相邻页。

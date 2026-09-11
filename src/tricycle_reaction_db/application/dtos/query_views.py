@@ -989,6 +989,11 @@ class ThermodynamicTopologyMinimumView(QueryView):
     enthalpy_hartree: EnergyHartree
     gibbs_free_energy_hartree: EnergyHartree
     entropy_cal_mol_k: float
+    # Provenance is optional for legacy materialized profiles. New profiles
+    # persist both selected source frames so authorization can be evaluated at
+    # source level instead of treating a shared Geometry as public evidence.
+    electronic_source_frame_id: UUID | None = None
+    thermochemistry_source_frame_id: UUID | None = None
 
 
 class ThermodynamicStateView(QueryView):

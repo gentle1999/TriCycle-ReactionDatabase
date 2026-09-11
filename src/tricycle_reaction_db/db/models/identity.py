@@ -28,7 +28,7 @@ from tricycle_reaction_db.domain.enums import (
 )
 
 if TYPE_CHECKING:
-    from tricycle_reaction_db.db.models.artifacts import ArtifactFile
+    from tricycle_reaction_db.db.models.artifacts import ArtifactFile, CalculationProtocol
 
 _SLUG_PATTERN = "^[a-z0-9]+(?:-[a-z0-9]+)*$"
 
@@ -198,6 +198,10 @@ class Project(SQLModel, table=True):
         passive_deletes="all",
     )
     artifacts: list["ArtifactFile"] = Relationship(back_populates="project")
+    calculation_protocols: list["CalculationProtocol"] = Relationship(
+        back_populates="project",
+        passive_deletes="all",
+    )
 
 
 class ProjectMembership(SQLModel, table=True):

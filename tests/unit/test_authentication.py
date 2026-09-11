@@ -39,6 +39,7 @@ from tricycle_reaction_db.domain.identity import DEVELOPMENT_USER_ID
 
 PUBLIC_ARTIFACT_ID = UUID("00000000-0000-7000-8000-000000000601")
 PROJECT_ARTIFACT_ID = UUID("00000000-0000-7000-8000-000000000602")
+PUBLIC_PROJECT_ID = UUID("00000000-0000-7000-8000-000000000603")
 
 
 async def _reject_authentication(_: str | None) -> None:
@@ -526,8 +527,14 @@ async def test_anonymous_user_can_preview_and_download_public_artifact(
         transport=ASGITransport(app=create_app()),
         base_url="http://test",
     ) as client:
-        preview_response = await client.get(f"/api/artifacts/{PUBLIC_ARTIFACT_ID}/preview")
-        download_response = await client.get(f"/api/artifacts/{PUBLIC_ARTIFACT_ID}/download")
+        preview_response = await client.get(
+            f"/api/artifacts/{PUBLIC_ARTIFACT_ID}/preview",
+            params={"project_id": str(PUBLIC_PROJECT_ID)},
+        )
+        download_response = await client.get(
+            f"/api/artifacts/{PUBLIC_ARTIFACT_ID}/download",
+            params={"project_id": str(PUBLIC_PROJECT_ID)},
+        )
 
     assert preview_response.status_code == 200
     assert preview_response.json()["preview_text"] == "Gaussian output\n"
@@ -553,7 +560,10 @@ async def test_anonymous_project_artifact_uses_not_found_semantics(
         transport=ASGITransport(app=create_app()),
         base_url="http://test",
     ) as client:
-        response = await client.get(f"/api/artifacts/{PROJECT_ARTIFACT_ID}/preview")
+        response = await client.get(
+            f"/api/artifacts/{PROJECT_ARTIFACT_ID}/preview",
+            params={"project_id": str(PUBLIC_PROJECT_ID)},
+        )
 
     assert response.status_code == 404
     assert response.json() == {"detail": "authentication is required for project artifacts"}

@@ -1,9 +1,14 @@
+from fastapi import Depends
 from nexusx import (  # type: ignore[import-untyped]
     UseCaseAppConfig,
     build_compose_schema,
     create_use_case_router,
 )
 
+from tricycle_reaction_db.api.query_guards import (
+    project_scoped_use_case_methods,
+    require_project_query_scope,
+)
 from tricycle_reaction_db.application.services import (
     ArtifactIngestionQueryService,
     ArtifactQueryService,
@@ -75,7 +80,20 @@ playground_config = UseCaseAppConfig(
 
 paginated_config = config
 
-router = create_use_case_router(config, prefix="/api")
+_project_scoped_methods = project_scoped_use_case_methods(config)
+_project_scoped_route_options = {
+    f"{service_name}.{method_name}": {
+        "dependencies": [Depends(require_project_query_scope)],
+    }
+    for service_name, method_names in _project_scoped_methods.items()
+    for method_name in method_names
+}
+
+router = create_use_case_router(
+    config,
+    prefix="/api",
+    route_options=_project_scoped_route_options,
+)
 schema = build_compose_schema(config)
 playground_schema = build_compose_schema(playground_config)
 paginated_schema = schema

@@ -24,6 +24,7 @@ from tricycle_reaction_db.application.services._persistence import (
     _assert_record_matches,
     _flush_shared_entity,
     _new_entity,
+    _project_owner_predicate,
     _require_id,
 )
 from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
@@ -85,6 +86,10 @@ class PersistedMolecularGeometry(PersistedMolecularTopology):
 class GeometryPersistenceContext:
     """File-transaction caches for normalized identities and Geometry matching."""
 
+    # A context is never shared between projects.  Keeping the owner on the
+    # context prevents a batch import from falling back to the old global
+    # Formula/Topology/Geometry identity namespace.
+    project_id: UUID | None = None
     topologies: dict[tuple[str, ...], PersistedMolecularTopology] = field(default_factory=dict)
     formulas_by_hash: dict[str, MolecularFormula] = field(default_factory=dict)
     topologies_by_identity: dict[tuple[str, str], MolecularTopology] = field(default_factory=dict)
@@ -175,6 +180,25 @@ class GeometryPersistenceContext:
     inferred_reaction_cache_hits: int = 0
     # Created lazily by batch reconciliation to avoid a module import cycle.
     reconciliation_cache: Any = None
+
+
+def _require_geometry_project_context(
+    context: GeometryPersistenceContext | None,
+) -> UUID:
+    """Require a project owner before materializing derived chemistry.
+
+    Formula, topology, topology-derivation, and Geometry rows are never
+    global identities.  Keeping this check at the persistence boundary makes
+    an omitted context fail closed before a legacy ``NULL`` project namespace
+    can be queried or populated.
+    """
+
+    if context is None or not isinstance(context.project_id, UUID):
+        raise ValueError(
+            "project-scoped molecular persistence requires a GeometryPersistenceContext "
+            "with project_id"
+        )
+    return context.project_id
 
 
 # Keep each set-based equivalence statement below the database statement
@@ -488,6 +512,7 @@ def _find_database_geometry_match(
     topology: MolecularTopology,
     record: NormalizedMoleculeRecord,
     coordinate_decimal_places: int | None,
+    project_id: UUID | None,
 ) -> tuple[Geometry, list[int], float, float, tuple[float, ...]] | None:
     """Let PostgreSQL narrow candidates, then choose the closest Geometry."""
 
@@ -497,6 +522,7 @@ def _find_database_geometry_match(
         session.exec(
             select(Geometry.id).where(
                 Geometry.topology_id == topology.id,
+                _project_owner_predicate(Geometry.project_id, project_id),
                 Geometry.canonicalization_version == observed.canonicalization_version,
                 Geometry.charge == record.charge,
                 Geometry.multiplicity == record.multiplicity,
@@ -630,6 +656,11 @@ def _register_topology_upstreams(
     upstreams = ensure_topology_upstreams(
         session,
         topology,
+        project_id=(
+            context.project_id
+            if context is not None
+            else getattr(topology, "project_id", None)
+        ),
         abstraction_policy_version=STEREO_ABSTRACTION_POLICY_VERSION,
         candidate_topologies=candidates,
     )
@@ -646,6 +677,7 @@ def _preload_molecular_topologies(
 ) -> None:
     """Resolve a batch of shared molecular identities with set-based reads."""
 
+    project_id = _require_geometry_project_context(context)
     pending: dict[tuple[str, ...], NormalizedTopologyRecord] = {}
     for record in records:
         context_key = _topology_context_key(record)
@@ -672,11 +704,11 @@ def _preload_molecular_topologies(
         _acquire_identity_locks(
             session,
             *(
-                ("molecular_formula", composition_hash)
+                ("molecular_formula", project_id, composition_hash)
                 for composition_hash in sorted(formula_hashes)
             ),
             *(
-                ("molecular_topology", schema_version, graph_hash)
+                ("molecular_topology", project_id, schema_version, graph_hash)
                 for schema_version, graph_hash in sorted(topology_identity_keys)
             ),
         )
@@ -684,7 +716,8 @@ def _preload_molecular_topologies(
     if formula_hashes:
         for existing_formula in session.exec(
             select(MolecularFormula).where(
-                col(MolecularFormula.composition_hash).in_(formula_hashes)
+                col(MolecularFormula.composition_hash).in_(formula_hashes),
+                _project_owner_predicate(col(MolecularFormula.project_id), project_id),
             )
         ).all():
             context.formulas_by_hash[existing_formula.composition_hash] = existing_formula
@@ -693,7 +726,12 @@ def _preload_molecular_topologies(
         formula = context.formulas_by_hash.get(composition_hash)
         if formula is not None:
             continue
-        formula = _new_entity(session, MolecularFormula, **record.formula.model_dump())
+        formula = _new_entity(
+            session,
+            MolecularFormula,
+            project_id=project_id,
+            **record.formula.model_dump(),
+        )
         _flush_shared_entity(
             session,
             formula,
@@ -711,6 +749,7 @@ def _preload_molecular_topologies(
                 col(MolecularTopology.graph_hash).in_(
                     {graph_hash for _, graph_hash in topology_identity_keys}
                 ),
+                _project_owner_predicate(col(MolecularTopology.project_id), project_id),
             )
         ).all():
             context.topologies_by_identity[
@@ -734,7 +773,11 @@ def _preload_molecular_topologies(
             )
             continue
         topology = _new_entity(
-            session, MolecularTopology, formula=formula, **record.topology.model_dump()
+            session,
+            MolecularTopology,
+            project_id=project_id,
+            formula=formula,
+            **record.topology.model_dump(),
         )
         _flush_shared_entity(
             session,
@@ -789,6 +832,10 @@ def _preload_molecular_topologies(
                 col(MolecularTopologyDerivation.provenance_hash).in_(
                     {key[2] for key in missing_derivation_keys}
                 ),
+                _project_owner_predicate(
+                    col(MolecularTopologyDerivation.project_id),
+                    project_id,
+                ),
             )
         ).all():
             context.topology_derivations_by_key[
@@ -813,6 +860,7 @@ def _preload_molecular_topologies(
             topology_derivation = _new_entity(
                 session,
                 MolecularTopologyDerivation,
+                project_id=project_id,
                 topology=topology,
                 **record.topology_derivation.model_dump(),
             )
@@ -847,6 +895,7 @@ def persist_molecular_topology(
 ) -> PersistedMolecularTopology:
     """Insert or reuse Formula and Topology without requiring a Geometry."""
 
+    project_id = _require_geometry_project_context(context)
     context_key = _topology_context_key(record)
     if context is not None and (cached := context.topologies.get(context_key)) is not None:
         _validate_cached_topology(cached, record)
@@ -875,18 +924,24 @@ def persist_molecular_topology(
     if formula is None or topology is None:
         lock_keys: list[tuple[object, ...]] = []
         if formula is None:
-            lock_keys.append(("molecular_formula", record.formula.composition_hash))
+            lock_keys.append(("molecular_formula", project_id, record.formula.composition_hash))
         if topology is None:
-            lock_keys.append(("molecular_topology", *topology_identity))
+            lock_keys.append(("molecular_topology", project_id, *topology_identity))
         _acquire_identity_locks(session, *lock_keys)
     if formula is None:
         formula = session.exec(
             select(MolecularFormula).where(
-                MolecularFormula.composition_hash == record.formula.composition_hash
+                MolecularFormula.composition_hash == record.formula.composition_hash,
+                _project_owner_predicate(MolecularFormula.project_id, project_id),
             )
         ).first()
     if formula is None:
-        formula = _new_entity(session, MolecularFormula, **record.formula.model_dump())
+        formula = _new_entity(
+            session,
+            MolecularFormula,
+            project_id=project_id,
+            **record.formula.model_dump(),
+        )
         _flush_shared_entity(session, formula, label="MolecularFormula", defer_if_fast=True)
     if context is not None:
         context.formulas_by_hash[record.formula.composition_hash] = formula
@@ -899,6 +954,7 @@ def persist_molecular_topology(
                 MolecularTopology.identity_schema_version
                 == record.topology.identity_schema_version,
                 MolecularTopology.graph_hash == record.topology.graph_hash,
+                _project_owner_predicate(MolecularTopology.project_id, project_id),
             )
         ).first()
     topology_created = topology is None
@@ -906,6 +962,7 @@ def persist_molecular_topology(
         topology = _new_entity(
             session,
             MolecularTopology,
+            project_id=project_id,
             formula=formula,
             **record.topology.model_dump(),
         )
@@ -954,12 +1011,17 @@ def persist_molecular_topology(
                 == record.topology_derivation.provenance_schema_version,
                 MolecularTopologyDerivation.provenance_hash
                 == record.topology_derivation.provenance_hash,
+                _project_owner_predicate(
+                    MolecularTopologyDerivation.project_id,
+                    project_id,
+                ),
             )
         ).first()
     if topology_derivation is None:
         topology_derivation = _new_entity(
             session,
             MolecularTopologyDerivation,
+            project_id=project_id,
             topology=topology,
             **record.topology_derivation.model_dump(),
         )
@@ -998,6 +1060,7 @@ def persist_molecular_geometry(
 ) -> PersistedMolecularGeometry:
     """Insert or reuse one normalized three-level chemical record."""
 
+    project_id = _require_geometry_project_context(context)
     persisted_topology = persist_molecular_topology(
         session,
         NormalizedTopologyRecord(
@@ -1040,6 +1103,7 @@ def persist_molecular_geometry(
         geometry = session.exec(
             select(Geometry).where(
                 Geometry.topology_id == topology.id,
+                _project_owner_predicate(Geometry.project_id, project_id),
                 Geometry.canonicalization_version == record.geometry.canonicalization_version,
                 Geometry.geometry_hash == record.geometry.geometry_hash,
                 Geometry.charge == record.charge,
@@ -1106,6 +1170,7 @@ def persist_molecular_geometry(
             topology=topology,
             record=record,
             coordinate_decimal_places=coordinate_decimal_places,
+            project_id=project_id,
         )
         if matched is not None:
             (
@@ -1125,6 +1190,7 @@ def persist_molecular_geometry(
         geometry = _new_entity(
             session,
             Geometry,
+            project_id=project_id,
             topology=topology,
             **record.geometry.model_dump(),
             internal_coordinate_distances_angstrom=distances,
@@ -1201,6 +1267,8 @@ def preload_molecular_geometry_context(
     missing keys are recorded so a new Geometry can be added without another
     round trip.
     """
+
+    _require_geometry_project_context(context)
 
     frame_topology_records = [
         NormalizedTopologyRecord(
@@ -1332,6 +1400,7 @@ def preload_molecular_geometry_context(
                 geometry_columns.multiplicity == exact_inputs.c.multiplicity,
             ),
         )
+        .where(_project_owner_predicate(geometry_columns.project_id, context.project_id))
     ).all()
     context.exact_geometry_keys_loaded.update(keys)
     for exact_geometry in rows:
@@ -1397,6 +1466,7 @@ def preload_molecular_geometry_context(
          AND geometry.canonicalization_version = inputs.canonicalization_version
          AND geometry.charge = inputs.charge
          AND geometry.multiplicity = inputs.multiplicity
+         AND geometry.project_id = :project_id
          AND geometry_internal_coordinates_equivalent(
                 geometry.internal_coordinate_distances_angstrom,
                 geometry.internal_coordinate_angles_degrees,
@@ -1415,7 +1485,10 @@ def preload_molecular_geometry_context(
         chunk = input_rows[start : start + GEOMETRY_MATCH_INPUT_BATCH_SIZE]
         matches = connection.execute(
             statement,
-            {"payload": json.dumps(chunk, separators=(",", ":"))},
+            {
+                "payload": json.dumps(chunk, separators=(",", ":")),
+                "project_id": context.project_id,
+            },
         ).all()
         for input_key, geometry_id in matches:
             if isinstance(input_key, str) and isinstance(geometry_id, UUID):

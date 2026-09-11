@@ -20,6 +20,7 @@ from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import MolecularFormula
 from tricycle_reaction_db.db.session import dispose_engine
 from tricycle_reaction_db.domain.formulas import ELEMENT_COUNT_VECTOR_SIZE
+from tricycle_reaction_db.domain.identity import SYSTEM_PROJECT_ID
 
 pytestmark = [
     pytest.mark.integration,
@@ -55,6 +56,7 @@ def _formula(hill_formula: str, vector: list[int], suffix: str) -> MolecularForm
     ]
     digest = hashlib.sha256(f"formula-search-{suffix}-{uuid4()}".encode()).hexdigest()
     return MolecularFormula(
+        project_id=SYSTEM_PROJECT_ID,
         hill_formula=hill_formula,
         composition=composition,
         composition_schema_version="formula-composition-v1",
@@ -118,6 +120,7 @@ def test_formula_search_service_returns_filtered_page(
             ).model_dump(),
             limit=1,
             offset=1,
+            project_id=SYSTEM_PROJECT_ID,
         )
     )
 
@@ -144,7 +147,11 @@ async def test_formula_search_rest_endpoint_returns_filtered_page(
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.post(
                 "/api/formulas/search?limit=10",
-                json={"minimum_counts": minimum_counts, "maximum_counts": maximum_counts},
+                json={
+                    "minimum_counts": minimum_counts,
+                    "maximum_counts": maximum_counts,
+                    "project_id": str(SYSTEM_PROJECT_ID),
+                },
             )
     finally:
         await dispose_engine()
@@ -165,7 +172,11 @@ async def test_nexusx_generated_formula_search_rest_route(
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.post(
                 "/api/molecular_formula_query_service/search_formulas",
-                json={**ranges.model_dump(), "limit": 10},
+                json={
+                    **ranges.model_dump(),
+                    "project_id": str(SYSTEM_PROJECT_ID),
+                    "limit": 10,
+                },
             )
     finally:
         await dispose_engine()

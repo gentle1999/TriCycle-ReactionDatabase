@@ -147,6 +147,8 @@ def _minimum_view(
         enthalpy_hartree=_required_float(view.enthalpy_hartree, label="H"),
         gibbs_free_energy_hartree=_required_float(view.gibbs_free_energy_hartree, label="G"),
         entropy_cal_mol_k=_required_float(view.entropy_cal_mol_k, label="S"),
+        electronic_source_frame_id=view.electronic_energy_source_frame_id,
+        thermochemistry_source_frame_id=view.thermochemistry_source_frame_id,
     )
 
 
@@ -162,6 +164,8 @@ def _transition_state_view(
         enthalpy_hartree=_required_float(view.enthalpy_hartree, label="H"),
         gibbs_free_energy_hartree=_required_float(view.gibbs_free_energy_hartree, label="G"),
         entropy_cal_mol_k=_required_float(view.entropy_cal_mol_k, label="S"),
+        electronic_source_frame_id=view.electronic_energy_source_frame_id,
+        thermochemistry_source_frame_id=view.thermochemistry_source_frame_id,
     )
 
 

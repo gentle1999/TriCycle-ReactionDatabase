@@ -25,6 +25,14 @@ current operating instructions.
 | [数据库实体关系图](database-erd.md) | [Database entity relationship diagram](en/database-erd.md) | 数据库边界、ERD 和完整性约束 / database boundaries, ERD, and integrity constraints |
 | [RDKit Mol 对象数据库往返契约](rdkit-mol-roundtrip.md) | [RDKit Mol database round-trip contract](en/rdkit-mol-roundtrip.md) | RDKit binary Mol 的持久化边界 / RDKit binary Mol persistence boundary |
 
+## 当前重构计划 / Active Refactor Plans
+
+以下页面规定待实施工作的目标与验收，不表示当前系统已经具备相应行为。
+
+| 中文 | English | 用途 / Purpose |
+| --- | --- | --- |
+| [数据库架构重构计划](database-architecture-refactor-plan.md) | [Database architecture refactor plan](en/database-architecture-refactor-plan.md) | 2026-09-10 固化；来源授权、选源、版本、约束、派生刷新与容量 / source authorization, selection, versions, constraints, refreshes, and capacity |
+
 ## 历史记录 / Historical Records
 
 这些文档记录了特定日期的计划、决策、基线或验收状态。实现可能已经变化；在作出当前决策前，

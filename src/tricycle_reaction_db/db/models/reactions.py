@@ -271,11 +271,15 @@ class ManifestArtifactBinding(SQLModel, table=True):
 
 
 class LogicalReaction(SQLModel, table=True):
-    """A globally reusable net transformation whose identity is its topologies."""
+    """A project-owned net transformation whose identity is its topologies."""
 
     __tablename__ = "logical_reaction"  # pyright: ignore[reportAssignmentType]
     __table_args__ = (
-        UniqueConstraint("reaction_hash", name="uq_logical_reaction_hash"),
+        UniqueConstraint(
+            "project_id",
+            "reaction_hash",
+            name="uq_logical_reaction_project_hash",
+        ),
         Index("ix_logical_reaction_created_id", "created_at", "id"),
         Index("ix_logical_reaction_reaction_key", "reaction_key"),
         Index(
@@ -289,6 +293,13 @@ class LogicalReaction(SQLModel, table=True):
 
     id: UUID | None = uuid_primary_key_field()
     created_at: datetime | None = created_at_field()
+    project_id: UUID | None = Field(
+        default=None,
+        foreign_key="project.id",
+        ondelete="RESTRICT",
+        index=True,
+        nullable=True,
+    )
     reaction_key: str = Field(sa_type=Text, nullable=False)
     label: str | None = Field(default=None, sa_type=Text)
     reaction_class: ReactionClass | None = Field(
@@ -477,6 +488,13 @@ class MappedReaction(SQLModel, table=True):
 
     id: UUID | None = uuid_primary_key_field()
     created_at: datetime | None = created_at_field()
+    project_id: UUID | None = Field(
+        default=None,
+        foreign_key="project.id",
+        ondelete="RESTRICT",
+        index=True,
+        nullable=True,
+    )
     logical_reaction_id: UUID = Field(
         foreign_key="logical_reaction.id", ondelete="CASCADE", index=True, nullable=False
     )

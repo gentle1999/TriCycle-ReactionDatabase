@@ -22,17 +22,17 @@ const navigationQuery = computed(() => withoutAccessState(route.query));
 const selectedFrameId = ref<string | null>(null);
 
 const artifactQuery = useQuery({
-  queryKey: computed(() => ["artifact-detail", artifactId.value]),
-  queryFn: ({ signal }) => api.artifact(artifactId.value ?? "", signal),
-  enabled: computed(() => artifactId.value !== null),
+  queryKey: computed(() => ["artifact-detail", { id: artifactId.value, projectId: currentProjectId.value }]),
+  queryFn: ({ signal }) => api.artifact(artifactId.value ?? "", { projectId: currentProjectId.value ?? undefined }, signal),
+  enabled: computed(() => artifactId.value !== null && currentProjectId.value !== null),
   staleTime: 60_000,
   refetchInterval: 5_000,
 });
 
 const artifact = computed(() => artifactQuery.data.value ?? null);
 const previewQuery = useQuery({
-  queryKey: computed(() => ["artifact-detail-preview", artifactId.value]),
-  queryFn: ({ signal }) => api.artifactPreview(artifactId.value ?? "", signal),
+  queryKey: computed(() => ["artifact-detail-preview", { id: artifactId.value, projectId: artifact.value?.project_id }]),
+  queryFn: ({ signal }) => api.artifactPreview(artifactId.value ?? "", { projectId: artifact.value?.project_id }, signal),
   enabled: computed(() => artifact.value?.storage_status === "available"),
   staleTime: 60_000,
 });
@@ -105,7 +105,7 @@ const frameError = computed(() => frameQuery.error.value instanceof Error ? fram
         v-if="artifact"
         class="command-button is-quiet"
         :class="{ 'is-disabled': artifact.storage_status !== 'available' }"
-        :href="artifactDownloadUrl(artifact.id)"
+        :href="artifactDownloadUrl(artifact.id, artifact.project_id)"
         :download="artifact.original_filename"
         title="下载原始文件"
         aria-label="下载原始文件"

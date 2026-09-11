@@ -11,6 +11,7 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
     close_molop_process_pool,
 )
 from tricycle_reaction_db.application.services.upload_batches import (
+    PendingIngestionJob,
     UploadBatchService,
     UploadProcessingJob,
 )
@@ -89,6 +90,70 @@ class UploadBatchWorker:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
 
+    async def _renew_pending_until_done(
+        self,
+        job: PendingIngestionJob,
+        finished: asyncio.Event,
+    ) -> None:
+        settings = get_settings()
+        interval = max(5.0, min(60.0, settings.upload_worker_lease_seconds / 3))
+        while not finished.is_set():
+            try:
+                await asyncio.wait_for(finished.wait(), timeout=interval)
+                return
+            except TimeoutError:
+                pass
+            try:
+                if not await UploadBatchService.renew_pending_ingestion_lease(job):
+                    logger.warning(
+                        "pending ingestion lease was lost ingestion=%s artifact=%s",
+                        job.ingestion_id,
+                        job.artifact_file_id,
+                    )
+                    return
+            except Exception:
+                logger.exception(
+                    "failed to renew pending ingestion lease ingestion=%s artifact=%s",
+                    job.ingestion_id,
+                    job.artifact_file_id,
+                )
+
+    async def _process_pending(self, job: PendingIngestionJob) -> None:
+        """Resume an orphaned reservation and let the service finalize it."""
+
+        finished = asyncio.Event()
+        heartbeat = asyncio.create_task(self._renew_pending_until_done(job, finished))
+        try:
+            await ArtifactUploadService.reparse(
+                artifact_id=job.artifact_file_id,
+                user_id=job.user_id,
+                ingestion_id=job.ingestion_id,
+                ingestion_lease_id=job.lease_id,
+            )
+        except asyncio.CancelledError:
+            # The lease deliberately remains claimable after expiry.
+            raise
+        except Exception as error:
+            # ``reparse`` records parse/storage failures itself. This fallback
+            # also covers authorization or precondition errors raised before
+            # its normal failure boundary.
+            try:
+                await ArtifactUploadService.fail_pending_ingestion(
+                    ingestion_id=job.ingestion_id,
+                    lease_id=job.lease_id,
+                    error=error,
+                )
+            except Exception:
+                logger.exception(
+                    "failed to record orphaned ingestion error ingestion=%s artifact=%s",
+                    job.ingestion_id,
+                    job.artifact_file_id,
+                )
+        finally:
+            finished.set()
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+
     async def run(self, stop_event: asyncio.Event | None = None) -> None:
         settings = get_settings()
         while stop_event is None or not stop_event.is_set():
@@ -99,6 +164,14 @@ class UploadBatchWorker:
                 )
                 if jobs:
                     await asyncio.gather(*(self._process(job) for job in jobs))
+                    continue
+                pending_jobs = await UploadBatchService.claim_pending_ingestions(
+                    limit=settings.upload_worker_concurrency,
+                )
+                if pending_jobs:
+                    await asyncio.gather(
+                        *(self._process_pending(job) for job in pending_jobs)
+                    )
                     continue
             except asyncio.CancelledError:
                 raise

@@ -6,6 +6,7 @@ from sqlalchemy import create_engine
 from sqlmodel import Session, col, select
 
 from tricycle_reaction_db.application.services.molecular_geometry import (
+    GeometryPersistenceContext,
     persist_molecular_topology,
 )
 from tricycle_reaction_db.application.services.topology_abstraction import (
@@ -18,6 +19,7 @@ from tricycle_reaction_db.application.services.topology_abstraction import (
 )
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import MolecularTopologyAbstraction
+from tricycle_reaction_db.domain.identity import SYSTEM_PROJECT_ID
 from tricycle_reaction_db.ingestion.normalization import normalize_topology
 
 pytestmark = [
@@ -42,12 +44,17 @@ def test_persisted_stereo_abstraction_is_a_dag() -> None:
 
     try:
         with Session(engine) as session:
-            persisted = persist_molecular_topology(session, record)
+            project_context = GeometryPersistenceContext(project_id=SYSTEM_PROJECT_ID)
+            persisted = persist_molecular_topology(session, record, context=project_context)
             assert persisted.topology.is_stereo_abstraction_upstream is False
             abstraction_edge_ids_before_ensure = set(
                 session.exec(select(MolecularTopologyAbstraction.id)).all()
             )
-            assert ensure_topology_upstreams(session, persisted.topology) == (persisted.topology,)
+            assert ensure_topology_upstreams(
+                session,
+                persisted.topology,
+                project_id=SYSTEM_PROJECT_ID,
+            ) == (persisted.topology,)
             abstraction_edge_ids_after_ensure = set(
                 session.exec(select(MolecularTopologyAbstraction.id)).all()
             )
@@ -58,21 +65,25 @@ def test_persisted_stereo_abstraction_is_a_dag() -> None:
                 session,
                 persisted.topology,
                 (features[0],),
+                context=project_context,
             )
             one_center_b, edge_b = persist_stereo_abstraction_projection(
                 session,
                 persisted.topology,
                 (features[1],),
+                context=project_context,
             )
             zero_center_a, edge_a_zero = persist_stereo_abstraction_projection(
                 session,
                 one_center_a,
                 assigned_stereo_features(one_center_a.mol),
+                context=project_context,
             )
             zero_center_b, edge_b_zero = persist_stereo_abstraction_projection(
                 session,
                 one_center_b,
                 assigned_stereo_features(one_center_b.mol),
+                context=project_context,
             )
             session.flush()
 
@@ -88,8 +99,16 @@ def test_persisted_stereo_abstraction_is_a_dag() -> None:
                 reconstruction_method="tests/topology-abstraction-alternate",
                 reconstruction_version="1",
             )
-            alternate = persist_molecular_topology(session, alternate_record)
-            upstreams = find_upstream_topologies(session, alternate.topology)
+            alternate = persist_molecular_topology(
+                session,
+                alternate_record,
+                context=project_context,
+            )
+            upstreams = find_upstream_topologies(
+                session,
+                alternate.topology,
+                project_id=SYSTEM_PROJECT_ID,
+            )
             assert one_center_a.id in {topology.id for topology in upstreams}
             assert (
                 session.exec(
@@ -107,8 +126,17 @@ def test_persisted_stereo_abstraction_is_a_dag() -> None:
             assert zero_center_a.id == zero_center_b.id
             zero_center_id = zero_center_a.id
             assert zero_center_id is not None
-            reachable_ids = specialized_topology_ids(session, zero_center_id)
-            loaded = specialized_topologies(session, zero_center_id, include_general=True)
+            reachable_ids = specialized_topology_ids(
+                session,
+                zero_center_id,
+                project_id=SYSTEM_PROJECT_ID,
+            )
+            loaded = specialized_topologies(
+                session,
+                zero_center_id,
+                project_id=SYSTEM_PROJECT_ID,
+                include_general=True,
+            )
 
             assert len(reachable_ids) == 4
             assert persisted.topology.id in reachable_ids
@@ -118,11 +146,13 @@ def test_persisted_stereo_abstraction_is_a_dag() -> None:
                 session,
                 persisted.topology,
                 (features[0],),
+                context=project_context,
             )
             repeated_b = persist_stereo_abstraction_projection(
                 session,
                 persisted.topology,
                 (features[1],),
+                context=project_context,
             )
             assert {repeated_a[1].id, repeated_b[1].id} == {edge_a.id, edge_b.id}
 

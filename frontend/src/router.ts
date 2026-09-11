@@ -26,6 +26,29 @@ const ArtifactQueryHelpView = () => import("./views/ArtifactQueryHelpView.vue");
 const UploadView = () => import("./views/UploadView.vue");
 
 const protectedNames = new Set(["uploads", "account", "organizations", "projects", "project", "statistics", "nexusx"]);
+const projectScopedNames = new Set([
+  "reactions",
+  "reaction-detail",
+  "mapped-reaction-detail",
+  "geometries",
+  "geometry-detail",
+  "topology-detail",
+  "calculation-detail",
+  "artifacts",
+  "artifact-detail",
+  "statistics",
+]);
+const ACTIVE_PROJECT_STORAGE_KEY = "tricycle.activeProjectId";
+
+function preferredProjectId(user: Awaited<ReturnType<typeof api.currentUser>>): string | null {
+  if (!user?.projects.length) return null;
+  const stored = typeof window === "undefined"
+    ? null
+    : window.localStorage.getItem(ACTIVE_PROJECT_STORAGE_KEY);
+  return user.projects.find((project) => project.project_id === stored)?.project_id
+    ?? user.projects[0]?.project_id
+    ?? null;
+}
 
 export const router = createRouter({
   history: createWebHistory(),
@@ -62,7 +85,12 @@ export const router = createRouter({
 });
 
 router.beforeEach(async (to) => {
-  if (!protectedNames.has(String(to.name)) && !to.meta.requiresAuth) return true;
+  const routeName = String(to.name);
+  if (
+    !protectedNames.has(routeName)
+    && !to.meta.requiresAuth
+    && !projectScopedNames.has(routeName)
+  ) return true;
   let user: Awaited<ReturnType<typeof api.currentUser>>;
   try {
     user = await queryClient.ensureQueryData({
@@ -81,6 +109,20 @@ router.beforeEach(async (to) => {
     };
   }
   if (user) {
+    const requestedProjectId = to.query.project_id;
+    if (
+      projectScopedNames.has(routeName)
+      && (typeof requestedProjectId !== "string" || requestedProjectId.length === 0)
+    ) {
+      const projectId = preferredProjectId(user);
+      if (projectId) {
+        return {
+          path: to.path,
+          query: { ...to.query, project_id: projectId },
+          hash: to.hash,
+        };
+      }
+    }
     if (to.name === "project" || to.name === "project-members") {
       const projectId = typeof to.params.projectId === "string" ? to.params.projectId : null;
       if (!projectId || !user.projects.some((project) => project.project_id === projectId)) {

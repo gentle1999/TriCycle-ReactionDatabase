@@ -34,7 +34,7 @@ from nexusx import UseCaseService, query  # type: ignore[import-untyped]
 from pydantic import Field
 from rdkit import Chem
 from rdkit.Chem import rdChemReactions
-from sqlalchemy import Boolean, Text, and_, case, func, literal, not_, or_, select
+from sqlalchemy import Boolean, Text, and_, case, false, func, literal, not_, or_, select
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.dialects.postgresql import ARRAY, aggregate_order_by, array
 from sqlalchemy.orm import aliased, defer, joinedload, load_only
@@ -93,11 +93,14 @@ from tricycle_reaction_db.application.services.geometry_energy import (
     protocol_level_view,
 )
 from tricycle_reaction_db.application.services.query_visibility import (
+    formula_id_is_visible,
     frame_id_is_visible,
     geometry_id_is_visible,
     logical_reaction_id_is_visible,
     mapped_reaction_id_is_visible,
     query_visibility_scope,
+    thermodynamic_profile_is_visible,
+    topology_derivation_id_is_visible,
     topology_id_is_visible,
     visible_frame_ids,
 )
@@ -125,6 +128,7 @@ from tricycle_reaction_db.db.models import (
     MappedReactionNodeGeometry,
     MappedReactionNodeGeometryMapping,
     MappedReactionParticipant,
+    MappedReactionThermodynamicProfile,
     MolecularFormula,
     MolecularTopology,
     MolecularTopologyDerivation,
@@ -185,7 +189,7 @@ def _validate_nonnegative_integer(value: Any, *, name: str) -> None:
         raise ValueError(f"{name} must be a non-negative integer")
 
 
-def _logical_reaction_ids_for_topology(topology_id: UUID) -> Any:
+def _logical_reaction_ids_for_topology(topology_id: UUID, *, project_id: UUID) -> Any:
     """Return logical reactions using a topology in any persisted role.
 
     A topology can be referenced directly by a logical participant, indirectly
@@ -197,15 +201,32 @@ def _logical_reaction_ids_for_topology(topology_id: UUID) -> Any:
     MappedReactionNodeGeometry rather than a participant row.
     """
 
-    participant_reaction_ids: Any = select(
-        col(LogicalReactionParticipant.logical_reaction_id).label("logical_reaction_id")
-    ).where(
-        or_(
-            col(LogicalReactionParticipant.topology_id) == topology_id,
-            col(LogicalReactionParticipant.id).in_(
-                select(
-                    col(LogicalParticipantConcreteTopology.logical_reaction_participant_id)
-                ).where(col(LogicalParticipantConcreteTopology.concrete_topology_id) == topology_id)
+    participant_reaction_ids: Any = (
+        select(col(LogicalReactionParticipant.logical_reaction_id).label("logical_reaction_id"))
+        .select_from(LogicalReactionParticipant)
+        .join(
+            LogicalReaction,
+            col(LogicalReaction.id) == col(LogicalReactionParticipant.logical_reaction_id),
+        )
+        .where(
+            col(LogicalReaction.project_id) == project_id,
+            or_(
+                col(LogicalReactionParticipant.topology_id) == topology_id,
+                col(LogicalReactionParticipant.id).in_(
+                    select(
+                        col(LogicalParticipantConcreteTopology.logical_reaction_participant_id)
+                    )
+                    .select_from(LogicalParticipantConcreteTopology)
+                    .join(
+                        MolecularTopology,
+                        col(MolecularTopology.id)
+                        == col(LogicalParticipantConcreteTopology.concrete_topology_id),
+                    )
+                    .where(
+                        col(LogicalParticipantConcreteTopology.concrete_topology_id) == topology_id,
+                        col(MolecularTopology.project_id) == project_id,
+                    )
+                ),
             ),
         )
     )
@@ -217,10 +238,15 @@ def _logical_reaction_ids_for_topology(topology_id: UUID) -> Any:
             col(TransitionStateEndpoint.calculation_frame_id)
             == col(TransitionStateInference.calculation_frame_id),
         )
+        .join(
+            LogicalReaction,
+            col(LogicalReaction.id) == col(TransitionStateInference.logical_reaction_id),
+        )
         .where(
             col(TransitionStateEndpoint.topology_id) == topology_id,
             col(TransitionStateInference.status) == TransitionStateInferenceStatus.SUCCEEDED,
             col(TransitionStateInference.logical_reaction_id).is_not(None),
+            col(LogicalReaction.project_id) == project_id,
         )
     )
     transition_state_node_reaction_ids: Any = (
@@ -235,9 +261,13 @@ def _logical_reaction_ids_for_topology(topology_id: UUID) -> Any:
             col(MappedReactionNodeGeometry.mapped_reaction_node_id) == col(MappedReactionNode.id),
         )
         .join(Geometry, col(MappedReactionNodeGeometry.geometry_id) == col(Geometry.id))
+        .join(LogicalReaction, col(LogicalReaction.id) == col(MappedReaction.logical_reaction_id))
         .where(
             col(Geometry.topology_id) == topology_id,
             col(MappedReactionNode.role) == "transition_state",
+            col(MappedReaction.project_id) == project_id,
+            col(Geometry.project_id) == project_id,
+            col(LogicalReaction.project_id) == project_id,
         )
     )
     return participant_reaction_ids.union(
@@ -477,6 +507,63 @@ def _mapped_reaction_count_expression(scope: Any) -> Any:
     )
 
 
+def mapped_reaction_has_thermodynamic_profile(
+    scope: Any,
+    mapped_reaction_id: Any,
+    *,
+    minimum_activation_gibbs_free_energy_kcal_mol: float | None = None,
+    maximum_activation_gibbs_free_energy_kcal_mol: float | None = None,
+    minimum_reaction_gibbs_free_energy_kcal_mol: float | None = None,
+    maximum_reaction_gibbs_free_energy_kcal_mol: float | None = None,
+    has_activation_gibbs_free_energy: bool = False,
+    has_reaction_gibbs_free_energy: bool = False,
+) -> Any:
+    """Match one visible profile, keeping all thermodynamic conditions together.
+
+    The denormalized bounds on ``MappedReaction`` remain useful as a cheap
+    candidate prefilter, but they cannot prove that one profile satisfies a
+    range. This correlated EXISTS is the final predicate and is deliberately
+    shared by list, total, and expression-filter paths.
+    """
+
+    profile = MappedReactionThermodynamicProfile
+    predicates: list[Any] = [
+        col(profile.mapped_reaction_id) == mapped_reaction_id,
+        thermodynamic_profile_is_visible(scope, profile),
+    ]
+    if minimum_activation_gibbs_free_energy_kcal_mol is not None:
+        predicates.append(
+            col(profile.activation_gibbs_free_energy_kcal_mol)
+            >= minimum_activation_gibbs_free_energy_kcal_mol
+        )
+    if maximum_activation_gibbs_free_energy_kcal_mol is not None:
+        predicates.append(
+            col(profile.activation_gibbs_free_energy_kcal_mol)
+            <= maximum_activation_gibbs_free_energy_kcal_mol
+        )
+    if minimum_reaction_gibbs_free_energy_kcal_mol is not None:
+        predicates.append(
+            col(profile.reaction_gibbs_free_energy_kcal_mol)
+            >= minimum_reaction_gibbs_free_energy_kcal_mol
+        )
+    if maximum_reaction_gibbs_free_energy_kcal_mol is not None:
+        predicates.append(
+            col(profile.reaction_gibbs_free_energy_kcal_mol)
+            <= maximum_reaction_gibbs_free_energy_kcal_mol
+        )
+    if has_activation_gibbs_free_energy:
+        predicates.append(col(profile.activation_gibbs_free_energy_kcal_mol).is_not(None))
+    if has_reaction_gibbs_free_energy:
+        predicates.append(col(profile.reaction_gibbs_free_energy_kcal_mol).is_not(None))
+    return (
+        select(1)
+        .select_from(profile)
+        .where(*predicates)
+        .correlate(MappedReaction)
+        .exists()
+    )
+
+
 def _logical_reaction_query_leaf_predicate(
     field: object,
     value: object,
@@ -550,28 +637,24 @@ def _logical_reaction_query_leaf_predicate(
             raise ValueError(f"{field_name} must be a finite number") from error
         if not isfinite(parsed_value):
             raise ValueError(f"{field_name} must be a finite number")
-        column = {
-            "minimum_activation_gibbs_free_energy_kcal_mol": (
-                MappedReaction.maximum_activation_gibbs_free_energy_kcal_mol
-            ),
-            "maximum_activation_gibbs_free_energy_kcal_mol": (
-                MappedReaction.minimum_activation_gibbs_free_energy_kcal_mol
-            ),
-            "minimum_reaction_gibbs_free_energy_kcal_mol": (
-                MappedReaction.maximum_reaction_gibbs_free_energy_kcal_mol
-            ),
-            "maximum_reaction_gibbs_free_energy_kcal_mol": (
-                MappedReaction.minimum_reaction_gibbs_free_energy_kcal_mol
-            ),
-        }[field_name]
-        comparison = (
-            col(column) >= parsed_value
-            if field_name.startswith("minimum_")
-            else col(column) <= parsed_value
-        )
         mapped_screening_ids = select(col(MappedReaction.logical_reaction_id)).where(
             mapped_reaction_id_is_visible(scope, col(MappedReaction.id)),
-            comparison,
+        )
+        profile_kwargs: dict[str, Any] = {}
+        if field_name.startswith("minimum_activation"):
+            profile_kwargs["minimum_activation_gibbs_free_energy_kcal_mol"] = parsed_value
+        elif field_name.startswith("maximum_activation"):
+            profile_kwargs["maximum_activation_gibbs_free_energy_kcal_mol"] = parsed_value
+        elif field_name.startswith("minimum_reaction"):
+            profile_kwargs["minimum_reaction_gibbs_free_energy_kcal_mol"] = parsed_value
+        else:
+            profile_kwargs["maximum_reaction_gibbs_free_energy_kcal_mol"] = parsed_value
+        mapped_screening_ids = mapped_screening_ids.where(
+            mapped_reaction_has_thermodynamic_profile(
+                scope,
+                col(MappedReaction.id),
+                **profile_kwargs,
+            )
         )
         return col(LogicalReaction.id).in_(mapped_screening_ids)
     if field_name in {"minimum_mapped_reaction_count", "maximum_mapped_reaction_count"}:
@@ -829,9 +912,22 @@ def _mapped_reaction_summary(
     reactant_product_changed: bool | None = None,
     reaction_smarts_match: bool | None = None,
     similarity_score: float | None = None,
+    thermodynamic_bounds: tuple[
+        float | None,
+        float | None,
+        float | None,
+        float | None,
+    ] | None = None,
     minimum_reaction_gibbs_free_energy_kcal_mol: float | None = None,
     maximum_reaction_gibbs_free_energy_kcal_mol: float | None = None,
 ) -> MappedReactionSummary:
+    if thermodynamic_bounds is None:
+        thermodynamic_bounds = (
+            path.minimum_activation_gibbs_free_energy_kcal_mol,
+            path.maximum_activation_gibbs_free_energy_kcal_mol,
+            path.minimum_reaction_gibbs_free_energy_kcal_mol,
+            path.maximum_reaction_gibbs_free_energy_kcal_mol,
+        )
     return MappedReactionSummary(
         id=_required_uuid(path.id, "MappedReaction"),
         logical_reaction_id=path.logical_reaction_id,
@@ -846,16 +942,16 @@ def _mapped_reaction_summary(
         reaction_smarts_match=reaction_smarts_match,
         similarity_score=similarity_score,
         minimum_activation_gibbs_free_energy_kcal_mol=(
-            path.minimum_activation_gibbs_free_energy_kcal_mol
+            thermodynamic_bounds[0]
         ),
         maximum_activation_gibbs_free_energy_kcal_mol=(
-            path.maximum_activation_gibbs_free_energy_kcal_mol
+            thermodynamic_bounds[1]
         ),
         minimum_reaction_gibbs_free_energy_kcal_mol=(
-            path.minimum_reaction_gibbs_free_energy_kcal_mol
+            thermodynamic_bounds[2]
         ),
         maximum_reaction_gibbs_free_energy_kcal_mol=(
-            path.maximum_reaction_gibbs_free_energy_kcal_mol
+            thermodynamic_bounds[3]
         ),
     )
 
@@ -1039,8 +1135,9 @@ def _artifact_summary(
     artifact: ArtifactFile,
     *,
     running_time_seconds: float | None = None,
+    include_derived_metadata: bool = True,
 ) -> ArtifactSummary:
-    ingestion = artifact.ingestion
+    ingestion = artifact.ingestion if include_derived_metadata else None
     return ArtifactSummary(
         id=_required_uuid(artifact.id, "ArtifactFile"),
         project_id=artifact.project_id,
@@ -1060,7 +1157,7 @@ def _artifact_summary(
         transition_state_frame_count=(
             ingestion.transition_state_frame_count if ingestion is not None else None
         ),
-        running_time_seconds=running_time_seconds,
+        running_time_seconds=(running_time_seconds if include_derived_metadata else None),
         ingestion_error_code=ingestion.error_code if ingestion is not None else None,
         ingestion_error_message=ingestion.error_message if ingestion is not None else None,
     )
@@ -1103,9 +1200,9 @@ class ArtifactQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def list_artifacts(
         cls,
+        project_id: UUID,
         artifact_id: UUID | None = None,
         artifact_kind: ArtifactKind | None = None,
-        project_id: UUID | None = None,
         content_sha256: str | None = None,
         storage_status: StorageStatus | None = None,
         ingestion_status: ArtifactIngestionStatus | None = None,
@@ -1118,18 +1215,23 @@ class ArtifactQueryService(UseCaseService):  # type: ignore[misc]
     ) -> ArtifactPage:
         """List artifact catalogue entries without exposing RustFS credentials."""
 
+        scope = await query_visibility_scope(ProjectPermission.ARTIFACT_READ, project_id=project_id)
+        include_derived_metadata = scope.unrestricted or scope.requested_project_permitted
         latest_running_time = (
-            select(col(ParseRevision.running_time_seconds))
-            .where(col(ParseRevision.artifact_file_id) == col(ArtifactFile.id))
-            .order_by(
-                col(ParseRevision.revision_number).desc(),
-                col(ParseRevision.id).desc(),
+            (
+                select(col(ParseRevision.running_time_seconds))
+                .where(col(ParseRevision.artifact_file_id) == col(ArtifactFile.id))
+                .order_by(
+                    col(ParseRevision.revision_number).desc(),
+                    col(ParseRevision.id).desc(),
+                )
+                .limit(1)
+                .correlate(ArtifactFile)
+                .scalar_subquery()
             )
-            .limit(1)
-            .correlate(ArtifactFile)
-            .scalar_subquery()
-            .label("running_time_seconds")
-        )
+            if include_derived_metadata
+            else literal(None)
+        ).label("running_time_seconds")
         artifact_sort_fields = {
             "created_at": col(ArtifactFile.created_at),
             "original_filename": col(ArtifactFile.original_filename),
@@ -1148,13 +1250,12 @@ class ArtifactQueryService(UseCaseService):  # type: ignore[misc]
             raise ValueError("cursor pagination only supports created_at descending order")
 
         count_statement = sqlmodel_select(func.count()).select_from(ArtifactFile)
-        statement = sqlmodel_select(ArtifactFile, latest_running_time).options(
-            joinedload(cast(Any, ArtifactFile.ingestion))
-        )
+        statement = sqlmodel_select(ArtifactFile, latest_running_time)
+        if include_derived_metadata:
+            statement = statement.options(joinedload(cast(Any, ArtifactFile.ingestion)))
         active_criterion = col(ArtifactFile.storage_status) != StorageStatus.RETIRED
         count_statement = count_statement.where(active_criterion)
         statement = statement.where(active_criterion)
-        scope = await query_visibility_scope(ProjectPermission.ARTIFACT_READ, project_id=project_id)
         visibility_criterion = scope.artifact_predicate()
         count_statement = count_statement.where(visibility_criterion)
         statement = statement.where(visibility_criterion)
@@ -1173,15 +1274,18 @@ class ArtifactQueryService(UseCaseService):  # type: ignore[misc]
                 count_statement = count_statement.where(criterion)
                 statement = statement.where(criterion)
         if ingestion_status is not None:
-            criterion = (
-                select(literal(1))
-                .select_from(ArtifactIngestion)
-                .where(
-                    col(ArtifactIngestion.artifact_file_id) == col(ArtifactFile.id),
-                    col(ArtifactIngestion.status) == ingestion_status,
+            if not include_derived_metadata:
+                criterion = false()
+            else:
+                criterion = (
+                    select(literal(1))
+                    .select_from(ArtifactIngestion)
+                    .where(
+                        col(ArtifactIngestion.artifact_file_id) == col(ArtifactFile.id),
+                        col(ArtifactIngestion.status) == ingestion_status,
+                    )
+                    .exists()
                 )
-                .exists()
-            )
             count_statement = count_statement.where(criterion)
             statement = statement.where(criterion)
         if original_filename_contains is not None:
@@ -1220,33 +1324,51 @@ class ArtifactQueryService(UseCaseService):  # type: ignore[misc]
         )
         return ArtifactPage(
             items=[
-                _artifact_summary(artifact, running_time_seconds=running_time_seconds)
+                _artifact_summary(
+                    artifact,
+                    running_time_seconds=running_time_seconds,
+                    include_derived_metadata=include_derived_metadata,
+                )
                 for artifact, running_time_seconds in artifact_rows
             ],
             page=PageInfo(total=total, limit=limit, offset=offset, next_cursor=next_cursor),
         )
 
     @query  # type: ignore[untyped-decorator]
-    async def get_artifact(cls, artifact_id: UUID) -> ArtifactSummary | None:
-        scope = await query_visibility_scope(ProjectPermission.ARTIFACT_READ)
-        latest_running_time = (
-            select(col(ParseRevision.running_time_seconds))
-            .where(col(ParseRevision.artifact_file_id) == col(ArtifactFile.id))
-            .order_by(
-                col(ParseRevision.revision_number).desc(),
-                col(ParseRevision.id).desc(),
-            )
-            .limit(1)
-            .correlate(ArtifactFile)
-            .scalar_subquery()
-            .label("running_time_seconds")
+    async def get_artifact(
+        cls,
+        project_id: UUID,
+        artifact_id: UUID,
+    ) -> ArtifactSummary | None:
+        scope = await query_visibility_scope(
+            ProjectPermission.ARTIFACT_READ,
+            project_id=project_id,
         )
+        include_derived_metadata = scope.unrestricted or scope.requested_project_permitted
+        latest_running_time = (
+            (
+                select(col(ParseRevision.running_time_seconds))
+                .where(col(ParseRevision.artifact_file_id) == col(ArtifactFile.id))
+                .order_by(
+                    col(ParseRevision.revision_number).desc(),
+                    col(ParseRevision.id).desc(),
+                )
+                .limit(1)
+                .correlate(ArtifactFile)
+                .scalar_subquery()
+            )
+            if include_derived_metadata
+            else literal(None)
+        ).label("running_time_seconds")
         async with session_factory() as session:
+            artifact_statement = sqlmodel_select(ArtifactFile, latest_running_time)
+            if include_derived_metadata:
+                artifact_statement = artifact_statement.options(
+                    joinedload(cast(Any, ArtifactFile.ingestion))
+                )
             row = (
                 await session.exec(
-                    sqlmodel_select(ArtifactFile, latest_running_time)
-                    .options(joinedload(cast(Any, ArtifactFile.ingestion)))
-                    .where(
+                    artifact_statement.where(
                         col(ArtifactFile.id) == artifact_id,
                         scope.artifact_predicate(),
                     )
@@ -1255,7 +1377,11 @@ class ArtifactQueryService(UseCaseService):  # type: ignore[misc]
         if row is None:
             return None
         artifact, running_time_seconds = row
-        return _artifact_summary(artifact, running_time_seconds=running_time_seconds)
+        return _artifact_summary(
+            artifact,
+            running_time_seconds=running_time_seconds,
+            include_derived_metadata=include_derived_metadata,
+        )
 
 
 def molecular_formula_range_predicates(
@@ -1291,6 +1417,7 @@ class MolecularFormulaQueryService(UseCaseService):  # type: ignore[misc]
         cls,
         minimum_counts: list[int | None],
         maximum_counts: list[int | None],
+        project_id: UUID,
         limit: PageLimit = 50,
         offset: PageOffset = 0,
     ) -> MolecularFormulaPage:
@@ -1298,7 +1425,10 @@ class MolecularFormulaQueryService(UseCaseService):  # type: ignore[misc]
             minimum_counts=minimum_counts,
             maximum_counts=maximum_counts,
         )
+        scope = await query_visibility_scope(project_id=project_id)
         predicates = molecular_formula_range_predicates(ranges)
+        if not scope.unrestricted:
+            predicates.append(formula_id_is_visible(scope, col(MolecularFormula.id)))
         count_statement = (
             sqlmodel_select(func.count()).select_from(MolecularFormula).where(*predicates)
         )
@@ -1334,12 +1464,13 @@ class MolecularTopologyQueryService(UseCaseService):  # type: ignore[misc]
     async def list_visible_topologies(
         cls,
         *,
+        project_id: UUID,
         limit: PageLimit = 50,
         offset: PageOffset = 0,
     ) -> MolecularTopologySearchPage:
         """Page through visible topologies without opening unfiltered structure search."""
 
-        scope = await query_visibility_scope()
+        scope = await query_visibility_scope(project_id=project_id)
         predicates = (
             [] if scope.unrestricted else [topology_id_is_visible(scope, col(MolecularTopology.id))]
         )
@@ -1409,7 +1540,7 @@ class MolecularTopologyQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def search_topologies(
         cls,
-        project_id: UUID | None = None,
+        project_id: UUID,
         topology_id: UUID | None = None,
         formula_id: UUID | None = None,
         formula_composition_hash: str | None = None,
@@ -1808,7 +1939,7 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def list_logical_reactions(
         cls,
-        project_id: UUID | None = None,
+        project_id: UUID,
         topology_id: UUID | None = None,
         reaction_key: str | None = None,
         label: str | None = None,
@@ -1910,7 +2041,9 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
         predicates: list[Any] = [logical_reaction_id_is_visible(scope, col(LogicalReaction.id))]
         if topology_id is not None:
             predicates.append(
-                col(LogicalReaction.id).in_(_logical_reaction_ids_for_topology(topology_id))
+                col(LogicalReaction.id).in_(
+                    _logical_reaction_ids_for_topology(topology_id, project_id=project_id)
+                )
             )
         if reaction_key is not None:
             predicates.append(col(LogicalReaction.reaction_key) == reaction_key)
@@ -2025,48 +2158,26 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             mapped_screening_ids = select(col(MappedReaction.logical_reaction_id)).where(
                 mapped_reaction_id_is_visible(scope, col(MappedReaction.id)),
             )
-            if minimum_activation_gibbs_free_energy_kcal_mol is not None:
-                mapped_screening_ids = mapped_screening_ids.where(
-                    col(MappedReaction.maximum_activation_gibbs_free_energy_kcal_mol)
-                    >= minimum_activation_gibbs_free_energy_kcal_mol
+            mapped_screening_ids = mapped_screening_ids.where(
+                mapped_reaction_has_thermodynamic_profile(
+                    scope,
+                    col(MappedReaction.id),
+                    minimum_activation_gibbs_free_energy_kcal_mol=(
+                        minimum_activation_gibbs_free_energy_kcal_mol
+                    ),
+                    maximum_activation_gibbs_free_energy_kcal_mol=(
+                        maximum_activation_gibbs_free_energy_kcal_mol
+                    ),
+                    minimum_reaction_gibbs_free_energy_kcal_mol=(
+                        minimum_reaction_gibbs_free_energy_kcal_mol
+                    ),
+                    maximum_reaction_gibbs_free_energy_kcal_mol=(
+                        maximum_reaction_gibbs_free_energy_kcal_mol
+                    ),
+                    has_activation_gibbs_free_energy=bool(has_activation_gibbs_free_energy),
+                    has_reaction_gibbs_free_energy=bool(has_reaction_gibbs_free_energy),
                 )
-            if maximum_activation_gibbs_free_energy_kcal_mol is not None:
-                mapped_screening_ids = mapped_screening_ids.where(
-                    col(MappedReaction.minimum_activation_gibbs_free_energy_kcal_mol)
-                    <= maximum_activation_gibbs_free_energy_kcal_mol
-                )
-            if minimum_reaction_gibbs_free_energy_kcal_mol is not None:
-                mapped_screening_ids = mapped_screening_ids.where(
-                    col(MappedReaction.maximum_reaction_gibbs_free_energy_kcal_mol)
-                    >= minimum_reaction_gibbs_free_energy_kcal_mol
-                )
-            if maximum_reaction_gibbs_free_energy_kcal_mol is not None:
-                mapped_screening_ids = mapped_screening_ids.where(
-                    col(MappedReaction.minimum_reaction_gibbs_free_energy_kcal_mol)
-                    <= maximum_reaction_gibbs_free_energy_kcal_mol
-                )
-            if has_activation_gibbs_free_energy:
-                mapped_screening_ids = mapped_screening_ids.where(
-                    or_(
-                        col(MappedReaction.minimum_activation_gibbs_free_energy_kcal_mol).is_not(
-                            None
-                        ),
-                        col(MappedReaction.maximum_activation_gibbs_free_energy_kcal_mol).is_not(
-                            None
-                        ),
-                    )
-                )
-            if has_reaction_gibbs_free_energy:
-                mapped_screening_ids = mapped_screening_ids.where(
-                    or_(
-                        col(MappedReaction.minimum_reaction_gibbs_free_energy_kcal_mol).is_not(
-                            None
-                        ),
-                        col(MappedReaction.maximum_reaction_gibbs_free_energy_kcal_mol).is_not(
-                            None
-                        ),
-                    )
-                )
+            )
             predicates.append(col(LogicalReaction.id).in_(mapped_screening_ids))
         if minimum_mapped_reaction_count is not None or maximum_mapped_reaction_count is not None:
             mapped_count = _mapped_reaction_count_expression(scope)
@@ -2183,7 +2294,11 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                         .where(
                             col(LogicalReactionParticipant.logical_reaction_id).in_(
                                 page_reaction_ids
-                            )
+                            ),
+                            topology_id_is_visible(
+                                scope,
+                                col(LogicalReactionParticipant.topology_id),
+                            ),
                         )
                         .order_by(
                             col(LogicalReactionParticipant.logical_reaction_id),
@@ -2242,6 +2357,10 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                             col(MappedReaction.logical_reaction_id).in_(page_reaction_ids),
                             col(MappedReactionNode.role) == "transition_state",
                             mapped_reaction_id_is_visible(scope, col(MappedReaction.id)),
+                            geometry_id_is_visible(
+                                scope,
+                                col(MappedReactionNodeGeometry.geometry_id),
+                            ),
                             geometry_has_thermodynamic_property_predicate(
                                 col(MappedReactionNodeGeometry.geometry_id)
                             ),
@@ -2264,21 +2383,39 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                         select(
                             col(MappedReaction.logical_reaction_id),
                             func.min(
-                                col(MappedReaction.minimum_activation_gibbs_free_energy_kcal_mol)
+                                col(
+                                    MappedReactionThermodynamicProfile.activation_gibbs_free_energy_kcal_mol
+                                )
                             ),
                             func.max(
-                                col(MappedReaction.maximum_activation_gibbs_free_energy_kcal_mol)
+                                col(
+                                    MappedReactionThermodynamicProfile.activation_gibbs_free_energy_kcal_mol
+                                )
                             ),
                             func.min(
-                                col(MappedReaction.minimum_reaction_gibbs_free_energy_kcal_mol)
+                                col(
+                                    MappedReactionThermodynamicProfile.reaction_gibbs_free_energy_kcal_mol
+                                )
                             ),
                             func.max(
-                                col(MappedReaction.maximum_reaction_gibbs_free_energy_kcal_mol)
+                                col(
+                                    MappedReactionThermodynamicProfile.reaction_gibbs_free_energy_kcal_mol
+                                )
                             ),
+                        )
+                        .select_from(MappedReactionThermodynamicProfile)
+                        .join(
+                            MappedReaction,
+                            col(MappedReaction.id)
+                            == col(MappedReactionThermodynamicProfile.mapped_reaction_id),
                         )
                         .where(
                             col(MappedReaction.logical_reaction_id).in_(page_reaction_ids),
                             mapped_reaction_id_is_visible(scope, col(MappedReaction.id)),
+                            thermodynamic_profile_is_visible(
+                                scope,
+                                MappedReactionThermodynamicProfile,
+                            ),
                         )
                         .group_by(col(MappedReaction.logical_reaction_id))
                     )
@@ -2343,8 +2480,8 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def get_logical_reaction(
         cls,
+        project_id: UUID,
         logical_reaction_id: UUID,
-        project_id: UUID | None = None,
     ) -> LogicalReactionDetail | None:
         """Get one logical reaction with topology participants and mapped reactions."""
 
@@ -2373,7 +2510,11 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                         )
                         .where(
                             col(LogicalReactionParticipant.logical_reaction_id)
-                            == logical_reaction_id
+                            == logical_reaction_id,
+                            topology_id_is_visible(
+                                scope,
+                                col(LogicalReactionParticipant.topology_id),
+                            ),
                         )
                         .order_by(
                             col(LogicalReactionParticipant.side),
@@ -2396,26 +2537,83 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                 .scalars()
                 .all()
             )
-        path_minima = [
-            path.minimum_activation_gibbs_free_energy_kcal_mol
+            path_ids = [path.id for path in paths if path.id is not None]
+            profile_bounds_by_mapped_id: dict[
+                UUID, tuple[float | None, float | None, float | None, float | None]
+            ] = {}
+            if path_ids:
+                profile_bounds_by_mapped_id = {
+                    mapped_id: (
+                        float(minimum_activation) if minimum_activation is not None else None,
+                        float(maximum_activation) if maximum_activation is not None else None,
+                        float(minimum_reaction) if minimum_reaction is not None else None,
+                        float(maximum_reaction) if maximum_reaction is not None else None,
+                    )
+                    for (
+                        mapped_id,
+                        minimum_activation,
+                        maximum_activation,
+                        minimum_reaction,
+                        maximum_reaction,
+                    ) in (
+                        await session.execute(
+                            select(
+                                col(MappedReactionThermodynamicProfile.mapped_reaction_id),
+                                func.min(
+                                    col(
+                                        MappedReactionThermodynamicProfile.activation_gibbs_free_energy_kcal_mol
+                                    )
+                                ),
+                                func.max(
+                                    col(
+                                        MappedReactionThermodynamicProfile.activation_gibbs_free_energy_kcal_mol
+                                    )
+                                ),
+                                func.min(
+                                    col(
+                                        MappedReactionThermodynamicProfile.reaction_gibbs_free_energy_kcal_mol
+                                    )
+                                ),
+                                func.max(
+                                    col(
+                                        MappedReactionThermodynamicProfile.reaction_gibbs_free_energy_kcal_mol
+                                    )
+                                ),
+                            )
+                            .select_from(MappedReactionThermodynamicProfile)
+                            .join(
+                                MappedReaction,
+                                col(MappedReaction.id)
+                                == col(MappedReactionThermodynamicProfile.mapped_reaction_id),
+                            )
+                            .where(
+                                col(MappedReactionThermodynamicProfile.mapped_reaction_id).in_(
+                                    path_ids
+                                ),
+                                mapped_reaction_id_is_visible(scope, col(MappedReaction.id)),
+                                thermodynamic_profile_is_visible(
+                                    scope,
+                                    MappedReactionThermodynamicProfile,
+                                ),
+                            )
+                            .group_by(
+                                col(MappedReactionThermodynamicProfile.mapped_reaction_id)
+                            )
+                        )
+                    ).all()
+                    if isinstance(mapped_id, UUID)
+                }
+        profile_bounds = [
+            profile_bounds_by_mapped_id.get(
+                _required_uuid(path.id, "MappedReaction"),
+                (None, None, None, None),
+            )
             for path in paths
-            if path.minimum_activation_gibbs_free_energy_kcal_mol is not None
         ]
-        path_maxima = [
-            path.maximum_activation_gibbs_free_energy_kcal_mol
-            for path in paths
-            if path.maximum_activation_gibbs_free_energy_kcal_mol is not None
-        ]
-        reaction_path_minima = [
-            path.minimum_reaction_gibbs_free_energy_kcal_mol
-            for path in paths
-            if path.minimum_reaction_gibbs_free_energy_kcal_mol is not None
-        ]
-        reaction_path_maxima = [
-            path.maximum_reaction_gibbs_free_energy_kcal_mol
-            for path in paths
-            if path.maximum_reaction_gibbs_free_energy_kcal_mol is not None
-        ]
+        path_minima = [bounds[0] for bounds in profile_bounds if bounds[0] is not None]
+        path_maxima = [bounds[1] for bounds in profile_bounds if bounds[1] is not None]
+        reaction_path_minima = [bounds[2] for bounds in profile_bounds if bounds[2] is not None]
+        reaction_path_maxima = [bounds[3] for bounds in profile_bounds if bounds[3] is not None]
         summary = _reaction_summary(
             reaction,
             mapped_reaction_count=len(paths),
@@ -2451,6 +2649,10 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                 _mapped_reaction_summary(
                     path,
                     reactant_product_changed=summary.reactant_product_changed,
+                    thermodynamic_bounds=profile_bounds_by_mapped_id.get(
+                        _required_uuid(path.id, "MappedReaction"),
+                        (None, None, None, None),
+                    ),
                 )
                 for path in paths
             ],
@@ -2463,7 +2665,7 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def list_mapped_reactions(
         cls,
-        project_id: UUID | None = None,
+        project_id: UUID,
         logical_reaction_id: UUID | None = None,
         topology_id: UUID | None = None,
         geometry_id: UUID | None = None,
@@ -2578,25 +2780,29 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
             minimum_name="minimum_reaction_gibbs_free_energy_kcal_mol",
             maximum_name="maximum_reaction_gibbs_free_energy_kcal_mol",
         )
-        if minimum_activation_gibbs_free_energy_kcal_mol is not None:
+        if (
+            minimum_activation_gibbs_free_energy_kcal_mol is not None
+            or maximum_activation_gibbs_free_energy_kcal_mol is not None
+            or minimum_reaction_gibbs_free_energy_kcal_mol is not None
+            or maximum_reaction_gibbs_free_energy_kcal_mol is not None
+        ):
             predicates.append(
-                col(MappedReaction.maximum_activation_gibbs_free_energy_kcal_mol)
-                >= minimum_activation_gibbs_free_energy_kcal_mol
-            )
-        if maximum_activation_gibbs_free_energy_kcal_mol is not None:
-            predicates.append(
-                col(MappedReaction.minimum_activation_gibbs_free_energy_kcal_mol)
-                <= maximum_activation_gibbs_free_energy_kcal_mol
-            )
-        if minimum_reaction_gibbs_free_energy_kcal_mol is not None:
-            predicates.append(
-                col(MappedReaction.maximum_reaction_gibbs_free_energy_kcal_mol)
-                >= minimum_reaction_gibbs_free_energy_kcal_mol
-            )
-        if maximum_reaction_gibbs_free_energy_kcal_mol is not None:
-            predicates.append(
-                col(MappedReaction.minimum_reaction_gibbs_free_energy_kcal_mol)
-                <= maximum_reaction_gibbs_free_energy_kcal_mol
+                mapped_reaction_has_thermodynamic_profile(
+                    scope,
+                    col(MappedReaction.id),
+                    minimum_activation_gibbs_free_energy_kcal_mol=(
+                        minimum_activation_gibbs_free_energy_kcal_mol
+                    ),
+                    maximum_activation_gibbs_free_energy_kcal_mol=(
+                        maximum_activation_gibbs_free_energy_kcal_mol
+                    ),
+                    minimum_reaction_gibbs_free_energy_kcal_mol=(
+                        minimum_reaction_gibbs_free_energy_kcal_mol
+                    ),
+                    maximum_reaction_gibbs_free_energy_kcal_mol=(
+                        maximum_reaction_gibbs_free_energy_kcal_mol
+                    ),
+                )
             )
         if node_role is not None:
             predicates.append(
@@ -2779,6 +2985,74 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
                 )
             total = int((await session.execute(count_statement)).scalar_one())
             rows = (await session.execute(statement)).all()
+            page_mapped_ids = [
+                reaction.id for reaction, *_values in rows if reaction.id is not None
+            ]
+            profile_bounds_by_mapped_id: dict[
+                UUID, tuple[float | None, float | None, float | None, float | None]
+            ] = {}
+            if page_mapped_ids:
+                profile_bounds_by_mapped_id = {
+                    mapped_id: (
+                        float(minimum_activation) if minimum_activation is not None else None,
+                        float(maximum_activation) if maximum_activation is not None else None,
+                        float(minimum_reaction) if minimum_reaction is not None else None,
+                        float(maximum_reaction) if maximum_reaction is not None else None,
+                    )
+                    for (
+                        mapped_id,
+                        minimum_activation,
+                        maximum_activation,
+                        minimum_reaction,
+                        maximum_reaction,
+                    ) in (
+                        await session.execute(
+                            select(
+                                col(MappedReactionThermodynamicProfile.mapped_reaction_id),
+                                func.min(
+                                    col(
+                                        MappedReactionThermodynamicProfile.activation_gibbs_free_energy_kcal_mol
+                                    )
+                                ),
+                                func.max(
+                                    col(
+                                        MappedReactionThermodynamicProfile.activation_gibbs_free_energy_kcal_mol
+                                    )
+                                ),
+                                func.min(
+                                    col(
+                                        MappedReactionThermodynamicProfile.reaction_gibbs_free_energy_kcal_mol
+                                    )
+                                ),
+                                func.max(
+                                    col(
+                                        MappedReactionThermodynamicProfile.reaction_gibbs_free_energy_kcal_mol
+                                    )
+                                ),
+                            )
+                            .select_from(MappedReactionThermodynamicProfile)
+                            .join(
+                                MappedReaction,
+                                col(MappedReaction.id)
+                                == col(MappedReactionThermodynamicProfile.mapped_reaction_id),
+                            )
+                            .where(
+                                col(MappedReactionThermodynamicProfile.mapped_reaction_id).in_(
+                                    page_mapped_ids
+                                ),
+                                mapped_reaction_id_is_visible(scope, col(MappedReaction.id)),
+                                thermodynamic_profile_is_visible(
+                                    scope,
+                                    MappedReactionThermodynamicProfile,
+                                ),
+                            )
+                            .group_by(
+                                col(MappedReactionThermodynamicProfile.mapped_reaction_id)
+                            )
+                        )
+                    ).all()
+                    if isinstance(mapped_id, UUID)
+                }
         return MappedReactionPage(
             items=[
                 _mapped_reaction_summary(
@@ -2794,6 +3068,10 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
                         if similarity_score_value is not None
                         else None
                     ),
+                    thermodynamic_bounds=profile_bounds_by_mapped_id.get(
+                        _required_uuid(reaction.id, "MappedReaction"),
+                        (None, None, None, None),
+                    ),
                 )
                 for (
                     reaction,
@@ -2808,8 +3086,8 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def get_mapped_reaction(
         cls,
+        project_id: UUID,
         mapped_reaction_id: UUID,
-        project_id: UUID | None = None,
     ) -> MappedReactionDetail | None:
         """Get one mapped reaction whose nodes reference Geometry-owned calculations."""
 
@@ -2855,7 +3133,21 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
                         col(MappedReactionParticipant.concrete_topology_id)
                         == col(concrete_topology.id),
                     )
-                    .where(col(MappedReactionParticipant.mapped_reaction_id) == mapped_reaction_id)
+                    .where(
+                        col(MappedReactionParticipant.mapped_reaction_id)
+                        == mapped_reaction_id,
+                        topology_id_is_visible(
+                            scope,
+                            col(LogicalReactionParticipant.topology_id),
+                        ),
+                        or_(
+                            col(MappedReactionParticipant.concrete_topology_id).is_(None),
+                            topology_id_is_visible(
+                                scope,
+                                col(concrete_topology.id),
+                            ),
+                        ),
+                    )
                     .order_by(
                         col(MappedReactionParticipant.side),
                         col(MappedReactionParticipant.template_index),
@@ -2866,7 +3158,23 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
                 (
                     await session.execute(
                         select(MappedReactionNode)
-                        .where(col(MappedReactionNode.mapped_reaction_id) == mapped_reaction_id)
+                        .where(
+                            col(MappedReactionNode.mapped_reaction_id) == mapped_reaction_id,
+                            select(1)
+                            .select_from(MappedReactionNodeGeometry)
+                            .where(
+                                col(MappedReactionNodeGeometry.mapped_reaction_node_id)
+                                == col(MappedReactionNode.id),
+                                geometry_id_is_visible(
+                                    scope,
+                                    col(MappedReactionNodeGeometry.geometry_id),
+                                ),
+                                geometry_has_thermodynamic_property_predicate(
+                                    col(MappedReactionNodeGeometry.geometry_id)
+                                ),
+                            )
+                            .exists(),
+                        )
                         .order_by(col(MappedReactionNode.node_index))
                     )
                 )
@@ -3001,12 +3309,58 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
                 (
                     await session.execute(
                         select(MappedReactionEdge)
-                        .where(col(MappedReactionEdge.mapped_reaction_id) == mapped_reaction_id)
+                        .where(
+                            col(MappedReactionEdge.mapped_reaction_id) == mapped_reaction_id,
+                            col(MappedReactionEdge.source_node_id).in_(node_ids),
+                            col(MappedReactionEdge.target_node_id).in_(node_ids),
+                            or_(
+                                col(MappedReactionEdge.transition_state_node_id).is_(None),
+                                col(MappedReactionEdge.transition_state_node_id).in_(node_ids),
+                            ),
+                        )
                         .order_by(col(MappedReactionEdge.edge_key))
                     )
                 )
                 .scalars()
                 .all()
+            )
+            profile_bounds_row = (
+                await session.execute(
+                    select(
+                        func.min(
+                            col(
+                                MappedReactionThermodynamicProfile.activation_gibbs_free_energy_kcal_mol
+                            )
+                        ),
+                        func.max(
+                            col(
+                                MappedReactionThermodynamicProfile.activation_gibbs_free_energy_kcal_mol
+                            )
+                        ),
+                        func.min(
+                            col(
+                                MappedReactionThermodynamicProfile.reaction_gibbs_free_energy_kcal_mol
+                            )
+                        ),
+                        func.max(
+                            col(
+                                MappedReactionThermodynamicProfile.reaction_gibbs_free_energy_kcal_mol
+                            )
+                        ),
+                    )
+                    .select_from(MappedReactionThermodynamicProfile)
+                    .where(
+                        col(MappedReactionThermodynamicProfile.mapped_reaction_id)
+                        == mapped_reaction_id,
+                        thermodynamic_profile_is_visible(
+                            scope,
+                            MappedReactionThermodynamicProfile,
+                        ),
+                    )
+                )
+            ).one()
+            profile_bounds = tuple(
+                float(value) if value is not None else None for value in profile_bounds_row
             )
 
         mappings_by_geometry: dict[UUID, list[NodeGeometryMappingView]] = {
@@ -3112,6 +3466,7 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
                     ) in participant_rows
                 ]
             ),
+            thermodynamic_bounds=profile_bounds,
         )
         return MappedReactionDetail(
             **summary.model_dump(),
@@ -3173,7 +3528,7 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def list_calculation_frames(
         cls,
-        project_id: UUID | None = None,
+        project_id: UUID,
         artifact_file_id: UUID | None = None,
         geometry_id: UUID | None = None,
         topology_id: UUID | None = None,
@@ -3205,7 +3560,8 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
         # stored on MolecularTopology.  Keep this query column-limited.
         statement = _frame_select(lightweight=True)
         scope = await query_visibility_scope(project_id=project_id)
-        visibility_criterion = scope.artifact_predicate()
+        visibility_criterion = scope.derived_artifact_predicate()
+        frame_visibility_criterion = frame_id_is_visible(scope, col(CalculationFrame.id))
         count_statement = (
             select(func.count())
             .select_from(CalculationFrame)
@@ -3217,7 +3573,7 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
                 ArtifactFile,
                 col(ParseRevision.artifact_file_id) == col(ArtifactFile.id),
             )
-            .where(visibility_criterion)
+            .where(visibility_criterion, frame_visibility_criterion)
         )
         predicates: list[Any] = []
         if artifact_file_id is not None:
@@ -3319,7 +3675,7 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
         # selective artifact/revision/frame join order.  The revision-level
         # visibility expression is equivalent here and would introduce a
         # broad semi-join over all visible frames.
-        statement = statement.where(visibility_criterion, *predicates)
+        statement = statement.where(visibility_criterion, frame_visibility_criterion, *predicates)
         count_statement = count_statement.where(*predicates)
         if artifact_file_id is not None:
             # A file has one stable filename.  Ordering directly by the
@@ -3342,7 +3698,13 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
                 # merely to populate the catalogue totals panel.
                 total_statement = select(
                     func.coalesce(func.sum(ProjectGeometryCatalog.frame_count), 0)
-                ).where(col(ProjectGeometryCatalog.project_id) == scope.requested_project_id)
+                ).join(
+                    Geometry,
+                    col(Geometry.id) == col(ProjectGeometryCatalog.geometry_id),
+                ).where(
+                    col(ProjectGeometryCatalog.project_id) == scope.requested_project_id,
+                    col(Geometry.project_id) == scope.requested_project_id,
+                )
                 total = int((await session.execute(total_statement)).scalar_one())
             else:
                 total = int((await session.execute(count_statement)).scalar_one())
@@ -3355,8 +3717,8 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def get_calculation_frame(
         cls,
+        project_id: UUID,
         frame_id: UUID,
-        project_id: UUID | None = None,
     ) -> CalculationFrameDetail | None:
         """Get one frame with scalar results and array metadata, excluding array payloads."""
 
@@ -3376,10 +3738,21 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
             topology_derivation = (
                 await session.execute(
                     select(MolecularTopologyDerivation).where(
-                        col(MolecularTopologyDerivation.id) == frame.topology_derivation_id
+                        col(MolecularTopologyDerivation.id) == frame.topology_derivation_id,
+                        topology_derivation_id_is_visible(
+                            scope,
+                            col(MolecularTopologyDerivation.id),
+                        ),
                     )
                 )
-            ).scalar_one()
+            ).scalar_one_or_none()
+            # A frame can survive in the raw source chain while its derived
+            # topology has been quarantined during historical isolation. The
+            # frame visibility predicate should normally reject that row; keep
+            # this endpoint fail-closed if a legacy/correlated query ever
+            # reaches this branch instead of turning it into a 500.
+            if topology_derivation is None:
+                return None
             energy = (
                 await session.execute(
                     select(FrameEnergyResult).where(col(FrameEnergyResult.frame_id) == frame_id)
@@ -3441,7 +3814,13 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
                 (
                     await session.execute(
                         select(TransitionStateEndpoint)
-                        .where(col(TransitionStateEndpoint.calculation_frame_id) == frame_id)
+                        .where(
+                            col(TransitionStateEndpoint.calculation_frame_id) == frame_id,
+                            topology_id_is_visible(
+                                scope,
+                                col(TransitionStateEndpoint.topology_id),
+                            ),
+                        )
                         .order_by(col(TransitionStateEndpoint.direction))
                     )
                 )

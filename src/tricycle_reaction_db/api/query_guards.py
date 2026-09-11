@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections.abc import Awaitable, Callable
+from typing import Any
 
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, HTTPException, Request, status
+from graphql import parse
+from graphql.language import ast
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, Response
 
 from tricycle_reaction_db.application.query_cost import (
     QueryBudgetExceeded,
+    QueryProjectScopeRequired,
     QueryRateLimitExceeded,
     QueryStatementTimeout,
     query_error_payload,
@@ -26,6 +31,13 @@ from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.core.observability import RATE_LIMIT_DECISIONS, UPLOAD_OPERATIONS
 
 logger = logging.getLogger(__name__)
+
+_PROJECT_SCOPE_EXEMPT_SERVICES = frozenset(
+    {
+        "SystemService",
+        "StorageGarbageCollectionQueryService",
+    }
+)
 
 _EXEMPT_PATHS = {
     "/docs",
@@ -76,6 +88,146 @@ def _is_read_request(method: str, path: str) -> bool:
         path in {"/graphql", "/graphql-playground"}
         or (path.startswith("/api/") and "_query_service/" in path)
     )
+
+
+def project_scoped_use_case_methods(app_config: Any) -> dict[str, frozenset[str]]:
+    """Return use-case fields that must receive an explicit project scope.
+
+    The generated NexusX routes and GraphQL schema are transport adapters over
+    the same service classes.  Keeping this check derived from the service
+    signatures makes adding a new project-owned query fail at application
+    startup if it forgets to expose ``project_id``.
+    """
+
+    scoped: dict[str, frozenset[str]] = {}
+    for service_cls in app_config.services:
+        service_name = service_cls.__name__
+        methods = getattr(service_cls, "__use_case_methods__", {})
+        if service_name in _PROJECT_SCOPE_EXEMPT_SERVICES:
+            continue
+        scoped_methods: set[str] = set()
+        for method_name, metadata in methods.items():
+            method_kind = metadata.get("kind", "query") if isinstance(metadata, dict) else "query"
+            if method_kind not in {"query", "mutation"}:
+                continue
+            method = getattr(service_cls, method_name)
+            parameters = inspect.signature(method).parameters
+            project_parameter = parameters.get("project_id")
+            if project_parameter is None:
+                raise RuntimeError(
+                    f"{service_name}.{method_name} must expose project_id for a project-scoped "
+                    "NexusX operation"
+                )
+            if project_parameter.default is not inspect.Parameter.empty:
+                raise RuntimeError(
+                    f"{service_name}.{method_name}.project_id must be required for a "
+                    "project-scoped NexusX operation"
+                )
+            scoped_methods.add(method_name)
+        if scoped_methods:
+            scoped[service_name] = frozenset(scoped_methods)
+    return scoped
+
+
+async def require_project_query_scope(request: Request) -> None:
+    """Reject generated REST operations whose JSON body omits ``project_id``."""
+
+    try:
+        payload = await request.json()
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="project_id is required for project-owned queries",
+        ) from error
+    if not isinstance(payload, dict):
+        missing_project_scope = True
+    else:
+        project_id = payload.get("project_id")
+        missing_project_scope = project_id is None or project_id == ""
+    if missing_project_scope:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="project_id is required for project-owned queries",
+        )
+
+
+def _selected_graphql_fields(
+    selection_set: ast.SelectionSetNode | None,
+    fragments: dict[str, ast.FragmentDefinitionNode],
+    active_fragments: frozenset[str] = frozenset(),
+) -> list[ast.FieldNode]:
+    if selection_set is None:
+        return []
+    fields: list[ast.FieldNode] = []
+    for selection in selection_set.selections:
+        if isinstance(selection, ast.FieldNode):
+            fields.append(selection)
+        elif isinstance(selection, ast.InlineFragmentNode):
+            fields.extend(
+                _selected_graphql_fields(
+                    selection.selection_set,
+                    fragments,
+                    active_fragments,
+                )
+            )
+        elif isinstance(selection, ast.FragmentSpreadNode):
+            fragment_name = selection.name.value
+            if fragment_name in active_fragments:
+                continue
+            fragment = fragments.get(fragment_name)
+            if fragment is not None:
+                fields.extend(
+                    _selected_graphql_fields(
+                        fragment.selection_set,
+                        fragments,
+                        active_fragments | {fragment_name},
+                    )
+                )
+    return fields
+
+
+def validate_graphql_project_scope(
+    query: str,
+    scoped_methods: dict[str, frozenset[str]],
+) -> None:
+    """Require a literal, non-null project_id on every project-owned root field."""
+
+    try:
+        document = parse(query)
+    except Exception:
+        # The normal GraphQL executor will return the syntax error.  This
+        # guard must not turn malformed documents into an HTTP 500.
+        return
+    fragments = {
+        definition.name.value: definition
+        for definition in document.definitions
+        if isinstance(definition, ast.FragmentDefinitionNode)
+    }
+    for definition in document.definitions:
+        if not isinstance(definition, ast.OperationDefinitionNode):
+            continue
+        for service_field in _selected_graphql_fields(definition.selection_set, fragments):
+            service_name = service_field.name.value
+            method_names = scoped_methods.get(service_name)
+            if method_names is None:
+                continue
+            for method_field in _selected_graphql_fields(service_field.selection_set, fragments):
+                method_name = method_field.name.value
+                if method_name not in method_names:
+                    continue
+                project_argument = next(
+                    (
+                        argument
+                        for argument in method_field.arguments
+                        if argument.name.value == "project_id"
+                    ),
+                    None,
+                )
+                if project_argument is None or isinstance(
+                    project_argument.value,
+                    (ast.NullValueNode, ast.VariableNode),
+                ):
+                    raise QueryProjectScopeRequired()
 
 
 class QueryRateLimitMiddleware(BaseHTTPMiddleware):
@@ -222,6 +374,16 @@ def install_query_guards(application: FastAPI) -> None:
             content={"detail": query_error_payload(error)},
         )
 
+    @application.exception_handler(QueryProjectScopeRequired)
+    async def query_project_scope_error(
+        _request: Request,
+        error: QueryProjectScopeRequired,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"detail": query_error_payload(error)},
+        )
+
     @application.exception_handler(QueryStatementTimeout)
     async def query_timeout_error(
         request: Request,
@@ -246,4 +408,10 @@ def install_query_guards(application: FastAPI) -> None:
         )
 
 
-__all__ = ["QueryRateLimitMiddleware", "install_query_guards"]
+__all__ = [
+    "QueryRateLimitMiddleware",
+    "install_query_guards",
+    "project_scoped_use_case_methods",
+    "require_project_query_scope",
+    "validate_graphql_project_scope",
+]

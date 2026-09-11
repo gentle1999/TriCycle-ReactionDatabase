@@ -45,6 +45,7 @@ from tricycle_reaction_db.core.chemistry_config import (
 from tricycle_reaction_db.db.models import (
     CalculationFrame,
     Geometry,
+    LogicalReaction,
     LogicalReactionParticipant,
     MappedReaction,
     MappedReactionEdge,
@@ -94,6 +95,13 @@ class ReconciliationBatchCache:
     new_node_geometry_ids: set[UUID] = field(default_factory=set)
     thermodynamic_property_geometry_ids: set[UUID] = field(default_factory=set)
     affected_reactions_by_id: dict[UUID, MappedReaction] = field(default_factory=dict)
+
+
+def _require_project_owner(entity: Any, *, label: str) -> UUID:
+    project_id = getattr(entity, "project_id", None)
+    if not isinstance(project_id, UUID):
+        raise ValueError(f"{label} must have a project_id before reaction reconciliation")
+    return project_id
 
 
 def _endpoint_spec(
@@ -592,31 +600,56 @@ def share_mapped_reaction_evidence(
     transfer.  Its transition-state geometry and every endpoint geometry whose
     concrete topology is unchanged are therefore facts about the same physical
     calculation and must be reused, not rediscovered from the target topology.
-    Geometry rows remain globally shared; only the mapping-specific node and
-    node-geometry bindings are created for the target reaction.
+    Geometry rows are project-local derived data; only the physical raw
+    ArtifactFile object may be reused across projects. The mapping-specific
+    node and node-geometry bindings are created inside the target project.
     """
 
     source_id = _require_id(source_mapped_reaction, label="source MappedReaction")
     target_id = _require_id(target_mapped_reaction, label="target MappedReaction")
     if source_id == target_id:
         return ()
+    source_project_id = _require_project_owner(
+        source_mapped_reaction,
+        label="source MappedReaction",
+    )
+    target_project_id = _require_project_owner(
+        target_mapped_reaction,
+        label="target MappedReaction",
+    )
+    if source_project_id != target_project_id:
+        raise ValueError("reaction evidence cannot cross project boundaries")
 
     target_participants = {
         (participant.side, participant.template_index): participant
         for participant in session.exec(
-            select(MappedReactionParticipant).where(
-                MappedReactionParticipant.mapped_reaction_id == target_id
+            select(MappedReactionParticipant)
+            .join(
+                MappedReaction,
+                col(MappedReactionParticipant.mapped_reaction_id) == col(MappedReaction.id),
+            )
+            .where(
+                col(MappedReactionParticipant.mapped_reaction_id) == target_id,
+                col(MappedReaction.project_id) == target_project_id,
             )
         ).all()
     }
     source_rows = session.exec(
         select(MappedReactionNode, MappedReactionNodeGeometry, Geometry)
         .join(
+            MappedReaction,
+            col(MappedReactionNode.mapped_reaction_id) == col(MappedReaction.id),
+        )
+        .join(
             MappedReactionNodeGeometry,
             col(MappedReactionNodeGeometry.mapped_reaction_node_id) == col(MappedReactionNode.id),
         )
         .join(Geometry, col(MappedReactionNodeGeometry.geometry_id) == col(Geometry.id))
-        .where(MappedReactionNode.mapped_reaction_id == source_id)
+        .where(
+            col(MappedReactionNode.mapped_reaction_id) == source_id,
+            col(MappedReaction.project_id) == source_project_id,
+            col(Geometry.project_id) == source_project_id,
+        )
         .order_by(
             col(MappedReactionNode.node_index),
             col(MappedReactionNodeGeometry.component_key),
@@ -625,9 +658,15 @@ def share_mapped_reaction_evidence(
     ).all()
     source_transition_state_exists = bool(
         session.exec(
-            select(MappedReactionNode.id).where(
+            select(MappedReactionNode.id)
+            .join(
+                MappedReaction,
+                col(MappedReactionNode.mapped_reaction_id) == col(MappedReaction.id),
+            )
+            .where(
                 MappedReactionNode.mapped_reaction_id == source_id,
                 MappedReactionNode.role == MappedReactionNodeRole.TRANSITION_STATE,
+                MappedReaction.project_id == source_project_id,
             )
         ).first()
     )
@@ -789,6 +828,7 @@ def reconcile_geometry_with_reactions(
 ) -> ReactionGeometryReconciliationResult:
     """Bind a converged Geometry to every matching reaction endpoint."""
 
+    project_id = _require_project_owner(geometry, label="Geometry")
     thermodynamic_property_verified = False
     if eligibility is None:
         eligibility = (
@@ -806,8 +846,24 @@ def reconcile_geometry_with_reactions(
             participants = tuple(
                 session.exec(
                     select(MappedReactionParticipant)
-                    .join(LogicalReactionParticipant)
+                    .join(
+                        LogicalReactionParticipant,
+                        col(MappedReactionParticipant.logical_reaction_participant_id)
+                        == col(LogicalReactionParticipant.id),
+                    )
+                    .join(
+                        LogicalReaction,
+                        col(LogicalReactionParticipant.logical_reaction_id)
+                        == col(LogicalReaction.id),
+                    )
+                    .join(
+                        MappedReaction,
+                        col(MappedReactionParticipant.mapped_reaction_id)
+                        == col(MappedReaction.id),
+                    )
                     .where(
+                        col(MappedReaction.project_id) == project_id,
+                        col(LogicalReaction.project_id) == project_id,
                         or_(
                             col(MappedReactionParticipant.concrete_topology_id)
                             == geometry.topology_id,
@@ -824,8 +880,23 @@ def reconcile_geometry_with_reactions(
         participants = tuple(
             session.exec(
                 select(MappedReactionParticipant)
-                .join(LogicalReactionParticipant)
+                .join(
+                    LogicalReactionParticipant,
+                    col(MappedReactionParticipant.logical_reaction_participant_id)
+                    == col(LogicalReactionParticipant.id),
+                )
+                .join(
+                    LogicalReaction,
+                    col(LogicalReactionParticipant.logical_reaction_id)
+                    == col(LogicalReaction.id),
+                )
+                .join(
+                    MappedReaction,
+                    col(MappedReactionParticipant.mapped_reaction_id) == col(MappedReaction.id),
+                )
                 .where(
+                    col(MappedReaction.project_id) == project_id,
+                    col(LogicalReaction.project_id) == project_id,
                     or_(
                         col(MappedReactionParticipant.concrete_topology_id) == geometry.topology_id,
                         and_(
@@ -848,6 +919,8 @@ def reconcile_geometry_with_reactions(
             mapped_reaction = session.get(MappedReaction, participant.mapped_reaction_id)
             if mapped_reactions_by_id is not None and mapped_reaction is not None:
                 mapped_reactions_by_id[participant.mapped_reaction_id] = mapped_reaction
+        if mapped_reaction is None or mapped_reaction.project_id != project_id:
+            continue
         bindings = _bind_participant_geometry(
             session,
             participant=participant,
@@ -882,6 +955,8 @@ def reconcile_geometry_with_reactions(
 def reconcilable_geometry_ids(
     session: Session,
     geometry_ids: set[UUID],
+    *,
+    project_id: UUID,
 ) -> set[UUID]:
     """Ask PostgreSQL which flushed Geometry rows need reaction reconciliation."""
 
@@ -890,6 +965,7 @@ def reconcilable_geometry_ids(
     rows = session.exec(
         select(Geometry.id).where(
             col(Geometry.id).in_(geometry_ids),
+            col(Geometry.project_id) == project_id,
             _reaction_geometry_predicate(),
         )
     ).all()
@@ -900,6 +976,7 @@ def preload_reconciliation_context(
     session: Session,
     topology_ids: set[UUID],
     *,
+    project_id: UUID,
     participants_by_topology: dict[UUID, tuple[MappedReactionParticipant, ...]],
     mapped_reactions_by_id: dict[UUID, MappedReaction],
     cache: ReconciliationBatchCache | None = None,
@@ -915,8 +992,22 @@ def preload_reconciliation_context(
             LogicalReactionParticipant.topology_id,
         )
         .options(selectinload(cast(Any, MappedReactionParticipant.logical_reaction_participant)))
-        .join(LogicalReactionParticipant)
+        .join(
+            LogicalReactionParticipant,
+            col(MappedReactionParticipant.logical_reaction_participant_id)
+            == col(LogicalReactionParticipant.id),
+        )
+        .join(
+            LogicalReaction,
+            col(LogicalReactionParticipant.logical_reaction_id) == col(LogicalReaction.id),
+        )
+        .join(
+            MappedReaction,
+            col(MappedReactionParticipant.mapped_reaction_id) == col(MappedReaction.id),
+        )
         .where(
+            col(MappedReaction.project_id) == project_id,
+            col(LogicalReaction.project_id) == project_id,
             or_(
                 col(MappedReactionParticipant.concrete_topology_id).in_(topology_ids),
                 and_(
@@ -940,7 +1031,10 @@ def preload_reconciliation_context(
         reaction_ids.add(participant.mapped_reaction_id)
     if reaction_ids:
         mapped_reactions = session.exec(
-            select(MappedReaction).where(col(MappedReaction.id).in_(reaction_ids))
+            select(MappedReaction).where(
+                col(MappedReaction.id).in_(reaction_ids),
+                col(MappedReaction.project_id) == project_id,
+            )
         ).all()
         mapped_reactions_by_id.update(
             {
@@ -955,7 +1049,14 @@ def preload_reconciliation_context(
     nodes = session.exec(
         select(MappedReactionNode)
         .options(selectinload(cast(Any, MappedReactionNode.mapped_reaction)))
-        .where(col(MappedReactionNode.mapped_reaction_id).in_(reaction_ids))
+        .join(
+            MappedReaction,
+            col(MappedReactionNode.mapped_reaction_id) == col(MappedReaction.id),
+        )
+        .where(
+            col(MappedReactionNode.mapped_reaction_id).in_(reaction_ids),
+            col(MappedReaction.project_id) == project_id,
+        )
     ).all()
     nodes_by_reaction: dict[UUID, list[MappedReactionNode]] = {
         reaction_id: [] for reaction_id in reaction_ids
@@ -1015,9 +1116,16 @@ def reconcile_mapped_reaction_with_geometries(
 ) -> ReactionGeometryReconciliationResult:
     """Backfill participant Geometries backed by converged optimizations."""
     mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
+    project_id = _require_project_owner(mapped_reaction, label="MappedReaction")
     participants = session.exec(
-        select(MappedReactionParticipant).where(
-            MappedReactionParticipant.mapped_reaction_id == mapped_reaction_id
+        select(MappedReactionParticipant)
+        .join(
+            MappedReaction,
+            col(MappedReactionParticipant.mapped_reaction_id) == col(MappedReaction.id),
+        )
+        .where(
+            col(MappedReactionParticipant.mapped_reaction_id) == mapped_reaction_id,
+            col(MappedReaction.project_id) == project_id,
         )
     ).all()
     node_geometries: list[MappedReactionNodeGeometry] = []
@@ -1032,6 +1140,7 @@ def reconcile_mapped_reaction_with_geometries(
         geometries = session.exec(
             select(Geometry).where(
                 Geometry.topology_id == topology_id,
+                col(Geometry.project_id) == project_id,
                 _reaction_geometry_predicate(),
             )
         ).all()
@@ -1234,6 +1343,9 @@ def bind_transition_state_frame(
 
     if not is_transition_state_frame_eligible(calculation_frame.frame_role):
         raise ValueError("TS calculations require a single-point or terminal frame")
+    project_id = _require_project_owner(mapped_reaction, label="MappedReaction")
+    if calculation_frame.geometry.project_id != project_id:
+        raise ValueError("TS calculation Geometry crosses the mapped reaction project boundary")
 
     transition_state_node = ensure_transition_state_path(
         session,
@@ -1272,6 +1384,7 @@ def bind_transition_state_frame(
         select(MappedReaction).where(
             MappedReaction.logical_reaction_id == mapped_reaction.logical_reaction_id,
             MappedReaction.id != mapped_reaction_id,
+            MappedReaction.project_id == project_id,
         )
     ).all()
     for sibling_reaction in sibling_reactions:

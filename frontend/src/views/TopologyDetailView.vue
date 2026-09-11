@@ -25,9 +25,13 @@ const reactionOffset = ref(0);
 const transitionStateReactionOffset = ref(0);
 
 const topologyQuery = useQuery({
-  queryKey: computed(() => ["topology-detail", topologyId.value]),
-  queryFn: ({ signal }) => api.topology(topologyId.value ?? "", signal),
-  enabled: computed(() => topologyId.value !== null),
+  queryKey: computed(() => ["topology-detail", { id: topologyId.value, projectId: currentProjectId.value }]),
+  queryFn: ({ signal }) => api.topology(
+    topologyId.value ?? "",
+    { projectId: currentProjectId.value ?? undefined },
+    signal,
+  ),
+  enabled: computed(() => topologyId.value !== null && currentProjectId.value !== null),
   staleTime: 60_000,
 });
 
@@ -255,7 +259,7 @@ onBeforeUnmount(() => {
     <template v-else>
       <section class="topology-overview">
         <div class="topology-structure-panel">
-          <ChemDoodleMolecule :topology-id="topology.id" :label="topology.canonical_isomeric_smiles ?? undefined" :height="360" />
+          <ChemDoodleMolecule :topology-id="topology.id" :project-id="currentProjectId ?? undefined" :label="topology.canonical_isomeric_smiles ?? undefined" :height="360" />
           <div class="topology-smiles-row">
             <code
               class="topology-smiles-value"

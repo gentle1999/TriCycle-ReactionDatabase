@@ -265,6 +265,16 @@ class ArtifactIngestion(SQLModel, table=True):
             "status = 'pending' OR completed_at IS NOT NULL",
             name="ck_artifact_ingestion_terminal_timestamp",
         ),
+        CheckConstraint(
+            "processing_attempt_count >= 0",
+            name="ck_artifact_ingestion_processing_attempts_nonnegative",
+        ),
+        Index(
+            "ix_artifact_ingestion_recovery_lease",
+            "status",
+            "worker_lease_expires_at",
+            "started_at",
+        ),
     )
 
     id: UUID | None = uuid_primary_key_field()
@@ -296,6 +306,15 @@ class ArtifactIngestion(SQLModel, table=True):
         default=None,
         sa_column=Column(DateTime(timezone=True), nullable=True),
     )
+    processing_attempt_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default="0"),
+    )
+    worker_lease_id: UUID | None = Field(default=None)
+    worker_lease_expires_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), nullable=True),
+    )
     error_code: str | None = Field(default=None, max_length=128)
     error_message: str | None = Field(default=None, sa_type=Text)
     parser_metadata: dict[str, Any] = Field(
@@ -311,7 +330,7 @@ class ArtifactIngestion(SQLModel, table=True):
 
 
 class TransitionStateInference(SQLModel, table=True):
-    """Provenance linking one MolOP-confirmed TS frame to a shared reaction."""
+    """Provenance linking one MolOP-confirmed TS frame to a project reaction."""
 
     __tablename__ = "transition_state_inference"  # pyright: ignore[reportAssignmentType]
     __table_args__ = (

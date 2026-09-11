@@ -1,5 +1,7 @@
 """Idempotent persistence and lifecycle checks for artifact records."""
 
+from uuid import UUID
+
 from sqlmodel import Session, select
 
 from tricycle_reaction_db.application.dtos.artifacts import (
@@ -58,13 +60,21 @@ def persist_artifact_file(session: Session, record: ArtifactFileRecord) -> Artif
 def persist_calculation_protocol(
     session: Session,
     record: CalculationProtocolRecord,
+    *,
+    project_id: UUID,
 ) -> CalculationProtocol:
-    _acquire_identity_locks(session, ("calculation_protocol", record.protocol_hash))
+    _acquire_identity_locks(
+        session,
+        ("calculation_protocol", project_id, record.protocol_hash),
+    )
     protocol = session.exec(
-        select(CalculationProtocol).where(CalculationProtocol.protocol_hash == record.protocol_hash)
+        select(CalculationProtocol).where(
+            CalculationProtocol.project_id == project_id,
+            CalculationProtocol.protocol_hash == record.protocol_hash,
+        )
     ).first()
     if protocol is None:
-        protocol = CalculationProtocol(**record.model_dump())
+        protocol = CalculationProtocol(project_id=project_id, **record.model_dump())
         _flush_shared_entity(session, protocol, label="CalculationProtocol")
     return protocol
 

@@ -7,6 +7,7 @@ import { loadChemRenderer } from "@/chem/useChemRenderer";
 const props = withDefaults(
   defineProps<{
     topologyId: string;
+    projectId?: string;
     atomMapNumbers?: number[];
     label?: string;
     height?: number;
@@ -88,7 +89,11 @@ async function renderMolecule(): Promise<void> {
       viewer.styles.atoms_implicitHydrogens_2D = false;
     }
 
-    const molfile = await getTopologyMolfile(props.topologyId, requestController.signal);
+    const molfile = await getTopologyMolfile(
+      props.topologyId,
+      props.projectId,
+      requestController.signal,
+    );
     const molecule = ChemDoodle.readMOL(molfile);
     if (!molecule) throw new Error("molfile 无法解析");
     const molCharges = readMolCharges(molfile);
@@ -134,7 +139,7 @@ onMounted(() => {
 });
 
 watch(
-  [() => props.topologyId, () => props.atomMapNumbers],
+  [() => props.topologyId, () => props.projectId, () => props.atomMapNumbers],
   () => void renderMolecule(),
 );
 

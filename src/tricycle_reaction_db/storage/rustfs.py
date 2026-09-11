@@ -49,6 +49,7 @@ class RustFSSettings(BaseSettings):
     ca_bundle: str | None = None
     connect_timeout_seconds: int = Field(default=5, ge=1, le=60)
     read_timeout_seconds: int = Field(default=30, ge=1, le=300)
+    max_pool_connections: int = Field(default=32, ge=1, le=256)
 
     @field_validator("endpoint_url")
     @classmethod
@@ -187,6 +188,7 @@ class RustFSObjectStore:
                 signature_version="s3v4",
                 connect_timeout=settings.connect_timeout_seconds,
                 read_timeout=settings.read_timeout_seconds,
+                max_pool_connections=settings.max_pool_connections,
                 retries={"mode": "standard", "max_attempts": 3},
                 s3={"addressing_style": "path"},
                 proxies={} if local_endpoint else None,
@@ -420,16 +422,25 @@ class RustFSObjectStore:
                 VersionId=version_id,
             )
 
-    def iter_objects(self, *, prefix: str) -> Iterator[ListedObject]:
-        """Yield every object under ``prefix`` using ListObjectsV2 pagination."""
+    def iter_objects(self, *, prefix: str, page_size: int = 1000) -> Iterator[ListedObject]:
+        """Yield every object under ``prefix`` using ListObjectsV2 pagination.
+
+        RustFS installations with a large content-addressed bucket can time
+        out while constructing a very large page.  Callers that shard an
+        inventory may request a smaller page without changing the default
+        behavior used by storage GC.
+        """
 
         clean_prefix = prefix.strip("/")
         if not clean_prefix:
             raise ValueError("prefix must not be empty")
+        if page_size < 1 or page_size > 1000:
+            raise ValueError("page_size must be between 1 and 1000")
         paginator = self._client.get_paginator("list_objects_v2")
         for page in paginator.paginate(
             Bucket=self.settings.bucket,
             Prefix=f"{clean_prefix}/",
+            PaginationConfig={"PageSize": page_size},
         ):
             for item in page.get("Contents", []):
                 key = item.get("Key")

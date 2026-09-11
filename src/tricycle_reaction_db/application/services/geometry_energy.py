@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
@@ -148,6 +149,47 @@ def _frame_order(frame: CalculationFrame) -> tuple[str, str]:
     )
 
 
+_SOURCE_EQUIVALENCE_TOLERANCE = 1e-8
+
+
+def _candidate_observations_are_equivalent(
+    candidates: Sequence[GeometryEnergyCandidate],
+) -> bool:
+    """Allow deterministic de-duplication only for numerically equal sources."""
+
+    if len(candidates) < 2:
+        return True
+
+    def observation(candidate: GeometryEnergyCandidate) -> tuple[float | None, ...]:
+        frame = candidate.frame
+        thermochemistry = candidate.thermochemistry
+        return (
+            frame.selected_energy_hartree,
+            thermochemistry.zpe_correction_hartree if thermochemistry is not None else None,
+            thermochemistry.thermal_energy_correction_hartree
+            if thermochemistry is not None
+            else None,
+            thermochemistry.thermal_enthalpy_correction_hartree
+            if thermochemistry is not None
+            else None,
+            thermochemistry.thermal_gibbs_correction_hartree
+            if thermochemistry is not None
+            else None,
+            thermochemistry.entropy_cal_mol_k if thermochemistry is not None else None,
+        )
+
+    reference = observation(candidates[0])
+    for candidate in candidates[1:]:
+        current = observation(candidate)
+        for expected, actual in zip(reference, current, strict=True):
+            if expected is None or actual is None:
+                if expected != actual:
+                    return False
+            elif abs(float(expected) - float(actual)) > _SOURCE_EQUIVALENCE_TOLERANCE:
+                return False
+    return True
+
+
 def _select_candidate(
     candidates: Sequence[GeometryEnergyCandidate],
     *,
@@ -178,6 +220,13 @@ def _select_candidate(
     )
     if len(top_levels) != 1:
         return "ambiguous", None, top_candidate_ids
+    protocol_identities = {
+        _protocol_selection_identity(candidate.protocol) for candidate in non_dominated
+    }
+    if len(protocol_identities) != 1:
+        return "ambiguous", None, top_candidate_ids
+    if not _candidate_observations_are_equivalent(non_dominated):
+        return "ambiguous", None, top_candidate_ids
     return (
         "selected",
         min(non_dominated, key=lambda item: _frame_order(item.frame)),
@@ -198,6 +247,28 @@ def _protocol_identity(protocol: CalculationProtocol | None) -> tuple[object, ..
         protocol.dispersion_model,
         protocol.solvation_model,
         protocol.solvent,
+    )
+
+
+def _protocol_selection_identity(protocol: CalculationProtocol | None) -> tuple[object, ...] | None:
+    """Return the complete protocol identity used for scientific equivalence."""
+
+    if protocol is None:
+        return None
+    software = getattr(protocol.qm_software, "value", protocol.qm_software)
+    normalized_spec = json.dumps(
+        protocol.normalized_spec,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return (
+        software,
+        protocol.qm_software_version,
+        protocol.spec_schema_version,
+        tuple(protocol.task_requests),
+        normalized_spec,
+        *_protocol_identity(protocol),
     )
 
 

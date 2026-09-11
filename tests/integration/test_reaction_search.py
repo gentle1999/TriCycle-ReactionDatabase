@@ -18,6 +18,7 @@ from tricycle_reaction_db.application.services import queries as query_services
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import LogicalReaction, MappedReaction
 from tricycle_reaction_db.domain.enums import MappedReactionKind, ReactionClass
+from tricycle_reaction_db.domain.identity import SYSTEM_PROJECT_ID
 
 pytestmark = [
     pytest.mark.integration,
@@ -54,11 +55,13 @@ def test_reaction_smarts_and_similarity_use_indexed_rdkit_projections(
             ):
                 logical_hash = _hash(f"logical-{index}")
                 logical = LogicalReaction(
+                    project_id=SYSTEM_PROJECT_ID,
                     reaction_key=f"reaction-search-{uuid4()}",
                     reaction_class=ReactionClass.CYCLOADDITION,
                     reaction_hash=logical_hash,
                 )
                 mapped = MappedReaction(
+                    project_id=SYSTEM_PROJECT_ID,
                     logical_reaction=logical,
                     mapped_reaction_key=f"path-{index}",
                     mapped_reaction_kind=MappedReactionKind.OTHER,
@@ -76,6 +79,7 @@ def test_reaction_smarts_and_similarity_use_indexed_rdkit_projections(
             # return the logical reaction only once.
             session.add(
                 MappedReaction(
+                    project_id=SYSTEM_PROJECT_ID,
                     logical_reaction_id=logical_ids[0],
                     mapped_reaction_key="path-0-alternate",
                     mapped_reaction_kind=MappedReactionKind.OTHER,
@@ -87,6 +91,7 @@ def test_reaction_smarts_and_similarity_use_indexed_rdkit_projections(
 
         smarts = asyncio.run(
             MappedReactionQueryService.list_mapped_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 reaction_smarts=query_smiles,
                 mapping_hash=mapped_hashes[0],
                 limit=20,
@@ -103,6 +108,7 @@ def test_reaction_smarts_and_similarity_use_indexed_rdkit_projections(
         assert reactant is not None and product is not None
         logical_structure = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 reaction_hash=logical_hashes[0],
                 reactant_mol_block=Chem.MolToMolBlock(reactant),
                 product_mol_block=Chem.MolToMolBlock(product),
@@ -114,6 +120,7 @@ def test_reaction_smarts_and_similarity_use_indexed_rdkit_projections(
 
         logical_mapped_structure = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 reaction_hash=logical_hashes[0],
                 reaction_smarts=query_smiles,
                 limit=20,
@@ -125,6 +132,7 @@ def test_reaction_smarts_and_similarity_use_indexed_rdkit_projections(
 
         logical_mapped_similarity = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 reaction_hash=logical_hashes[0],
                 similarity_reaction_smiles=query_smiles,
                 limit=20,
@@ -136,6 +144,7 @@ def test_reaction_smarts_and_similarity_use_indexed_rdkit_projections(
 
         logical_and = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 filter_expression=json.dumps(
                     {
                         "operator": "and",
@@ -153,6 +162,7 @@ def test_reaction_smarts_and_similarity_use_indexed_rdkit_projections(
 
         logical_or = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 filter_expression=json.dumps(
                     {
                         "operator": "or",
@@ -170,6 +180,7 @@ def test_reaction_smarts_and_similarity_use_indexed_rdkit_projections(
 
         logical_not = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 filter_expression=json.dumps(
                     {
                         "operator": "and",
@@ -192,6 +203,7 @@ def test_reaction_smarts_and_similarity_use_indexed_rdkit_projections(
 
         reactant_only = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 reactant_mol_block=Chem.MolToMolBlock(reactant),
                 limit=200,
                 offset=0,
@@ -201,6 +213,7 @@ def test_reaction_smarts_and_similarity_use_indexed_rdkit_projections(
 
         product_only = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 product_mol_block=Chem.MolToMolBlock(product),
                 limit=200,
                 offset=0,
@@ -210,6 +223,7 @@ def test_reaction_smarts_and_similarity_use_indexed_rdkit_projections(
 
         similar = asyncio.run(
             MappedReactionQueryService.list_mapped_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 similarity_reaction_smiles=query_smiles,
                 minimum_similarity=0.999,
                 limit=20,
@@ -225,6 +239,7 @@ def test_reaction_smarts_and_similarity_use_indexed_rdkit_projections(
         with pytest.raises(QueryBudgetExceeded, match="candidate set exceeds the 1-row limit"):
             asyncio.run(
                 MappedReactionQueryService.list_mapped_reactions(
+                    project_id=SYSTEM_PROJECT_ID,
                     reaction_smarts=query_smiles,
                     limit=1,
                     offset=0,
@@ -233,6 +248,7 @@ def test_reaction_smarts_and_similarity_use_indexed_rdkit_projections(
 
         indexed_smarts = asyncio.run(
             MappedReactionQueryService.list_mapped_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 reaction_smarts=rare_smiles,
                 limit=1,
                 offset=0,
@@ -242,6 +258,7 @@ def test_reaction_smarts_and_similarity_use_indexed_rdkit_projections(
 
         indexed_threshold = asyncio.run(
             MappedReactionQueryService.list_mapped_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 similarity_reaction_smiles=rare_smiles,
                 minimum_similarity=1.0,
                 limit=1,
@@ -252,6 +269,7 @@ def test_reaction_smarts_and_similarity_use_indexed_rdkit_projections(
 
         nearest = asyncio.run(
             MappedReactionQueryService.list_mapped_reactions(
+                project_id=SYSTEM_PROJECT_ID,
                 similarity_reaction_smiles=rare_smiles,
                 limit=1,
                 offset=0,

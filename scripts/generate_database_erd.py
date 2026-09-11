@@ -25,7 +25,7 @@ from sqlalchemy.sql.sqltypes import Enum, Uuid
 
 from tricycle_reaction_db.db.models import metadata
 
-SCHEMA_REVISION = "0028_restore_mapped_text_id"
+SCHEMA_REVISION = "0037_project_owned_calculation_protocol"
 OUTPUT_PATH = Path(__file__).parents[1] / "docs" / "database-erd.md"
 
 POSTGRESQL_GROUPS = {
@@ -40,6 +40,7 @@ POSTGRESQL_GROUPS = {
         "project_membership",
         "project_invitation",
         "audit_event",
+        "derived_data_isolation_quarantine",
     ),
     "Artifact、解析与计算帧": (
         "artifact_file",
@@ -383,6 +384,11 @@ def _document() -> str:
         "Artifact SHA-256 和大小仍以原始逻辑字节为准。新上传对象按 UTC 小时分区，",
         "上传失败由生命周期 Hook 定点补偿；可选 GC 的水位和运行审计存放 PostgreSQL；",
         "对象是否保留以 ArtifactFile 关系为准。",
+        "跨用户/项目共享边界固定为不可变 ArtifactFile；其解析、帧、化学身份、反应和派生关系",
+        "必须沿同一项目归属访问。无法唯一归属的历史派生行记录在隔离台账中，不进入普通项目查询。",
+        "所有项目派生查询都必须同时带显式 project_id，并由当前认证用户的项目权限缩小结果集；",
+        "缺少 project_id 或无权访问项目时 fail closed。只有原始 ArtifactFile 可作为公共缓存边界，",
+        "且仍按 project_id 过滤，不暴露解析、状态或任何派生元数据。",
         "",
         "## 物理存储边界",
         "",
@@ -449,6 +455,9 @@ def _document() -> str:
         "  `content_sha256` 才是跨后端内容身份，S3 ETag 不替代 SHA-256。",
         "- `artifact_file.project_id/created_by_user_id/visibility` 存在 PostgreSQL；",
         "  `public` 允许匿名列表、预览和下载，`project` 要求有效项目成员权限。",
+        "- Formula、Topology、Geometry、Reaction、TS inference、Calculation 和热力学读取",
+        "  均要求显式 `project_id` 与当前用户的项目权限；同一 hash 只表示内容相似，不能跨",
+        "  项目复用派生身份。",
         "- `external_identity` 只保存外部 OIDC 的 issuer、subject、claims 与本地用户映射；",
         "  本系统不保存密码，用户、组织和项目成员关系均以 PostgreSQL 为权威。",
         "- RustFS object 的上传与 PostgreSQL transaction 不原子提交；",

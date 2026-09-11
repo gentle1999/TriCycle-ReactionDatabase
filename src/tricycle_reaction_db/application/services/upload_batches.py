@@ -39,6 +39,7 @@ from tricycle_reaction_db.db.models import (
 from tricycle_reaction_db.db.session import session_factory
 from tricycle_reaction_db.domain.enums import (
     ArtifactIngestionStatus,
+    ArtifactKind,
     StorageStatus,
     UploadBatchItemStatus,
     UploadBatchStatus,
@@ -99,6 +100,16 @@ class UploadProcessingJob:
     batch_id: UUID
     item_id: UUID
     client_file_id: UUID
+    artifact_file_id: UUID
+    user_id: UUID
+    lease_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class PendingIngestionJob:
+    """A lease for a calculation ingestion left outside the web queue."""
+
+    ingestion_id: UUID
     artifact_file_id: UUID
     user_id: UUID
     lease_id: UUID
@@ -187,12 +198,15 @@ async def _owned_batch(
     batch_id: UUID,
     user_id: UUID,
     *,
+    project_id: UUID | None = None,
     lock: bool = False,
 ) -> UploadBatch:
     statement = select(UploadBatch).where(
         col(UploadBatch.id) == batch_id,
         col(UploadBatch.created_by_user_id) == user_id,
     )
+    if project_id is not None:
+        statement = statement.where(col(UploadBatch.project_id) == project_id)
     if lock:
         statement = statement.with_for_update()
     batch = (await session.exec(statement)).one_or_none()
@@ -314,13 +328,12 @@ class UploadBatchService:
     async def list_batches(
         *,
         user_id: UUID,
-        project_id: UUID | None = None,
+        project_id: UUID,
         limit: int = 25,
         offset: int = 0,
     ) -> UploadBatchPage:
         criteria = [col(UploadBatch.created_by_user_id) == user_id]
-        if project_id is not None:
-            criteria.append(col(UploadBatch.project_id) == project_id)
+        criteria.append(col(UploadBatch.project_id) == project_id)
         count_statement = select(func.count()).select_from(UploadBatch).where(*criteria)
         statement = (
             select(UploadBatch)
@@ -340,22 +353,25 @@ class UploadBatchService:
         )
 
     @staticmethod
-    async def get(batch_id: UUID, *, user_id: UUID) -> UploadBatchView:
+    async def get(batch_id: UUID, *, user_id: UUID, project_id: UUID) -> UploadBatchView:
         async with session_factory() as session:
-            return _batch_view(await _owned_batch(session, batch_id, user_id))
+            return _batch_view(
+                await _owned_batch(session, batch_id, user_id, project_id=project_id)
+            )
 
     @staticmethod
     async def list_items(
         batch_id: UUID,
         *,
         user_id: UUID,
+        project_id: UUID,
         status: UploadBatchItemStatus | None = None,
         updated_after: datetime | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> UploadBatchItemPage:
         async with session_factory() as session:
-            await _owned_batch(session, batch_id, user_id)
+            await _owned_batch(session, batch_id, user_id, project_id=project_id)
             criteria = [col(UploadBatchItem.batch_id) == batch_id]
             if status is not None:
                 criteria.append(col(UploadBatchItem.status) == status)
@@ -1063,6 +1079,123 @@ class UploadBatchService:
                 await session.commit()
             return recovered
 
+    @classmethod
+    async def claim_pending_ingestions(
+        cls,
+        *,
+        limit: int | None = None,
+    ) -> list[PendingIngestionJob]:
+        """Lease old pending ingestions that have no active upload-batch item.
+
+        The legacy single/batch artifact endpoints and the local importer can
+        commit an ``ArtifactFile`` reservation before their process exits.
+        Those rows predate the durable ``UploadBatch`` manifest, so they need a
+        small compatibility queue.  Active web-queue items are excluded here;
+        their own item lease remains the source of truth.
+        """
+
+        settings = get_settings()
+        resolved_limit = limit or settings.upload_worker_concurrency
+        now = datetime.now(UTC)
+        cutoff = now - timedelta(seconds=settings.upload_pending_recovery_seconds)
+        active_upload_item = (
+            select(1)
+            .where(
+                col(UploadBatchItem.artifact_file_id)
+                == col(ArtifactIngestion.artifact_file_id),
+                col(UploadBatchItem.status).in_(
+                    (
+                        UploadBatchItemStatus.UPLOADING,
+                        UploadBatchItemStatus.STAGED,
+                        UploadBatchItemStatus.PROCESSING,
+                    )
+                ),
+            )
+            .exists()
+        )
+        statement = (
+            select(ArtifactIngestion, ArtifactFile)
+            .join(
+                ArtifactFile,
+                col(ArtifactFile.id) == col(ArtifactIngestion.artifact_file_id),
+            )
+            .where(
+                col(ArtifactIngestion.status) == ArtifactIngestionStatus.PENDING,
+                col(ArtifactFile.artifact_kind) == ArtifactKind.CALCULATION_OUTPUT,
+                col(ArtifactFile.storage_status).in_(
+                    (StorageStatus.PENDING, StorageStatus.AVAILABLE)
+                ),
+                or_(
+                    col(ArtifactIngestion.worker_lease_id).is_(None),
+                    col(ArtifactIngestion.worker_lease_expires_at).is_(None),
+                    col(ArtifactIngestion.worker_lease_expires_at) <= now,
+                ),
+                or_(
+                    col(ArtifactIngestion.started_at).is_(None),
+                    col(ArtifactIngestion.started_at) <= cutoff,
+                ),
+                ~active_upload_item,
+            )
+            .order_by(
+                col(ArtifactIngestion.started_at).nulls_first(),
+                col(ArtifactIngestion.id),
+            )
+            .limit(resolved_limit)
+            .with_for_update(skip_locked=True)
+        )
+        jobs: list[PendingIngestionJob] = []
+        async with session_factory() as session:
+            rows = (await session.exec(statement)).all()
+            for ingestion, artifact in rows:
+                ingestion_id = _required_uuid(ingestion.id, "ArtifactIngestion")
+                artifact_id = _required_uuid(artifact.id, "ArtifactFile")
+                lease_id = uuid4()
+                ingestion.processing_attempt_count += 1
+                ingestion.worker_lease_id = lease_id
+                ingestion.worker_lease_expires_at = now + timedelta(
+                    seconds=settings.upload_worker_lease_seconds
+                )
+                ingestion.started_at = now
+                session.add(ingestion)
+                jobs.append(
+                    PendingIngestionJob(
+                        ingestion_id=ingestion_id,
+                        artifact_file_id=artifact_id,
+                        user_id=artifact.created_by_user_id,
+                        lease_id=lease_id,
+                    )
+                )
+            if jobs:
+                await session.commit()
+        return jobs
+
+    @staticmethod
+    async def renew_pending_ingestion_lease(job: PendingIngestionJob) -> bool:
+        """Keep a compatibility-queue ingestion owned while MolOP runs."""
+
+        settings = get_settings()
+        async with session_factory() as session:
+            ingestion = (
+                await session.exec(
+                    select(ArtifactIngestion)
+                    .where(
+                        col(ArtifactIngestion.id) == job.ingestion_id,
+                        col(ArtifactIngestion.artifact_file_id) == job.artifact_file_id,
+                        col(ArtifactIngestion.status) == ArtifactIngestionStatus.PENDING,
+                        col(ArtifactIngestion.worker_lease_id) == job.lease_id,
+                    )
+                    .with_for_update()
+                )
+            ).one_or_none()
+            if ingestion is None:
+                return False
+            ingestion.worker_lease_expires_at = datetime.now(UTC) + timedelta(
+                seconds=settings.upload_worker_lease_seconds
+            )
+            session.add(ingestion)
+            await session.commit()
+            return True
+
     @staticmethod
     async def _recover_items_in_session(
         session: AsyncSession,
@@ -1332,6 +1465,7 @@ class UploadBatchService:
 
 
 __all__ = [
+    "PendingIngestionJob",
     "UploadBatchConflictError",
     "UploadBatchError",
     "UploadBatchLimitError",

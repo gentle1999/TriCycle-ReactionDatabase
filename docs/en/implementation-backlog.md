@@ -5,6 +5,11 @@
 > Historical phased backlog. Status and test counts are valid only at their
 > recorded date; consult current code and tests before planning new work.
 
+> Follow-up recorded 2026-09-10: the [database architecture refactor plan](database-architecture-refactor-plan.md)
+> owns DB-00 through DB-09 priorities, dependencies, migrations, and acceptance.
+> Earlier completion and benchmark records do not establish acceptance of the new
+> source-isolation, effective-revision, or concurrency requirements.
+
 ## Recorded Workstreams
 
 The backlog grouped work into read-side APIs, upload/ingestion closure, domain

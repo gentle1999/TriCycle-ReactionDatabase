@@ -33,7 +33,7 @@ from tricycle_reaction_db.application.services.queries import (
     _required_uuid,
 )
 from tricycle_reaction_db.application.services.query_visibility import (
-    artifact_id_is_visible,
+    derived_artifact_id_is_visible,
     frame_id_is_visible,
     manifest_binding_id_is_visible,
     query_visibility_scope,
@@ -134,6 +134,7 @@ class WorkflowManifestQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def list_workflow_manifests(
         cls,
+        project_id: UUID,
         artifact_file_id: UUID | None = None,
         manifest_key: str | None = None,
         revision: int | None = None,
@@ -144,7 +145,7 @@ class WorkflowManifestQueryService(UseCaseService):  # type: ignore[misc]
         limit: PageLimit = 50,
         offset: PageOffset = 0,
     ) -> WorkflowManifestPage:
-        scope = await query_visibility_scope()
+        scope = await query_visibility_scope(project_id=project_id)
         predicates: list[Any] = [workflow_manifest_id_is_visible(scope, col(WorkflowManifest.id))]
         for field, value in (
             (WorkflowManifest.artifact_file_id, artifact_file_id),
@@ -157,17 +158,25 @@ class WorkflowManifestQueryService(UseCaseService):  # type: ignore[misc]
             if value is not None:
                 predicates.append(col(field) == value)
         if artifact_file_id is not None:
-            predicates.append(artifact_id_is_visible(scope, literal(artifact_file_id)))
+            predicates.append(derived_artifact_id_is_visible(scope, literal(artifact_file_id)))
         if bound_artifact_file_id is not None:
             manifest_ids = select(col(ManifestArtifactBinding.workflow_manifest_id)).where(
                 col(ManifestArtifactBinding.artifact_file_id) == bound_artifact_file_id
             )
             predicates.append(col(WorkflowManifest.id).in_(manifest_ids))
-            predicates.append(artifact_id_is_visible(scope, literal(bound_artifact_file_id)))
+            predicates.append(
+                derived_artifact_id_is_visible(scope, literal(bound_artifact_file_id))
+            )
         binding_count = (
             select(func.count())
             .select_from(ManifestArtifactBinding)
-            .where(col(ManifestArtifactBinding.workflow_manifest_id) == col(WorkflowManifest.id))
+            .where(
+                col(ManifestArtifactBinding.workflow_manifest_id) == col(WorkflowManifest.id),
+                manifest_binding_id_is_visible(
+                    scope,
+                    col(ManifestArtifactBinding.id),
+                ),
+            )
             .scalar_subquery()
         )
         count_statement = select(func.count()).select_from(WorkflowManifest).where(*predicates)
@@ -189,9 +198,10 @@ class WorkflowManifestQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def get_workflow_manifest(
         cls,
+        project_id: UUID,
         workflow_manifest_id: UUID,
     ) -> WorkflowManifestDetail | None:
-        scope = await query_visibility_scope()
+        scope = await query_visibility_scope(project_id=project_id)
         async with session_factory() as session:
             manifest = (
                 await session.execute(
@@ -226,7 +236,13 @@ class WorkflowManifestQueryService(UseCaseService):  # type: ignore[misc]
                         col(ManifestArtifactBinding.workflow_manifest_id),
                         func.count(col(ManifestArtifactBinding.id)),
                     )
-                    .where(col(ManifestArtifactBinding.workflow_manifest_id).in_(revision_ids))
+                    .where(
+                        col(ManifestArtifactBinding.workflow_manifest_id).in_(revision_ids),
+                        manifest_binding_id_is_visible(
+                            scope,
+                            col(ManifestArtifactBinding.id),
+                        ),
+                    )
                     .group_by(col(ManifestArtifactBinding.workflow_manifest_id))
                 )
             ).all()
@@ -237,7 +253,11 @@ class WorkflowManifestQueryService(UseCaseService):  # type: ignore[misc]
                         select(ManifestArtifactBinding)
                         .where(
                             col(ManifestArtifactBinding.workflow_manifest_id)
-                            == workflow_manifest_id
+                            == workflow_manifest_id,
+                            manifest_binding_id_is_visible(
+                                scope,
+                                col(ManifestArtifactBinding.id),
+                            ),
                         )
                         .order_by(col(ManifestArtifactBinding.artifact_key))
                     )
@@ -252,7 +272,11 @@ class WorkflowManifestQueryService(UseCaseService):  # type: ignore[misc]
                             col(ManifestArtifactBinding.workflow_manifest_id)
                             == workflow_manifest_id,
                             col(ManifestArtifactBinding.artifact_file_id).is_not(None),
-                            artifact_id_is_visible(
+                            manifest_binding_id_is_visible(
+                                scope,
+                                col(ManifestArtifactBinding.id),
+                            ),
+                            derived_artifact_id_is_visible(
                                 scope,
                                 col(ManifestArtifactBinding.artifact_file_id),
                             ),
@@ -290,6 +314,7 @@ class WorkflowManifestQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def list_manifest_artifact_bindings(
         cls,
+        project_id: UUID,
         workflow_manifest_id: UUID | None = None,
         artifact_file_id: UUID | None = None,
         reaction_key: str | None = None,
@@ -300,7 +325,7 @@ class WorkflowManifestQueryService(UseCaseService):  # type: ignore[misc]
         limit: PageLimit = 100,
         offset: PageOffset = 0,
     ) -> ManifestArtifactBindingPage:
-        scope = await query_visibility_scope()
+        scope = await query_visibility_scope(project_id=project_id)
         predicates: list[Any] = [
             manifest_binding_id_is_visible(scope, col(ManifestArtifactBinding.id))
         ]
@@ -316,13 +341,16 @@ class WorkflowManifestQueryService(UseCaseService):  # type: ignore[misc]
             if value is not None:
                 predicates.append(col(field) == value)
         if artifact_file_id is not None:
-            predicates.append(artifact_id_is_visible(scope, literal(artifact_file_id)))
+            predicates.append(derived_artifact_id_is_visible(scope, literal(artifact_file_id)))
         count_statement = (
             select(func.count()).select_from(ManifestArtifactBinding).where(*predicates)
         )
         artifact_file_visible = or_(
             col(ManifestArtifactBinding.artifact_file_id).is_(None),
-            artifact_id_is_visible(scope, col(ManifestArtifactBinding.artifact_file_id)),
+            derived_artifact_id_is_visible(
+                scope,
+                col(ManifestArtifactBinding.artifact_file_id),
+            ),
         )
         statement = (
             select(ManifestArtifactBinding, artifact_file_visible.label("artifact_file_visible"))
@@ -348,9 +376,10 @@ class WorkflowManifestQueryService(UseCaseService):  # type: ignore[misc]
     @query  # type: ignore[untyped-decorator]
     async def get_manifest_artifact_binding(
         cls,
+        project_id: UUID,
         binding_id: UUID,
     ) -> ManifestArtifactBindingDetail | None:
-        scope = await query_visibility_scope()
+        scope = await query_visibility_scope(project_id=project_id)
         async with session_factory() as session:
             row = (
                 await session.execute(
@@ -358,7 +387,7 @@ class WorkflowManifestQueryService(UseCaseService):  # type: ignore[misc]
                         ManifestArtifactBinding,
                         or_(
                             col(ManifestArtifactBinding.artifact_file_id).is_(None),
-                            artifact_id_is_visible(
+                            derived_artifact_id_is_visible(
                                 scope,
                                 col(ManifestArtifactBinding.artifact_file_id),
                             ),
@@ -384,6 +413,10 @@ class WorkflowManifestQueryService(UseCaseService):  # type: ignore[misc]
                             == binding.workflow_manifest_id,
                             col(ManifestArtifactBinding.artifact_key)
                             == binding.source_geometry_artifact_key,
+                            manifest_binding_id_is_visible(
+                                scope,
+                                col(ManifestArtifactBinding.id),
+                            ),
                         )
                     )
                 ).scalar_one_or_none()
@@ -396,6 +429,10 @@ class WorkflowManifestQueryService(UseCaseService):  # type: ignore[misc]
                             == binding.workflow_manifest_id,
                             col(ManifestArtifactBinding.source_geometry_artifact_key)
                             == binding.artifact_key,
+                            manifest_binding_id_is_visible(
+                                scope,
+                                col(ManifestArtifactBinding.id),
+                            ),
                         )
                         .order_by(col(ManifestArtifactBinding.artifact_key))
                     )
@@ -626,6 +663,7 @@ class MolecularTopologyDerivationQueryService(UseCaseService):  # type: ignore[m
     @query  # type: ignore[untyped-decorator]
     async def list_topology_derivations(
         cls,
+        project_id: UUID,
         topology_id: UUID | None = None,
         reconstruction_method: str | None = None,
         reconstruction_version: str | None = None,
@@ -634,7 +672,7 @@ class MolecularTopologyDerivationQueryService(UseCaseService):  # type: ignore[m
         limit: PageLimit = 50,
         offset: PageOffset = 0,
     ) -> MolecularTopologyDerivationPage:
-        scope = await query_visibility_scope()
+        scope = await query_visibility_scope(project_id=project_id)
         predicates: list[Any] = [
             topology_derivation_id_is_visible(
                 scope,
@@ -682,9 +720,10 @@ class MolecularTopologyDerivationQueryService(UseCaseService):  # type: ignore[m
     @query  # type: ignore[untyped-decorator]
     async def get_topology_derivation(
         cls,
+        project_id: UUID,
         derivation_id: UUID,
     ) -> MolecularTopologyDerivationDetail | None:
-        scope = await query_visibility_scope()
+        scope = await query_visibility_scope(project_id=project_id)
         async with session_factory() as session:
             row = (
                 await session.execute(

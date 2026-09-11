@@ -19,6 +19,7 @@ from tricycle_reaction_db.application.services._persistence import (
     _acquire_identity_locks,
     _flush_new_entity,
     _new_entity,
+    _project_owner_predicate,
     _require_id,
 )
 from tricycle_reaction_db.application.services.molecular_geometry import (
@@ -310,6 +311,7 @@ def persist_stereo_abstraction(
     specific_topology: MolecularTopology,
     general_topology: MolecularTopology,
     *,
+    project_id: UUID | None = None,
     abstraction_policy_version: str = STEREO_ABSTRACTION_POLICY_VERSION,
     abstraction_metadata: dict[str, Any] | None = None,
 ) -> MolecularTopologyAbstraction:
@@ -317,6 +319,16 @@ def persist_stereo_abstraction(
 
     specific_id = _require_id(specific_topology, label="specific MolecularTopology")
     general_id = _require_id(general_topology, label="general MolecularTopology")
+    specific_project_id = getattr(specific_topology, "project_id", None)
+    general_project_id = getattr(general_topology, "project_id", None)
+    owner_project_id = specific_project_id if project_id is None else project_id
+    if (
+        specific_project_id != owner_project_id
+        or general_project_id != owner_project_id
+    ):
+        raise StereoAbstractionError(
+            "stereo abstraction endpoints must belong to the same project"
+        )
     if specific_id == general_id:
         raise StereoAbstractionError("specific and general topology must be different")
     if not general_topology.is_stereo_abstraction_upstream:
@@ -336,6 +348,7 @@ def persist_stereo_abstraction(
     if general_id in specialized_topology_ids(
         session,
         specific_topology,
+        project_id=owner_project_id,
         abstraction_policy_version=abstraction_policy_version,
     ):
         raise StereoAbstractionError("stereo abstraction edges must form an acyclic graph")
@@ -343,6 +356,7 @@ def persist_stereo_abstraction(
         session,
         (
             "molecular_topology_abstraction",
+            owner_project_id,
             specific_id,
             general_id,
             abstraction_policy_version,
@@ -353,6 +367,10 @@ def persist_stereo_abstraction(
             MolecularTopologyAbstraction.specific_topology_id == specific_id,
             MolecularTopologyAbstraction.general_topology_id == general_id,
             MolecularTopologyAbstraction.abstraction_policy_version == abstraction_policy_version,
+            _project_owner_predicate(
+                MolecularTopologyAbstraction.project_id,
+                owner_project_id,
+            ),
         )
     ).first()
     if existing is not None:
@@ -361,7 +379,8 @@ def persist_stereo_abstraction(
         if not isinstance(pending, MolecularTopologyAbstraction):
             continue
         if (
-            pending.specific_topology_id == specific_id
+            pending.project_id == owner_project_id
+            and pending.specific_topology_id == specific_id
             and pending.general_topology_id == general_id
             and pending.abstraction_policy_version == abstraction_policy_version
         ):
@@ -374,6 +393,7 @@ def persist_stereo_abstraction(
         MolecularTopologyAbstraction,
         specific_topology=specific_topology,
         general_topology=general_topology,
+        project_id=owner_project_id,
         abstraction_policy_version=abstraction_policy_version,
         abstraction_metadata=metadata,
     )
@@ -385,6 +405,7 @@ def find_upstream_topologies(
     session: Session,
     specific_topology: MolecularTopology,
     *,
+    project_id: UUID | None = None,
     abstraction_policy_version: str = STEREO_ABSTRACTION_POLICY_VERSION,
     candidate_topologies: Iterable[MolecularTopology] = (),
 ) -> tuple[MolecularTopology, ...]:
@@ -397,6 +418,8 @@ def find_upstream_topologies(
     """
 
     specific_id = _require_id(specific_topology, label="specific MolecularTopology")
+    specific_project_id = getattr(specific_topology, "project_id", None)
+    owner_project_id = specific_project_id if project_id is None else project_id
     candidates_by_id: dict[UUID, MolecularTopology] = {}
     for candidate in candidate_topologies:
         candidate_id = _require_id(candidate, label="candidate MolecularTopology")
@@ -404,6 +427,7 @@ def find_upstream_topologies(
             candidate_id != specific_id
             and candidate.is_stereo_abstraction_upstream
             and candidate.formula_id == specific_topology.formula_id
+            and getattr(candidate, "project_id", None) == owner_project_id
         ):
             candidates_by_id[candidate_id] = candidate
     for candidate in session.exec(
@@ -413,6 +437,7 @@ def find_upstream_topologies(
             col(MolecularTopology.formal_charge) == specific_topology.formal_charge,
             col(MolecularTopology.is_stereo_abstraction_upstream).is_(True),
             col(MolecularTopology.id) != specific_id,
+            _project_owner_predicate(col(MolecularTopology.project_id), owner_project_id),
         )
     ).all():
         candidate_id = _require_id(candidate, label="candidate MolecularTopology")
@@ -436,6 +461,7 @@ def ensure_topology_upstreams(
     session: Session,
     specific_topology: MolecularTopology,
     *,
+    project_id: UUID | None = None,
     abstraction_policy_version: str = STEREO_ABSTRACTION_POLICY_VERSION,
     candidate_topologies: Iterable[MolecularTopology] = (),
     abstraction_metadata: dict[str, Any] | None = None,
@@ -450,6 +476,7 @@ def ensure_topology_upstreams(
     upstreams = find_upstream_topologies(
         session,
         specific_topology,
+        project_id=project_id,
         abstraction_policy_version=abstraction_policy_version,
         candidate_topologies=candidate_topologies,
     )
@@ -460,6 +487,11 @@ def ensure_topology_upstreams(
             session,
             specific_topology,
             upstream,
+            project_id=(
+                getattr(specific_topology, "project_id", None)
+                if project_id is None
+                else project_id
+            ),
             abstraction_policy_version=abstraction_policy_version,
             abstraction_metadata=abstraction_metadata,
         )
@@ -503,6 +535,7 @@ def backfill_stereo_abstraction_downstreams(
     session: Session,
     general_topology: MolecularTopology,
     *,
+    project_id: UUID | None = None,
     candidate_topologies: Iterable[MolecularTopology] = (),
     abstraction_policy_version: str = STEREO_ABSTRACTION_POLICY_VERSION,
     abstraction_metadata: dict[str, Any] | None = None,
@@ -516,6 +549,10 @@ def backfill_stereo_abstraction_downstreams(
     """
 
     general_id = _require_id(general_topology, label="general MolecularTopology")
+    general_project_id = getattr(general_topology, "project_id", None)
+    owner_project_id = general_project_id if project_id is None else project_id
+    if general_project_id != owner_project_id:
+        raise StereoAbstractionError("stereo abstraction topology has a different project owner")
     if not general_topology.is_stereo_abstraction_upstream:
         raise StereoAbstractionError(
             "general topology is not marked as a stereo-abstraction upstream"
@@ -524,7 +561,10 @@ def backfill_stereo_abstraction_downstreams(
     candidates_by_id: dict[UUID, MolecularTopology] = {}
     for candidate in candidate_topologies:
         candidate_id = _require_id(candidate, label="candidate MolecularTopology")
-        if candidate_id != general_id:
+        if (
+            candidate_id != general_id
+            and getattr(candidate, "project_id", None) == owner_project_id
+        ):
             candidates_by_id[candidate_id] = candidate
     for candidate in session.exec(
         select(MolecularTopology).where(
@@ -532,6 +572,7 @@ def backfill_stereo_abstraction_downstreams(
             col(MolecularTopology.atom_count) == general_topology.atom_count,
             col(MolecularTopology.formal_charge) == general_topology.formal_charge,
             col(MolecularTopology.id) != general_id,
+            _project_owner_predicate(col(MolecularTopology.project_id), owner_project_id),
         )
     ).all():
         candidates_by_id[_require_id(candidate, label="candidate MolecularTopology")] = candidate
@@ -567,6 +608,11 @@ def backfill_stereo_abstraction_downstreams(
             col(MolecularTopology.formal_charge) == general_topology.formal_charge,
             col(MolecularTopologyAbstraction.abstraction_policy_version)
             == abstraction_policy_version,
+            _project_owner_predicate(
+                col(MolecularTopologyAbstraction.project_id),
+                owner_project_id,
+            ),
+            _project_owner_predicate(col(MolecularTopology.project_id), owner_project_id),
         )
     ).all()
     general_by_specific: dict[UUID, set[UUID]] = {}
@@ -579,6 +625,7 @@ def backfill_stereo_abstraction_downstreams(
             isinstance(edge_specific_id, UUID)
             and isinstance(edge_general_id, UUID)
             and edge.abstraction_policy_version == abstraction_policy_version
+            and edge.project_id == owner_project_id
         ):
             general_by_specific.setdefault(edge_specific_id, set()).add(edge_general_id)
     edges: list[MolecularTopologyAbstraction] = []
@@ -594,6 +641,7 @@ def backfill_stereo_abstraction_downstreams(
             session,
             candidate,
             general_topology,
+            project_id=owner_project_id,
             abstraction_policy_version=abstraction_policy_version,
             abstraction_metadata={
                 **(abstraction_metadata or {}),
@@ -641,6 +689,11 @@ def persist_stereo_abstraction_projection(
         session,
         specific_topology,
         persisted.topology,
+        project_id=(
+            context.project_id
+            if context is not None
+            else getattr(persisted.topology, "project_id", None)
+        ),
         abstraction_policy_version=abstraction_policy_version,
         abstraction_metadata=abstraction_metadata,
     )
@@ -652,6 +705,11 @@ def persist_stereo_abstraction_projection(
     backfill_stereo_abstraction_downstreams(
         session,
         persisted.topology,
+        project_id=(
+            context.project_id
+            if context is not None
+            else getattr(persisted.topology, "project_id", None)
+        ),
         candidate_topologies=context_candidates,
         abstraction_policy_version=abstraction_policy_version,
         abstraction_metadata=abstraction_metadata,
@@ -668,6 +726,7 @@ def specialized_topology_ids(
     session: Session,
     general_topology: MolecularTopology | UUID,
     *,
+    project_id: UUID | None = None,
     abstraction_policy_version: str = STEREO_ABSTRACTION_POLICY_VERSION,
 ) -> tuple[UUID, ...]:
     """Return every topology reachable below a general topology in the DAG.
@@ -683,6 +742,14 @@ def specialized_topology_ids(
         if isinstance(general_topology, UUID)
         else _require_id(general_topology, label="general MolecularTopology")
     )
+    owner_project_id = project_id
+    if owner_project_id is None:
+        if isinstance(general_topology, UUID):
+            owner_project_id = session.exec(
+                select(MolecularTopology.project_id).where(MolecularTopology.id == root_id)
+            ).first()
+        else:
+            owner_project_id = getattr(general_topology, "project_id", None)
     edge_table = cast(Any, MolecularTopologyAbstraction).__table__
     seed = (
         select(
@@ -692,6 +759,7 @@ def specialized_topology_ids(
         .where(
             edge_table.c.general_topology_id == root_id,
             edge_table.c.abstraction_policy_version == abstraction_policy_version,
+            _project_owner_predicate(edge_table.c.project_id, owner_project_id),
         )
         .cte("molecular_topology_specializations", recursive=True)
     )
@@ -702,6 +770,9 @@ def specialized_topology_ids(
         edge_table,
         (edge_table.c.general_topology_id == seed.c.descendant_id)
         & (edge_table.c.abstraction_policy_version == abstraction_policy_version),
+    )
+    recursive_term = recursive_term.where(
+        _project_owner_predicate(edge_table.c.project_id, owner_project_id)
     )
     # UNION (rather than UNION ALL) also terminates safely if a manually
     # repaired database contains a cycle; normal writes reject cycles below.
@@ -716,6 +787,7 @@ def specialized_topologies(
     session: Session,
     general_topology: MolecularTopology | UUID,
     *,
+    project_id: UUID | None = None,
     abstraction_policy_version: str = STEREO_ABSTRACTION_POLICY_VERSION,
     include_general: bool = False,
 ) -> tuple[MolecularTopology, ...]:
@@ -726,9 +798,18 @@ def specialized_topologies(
         if isinstance(general_topology, UUID)
         else _require_id(general_topology, label="general MolecularTopology")
     )
+    owner_project_id = project_id
+    if owner_project_id is None:
+        if isinstance(general_topology, UUID):
+            owner_project_id = session.exec(
+                select(MolecularTopology.project_id).where(MolecularTopology.id == root_id)
+            ).first()
+        else:
+            owner_project_id = getattr(general_topology, "project_id", None)
     topology_ids = specialized_topology_ids(
         session,
-        root_id,
+        general_topology,
+        project_id=owner_project_id,
         abstraction_policy_version=abstraction_policy_version,
     )
     if include_general:
@@ -738,7 +819,10 @@ def specialized_topologies(
     return tuple(
         session.exec(
             select(MolecularTopology)
-            .where(col(MolecularTopology.id).in_(topology_ids))
+            .where(
+                col(MolecularTopology.id).in_(topology_ids),
+                _project_owner_predicate(col(MolecularTopology.project_id), owner_project_id),
+            )
             .order_by(col(MolecularTopology.graph_hash), col(MolecularTopology.id))
         ).all()
     )

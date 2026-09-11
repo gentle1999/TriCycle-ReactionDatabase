@@ -61,6 +61,7 @@ from tricycle_reaction_db.domain.enums import (
     StorageStatus,
     WorkflowManifestStatus,
 )
+from tricycle_reaction_db.domain.identity import SYSTEM_PROJECT_ID
 from tricycle_reaction_db.ingestion import artifact_record_from_path
 
 pytestmark = [
@@ -89,7 +90,10 @@ def _artifact(
     )
 
 
-def test_manifest_revision_and_binding_queries(tmp_path: Path) -> None:
+def test_manifest_revision_and_binding_queries(
+    tmp_path: Path,
+    development_query_principal: object,
+) -> None:
     first_path = tmp_path / "manifest-v1.json"
     second_path = tmp_path / "manifest-v2.json"
     calculation_path = tmp_path / "calculation.log"
@@ -182,16 +186,21 @@ def test_manifest_revision_and_binding_queries(tmp_path: Path) -> None:
 
         page = asyncio.run(
             WorkflowManifestQueryService.list_workflow_manifests(
+                project_id=SYSTEM_PROJECT_ID,
                 manifest_key=manifest_key,
                 limit=10,
                 offset=0,
             )
         )
         detail = asyncio.run(
-            WorkflowManifestQueryService.get_workflow_manifest(workflow_manifest_id=manifest_ids[1])
+            WorkflowManifestQueryService.get_workflow_manifest(
+                project_id=SYSTEM_PROJECT_ID,
+                workflow_manifest_id=manifest_ids[1],
+            )
         )
         reverse = asyncio.run(
             WorkflowManifestQueryService.list_workflow_manifests(
+                project_id=SYSTEM_PROJECT_ID,
                 bound_artifact_file_id=artifact_ids[2],
                 limit=10,
                 offset=0,
@@ -199,6 +208,7 @@ def test_manifest_revision_and_binding_queries(tmp_path: Path) -> None:
         )
         bindings = asyncio.run(
             WorkflowManifestQueryService.list_manifest_artifact_bindings(
+                project_id=SYSTEM_PROJECT_ID,
                 workflow_manifest_id=manifest_ids[1],
                 resolution_status=ArtifactResolutionStatus.RESOLVED,
                 limit=10,
@@ -207,7 +217,10 @@ def test_manifest_revision_and_binding_queries(tmp_path: Path) -> None:
         )
         source = next(item for item in bindings.items if item.artifact_key == "geometry")
         source_detail = asyncio.run(
-            WorkflowManifestQueryService.get_manifest_artifact_binding(binding_id=source.id)
+            WorkflowManifestQueryService.get_manifest_artifact_binding(
+                project_id=SYSTEM_PROJECT_ID,
+                binding_id=source.id,
+            )
         )
 
         assert [item.revision for item in page.items] == [1, 2]
@@ -451,6 +464,7 @@ def test_advanced_results_and_derivation_queries_use_explicit_fixture(
 
         orbital_page = asyncio.run(
             CalculationResultQueryService.list_calculation_results(
+                project_id=SYSTEM_PROJECT_ID,
                 result_kind="molecular_orbitals",
                 frame_id=orbital_frame_id,
                 limit=10,
@@ -458,18 +472,28 @@ def test_advanced_results_and_derivation_queries_use_explicit_fixture(
             )
         )
         orbital_detail = asyncio.run(
-            CalculationResultQueryService.get_calculation_results(frame_id=orbital_frame_id)
+            CalculationResultQueryService.get_calculation_results(
+                project_id=SYSTEM_PROJECT_ID,
+                frame_id=orbital_frame_id,
+            )
         )
         state_detail = asyncio.run(
-            CalculationResultQueryService.get_calculation_results(frame_id=state_frame_id)
+            CalculationResultQueryService.get_calculation_results(
+                project_id=SYSTEM_PROJECT_ID,
+                frame_id=state_frame_id,
+            )
         )
         derivation_detail = asyncio.run(
             MolecularTopologyDerivationQueryService.get_topology_derivation(
+                project_id=SYSTEM_PROJECT_ID,
                 derivation_id=derivation_id
             )
         )
         frame_detail = asyncio.run(
-            CalculationQueryService.get_calculation_frame(frame_id=orbital_frame_id)
+            CalculationQueryService.get_calculation_frame(
+                project_id=SYSTEM_PROJECT_ID,
+                frame_id=orbital_frame_id,
+            )
         )
 
         assert orbital_page.page.total == 1

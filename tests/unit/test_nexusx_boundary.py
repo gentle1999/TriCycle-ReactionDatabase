@@ -56,26 +56,30 @@ def test_nexusx_exposes_only_the_explicit_reaction_mutation() -> None:
         "WorkflowManifestQueryService",
         "ReactionCommandService",
     ]
-    # Project scoping is additive: existing GraphQL callers can continue to omit
-    # the optional argument while route-driven clients pin a detail to one project.
+    # Every project-owned operation exposes the project as a non-null input;
+    # the user permission check is then applied to that explicit scope.
     logical_reaction_field = _graphql_field(sdl, "get_logical_reaction")
-    assert logical_reaction_field.startswith("  get_logical_reaction(logical_reaction_id: UUID!")
-    assert "project_id: UUID = null" in logical_reaction_field
+    assert logical_reaction_field.startswith(
+        "  get_logical_reaction(project_id: UUID!, logical_reaction_id: UUID!"
+    )
+    assert "project_id: UUID!" in logical_reaction_field
     mapped_reaction_detail_field = _graphql_field(sdl, "get_mapped_reaction")
     assert mapped_reaction_detail_field.startswith(
-        "  get_mapped_reaction(mapped_reaction_id: UUID!"
+        "  get_mapped_reaction(project_id: UUID!, mapped_reaction_id: UUID!"
     )
-    assert "project_id: UUID = null" in mapped_reaction_detail_field
+    assert "project_id: UUID!" in mapped_reaction_detail_field
     assert "create_reaction(" in sdl
     assert "reaction: String!" in sdl
     assert "CreateReactionCommand" not in sdl
     calculation_detail_field = _graphql_field(sdl, "get_calculation_frame")
-    assert calculation_detail_field.startswith("  get_calculation_frame(frame_id: UUID!")
-    assert "project_id: UUID = null" in calculation_detail_field
+    assert calculation_detail_field.startswith(
+        "  get_calculation_frame(project_id: UUID!, frame_id: UUID!"
+    )
+    assert "project_id: UUID!" in calculation_detail_field
     assert "search_formulas(minimum_counts: [Int]!" in sdl
     topology_search_field = _graphql_field(sdl, "search_topologies")
     assert topology_search_field.startswith(
-        "  search_topologies(project_id: UUID = null, topology_id: UUID = null"
+        "  search_topologies(project_id: UUID!, topology_id: UUID = null"
     )
     assert "similarity_metric: SimilarityMetric! = tanimoto" in sdl
     assert "similarity_score: Float" in sdl
@@ -106,7 +110,7 @@ def test_nexusx_exposes_only_the_explicit_reaction_mutation() -> None:
     assert 'sort_by: String! = "created_at"' in artifact_field
     assert 'sort_direction: String! = "desc"' in artifact_field
     mapped_reaction_field = _graphql_field(sdl, "list_mapped_reactions")
-    assert "project_id: UUID = null" in mapped_reaction_field
+    assert "project_id: UUID!" in mapped_reaction_field
     assert "minimum_transition_state_geometry_count: Int = null" in mapped_reaction_field
     assert "created_after: DateTime = null" in mapped_reaction_field
 
@@ -223,7 +227,8 @@ def test_fastapi_mounts_all_allowlisted_nexusx_transports() -> None:
 
     assert expected_paths <= set(openapi["paths"])
     request_schema = openapi["components"]["schemas"]["ReactionCommandServiceCreateReactionRequest"]
-    assert request_schema["required"] == ["reaction"]
+    assert request_schema["required"] == ["project_id", "reaction"]
+    assert "project_id" in request_schema["properties"]
     assert "reaction" in request_schema["properties"]
     assert "command" not in request_schema["properties"]
     for path in expected_paths:

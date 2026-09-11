@@ -44,12 +44,17 @@ from tricycle_reaction_db.application.services import (
     persist_mapped_reaction_node,
     persist_mapped_reaction_node_geometry,
     persist_mapped_reaction_node_geometry_mapping,
-    persist_molecular_geometry,
     persist_parse_revision,
     persist_thermochemistry_result,
     persist_workflow_manifest,
     reaction_hash_for_participants,
     validate_logical_reaction,
+)
+from tricycle_reaction_db.application.services.molecular_geometry import (
+    GeometryPersistenceContext,
+)
+from tricycle_reaction_db.application.services.molecular_geometry import (
+    persist_molecular_geometry as _persist_molecular_geometry_impl,
 )
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import ArtifactFile, LogicalReaction, WorkflowManifest
@@ -72,6 +77,7 @@ from tricycle_reaction_db.domain.enums import (
     TerminationStatus,
     WorkflowManifestStatus,
 )
+from tricycle_reaction_db.domain.identity import SYSTEM_PROJECT_ID
 from tricycle_reaction_db.ingestion import (
     artifact_record_from_path,
     calculation_protocol_record,
@@ -85,6 +91,13 @@ pytestmark = [
         reason="set TRICYCLE_RUN_DATABASE_TESTS=1 to run database tests",
     ),
 ]
+
+
+def persist_molecular_geometry(session: Session, record: Any, **kwargs: Any) -> Any:
+    """Keep the DA-bench reaction fixture inside an explicit project scope."""
+
+    kwargs.setdefault("context", GeometryPersistenceContext(project_id=SYSTEM_PROJECT_ID))
+    return _persist_molecular_geometry_impl(session, record, **kwargs)
 
 
 def _exact_geometry_assignment(molecule: NormalizedMoleculeRecord) -> dict[str, object]:
@@ -345,6 +358,7 @@ def test_real_da_subset_round_trips_manifest_reaction_path_and_frame_bindings(
                                 "segment_index": segment_index,
                             },
                         ),
+                        project_id=artifact.project_id,
                     )
                     segment_span = _span_values(segment_spec["segment_span"])
                     segment_slice = payload[

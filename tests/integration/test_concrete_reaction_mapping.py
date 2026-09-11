@@ -2,6 +2,7 @@
 
 import os
 from hashlib import sha256
+from typing import Any
 
 import numpy as np
 import pytest
@@ -17,8 +18,13 @@ from tricycle_reaction_db.application.dtos.reactions import (
     MappedReactionRecord,
 )
 from tricycle_reaction_db.application.services.molecular_geometry import (
-    persist_molecular_geometry,
-    persist_molecular_topology,
+    GeometryPersistenceContext,
+)
+from tricycle_reaction_db.application.services.molecular_geometry import (
+    persist_molecular_geometry as _persist_molecular_geometry_impl,
+)
+from tricycle_reaction_db.application.services.molecular_geometry import (
+    persist_molecular_topology as _persist_molecular_topology_impl,
 )
 from tricycle_reaction_db.application.services.reaction_commands import (
     _logicalize_components,
@@ -61,6 +67,7 @@ from tricycle_reaction_db.domain.enums import (
     MappedReactionKind,
     MappedReactionNodeRole,
 )
+from tricycle_reaction_db.domain.identity import SYSTEM_PROJECT_ID
 from tricycle_reaction_db.ingestion.normalization import normalize_molecule, normalize_topology
 
 pytestmark = [
@@ -70,6 +77,20 @@ pytestmark = [
         reason="set TRICYCLE_RUN_DATABASE_TESTS=1 to run database tests",
     ),
 ]
+
+
+def persist_molecular_geometry(session: Session, record: Any, **kwargs: Any) -> Any:
+    """Keep legacy mapping fixtures inside an explicit project scope."""
+
+    kwargs.setdefault("context", GeometryPersistenceContext(project_id=SYSTEM_PROJECT_ID))
+    return _persist_molecular_geometry_impl(session, record, **kwargs)
+
+
+def persist_molecular_topology(session: Session, record: Any, **kwargs: Any) -> Any:
+    """Keep legacy topology fixtures inside an explicit project scope."""
+
+    kwargs.setdefault("context", GeometryPersistenceContext(project_id=SYSTEM_PROJECT_ID))
+    return _persist_molecular_topology_impl(session, record, **kwargs)
 
 
 def _strict_stereo_topology(
@@ -108,6 +129,7 @@ def _mapped_reaction_fixture(
         session,
         source,
         assigned_stereo_features(source.mol),
+        context=GeometryPersistenceContext(project_id=SYSTEM_PROJECT_ID),
     )
     session.flush()
 
@@ -592,7 +614,11 @@ def test_inversion_projection_clears_n_related_ez_only() -> None:
                     )
                 )
 
-            logical_components = _logicalize_components(session, components)
+            logical_components = _logicalize_components(
+                session,
+                components,
+                topology_context=GeometryPersistenceContext(project_id=SYSTEM_PROJECT_ID),
+            )
             reactant = logical_components[0]
             product = logical_components[1]
             assert reactant.logical_topology is not None
@@ -648,7 +674,11 @@ def test_inversion_projection_clears_sulfur_chirality() -> None:
                     )
                 )
 
-            logical_components = _logicalize_components(session, components)
+            logical_components = _logicalize_components(
+                session,
+                components,
+                topology_context=GeometryPersistenceContext(project_id=SYSTEM_PROJECT_ID),
+            )
             reactant = logical_components[0]
             product = logical_components[1]
             assert reactant.logical_topology is not None

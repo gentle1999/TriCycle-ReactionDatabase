@@ -70,11 +70,45 @@ _ELEMENT_COUNT_TOKENS_SQL = (
 )
 
 
+class DerivedDataIsolationQuarantine(SQLModel, table=True):
+    """Audit ledger for historical derived rows without one project owner."""
+
+    __tablename__ = "derived_data_isolation_quarantine"  # pyright: ignore[reportAssignmentType]
+    __table_args__ = (
+        Index(
+            "ix_derived_isolation_quarantine_object_id",
+            "object_id",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(source_project_ids) = 'array'",
+            name="ck_derived_isolation_quarantine_project_ids_array",
+        ),
+    )
+
+    object_type: str = Field(sa_type=Text, primary_key=True, nullable=False)
+    object_id: UUID = Field(primary_key=True, nullable=False)
+    source_project_ids: list[UUID] = Field(
+        default_factory=list,
+        sa_column=Column(
+            JSONB,
+            nullable=False,
+            server_default=text("'[]'::jsonb"),
+        ),
+    )
+    reason: str = Field(sa_type=Text, nullable=False)
+    created_at: datetime | None = created_at_field()
+
+
 class MolecularFormula(SQLModel, table=True):
     """Element and isotope composition independent of charge and bonding."""
 
     __tablename__ = "molecular_formula"  # pyright: ignore[reportAssignmentType]
     __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "composition_hash",
+            name="uq_molecular_formula_project_composition",
+        ),
         CheckConstraint("atom_count > 0", name="ck_molecular_formula_atom_count_positive"),
         CheckConstraint(
             f"composition_hash ~ '{_HASH_PATTERN}'",
@@ -97,6 +131,13 @@ class MolecularFormula(SQLModel, table=True):
 
     id: UUID | None = uuid_primary_key_field()
     created_at: datetime | None = created_at_field()
+    project_id: UUID | None = Field(
+        default=None,
+        foreign_key="project.id",
+        ondelete="RESTRICT",
+        index=True,
+        nullable=True,
+    )
     hill_formula: str = Field(sa_type=Text, index=True, nullable=False)
     composition: list[dict[str, int]] = Field(
         default_factory=list,
@@ -111,7 +152,7 @@ class MolecularFormula(SQLModel, table=True):
         ),
     )
     atom_count: int = Field(sa_type=INTEGER, nullable=False)
-    composition_hash: str = Field(max_length=64, unique=True, nullable=False)
+    composition_hash: str = Field(max_length=64, nullable=False)
     element_count_vector: list[int] = Field(
         sa_column=Column(
             ARRAY(INTEGER, dimensions=1),
@@ -146,9 +187,10 @@ class MolecularTopology(SQLModel, table=True):
     __tablename__ = "molecular_topology"  # pyright: ignore[reportAssignmentType]
     __table_args__ = (
         UniqueConstraint(
+            "project_id",
             "identity_schema_version",
             "graph_hash",
-            name="uq_molecular_topology_identity_hash",
+            name="uq_molecular_topology_project_identity_hash",
         ),
         CheckConstraint("atom_count > 0", name="ck_molecular_topology_atom_count_positive"),
         CheckConstraint("heavy_atom_count >= 0", name="ck_molecular_topology_heavy_atoms"),
@@ -179,6 +221,13 @@ class MolecularTopology(SQLModel, table=True):
 
     id: UUID | None = uuid_primary_key_field()
     created_at: datetime | None = created_at_field()
+    project_id: UUID | None = Field(
+        default=None,
+        foreign_key="project.id",
+        ondelete="RESTRICT",
+        index=True,
+        nullable=True,
+    )
     formula_id: UUID = Field(
         foreign_key="molecular_formula.id",
         ondelete="RESTRICT",
@@ -332,6 +381,13 @@ class MolecularTopologyAbstraction(SQLModel, table=True):
 
     id: UUID | None = uuid_primary_key_field()
     created_at: datetime | None = created_at_field()
+    project_id: UUID | None = Field(
+        default=None,
+        foreign_key="project.id",
+        ondelete="RESTRICT",
+        index=True,
+        nullable=True,
+    )
     specific_topology_id: UUID = Field(
         foreign_key="molecular_topology.id",
         ondelete="CASCADE",
@@ -392,6 +448,13 @@ class MolecularTopologyDerivation(SQLModel, table=True):
 
     id: UUID | None = uuid_primary_key_field()
     created_at: datetime | None = created_at_field()
+    project_id: UUID | None = Field(
+        default=None,
+        foreign_key="project.id",
+        ondelete="RESTRICT",
+        index=True,
+        nullable=True,
+    )
     topology_id: UUID = Field(
         foreign_key="molecular_topology.id",
         ondelete="RESTRICT",
@@ -448,6 +511,17 @@ class Geometry(SQLModel, table=True):
             "charge",
             "multiplicity",
         ),
+        # Project-local geometry identity matching is the hot path during
+        # import.  Keep the ownership predicate in the same index prefix so
+        # a project never scans another project's geometry candidates.
+        Index(
+            "ix_geometry_project_match_candidates",
+            "project_id",
+            "topology_id",
+            "canonicalization_version",
+            "charge",
+            "multiplicity",
+        ),
         Index("ix_geometry_created_id", "created_at", "id"),
         CheckConstraint(
             f"internal_coordinate_hash ~ '{_HASH_PATTERN}'",
@@ -486,6 +560,13 @@ class Geometry(SQLModel, table=True):
 
     id: UUID | None = uuid_primary_key_field()
     created_at: datetime | None = created_at_field()
+    project_id: UUID | None = Field(
+        default=None,
+        foreign_key="project.id",
+        ondelete="RESTRICT",
+        index=True,
+        nullable=True,
+    )
     topology_id: UUID = Field(
         foreign_key="molecular_topology.id",
         ondelete="RESTRICT",

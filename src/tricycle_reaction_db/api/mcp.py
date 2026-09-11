@@ -12,8 +12,13 @@ from starlette.responses import JSONResponse
 from starlette.types import Receive, Scope, Send
 
 from tricycle_reaction_db.api.nexusx import config
+from tricycle_reaction_db.api.query_guards import (
+    project_scoped_use_case_methods,
+    validate_graphql_project_scope,
+)
 from tricycle_reaction_db.application.query_cost import (
     QueryBudgetExceeded,
+    QueryProjectScopeRequired,
     QueryRateLimitExceeded,
     graphql_error_result,
     normalize_graphql_query_errors,
@@ -150,6 +155,7 @@ class QueryGuardMiddleware(FastMCPMiddleware):
     def __init__(self) -> None:
         settings = get_settings()
         self._settings = settings
+        self._scoped_methods = project_scoped_use_case_methods(config)
         self._limiter = create_rate_limiter(
             policy="mcp-read",
             maximum_requests=settings.read_rate_limit_requests,
@@ -218,6 +224,10 @@ class QueryGuardMiddleware(FastMCPMiddleware):
                         maximum_complexity=self._settings.graphql_max_complexity,
                     )
                 except QueryBudgetExceeded as error:
+                    return self._result(graphql_error_result(error))
+                try:
+                    validate_graphql_project_scope(query, self._scoped_methods)
+                except QueryProjectScopeRequired as error:
                     return self._result(graphql_error_result(error))
 
         result: ToolResult = await call_next(context)
