@@ -15,6 +15,8 @@ export type ReactionQueryField =
   | "maximum_activation_gibbs_free_energy_kcal_mol"
   | "minimum_reaction_gibbs_free_energy_kcal_mol"
   | "maximum_reaction_gibbs_free_energy_kcal_mol"
+  | "has_activation_gibbs_free_energy"
+  | "has_reaction_gibbs_free_energy"
   | "minimum_mapped_reaction_count"
   | "maximum_mapped_reaction_count"
   | "reactant_product_changed"
@@ -109,6 +111,8 @@ export const reactionQueryFieldOptions: ReactionQueryFieldOption[] = [
   { value: "maximum_activation_gibbs_free_energy_kcal_mol", label: "最高活化自由能（kcal/mol）", kind: "number" },
   { value: "minimum_reaction_gibbs_free_energy_kcal_mol", label: "最低反应自由能（kcal/mol）", kind: "number" },
   { value: "maximum_reaction_gibbs_free_energy_kcal_mol", label: "最高反应自由能（kcal/mol）", kind: "number" },
+  { value: "has_activation_gibbs_free_energy", label: "含活化自由能", kind: "boolean" },
+  { value: "has_reaction_gibbs_free_energy", label: "含反应自由能", kind: "boolean" },
   { value: "minimum_mapped_reaction_count", label: "最少映射反应数", kind: "number" },
   { value: "maximum_mapped_reaction_count", label: "最多映射反应数", kind: "number" },
   { value: "reactant_product_changed", label: "前后体拓扑发生变化", kind: "boolean" },
@@ -155,6 +159,8 @@ export function reactionFilterExpression(filters: ReactionQueryFilters): Reactio
     "maximum_reaction_gibbs_free_energy_kcal_mol",
     filters.maximumReactionGibbsFreeEnergyKcalMol,
   );
+  add("has_activation_gibbs_free_energy", filters.hasActivationGibbsFreeEnergy);
+  add("has_reaction_gibbs_free_energy", filters.hasReactionGibbsFreeEnergy);
   add("minimum_mapped_reaction_count", filters.minimumMappedReactionCount);
   add("maximum_mapped_reaction_count", filters.maximumMappedReactionCount);
   add("reactant_product_changed", filters.reactantProductChanged);

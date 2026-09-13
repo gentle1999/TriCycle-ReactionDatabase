@@ -1019,7 +1019,9 @@ class MappedReactionThermodynamicsProfile(QueryView):
     level_of_theory: str
     temperature_kelvin: float
     pressure_atm: float
-    reactants: ThermodynamicStateView
+    # TS-only profiles intentionally omit endpoint thermochemistry when the
+    # source calculation only contains a transition-state frequency job.
+    reactants: ThermodynamicStateView | None = None
     transition_state: ThermodynamicStateView | None = None
     products: ThermodynamicStateView | None = None
     activation: ThermodynamicDifferenceView | None = None

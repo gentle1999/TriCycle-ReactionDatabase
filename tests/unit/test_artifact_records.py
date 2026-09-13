@@ -92,6 +92,56 @@ def test_protocol_hash_is_independent_of_task_order_and_duplicates() -> None:
 
     assert first.protocol_hash == second.protocol_hash
     assert first.task_requests == second.task_requests == ["freq", "opt"]
+    assert first.basis_set == second.basis_set == "DEF2SVP"
+
+
+def test_protocol_fields_are_case_insensitive_and_source_spelling_is_not_identity() -> None:
+    common = {
+        "qm_software": QMSoftware.GAUSSIAN,
+        "qm_software_version": "G16RevA.03",
+        "method_family": "DFT",
+        "task_requests": ["freq"],
+    }
+    first = calculation_protocol_record(
+        functional="b3lyp",
+        basis_set="def2SVP",
+        auxiliary_basis_set="def2/J",
+        dispersion_model="d3bj",
+        normalized_spec={
+            "protocol": {
+                "functional": "b3lyp",
+                "basis_set": "def2SVP",
+                "auxiliary_basis_set": "def2/J",
+                "dispersion_correction": "d3bj",
+            }
+        },
+        **common,
+    )
+    second = calculation_protocol_record(
+        functional="B3LYP",
+        basis_set="DEF2svp",
+        auxiliary_basis_set="DEF2/j",
+        dispersion_model="GD3BJ",
+        normalized_spec={
+            "protocol": {
+                "functional": "B3LYP",
+                "basis_set": "DEF2svp",
+                "auxiliary_basis_set": "DEF2/j",
+                "dispersion_correction": "GD3BJ",
+            }
+        },
+        **common,
+    )
+
+    assert first.protocol_hash == second.protocol_hash
+    assert first.functional == second.functional == "B3LYP-GD3BJ"
+    assert first.basis_set == second.basis_set == "DEF2SVP"
+    assert first.auxiliary_basis_set == second.auxiliary_basis_set == "DEF2/J"
+    assert first.dispersion_model == second.dispersion_model == "GD3BJ"
+
+
+def test_mixed_case_functional_is_canonicalized() -> None:
+    assert normalize_functional_and_dispersion("wB97M-V", None) == ("WB97M-V", None)
 
 
 def test_functional_gets_the_canonical_dispersion_suffix() -> None:

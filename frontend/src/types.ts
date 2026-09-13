@@ -197,7 +197,7 @@ export interface MappedReactionThermodynamicsProfile {
   level_of_theory: string;
   temperature_kelvin: number;
   pressure_atm: number;
-  reactants: { enthalpy_hartree: number; gibbs_free_energy_hartree: number; entropy_cal_mol_k: number };
+  reactants: { enthalpy_hartree: number; gibbs_free_energy_hartree: number; entropy_cal_mol_k: number } | null;
   transition_state: { enthalpy_hartree: number; gibbs_free_energy_hartree: number; entropy_cal_mol_k: number } | null;
   products: { enthalpy_hartree: number; gibbs_free_energy_hartree: number; entropy_cal_mol_k: number } | null;
   activation: ThermodynamicDifference | null;

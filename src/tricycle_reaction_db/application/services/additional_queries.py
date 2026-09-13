@@ -88,6 +88,7 @@ from tricycle_reaction_db.application.services.reaction_geometry_policy import (
     geometry_ids_with_thermodynamic_property,
 )
 from tricycle_reaction_db.core.config import get_settings
+from tricycle_reaction_db.core.protocol_normalization import normalize_protocol_text
 from tricycle_reaction_db.core.units import hartree_per_particle_to_kcal_per_mol
 from tricycle_reaction_db.db.models import (
     ArtifactIngestion,
@@ -1474,6 +1475,8 @@ class CalculationProtocolQueryService(UseCaseService):  # type: ignore[misc]
             (CalculationProtocol.solvent, solvent),
         ):
             if value is not None:
+                if field is CalculationProtocol.basis_set:
+                    value = normalize_protocol_text(value)
                 predicates.append(col(field) == value)
         count_statement = select(func.count()).select_from(CalculationProtocol).where(*predicates)
         statement = (
@@ -2090,7 +2093,11 @@ class ReactionEnergyQueryService(UseCaseService):  # type: ignore[misc]
                 ),
                 temperature_kelvin=row.temperature_kelvin,
                 pressure_atm=row.pressure_atm,
-                reactants=ThermodynamicStateView.model_validate(row.reactants),
+                reactants=(
+                    ThermodynamicStateView.model_validate(row.reactants)
+                    if row.reactants is not None
+                    else None
+                ),
                 transition_state=(
                     ThermodynamicStateView.model_validate(row.transition_state)
                     if row.transition_state is not None

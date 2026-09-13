@@ -4,6 +4,7 @@ from tricycle_reaction_db.ingestion.artifacts import (
     artifact_record_from_path,
     calculation_protocol_record,
     normalize_functional_and_dispersion,
+    normalize_protocol_text,
 )
 from tricycle_reaction_db.ingestion.media_type import (
     detect_artifact_media_type,
@@ -42,6 +43,7 @@ __all__ = [
     "artifact_record_from_path",
     "calculation_protocol_record",
     "normalize_functional_and_dispersion",
+    "normalize_protocol_text",
     "configure_molecular_graph_reconstruction",
     "detect_artifact_media_type",
     "clear_inversion_labile_atom_chirality",

@@ -6,8 +6,8 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import and_, or_
-from sqlalchemy.orm import selectinload
+from sqlalchemy import and_, func, or_
+from sqlalchemy.orm import aliased, selectinload
 from sqlmodel import Session, col, select
 
 from tricycle_reaction_db.application.dtos import (
@@ -38,6 +38,9 @@ from tricycle_reaction_db.application.services.reactions import (
     persist_mapped_reaction_node_geometry,
     persist_mapped_reaction_node_geometry_mapping,
 )
+from tricycle_reaction_db.application.services.topology_compatibility import (
+    source_geometry_compatible_topology,
+)
 from tricycle_reaction_db.core.chemistry_config import (
     REACTION_GEOMETRY_LINK_METHOD,
     REACTION_GEOMETRY_LINK_POLICY_VERSION,
@@ -45,6 +48,7 @@ from tricycle_reaction_db.core.chemistry_config import (
 from tricycle_reaction_db.db.models import (
     CalculationFrame,
     Geometry,
+    LogicalParticipantConcreteTopology,
     LogicalReaction,
     LogicalReactionParticipant,
     MappedReaction,
@@ -53,6 +57,7 @@ from tricycle_reaction_db.db.models import (
     MappedReactionNodeGeometry,
     MappedReactionNodeGeometryMapping,
     MappedReactionParticipant,
+    MolecularTopology,
 )
 from tricycle_reaction_db.domain.enums import (
     LogicalReactionParticipantSide,
@@ -817,6 +822,65 @@ def _reaction_geometry_predicate() -> Any:
     )
 
 
+def _endpoint_compatible_mapped_reactions(
+    session: Session,
+    geometry: Geometry,
+    *,
+    project_id: UUID,
+) -> tuple[MappedReaction, ...]:
+    """Find mappings that can consume a unique endpoint-compatible Geometry.
+
+    This lookup is intentionally refresh-only.  It does not bind a Geometry
+    whose strict graph differs from the mapped participant; the thermodynamic
+    persistence layer performs the same uniqueness check before selecting it
+    as a source-compatible fallback.
+    """
+
+    source_topology = session.get(MolecularTopology, geometry.topology_id)
+    if source_topology is None:
+        return ()
+    strict_topology = aliased(MolecularTopology)
+    rows = session.exec(
+        select(MappedReaction, strict_topology)
+        .join(
+            MappedReactionParticipant,
+            col(MappedReactionParticipant.mapped_reaction_id) == col(MappedReaction.id),
+        )
+        .join(
+            LogicalReactionParticipant,
+            col(MappedReactionParticipant.logical_reaction_participant_id)
+            == col(LogicalReactionParticipant.id),
+        )
+        .join(
+            strict_topology,
+            col(strict_topology.id)
+            == func.coalesce(
+                col(MappedReactionParticipant.concrete_topology_id),
+                col(LogicalReactionParticipant.topology_id),
+            ),
+        )
+        .where(
+            col(MappedReaction.project_id) == project_id,
+            col(strict_topology.project_id) == project_id,
+            col(strict_topology.formula_id) == source_topology.formula_id,
+            col(strict_topology.atom_count) == source_topology.atom_count,
+            col(strict_topology.formal_charge) == source_topology.formal_charge,
+            col(strict_topology.fragment_count) == source_topology.fragment_count,
+            col(strict_topology.id) != geometry.topology_id,
+        )
+    ).all()
+    reaction_ids: set[UUID] = set()
+    reactions: list[MappedReaction] = []
+    for mapped_reaction, candidate_topology in rows:
+        mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
+        if mapped_reaction_id in reaction_ids:
+            continue
+        if source_geometry_compatible_topology(candidate_topology.mol, source_topology.mol):
+            reaction_ids.add(mapped_reaction_id)
+            reactions.append(mapped_reaction)
+    return tuple(reactions)
+
+
 def reconcile_geometry_with_reactions(
     session: Session,
     geometry: Geometry,
@@ -937,6 +1001,50 @@ def reconcile_geometry_with_reactions(
         node_geometries.extend(bindings)
         if mapped_reaction is not None:
             affected_reactions[participant.mapped_reaction_id] = mapped_reaction
+
+    # A Geometry may be the source-compatible concrete member for a mapped
+    # participant whose strict topology was reconstructed only from a TS
+    # endpoint.  Such a mapping has no exact participant binding by design, so
+    # the topology-indexed reverse lookup above cannot mark it dirty.  The
+    # membership relation is the audited bridge for the thermodynamic fallback
+    # loader; refresh every mapped reaction that can consume this member.
+    logical_member_reactions = session.exec(
+        select(MappedReaction)
+        .join(
+            MappedReactionParticipant,
+            col(MappedReactionParticipant.mapped_reaction_id) == col(MappedReaction.id),
+        )
+        .join(
+            LogicalParticipantConcreteTopology,
+            col(LogicalParticipantConcreteTopology.logical_reaction_participant_id)
+            == col(MappedReactionParticipant.logical_reaction_participant_id),
+        )
+        .where(
+            col(MappedReaction.project_id) == project_id,
+            col(LogicalParticipantConcreteTopology.concrete_topology_id) == geometry.topology_id,
+        )
+        # ``mapped_reaction.reaction`` is a PostgreSQL custom type without an
+        # equality operator, so a full-row DISTINCT cannot be planned.  The
+        # joins can produce several rows for one mapping; PostgreSQL DISTINCT
+        # ON the UUID primary key removes only that join multiplicity without
+        # comparing the custom reaction column.
+        .distinct(col(MappedReaction.id))
+    ).all()
+    for mapped_reaction in logical_member_reactions:
+        mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
+        affected_reactions[mapped_reaction_id] = mapped_reaction
+
+    # An endpoint/source topology mismatch cannot be bound as a node Geometry,
+    # but a newly eligible source Geometry must still invalidate the derived
+    # thermodynamic profile.  The persistence loader will accept it only if it
+    # is the unique eligible endpoint-compatible source for that participant.
+    for mapped_reaction in _endpoint_compatible_mapped_reactions(
+        session,
+        geometry,
+        project_id=project_id,
+    ):
+        mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
+        affected_reactions[mapped_reaction_id] = mapped_reaction
     if cache is None:
         for mapped_reaction in affected_reactions.values():
             refresh_mapped_reaction_thermodynamics(session, mapped_reaction)

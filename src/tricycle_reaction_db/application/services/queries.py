@@ -333,6 +333,8 @@ _LOGICAL_REACTION_QUERY_EXPRESSION_FIELDS = frozenset(
         "maximum_activation_gibbs_free_energy_kcal_mol",
         "minimum_reaction_gibbs_free_energy_kcal_mol",
         "maximum_reaction_gibbs_free_energy_kcal_mol",
+        "has_activation_gibbs_free_energy",
+        "has_reaction_gibbs_free_energy",
         "minimum_mapped_reaction_count",
         "maximum_mapped_reaction_count",
         "reactant_product_changed",
@@ -647,6 +649,29 @@ def _logical_reaction_query_leaf_predicate(
                 col(MappedReaction.id),
                 **profile_kwargs,
             )
+        )
+        return col(LogicalReaction.id).in_(mapped_screening_ids)
+    if field_name in {
+        "has_activation_gibbs_free_energy",
+        "has_reaction_gibbs_free_energy",
+    }:
+        if not isinstance(value, bool):
+            raise ValueError(f"{field_name} must be a boolean")
+        mapped_screening_ids = select(col(MappedReaction.logical_reaction_id)).where(
+            mapped_reaction_id_is_visible(scope, col(MappedReaction.id)),
+        )
+        presence = mapped_reaction_has_thermodynamic_profile(
+            scope,
+            col(MappedReaction.id),
+            has_activation_gibbs_free_energy=(
+                field_name == "has_activation_gibbs_free_energy"
+            ),
+            has_reaction_gibbs_free_energy=(
+                field_name == "has_reaction_gibbs_free_energy"
+            ),
+        )
+        mapped_screening_ids = mapped_screening_ids.where(
+            presence if value else ~presence
         )
         return col(LogicalReaction.id).in_(mapped_screening_ids)
     if field_name in {"minimum_mapped_reaction_count", "maximum_mapped_reaction_count"}:
@@ -1998,6 +2023,8 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             maximum_reaction_gibbs_free_energy_kcal_mol,
             minimum_mapped_reaction_count,
             maximum_mapped_reaction_count,
+            has_activation_gibbs_free_energy,
+            has_reaction_gibbs_free_energy,
             reactant_product_changed,
             created_after,
             created_before,
@@ -2132,37 +2159,65 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             minimum_name="minimum_mapped_reaction_count",
             maximum_name="maximum_mapped_reaction_count",
         )
-        if (
-            minimum_activation_gibbs_free_energy_kcal_mol is not None
-            or maximum_activation_gibbs_free_energy_kcal_mol is not None
-            or minimum_reaction_gibbs_free_energy_kcal_mol is not None
-            or maximum_reaction_gibbs_free_energy_kcal_mol is not None
-            or has_activation_gibbs_free_energy
-            or has_reaction_gibbs_free_energy
+        thermodynamic_profile_kwargs: dict[str, Any] = {}
+        for name, value in (
+            (
+                "minimum_activation_gibbs_free_energy_kcal_mol",
+                minimum_activation_gibbs_free_energy_kcal_mol,
+            ),
+            (
+                "maximum_activation_gibbs_free_energy_kcal_mol",
+                maximum_activation_gibbs_free_energy_kcal_mol,
+            ),
+            (
+                "minimum_reaction_gibbs_free_energy_kcal_mol",
+                minimum_reaction_gibbs_free_energy_kcal_mol,
+            ),
+            (
+                "maximum_reaction_gibbs_free_energy_kcal_mol",
+                maximum_reaction_gibbs_free_energy_kcal_mol,
+            ),
         ):
+            if value is not None:
+                thermodynamic_profile_kwargs[name] = value
+        if has_activation_gibbs_free_energy is True:
+            thermodynamic_profile_kwargs["has_activation_gibbs_free_energy"] = True
+        if has_reaction_gibbs_free_energy is True:
+            thermodynamic_profile_kwargs["has_reaction_gibbs_free_energy"] = True
+
+        thermodynamic_presence_predicates: list[Any] = []
+        if has_activation_gibbs_free_energy is False:
+            thermodynamic_presence_predicates.append(
+                ~mapped_reaction_has_thermodynamic_profile(
+                    scope,
+                    col(MappedReaction.id),
+                    has_activation_gibbs_free_energy=True,
+                )
+            )
+        if has_reaction_gibbs_free_energy is False:
+            thermodynamic_presence_predicates.append(
+                ~mapped_reaction_has_thermodynamic_profile(
+                    scope,
+                    col(MappedReaction.id),
+                    has_reaction_gibbs_free_energy=True,
+                )
+            )
+        if thermodynamic_profile_kwargs or thermodynamic_presence_predicates:
             mapped_screening_ids = select(col(MappedReaction.logical_reaction_id)).where(
                 mapped_reaction_id_is_visible(scope, col(MappedReaction.id)),
             )
-            mapped_screening_ids = mapped_screening_ids.where(
-                mapped_reaction_has_thermodynamic_profile(
-                    scope,
-                    col(MappedReaction.id),
-                    minimum_activation_gibbs_free_energy_kcal_mol=(
-                        minimum_activation_gibbs_free_energy_kcal_mol
-                    ),
-                    maximum_activation_gibbs_free_energy_kcal_mol=(
-                        maximum_activation_gibbs_free_energy_kcal_mol
-                    ),
-                    minimum_reaction_gibbs_free_energy_kcal_mol=(
-                        minimum_reaction_gibbs_free_energy_kcal_mol
-                    ),
-                    maximum_reaction_gibbs_free_energy_kcal_mol=(
-                        maximum_reaction_gibbs_free_energy_kcal_mol
-                    ),
-                    has_activation_gibbs_free_energy=bool(has_activation_gibbs_free_energy),
-                    has_reaction_gibbs_free_energy=bool(has_reaction_gibbs_free_energy),
+            if thermodynamic_profile_kwargs:
+                mapped_screening_ids = mapped_screening_ids.where(
+                    mapped_reaction_has_thermodynamic_profile(
+                        scope,
+                        col(MappedReaction.id),
+                        **thermodynamic_profile_kwargs,
+                    )
                 )
-            )
+            if thermodynamic_presence_predicates:
+                mapped_screening_ids = mapped_screening_ids.where(
+                    *thermodynamic_presence_predicates
+                )
             predicates.append(col(LogicalReaction.id).in_(mapped_screening_ids))
         if minimum_mapped_reaction_count is not None or maximum_mapped_reaction_count is not None:
             mapped_count = _mapped_reaction_count_expression(scope)

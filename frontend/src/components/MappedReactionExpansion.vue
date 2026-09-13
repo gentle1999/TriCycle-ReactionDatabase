@@ -132,13 +132,14 @@ function finiteNumber(value: number | null | undefined): value is number {
 
 const thermodynamicPotentialProfile = computed<ReactionPotentialEnergyProfile | null>(() => {
   const profile = profiles.value.find((candidate) =>
-    candidate.transition_state !== null
+    candidate.reactants !== null
+    && candidate.transition_state !== null
     && candidate.products !== null
     && finiteNumber(candidate.reactants.gibbs_free_energy_hartree)
     && finiteNumber(candidate.transition_state.gibbs_free_energy_hartree)
     && finiteNumber(candidate.products.gibbs_free_energy_hartree),
   );
-  if (!profile || !profile.transition_state || !profile.products) return null;
+  if (!profile || !profile.reactants || !profile.transition_state || !profile.products) return null;
   const referenceEnergy = profile.reactants.gibbs_free_energy_hartree;
   const relativeEnergy = (value: number): number =>
     (value - referenceEnergy) * HARTREE_TO_KCAL_MOL;
@@ -265,7 +266,7 @@ watch(selectedGeometryTotal, (total) => {
     </header>
 
     <section v-if="profiles.length" class="reaction-thermodynamics" aria-label="反应热力学">
-      <header class="thermo-section-header"><div><span class="eyebrow">Thermodynamics</span><h3>活化和反应能差</h3></div><span>{{ profiles.length }} 个计算 profile</span></header>
+      <header class="thermo-section-header"><div><span class="eyebrow">Thermodynamics</span><h3>TS、活化和反应热力学</h3></div><span>{{ profiles.length }} 个计算 profile</span></header>
       <div class="thermo-profile-list">
         <article v-for="(profile, profileIndex) in profiles" :key="`${profile.level_of_theory}-${profile.temperature_kelvin}-${profile.pressure_atm}-${profileIndex}`" class="thermo-profile">
           <header class="thermo-profile-header"><div><span class="eyebrow">Profile {{ String(profileIndex + 1).padStart(2, "0") }}</span><code class="thermo-level">{{ profile.level_of_theory }}</code></div><span>{{ profile.temperature_kelvin }} K · {{ profile.pressure_atm }} atm</span></header>
@@ -279,6 +280,11 @@ watch(selectedGeometryTotal, (total) => {
               <div><span>ΔH 反应</span><strong>{{ profile.reaction.enthalpy_kcal_mol.toFixed(2) }}</strong><small>kcal/mol</small></div>
               <div><span>ΔG 反应</span><strong>{{ profile.reaction.gibbs_free_energy_kcal_mol.toFixed(2) }}</strong><small>kcal/mol</small></div>
               <div><span>ΔS 反应</span><strong>{{ profile.reaction.entropy_cal_mol_k.toFixed(2) }}</strong><small>cal/mol/K</small></div>
+            </template>
+            <template v-if="profile.transition_state">
+              <div><span>TS H</span><strong>{{ profile.transition_state.enthalpy_hartree.toFixed(6) }}</strong><small>Eh</small></div>
+              <div><span>TS G</span><strong>{{ profile.transition_state.gibbs_free_energy_hartree.toFixed(6) }}</strong><small>Eh</small></div>
+              <div><span>TS S</span><strong>{{ profile.transition_state.entropy_cal_mol_k.toFixed(3) }}</strong><small>cal/mol/K</small></div>
             </template>
           </div>
           <dl class="thermo-runtime-facts" aria-label="反应路径文件计算用时">

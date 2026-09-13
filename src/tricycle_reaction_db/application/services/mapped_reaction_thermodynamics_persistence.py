@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import delete, func
+from sqlalchemy import and_, delete, func, or_
 from sqlmodel import Session, col, select
 
 from tricycle_reaction_db.application.dtos import MappedReactionThermodynamics
@@ -27,6 +27,13 @@ from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics im
     GeometryThermodynamicCandidate,
     build_mapped_reaction_thermodynamics,
 )
+from tricycle_reaction_db.application.services.reaction_geometry_policy import (
+    geometry_has_no_imaginary_frequency_predicate,
+    geometry_has_thermodynamic_property_predicate,
+)
+from tricycle_reaction_db.application.services.topology_compatibility import (
+    source_geometry_compatible_topology,
+)
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
     ArtifactIngestion,
@@ -34,6 +41,7 @@ from tricycle_reaction_db.db.models import (
     CalculationProtocol,
     CalculationSegment,
     Geometry,
+    LogicalParticipantConcreteTopology,
     LogicalReactionParticipant,
     MappedReaction,
     MappedReactionEdge,
@@ -41,15 +49,43 @@ from tricycle_reaction_db.db.models import (
     MappedReactionNodeGeometry,
     MappedReactionParticipant,
     MappedReactionThermodynamicProfile,
+    MolecularTopology,
     ParseRevision,
     ThermochemistryResult,
 )
 from tricycle_reaction_db.domain.enums import (
     ArtifactIngestionStatus,
     MappedReactionNodeRole,
+    OptimizationStatus,
+    ParseCompleteness,
     ParseStatus,
     StorageStatus,
 )
+
+
+def _thermodynamic_source_ingestion_predicate(
+    transition_state_geometry_ids: set[UUID],
+) -> Any:
+    """Allow complete TS evidence from a partially indexed artifact.
+
+    Some legacy autode artifacts were marked ``partial`` because one parse
+    revision in the artifact batch was incomplete, while the selected TS
+    frequency frame itself is complete and carries H/G/S.  Endpoint source
+    selection remains restricted to successful artifacts; this narrow
+    predicate only admits complete TS frames for TS-only profiles.
+    """
+
+    if not transition_state_geometry_ids:
+        return col(ArtifactIngestion.status) == ArtifactIngestionStatus.SUCCEEDED
+    return or_(
+        col(ArtifactIngestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+        and_(
+            col(ArtifactIngestion.status) == ArtifactIngestionStatus.PARTIAL,
+            col(CalculationFrame.geometry_id).in_(transition_state_geometry_ids),
+            col(ParseRevision.parse_completeness) == ParseCompleteness.COMPLETE,
+            col(ParseRevision.source_complete).is_(True),
+        ),
+    )
 
 
 @dataclass(slots=True)
@@ -59,6 +95,7 @@ class _MappedReactionThermodynamicsInput:
     mapped_reaction: MappedReaction
     participant_rows: tuple[tuple[MappedReactionParticipant, LogicalReactionParticipant], ...]
     binding_rows: tuple[tuple[MappedReactionNode, MappedReactionNodeGeometry, Geometry], ...]
+    endpoint_geometries_by_participant: dict[UUID, tuple[Geometry, ...]]
     transition_state_node_ids: frozenset[UUID]
     composites: dict[UUID, GeometryEnergyComposite]
     runtimes_by_geometry: dict[UUID, dict[UUID, tuple[int, float | None]]]
@@ -84,6 +121,228 @@ def _runtime_for_geometry_ids(
     if not files or any(runtime is None for _, runtime in files.values()):
         return None
     return round(sum(float(runtime) for _, runtime in files.values() if runtime is not None), 6)
+
+
+def _endpoint_geometries_by_participant(
+    session: Session,
+    participant_rows: Sequence[tuple[MappedReactionParticipant, LogicalReactionParticipant]],
+    *,
+    project_id: UUID,
+) -> dict[UUID, tuple[Geometry, ...]]:
+    """Load eligible endpoint geometries, including audited concrete members.
+
+    A mapped reaction can be created from a displaced TS endpoint before the
+    corresponding standalone reactant/ene optimization is reconciled.  The TS
+    endpoint's strict topology is then a valid reaction fact but has no
+    endpoint ``Geometry`` of its own.  The logical participant membership table
+    is the explicit bridge to already imported concrete members; this helper
+    uses it only when the strict topology has no eligible Geometry.
+
+    The returned mapping intentionally contains either all eligible geometries
+    under the strict topology or, when that set is empty, all eligible
+    geometries under the participant's concrete members.  It never crosses a
+    logical participant or project boundary.
+    """
+
+    if not participant_rows:
+        return {}
+    participant_ids: list[UUID] = []
+    logical_participant_ids: set[UUID] = set()
+    strict_topology_ids: dict[UUID, UUID] = {}
+    for mapped_participant, logical_participant in participant_rows:
+        participant_id = _require_id(mapped_participant, label="MappedReactionParticipant")
+        logical_participant_id = _require_id(
+            logical_participant,
+            label="LogicalReactionParticipant",
+        )
+        strict_topology_id = (
+            mapped_participant.concrete_topology_id or logical_participant.topology_id
+        )
+        if not isinstance(strict_topology_id, UUID):
+            continue
+        participant_ids.append(participant_id)
+        logical_participant_ids.add(logical_participant_id)
+        strict_topology_ids[participant_id] = strict_topology_id
+
+    concrete_topology_ids_by_logical: dict[UUID, set[UUID]] = {
+        logical_participant_id: set()
+        for logical_participant_id in logical_participant_ids
+    }
+    if logical_participant_ids:
+        memberships = session.exec(
+            select(LogicalParticipantConcreteTopology).where(
+                col(
+                    LogicalParticipantConcreteTopology.logical_reaction_participant_id
+                ).in_(logical_participant_ids)
+            )
+        ).all()
+        for membership in memberships:
+            logical_participant_id = membership.logical_reaction_participant_id
+            concrete_topology_id = membership.concrete_topology_id
+            if (
+                isinstance(logical_participant_id, UUID)
+                and isinstance(concrete_topology_id, UUID)
+            ):
+                concrete_topology_ids_by_logical.setdefault(logical_participant_id, set()).add(
+                    concrete_topology_id
+                )
+
+    allowed_topology_ids_by_participant: dict[UUID, set[UUID]] = {}
+    logical_id_by_participant = {
+        _require_id(mapped_participant, label="MappedReactionParticipant"):
+        _require_id(logical_participant, label="LogicalReactionParticipant")
+        for mapped_participant, logical_participant in participant_rows
+    }
+    all_topology_ids: set[UUID] = set()
+    for participant_id in participant_ids:
+        strict_topology_id = strict_topology_ids[participant_id]
+        logical_participant_id = logical_id_by_participant[participant_id]
+        allowed = {
+            strict_topology_id,
+            *concrete_topology_ids_by_logical.get(logical_participant_id, set()),
+        }
+        allowed_topology_ids_by_participant[participant_id] = allowed
+        all_topology_ids.update(allowed)
+
+    if not all_topology_ids:
+        return dict.fromkeys(participant_ids, ())
+    eligible_geometry_ids = select(col(CalculationFrame.geometry_id)).where(
+        col(CalculationFrame.optimization_status) == OptimizationStatus.CONVERGED,
+    )
+    geometries = session.exec(
+        select(Geometry).where(
+            col(Geometry.project_id) == project_id,
+            col(Geometry.topology_id).in_(all_topology_ids),
+            col(Geometry.id).in_(eligible_geometry_ids),
+            geometry_has_thermodynamic_property_predicate(col(Geometry.id)),
+            geometry_has_no_imaginary_frequency_predicate(col(Geometry.id)),
+        )
+    ).all()
+    geometries_by_topology: dict[UUID, list[Geometry]] = {}
+    for geometry in geometries:
+        topology_id = geometry.topology_id
+        if isinstance(topology_id, UUID):
+            geometries_by_topology.setdefault(topology_id, []).append(geometry)
+
+    # MolOP endpoint reconstruction can retain an endpoint-only bond and a
+    # different electronic form from the corresponding isolated optimization.
+    # That is not a normal topology membership and must not be treated as one:
+    # only search for it after every strict/member source has failed, and
+    # accept it only when exactly one compatible topology has eligible
+    # thermochemistry in this project.
+    endpoint_compatible_topology_ids_by_participant: dict[UUID, set[UUID]] = {}
+    strict_topologies = session.exec(
+        select(MolecularTopology).where(
+            col(MolecularTopology.id).in_(set(strict_topology_ids.values()))
+        )
+    ).all()
+    strict_topologies_by_id = {
+        topology.id: topology
+        for topology in strict_topologies
+        if isinstance(topology.id, UUID)
+    }
+    endpoint_compatible_search_specs: dict[UUID, MolecularTopology] = {}
+    for participant_id in participant_ids:
+        strict_topology_id = strict_topology_ids[participant_id]
+        if geometries_by_topology.get(strict_topology_id):
+            continue
+        member_ids = allowed_topology_ids_by_participant[participant_id] - {strict_topology_id}
+        if any(geometries_by_topology.get(topology_id) for topology_id in member_ids):
+            continue
+        strict_topology = strict_topologies_by_id.get(strict_topology_id)
+        if strict_topology is not None:
+            endpoint_compatible_search_specs[participant_id] = strict_topology
+
+    if endpoint_compatible_search_specs:
+        candidate_topologies = session.exec(
+            select(MolecularTopology).where(
+                col(MolecularTopology.project_id) == project_id,
+                col(MolecularTopology.formula_id).in_(
+                    {
+                        topology.formula_id
+                        for topology in endpoint_compatible_search_specs.values()
+                    }
+                ),
+            )
+        ).all()
+        endpoint_compatible_topologies_by_participant: dict[UUID, set[UUID]] = {}
+        endpoint_compatible_candidate_ids: set[UUID] = set()
+        for participant_id, strict_topology in endpoint_compatible_search_specs.items():
+            allowed_ids = allowed_topology_ids_by_participant[participant_id]
+            matching_ids = {
+                topology.id
+                for topology in candidate_topologies
+                if isinstance(topology.id, UUID)
+                and topology.id not in allowed_ids
+                and topology.formula_id == strict_topology.formula_id
+                and topology.atom_count == strict_topology.atom_count
+                and topology.formal_charge == strict_topology.formal_charge
+                and topology.fragment_count == strict_topology.fragment_count
+                and source_geometry_compatible_topology(strict_topology.mol, topology.mol)
+            }
+            if matching_ids:
+                endpoint_compatible_topologies_by_participant[participant_id] = matching_ids
+                endpoint_compatible_candidate_ids.update(matching_ids)
+        if endpoint_compatible_candidate_ids:
+            endpoint_compatible_geometries = session.exec(
+                select(Geometry).where(
+                    col(Geometry.project_id) == project_id,
+                    col(Geometry.topology_id).in_(endpoint_compatible_candidate_ids),
+                    col(Geometry.id).in_(eligible_geometry_ids),
+                    geometry_has_thermodynamic_property_predicate(col(Geometry.id)),
+                    geometry_has_no_imaginary_frequency_predicate(col(Geometry.id)),
+                )
+            ).all()
+            for geometry in endpoint_compatible_geometries:
+                topology_id = geometry.topology_id
+                if isinstance(topology_id, UUID):
+                    geometries_by_topology.setdefault(topology_id, []).append(geometry)
+            for (
+                participant_id,
+                topology_ids,
+            ) in endpoint_compatible_topologies_by_participant.items():
+                eligible_ids = {
+                    topology_id
+                    for topology_id in topology_ids
+                    if geometries_by_topology.get(topology_id)
+                }
+                # More than one eligible endpoint-compatible topology is ambiguous and
+                # remains intentionally unresolved instead of guessing.
+                if len(eligible_ids) == 1:
+                    endpoint_compatible_topology_ids_by_participant[participant_id] = eligible_ids
+
+    result: dict[UUID, tuple[Geometry, ...]] = {}
+    for participant_id in participant_ids:
+        strict_topology_id = strict_topology_ids[participant_id]
+        strict_geometries = geometries_by_topology.get(strict_topology_id, [])
+        selected = strict_geometries or [
+            geometry
+            for topology_id in sorted(
+                allowed_topology_ids_by_participant[participant_id], key=str
+            )
+            if topology_id != strict_topology_id
+            for geometry in geometries_by_topology.get(topology_id, [])
+        ]
+        if not selected:
+            selected = [
+                geometry
+                for topology_id in sorted(
+                    endpoint_compatible_topology_ids_by_participant.get(participant_id, set()),
+                    key=str,
+                )
+                for geometry in geometries_by_topology.get(topology_id, [])
+            ]
+        result[participant_id] = tuple(
+            sorted(
+                {
+                    geometry.id: geometry
+                    for geometry in selected
+                    if geometry.id is not None
+                }.values(),
+                key=lambda geometry: str(geometry.id),
+            )
+        )
+    return result
 
 
 def _load_mapped_reaction_thermodynamics_input(
@@ -117,6 +376,11 @@ def _load_mapped_reaction_thermodynamics_input(
         .join(Geometry, col(MappedReactionNodeGeometry.geometry_id) == col(Geometry.id))
         .where(MappedReactionNode.mapped_reaction_id == mapped_reaction_id)
     ).all()
+    transition_state_geometry_ids = {
+        _require_id(geometry, label="Geometry")
+        for node, _binding, geometry in binding_rows
+        if node.role is MappedReactionNodeRole.TRANSITION_STATE
+    }
     transition_state_node_ids = frozenset(
         node_id
         for node_id in session.exec(
@@ -127,9 +391,20 @@ def _load_mapped_reaction_thermodynamics_input(
         ).all()
         if isinstance(node_id, UUID)
     )
+    project_id = mapped_reaction.project_id
+    if not isinstance(project_id, UUID):
+        raise ValueError("MappedReaction must have a project_id before thermodynamic refresh")
+    endpoint_geometries_by_participant = _endpoint_geometries_by_participant(
+        session,
+        participant_rows,
+        project_id=project_id,
+    )
     geometries = {
         _require_id(geometry, label="Geometry"): geometry for _, _, geometry in binding_rows
     }
+    for endpoint_geometries in endpoint_geometries_by_participant.values():
+        for geometry in endpoint_geometries:
+            geometries[_require_id(geometry, label="Geometry")] = geometry
     geometry_ids = list(geometries)
     calculation_rows: Sequence[Any] = ()
     if geometry_ids:
@@ -162,7 +437,7 @@ def _load_mapped_reaction_thermodynamics_input(
             .where(
                 col(CalculationFrame.geometry_id).in_(geometry_ids),
                 col(ParseRevision.status) == ParseStatus.SUCCEEDED,
-                col(ArtifactIngestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+                _thermodynamic_source_ingestion_predicate(transition_state_geometry_ids),
                 col(ArtifactFile.storage_status) != StorageStatus.RETIRED,
             )
         ).all()
@@ -191,7 +466,7 @@ def _load_mapped_reaction_thermodynamics_input(
             .where(
                 col(CalculationFrame.geometry_id).in_(geometry_ids),
                 col(ParseRevision.status) == ParseStatus.SUCCEEDED,
-                col(ArtifactIngestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+                _thermodynamic_source_ingestion_predicate(transition_state_geometry_ids),
                 col(ArtifactFile.storage_status) != StorageStatus.RETIRED,
             )
         ).all()
@@ -208,11 +483,13 @@ def _load_mapped_reaction_thermodynamics_input(
         mapped_reaction=mapped_reaction,
         participant_rows=tuple(participant_rows),
         binding_rows=tuple(binding_rows),
+        endpoint_geometries_by_participant=endpoint_geometries_by_participant,
         transition_state_node_ids=transition_state_node_ids,
         composites=geometry_energy_composites(
             geometry_ids,
             calculation_rows,
             source_frame_ids_by_geometry=source_frame_ids_by_geometry,
+            thermodynamic_only_geometry_ids=transition_state_geometry_ids,
         ),
         runtimes_by_geometry=runtimes_by_geometry,
     )
@@ -223,6 +500,7 @@ def _build_mapped_reaction_thermodynamics(
     mapped_reaction_id: UUID,
     participant_rows: Sequence[tuple[MappedReactionParticipant, LogicalReactionParticipant]],
     binding_rows: Sequence[tuple[MappedReactionNode, MappedReactionNodeGeometry, Geometry]],
+    endpoint_geometries_by_participant: Mapping[UUID, Sequence[Geometry]] | None = None,
     transition_state_node_ids: frozenset[UUID],
     composites: dict[UUID, GeometryEnergyComposite],
 ) -> MappedReactionThermodynamics:
@@ -230,9 +508,23 @@ def _build_mapped_reaction_thermodynamics(
 
     requirements: list[EndpointComponentRequirement] = []
     expected_roles: dict[UUID, MappedReactionNodeRole] = {}
+    endpoint_topology_ids_by_participant: dict[UUID, set[UUID]] = {}
+    for participant_id, geometries in (endpoint_geometries_by_participant or {}).items():
+        endpoint_topology_ids_by_participant[participant_id] = {
+            geometry.topology_id
+            for geometry in geometries
+            if isinstance(geometry.topology_id, UUID)
+        }
+    for _, binding, geometry in binding_rows:
+        participant_id = binding.mapped_reaction_participant_id
+        if participant_id is not None and isinstance(geometry.topology_id, UUID):
+            endpoint_topology_ids_by_participant.setdefault(participant_id, set()).add(
+                geometry.topology_id
+            )
     for mapped_participant, logical_participant in participant_rows:
         participant_id = _require_id(mapped_participant, label="MappedReactionParticipant")
         side = mapped_participant.side.value
+        allowed_topology_ids = endpoint_topology_ids_by_participant.get(participant_id)
         requirements.append(
             EndpointComponentRequirement(
                 side=side,
@@ -241,6 +533,9 @@ def _build_mapped_reaction_thermodynamics(
                     mapped_participant.concrete_topology_id or logical_participant.topology_id
                 ),
                 stoichiometric_coefficient=logical_participant.stoichiometric_coefficient,
+                allowed_topology_ids=(
+                    frozenset(allowed_topology_ids) if allowed_topology_ids else None
+                ),
             )
         )
         expected_roles[participant_id] = (
@@ -284,6 +579,22 @@ def _build_mapped_reaction_thermodynamics(
                 )
             )
 
+    for participant_id, endpoint_geometries in (
+        endpoint_geometries_by_participant or {}
+    ).items():
+        for geometry in endpoint_geometries:
+            geometry_id = _require_id(geometry, label="Geometry")
+            if (participant_id, geometry_id) in seen_endpoints:
+                continue
+            seen_endpoints.add((participant_id, geometry_id))
+            candidates_by_component.setdefault(participant_id, []).append(
+                GeometryThermodynamicCandidate(
+                    geometry_id=geometry_id,
+                    topology_id=geometry.topology_id,
+                    composite=composites[geometry_id],
+                )
+            )
+
     return build_mapped_reaction_thermodynamics(
         mapped_reaction_id=mapped_reaction_id,
         endpoint_requirements=requirements,
@@ -305,7 +616,7 @@ def _materialize_profile_rows(
         products = profile.products
         reactant_geometry_ids = {
             selection.geometry_id for selection in profile.reactants.topologies
-        }
+        } if profile.reactants is not None else set()
         transition_state_geometry_ids = (
             {selection.geometry_id for selection in transition_state.topologies}
             if transition_state is not None
@@ -362,18 +673,32 @@ def _materialize_profile_rows(
                 thermochemistry_level=list(profile.thermochemistry_level),
                 temperature_kelvin=profile.temperature_kelvin,
                 pressure_atm=profile.pressure_atm,
-                reactants=profile.reactants.model_dump(mode="json"),
+                reactants=(
+                    profile.reactants.model_dump(mode="json")
+                    if profile.reactants is not None
+                    else None
+                ),
                 transition_state=(
                     transition_state.model_dump(mode="json")
                     if transition_state is not None
                     else None
                 ),
                 products=products.model_dump(mode="json") if products is not None else None,
-                reactants_enthalpy_hartree=float(profile.reactants.enthalpy_hartree),
-                reactants_gibbs_free_energy_hartree=float(
-                    profile.reactants.gibbs_free_energy_hartree
+                reactants_enthalpy_hartree=(
+                    float(profile.reactants.enthalpy_hartree)
+                    if profile.reactants is not None
+                    else None
                 ),
-                reactants_entropy_cal_mol_k=profile.reactants.entropy_cal_mol_k,
+                reactants_gibbs_free_energy_hartree=(
+                    float(profile.reactants.gibbs_free_energy_hartree)
+                    if profile.reactants is not None
+                    else None
+                ),
+                reactants_entropy_cal_mol_k=(
+                    profile.reactants.entropy_cal_mol_k
+                    if profile.reactants is not None
+                    else None
+                ),
                 transition_state_enthalpy_hartree=(
                     float(transition_state.enthalpy_hartree)
                     if transition_state is not None
@@ -469,6 +794,7 @@ def refresh_mapped_reaction_thermodynamics(
         mapped_reaction_id=mapped_reaction_id,
         participant_rows=participant_rows,
         binding_rows=binding_rows,
+        endpoint_geometries_by_participant=refresh_input.endpoint_geometries_by_participant,
         transition_state_node_ids=transition_state_node_ids,
         composites=composites,
     )
@@ -484,7 +810,7 @@ def refresh_mapped_reaction_thermodynamics(
         products = profile.products
         reactant_geometry_ids = {
             selection.geometry_id for selection in profile.reactants.topologies
-        }
+        } if profile.reactants is not None else set()
         transition_state_geometry_ids = (
             {selection.geometry_id for selection in transition_state.topologies}
             if transition_state is not None
@@ -541,18 +867,32 @@ def refresh_mapped_reaction_thermodynamics(
                 thermochemistry_level=list(profile.thermochemistry_level),
                 temperature_kelvin=profile.temperature_kelvin,
                 pressure_atm=profile.pressure_atm,
-                reactants=profile.reactants.model_dump(mode="json"),
+                reactants=(
+                    profile.reactants.model_dump(mode="json")
+                    if profile.reactants is not None
+                    else None
+                ),
                 transition_state=(
                     transition_state.model_dump(mode="json")
                     if transition_state is not None
                     else None
                 ),
                 products=products.model_dump(mode="json") if products is not None else None,
-                reactants_enthalpy_hartree=float(profile.reactants.enthalpy_hartree),
-                reactants_gibbs_free_energy_hartree=float(
-                    profile.reactants.gibbs_free_energy_hartree
+                reactants_enthalpy_hartree=(
+                    float(profile.reactants.enthalpy_hartree)
+                    if profile.reactants is not None
+                    else None
                 ),
-                reactants_entropy_cal_mol_k=profile.reactants.entropy_cal_mol_k,
+                reactants_gibbs_free_energy_hartree=(
+                    float(profile.reactants.gibbs_free_energy_hartree)
+                    if profile.reactants is not None
+                    else None
+                ),
+                reactants_entropy_cal_mol_k=(
+                    profile.reactants.entropy_cal_mol_k
+                    if profile.reactants is not None
+                    else None
+                ),
                 transition_state_enthalpy_hartree=(
                     float(transition_state.enthalpy_hartree)
                     if transition_state is not None
@@ -657,6 +997,24 @@ def refresh_mapped_reactions_thermodynamics(
         if isinstance(mapped_reaction_id, UUID):
             participants_by_reaction[mapped_reaction_id].append((participant, logical_participant))
 
+    endpoint_geometries_by_participant: dict[UUID, tuple[Geometry, ...]] = {}
+    mapped_reactions_by_project: dict[
+        UUID,
+        list[tuple[MappedReactionParticipant, LogicalReactionParticipant]],
+    ] = {}
+    for mapped_reaction_id, rows in participants_by_reaction.items():
+        mapped_reaction = mapped_reactions_by_id[mapped_reaction_id]
+        if isinstance(mapped_reaction.project_id, UUID):
+            mapped_reactions_by_project.setdefault(mapped_reaction.project_id, []).extend(rows)
+    for project_id, project_participant_rows in mapped_reactions_by_project.items():
+        endpoint_geometries_by_participant.update(
+            _endpoint_geometries_by_participant(
+                session,
+                project_participant_rows,
+                project_id=project_id,
+            )
+        )
+
     binding_rows = session.exec(
         select(MappedReactionNode, MappedReactionNodeGeometry, Geometry)
         .join(
@@ -677,6 +1035,24 @@ def refresh_mapped_reactions_thermodynamics(
             bindings_by_reaction[mapped_reaction_id].append((node, binding, geometry))
         geometry_id = _require_id(geometry, label="Geometry")
         geometries[geometry_id] = geometry
+    for endpoint_geometries in endpoint_geometries_by_participant.values():
+        for geometry in endpoint_geometries:
+            geometries[_require_id(geometry, label="Geometry")] = geometry
+
+    endpoint_geometries_by_reaction: dict[UUID, dict[UUID, tuple[Geometry, ...]]] = {
+        mapped_reaction_id: {
+            _require_id(mapped_participant, label="MappedReactionParticipant"): (
+                endpoint_geometries_by_participant.get(
+                    _require_id(mapped_participant, label="MappedReactionParticipant"),
+                    (),
+                )
+            )
+            for mapped_participant, _logical_participant in participants_by_reaction[
+                mapped_reaction_id
+            ]
+        }
+        for mapped_reaction_id in mapped_reaction_ids
+    }
 
     transition_state_node_ids_by_reaction: dict[UUID, set[UUID]] = {
         mapped_reaction_id: set() for mapped_reaction_id in mapped_reaction_ids
@@ -693,6 +1069,11 @@ def refresh_mapped_reactions_thermodynamics(
         if isinstance(mapped_reaction_id, UUID) and isinstance(node_id, UUID):
             transition_state_node_ids_by_reaction[mapped_reaction_id].add(node_id)
 
+    transition_state_geometry_ids = {
+        _require_id(geometry, label="Geometry")
+        for node, _binding, geometry in binding_rows
+        if node.role is MappedReactionNodeRole.TRANSITION_STATE
+    }
     geometry_ids = list(geometries)
     calculation_rows: Sequence[Any] = ()
     if geometry_ids:
@@ -725,7 +1106,7 @@ def refresh_mapped_reactions_thermodynamics(
             .where(
                 col(CalculationFrame.geometry_id).in_(geometry_ids),
                 col(ParseRevision.status) == ParseStatus.SUCCEEDED,
-                col(ArtifactIngestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+                _thermodynamic_source_ingestion_predicate(transition_state_geometry_ids),
                 col(ArtifactFile.storage_status) != StorageStatus.RETIRED,
             )
         ).all()
@@ -754,7 +1135,7 @@ def refresh_mapped_reactions_thermodynamics(
             .where(
                 col(CalculationFrame.geometry_id).in_(geometry_ids),
                 col(ParseRevision.status) == ParseStatus.SUCCEEDED,
-                col(ArtifactIngestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+                _thermodynamic_source_ingestion_predicate(transition_state_geometry_ids),
                 col(ArtifactFile.storage_status) != StorageStatus.RETIRED,
             )
         ).all()
@@ -767,7 +1148,11 @@ def refresh_mapped_reactions_thermodynamics(
             if previous is None or candidate[0] > previous[0]:
                 by_file[artifact_id] = candidate
 
-    composites = geometry_energy_composites(geometry_ids, calculation_rows)
+    composites = geometry_energy_composites(
+        geometry_ids,
+        calculation_rows,
+        thermodynamic_only_geometry_ids=transition_state_geometry_ids,
+    )
     results: list[MappedReactionThermodynamics] = []
     profile_rows: list[MappedReactionThermodynamicProfile] = []
     for mapped_reaction_id, _mapped_reaction in mapped_reactions_by_id.items():
@@ -775,6 +1160,9 @@ def refresh_mapped_reactions_thermodynamics(
             mapped_reaction_id=mapped_reaction_id,
             participant_rows=participants_by_reaction[mapped_reaction_id],
             binding_rows=bindings_by_reaction[mapped_reaction_id],
+            endpoint_geometries_by_participant=endpoint_geometries_by_reaction[
+                mapped_reaction_id
+            ],
             transition_state_node_ids=frozenset(
                 transition_state_node_ids_by_reaction[mapped_reaction_id]
             ),

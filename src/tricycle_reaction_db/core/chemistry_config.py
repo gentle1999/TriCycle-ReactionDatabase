@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Final
 
 # Formula, topology, geometry, and calculation-protocol identity contracts.
-CALCULATION_PROTOCOL_VERSION: Final[str] = "calculation-protocol-v2"
+CALCULATION_PROTOCOL_VERSION: Final[str] = "calculation-protocol-v3"
 FORMULA_COMPOSITION_VERSION: Final[str] = "formula-composition-v1"
 TOPOLOGY_IDENTITY_VERSION: Final[str] = "topology-identity-v1"
 TOPOLOGY_SOURCE_ORDER_STEREO_IDENTITY_VERSION: Final[str] = (
@@ -38,7 +38,7 @@ GEOMETRY_MATCH_POLICY_VERSION: Final[str] = "geometry-internal-coordinate-match-
 REACTION_GEOMETRY_LINK_METHOD: Final[str] = "topology-identity"
 REACTION_GEOMETRY_LINK_POLICY_VERSION: Final[str] = "reaction-geometry-link-v1"
 GEOMETRY_ENERGY_POLICY_VERSION: Final[str] = "geometry-energy-view-v1"
-MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION: Final[str] = "mapped-reaction-thermodynamics-v1"
+MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION: Final[str] = "mapped-reaction-thermodynamics-v3"
 
 
 @dataclass(frozen=True, slots=True)

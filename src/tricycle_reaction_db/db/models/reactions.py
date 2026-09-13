@@ -589,6 +589,10 @@ class MappedReactionThermodynamicProfile(SQLModel, table=True):
             "activation_gibbs_free_energy_kcal_mol",
         ),
         CheckConstraint(
+            "reactants IS NOT NULL OR transition_state IS NOT NULL",
+            name="ck_mapped_rxn_profile_has_thermodynamic_state",
+        ),
+        CheckConstraint(
             "reactants_running_time_seconds IS NULL OR reactants_running_time_seconds >= 0",
             name="ck_mapped_rxn_profile_reactants_runtime_nonnegative",
         ),
@@ -618,14 +622,20 @@ class MappedReactionThermodynamicProfile(SQLModel, table=True):
     thermochemistry_level: list[str | None] = Field(sa_column=Column(JSONB, nullable=False))
     temperature_kelvin: float = Field(nullable=False)
     pressure_atm: float = Field(nullable=False)
-    reactants: dict[str, Any] = Field(sa_column=Column(JSONB, nullable=False))
-    transition_state: dict[str, Any] | None = Field(
-        default=None, sa_column=Column(JSONB, nullable=True)
+    reactants: dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB(none_as_null=True), nullable=True),
     )
-    products: dict[str, Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
-    reactants_enthalpy_hartree: float = Field(nullable=False)
-    reactants_gibbs_free_energy_hartree: float = Field(nullable=False)
-    reactants_entropy_cal_mol_k: float = Field(nullable=False)
+    transition_state: dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSONB(none_as_null=True), nullable=True)
+    )
+    products: dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB(none_as_null=True), nullable=True),
+    )
+    reactants_enthalpy_hartree: float | None = Field(default=None)
+    reactants_gibbs_free_energy_hartree: float | None = Field(default=None)
+    reactants_entropy_cal_mol_k: float | None = Field(default=None)
     transition_state_enthalpy_hartree: float | None = Field(default=None)
     transition_state_gibbs_free_energy_hartree: float | None = Field(default=None)
     transition_state_entropy_cal_mol_k: float | None = Field(default=None)

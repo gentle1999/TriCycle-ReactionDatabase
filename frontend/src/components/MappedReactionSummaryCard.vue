@@ -88,7 +88,7 @@ function energyRange(minimum: number | null, maximum: number | null): string {
         </header>
         <div v-if="thermodynamics.isPending.value || thermodynamics.isFetching.value" class="loading-block is-wide"></div>
         <div v-else-if="thermodynamicsError" class="compact-empty is-error" role="alert">热力学读取失败：{{ thermodynamicsError }}</div>
-        <div v-else-if="!profiles.length" class="compact-empty">当前映射反应没有完整热力学 profile</div>
+        <div v-else-if="!profiles.length" class="compact-empty">当前映射反应没有热力学 profile</div>
         <div v-else class="thermo-profile-list">
           <article v-for="(profile, profileIndex) in profiles" :key="`${profile.level_of_theory}-${profile.temperature_kelvin}-${profile.pressure_atm}-${profileIndex}`" class="thermo-profile">
             <header class="thermo-profile-header"><div><span class="eyebrow">Profile {{ String(profileIndex + 1).padStart(2, "0") }}</span><code class="thermo-level">{{ profile.level_of_theory }}</code></div><span>{{ profile.temperature_kelvin }} K · {{ profile.pressure_atm }} atm</span></header>
@@ -102,6 +102,11 @@ function energyRange(minimum: number | null, maximum: number | null): string {
                 <div><span>ΔH 反应</span><strong>{{ formatNumber(profile.reaction.enthalpy_kcal_mol, 2) }}</strong><small>kcal/mol</small></div>
                 <div><span>ΔG 反应</span><strong>{{ formatNumber(profile.reaction.gibbs_free_energy_kcal_mol, 2) }}</strong><small>kcal/mol</small></div>
                 <div><span>ΔS 反应</span><strong>{{ formatNumber(profile.reaction.entropy_cal_mol_k, 2) }}</strong><small>cal/mol/K</small></div>
+              </template>
+              <template v-if="profile.transition_state">
+                <div><span>TS H</span><strong>{{ formatNumber(profile.transition_state.enthalpy_hartree, 6) }}</strong><small>Eh</small></div>
+                <div><span>TS G</span><strong>{{ formatNumber(profile.transition_state.gibbs_free_energy_hartree, 6) }}</strong><small>Eh</small></div>
+                <div><span>TS S</span><strong>{{ formatNumber(profile.transition_state.entropy_cal_mol_k, 3) }}</strong><small>cal/mol/K</small></div>
               </template>
             </div>
             <dl class="thermo-runtime-facts" aria-label="反应路径文件计算用时">

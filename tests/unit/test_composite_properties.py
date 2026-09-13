@@ -5,6 +5,7 @@ import pytest
 from tricycle_reaction_db.application.services.geometry_energy import (
     GeometryEnergyCandidate,
     geometry_energy_composite,
+    geometry_energy_composites,
     protocol_level_view,
 )
 from tricycle_reaction_db.application.services.queries import (
@@ -80,8 +81,8 @@ def test_geometry_energy_prefers_higher_level_single_point_and_adds_thermal_corr
         "DFT",
         "DFT",
         None,
-        "wB97M-V",
-        "def2-TZVPP",
+        "WB97M-V",
+        "DEF2-TZVPP",
         None,
         None,
         None,
@@ -92,7 +93,7 @@ def test_geometry_energy_prefers_higher_level_single_point_and_adds_thermal_corr
         "DFT",
         None,
         "B3LYP-GD3BJ",
-        "def2-SVP",
+        "DEF2-SVP",
         None,
         None,
         None,
@@ -108,6 +109,38 @@ def test_geometry_energy_prefers_higher_level_single_point_and_adds_thermal_corr
     assert aggregate.source_levels_compatible is True
     assert aggregate.electronic_energy_hartree == -200.0
     assert aggregate.gibbs_free_energy_hartree == pytest.approx(-199.9)
+
+
+def test_same_protocol_single_point_and_frequency_frames_are_compatible() -> None:
+    geometry_id = uuid4()
+    protocol = _protocol("B3LYP-GD3BJ", "def2-SVP", software="gaussian")
+    frequency_protocol = protocol.model_copy(
+        update={"task_requests": ["freq"], "normalized_spec": {"route": "freq"}}
+    )
+    single_point_frame = _frame(geometry_id, -99.0)
+    frequency_frame = _frame(geometry_id, -99.0)
+    thermochemistry = ThermochemistryResult(
+        temperature_kelvin=298.15,
+        pressure_atm=1.0,
+        thermal_enthalpy_correction_hartree=0.06,
+        thermal_gibbs_correction_hartree=0.05,
+        entropy_cal_mol_k=12.5,
+    )
+
+    composite = geometry_energy_composite(
+        geometry_id,
+        [
+            GeometryEnergyCandidate(single_point_frame, protocol, None),
+            GeometryEnergyCandidate(frequency_frame, frequency_protocol, thermochemistry),
+        ],
+    )
+
+    assert composite.view.electronic_selection_status == "selected"
+    assert composite.view.thermochemistry_selection_status == "selected"
+    assert composite.view.electronic_energy_hartree == -99.0
+    assert composite.view.gibbs_free_energy_hartree == pytest.approx(-98.95)
+    assert composite.view.enthalpy_hartree == pytest.approx(-98.94)
+    assert composite.view.entropy_cal_mol_k == pytest.approx(12.5)
 
 
 def test_incomparable_protocols_produce_an_ambiguous_energy_view() -> None:
@@ -172,6 +205,44 @@ def test_same_protocol_conflicting_values_are_ambiguous() -> None:
 
     assert composite.view.electronic_selection_status == "ambiguous"
     assert composite.view.electronic_energy_hartree is None
+
+
+def test_ts_thermodynamic_only_composite_chooses_complete_lowest_gibbs_frame() -> None:
+    geometry_id = uuid4()
+    first_protocol = _protocol("B3LYP", "def2-SVP", software="gaussian")
+    second_protocol = first_protocol.model_copy(update={"basis_set": "def2-TZVPP"})
+    first_frame = _frame(geometry_id, -100.0)
+    second_frame = _frame(geometry_id, -101.0)
+    first_thermochemistry = ThermochemistryResult(
+        temperature_kelvin=298.15,
+        pressure_atm=1.0,
+        enthalpy_hartree=-99.90,
+        gibbs_free_energy_hartree=-99.95,
+        entropy_cal_mol_k=10.0,
+    )
+    second_thermochemistry = ThermochemistryResult(
+        temperature_kelvin=298.15,
+        pressure_atm=1.0,
+        enthalpy_hartree=-100.90,
+        gibbs_free_energy_hartree=-100.95,
+        entropy_cal_mol_k=11.0,
+    )
+
+    composite = geometry_energy_composites(
+        [geometry_id],
+        [
+            (first_frame, first_protocol, first_thermochemistry),
+            (second_frame, second_protocol, second_thermochemistry),
+        ],
+        thermodynamic_only_geometry_ids=[geometry_id],
+    )[geometry_id]
+
+    assert composite.thermodynamic_only is True
+    assert composite.view.thermochemistry_selection_status == "selected"
+    assert composite.view.thermochemistry_source_frame_id == second_frame.id
+    assert composite.view.enthalpy_hartree == pytest.approx(-100.90)
+    assert composite.view.gibbs_free_energy_hartree == pytest.approx(-100.95)
+    assert composite.view.entropy_cal_mol_k == pytest.approx(11.0)
 
 
 def test_protocol_version_difference_is_not_equivalent() -> None:

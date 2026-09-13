@@ -53,6 +53,7 @@ from tricycle_reaction_db.db.models import (
 from tricycle_reaction_db.domain.enums import (
     ArtifactIngestionStatus,
     ArtifactVisibility,
+    ParseCompleteness,
     ParseStatus,
     StorageStatus,
 )
@@ -1008,6 +1009,7 @@ def _profile_state_is_visible(
     *,
     alias_name: str,
     required: bool,
+    allow_partial_complete_source: bool = False,
 ) -> Any:
     """Authorize the source evidence embedded in one profile state.
 
@@ -1043,12 +1045,114 @@ def _profile_state_is_visible(
         selection.op("?")("electronic_source_frame_id"),
         selection.op("?")("thermochemistry_source_frame_id"),
     )
+    ingestion_is_visible = col(ArtifactIngestion.status) == ArtifactIngestionStatus.SUCCEEDED
+    if allow_partial_complete_source:
+        ingestion_is_visible = or_(
+            ingestion_is_visible,
+            and_(
+                col(ArtifactIngestion.status) == ArtifactIngestionStatus.PARTIAL,
+                col(ParseRevision.parse_completeness) == ParseCompleteness.COMPLETE,
+                col(ParseRevision.source_complete).is_(True),
+            ),
+        )
+    if scope.uses_project_owned_fast_path:
+        def source_frame_is_visible(frame_id: Any) -> Any:
+            """Check one selected frame through indexed primary-key joins."""
+
+            return (
+                select(1)
+                .select_from(CalculationFrame)
+                .join(
+                    ParseRevision,
+                    col(CalculationFrame.parse_revision_id) == col(ParseRevision.id),
+                )
+                .join(
+                    ArtifactFile,
+                    col(ParseRevision.artifact_file_id) == col(ArtifactFile.id),
+                )
+                .join(
+                    ArtifactIngestion,
+                    col(ArtifactIngestion.artifact_file_id) == col(ArtifactFile.id),
+                )
+                .join(Geometry, col(CalculationFrame.geometry_id) == col(Geometry.id))
+                .join(
+                    MolecularTopologyDerivation,
+                    col(CalculationFrame.topology_derivation_id)
+                    == col(MolecularTopologyDerivation.id),
+                )
+                .where(
+                    col(CalculationFrame.id) == frame_id,
+                    col(ArtifactFile.project_id) == scope.requested_project_id,
+                    col(ArtifactFile.storage_status) != StorageStatus.RETIRED,
+                    ingestion_is_visible,
+                    col(ParseRevision.status) == ParseStatus.SUCCEEDED,
+                    col(Geometry.project_id) == scope.requested_project_id,
+                    col(MolecularTopologyDerivation.project_id) == scope.requested_project_id,
+                )
+                .correlate(profile)
+                .exists()
+            )
+    else:
+        if allow_partial_complete_source:
+            partial_complete_visible_frame_ids = (
+                select(col(CalculationFrame.id))
+                .join(
+                    ParseRevision,
+                    col(CalculationFrame.parse_revision_id) == col(ParseRevision.id),
+                )
+                .join(
+                    CalculationSegment,
+                    col(CalculationFrame.segment_id) == col(CalculationSegment.id),
+                )
+                .outerjoin(
+                    CalculationProtocol,
+                    col(CalculationSegment.protocol_id) == col(CalculationProtocol.id),
+                )
+                .join(
+                    ArtifactFile,
+                    col(ParseRevision.artifact_file_id) == col(ArtifactFile.id),
+                )
+                .join(
+                    ArtifactIngestion,
+                    col(ArtifactIngestion.artifact_file_id) == col(ArtifactFile.id),
+                )
+                .join(Geometry, col(CalculationFrame.geometry_id) == col(Geometry.id))
+                .join(
+                    MolecularTopologyDerivation,
+                    col(CalculationFrame.topology_derivation_id)
+                    == col(MolecularTopologyDerivation.id),
+                )
+                .where(
+                    scope.derived_artifact_predicate(),
+                    col(ArtifactFile.storage_status) != StorageStatus.RETIRED,
+                    ingestion_is_visible,
+                    col(ParseRevision.status) == ParseStatus.SUCCEEDED,
+                    _derived_project_owner_is_visible(scope, col(Geometry.project_id)),
+                    col(Geometry.project_id) == col(ArtifactFile.project_id),
+                    _protocol_project_is_visible(
+                        scope,
+                        col(CalculationSegment.protocol_id),
+                        col(CalculationProtocol.project_id),
+                        col(ArtifactFile.project_id),
+                    ),
+                    _derived_project_owner_is_visible(
+                        scope,
+                        col(MolecularTopologyDerivation.project_id),
+                    ),
+                )
+            )
+
+            def source_frame_is_visible(frame_id: Any) -> Any:
+                return frame_id.in_(partial_complete_visible_frame_ids)
+        else:
+            def source_frame_is_visible(frame_id: Any) -> Any:
+                return frame_id.in_(visible_frame_ids(scope))
     source_is_visible = and_(
         has_all_source_provenance,
         electronic_source_frame_id.is_not(None),
         thermochemistry_source_frame_id.is_not(None),
-        electronic_source_frame_id.in_(visible_frame_ids(scope)),
-        thermochemistry_source_frame_id.in_(visible_frame_ids(scope)),
+        source_frame_is_visible(electronic_source_frame_id),
+        source_frame_is_visible(thermochemistry_source_frame_id),
     )
     legacy_is_visible = and_(
         ~has_any_source_provenance,
@@ -1083,15 +1187,8 @@ def thermodynamic_profile_is_visible(
 
     if scope.unrestricted:
         return true()
-    return and_(
-        # The profile has no independent project column.  Its parent is the
-        # ownership boundary, so keep this predicate safe even when a caller
-        # uses it outside a query that already joins a visible MappedReaction.
-        col(profile.mapped_reaction_id).in_(
-            select(col(MappedReaction.id)).where(
-                _derived_project_owner_is_visible(scope, col(MappedReaction.project_id))
-            )
-        ),
+    standard_profile = and_(
+        col(profile.reactants).is_not(None),
         _profile_state_is_visible(
             scope,
             profile,
@@ -1113,6 +1210,36 @@ def thermodynamic_profile_is_visible(
             alias_name="thermodynamic_profile_products",
             required=False,
         ),
+    )
+    ts_only_profile = and_(
+        col(profile.reactants).is_(None),
+        col(profile.transition_state).is_not(None),
+        _profile_state_is_visible(
+            scope,
+            profile,
+            profile.transition_state,
+            alias_name="thermodynamic_profile_ts_only_transition_state",
+            required=True,
+            allow_partial_complete_source=True,
+        ),
+        _profile_state_is_visible(
+            scope,
+            profile,
+            profile.products,
+            alias_name="thermodynamic_profile_ts_only_products",
+            required=False,
+        ),
+    )
+    return and_(
+        # The profile has no independent project column.  Its parent is the
+        # ownership boundary, so keep this predicate safe even when a caller
+        # uses it outside a query that already joins a visible MappedReaction.
+        col(profile.mapped_reaction_id).in_(
+            select(col(MappedReaction.id)).where(
+                _derived_project_owner_is_visible(scope, col(MappedReaction.project_id))
+            )
+        ),
+        or_(standard_profile, ts_only_profile),
     )
 
 

@@ -58,6 +58,28 @@ def test_profile_range_filter_keeps_all_conditions_in_one_exists() -> None:
     assert "maximum_activation_gibbs_free_energy_kcal_mol" not in compiled
 
 
+def test_profile_presence_filter_requires_non_null_gibbs_values() -> None:
+    scope = QueryVisibilityScope(
+        principal=None,
+        project_ids=frozenset(),
+        unrestricted=True,
+    )
+    statement = select(MappedReaction.id).where(
+        mapped_reaction_has_thermodynamic_profile(
+            scope,
+            col(MappedReaction.id),
+            has_activation_gibbs_free_energy=True,
+            has_reaction_gibbs_free_energy=True,
+        )
+    )
+
+    compiled = _sql(statement)
+
+    assert compiled.count("FROM mapped_reaction_thermodynamic_profile") == 1
+    assert compiled.count("activation_gibbs_free_energy_kcal_mol IS NOT NULL") == 1
+    assert compiled.count("reaction_gibbs_free_energy_kcal_mol IS NOT NULL") == 1
+
+
 def test_restricted_profile_visibility_requires_successful_source_provenance() -> None:
     project_id = uuid4()
     scope = QueryVisibilityScope(

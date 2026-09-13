@@ -876,6 +876,40 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
             )
         )
         assert logical_has_activation_gibbs_page.page.total == 0
+        logical_expression_has_reaction_page = asyncio.run(
+            LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
+                filter_expression=json.dumps(
+                    {
+                        "operator": "and",
+                        "conditions": [
+                            {"field": "reaction_hash", "value": logical_reaction.reaction_hash},
+                            {"field": "has_reaction_gibbs_free_energy", "value": True},
+                        ],
+                    }
+                ),
+                limit=1,
+                offset=0,
+            )
+        )
+        assert logical_expression_has_reaction_page.page.total == 1
+        logical_expression_without_activation_page = asyncio.run(
+            LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
+                filter_expression=json.dumps(
+                    {
+                        "operator": "and",
+                        "conditions": [
+                            {"field": "reaction_hash", "value": logical_reaction.reaction_hash},
+                            {"field": "has_activation_gibbs_free_energy", "value": False},
+                        ],
+                    }
+                ),
+                limit=1,
+                offset=0,
+            )
+        )
+        assert logical_expression_without_activation_page.page.total == 1
     finally:
         if sample is not None:
             with Session(engine) as session:

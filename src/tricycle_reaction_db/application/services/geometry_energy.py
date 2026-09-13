@@ -11,6 +11,10 @@ from uuid import UUID
 
 from tricycle_reaction_db.application.dtos import GeometryEnergyView
 from tricycle_reaction_db.core.chemistry_config import GEOMETRY_ENERGY_POLICY_VERSION
+from tricycle_reaction_db.core.protocol_normalization import (
+    normalize_functional_and_dispersion,
+    normalize_protocol_text,
+)
 from tricycle_reaction_db.db.models import (
     CalculationFrame,
     CalculationProtocol,
@@ -87,6 +91,9 @@ class GeometryEnergyComposite:
     view: GeometryEnergyView
     electronic_level: tuple[object, ...] | None
     thermochemistry_level: tuple[object, ...] | None
+    # TS-only profiles may use a complete frequency/thermochemistry frame even
+    # when the Geometry has no unique electronic single-point selection.
+    thermodynamic_only: bool = False
 
 
 def _normalise_level_text(value: str | None) -> str:
@@ -154,8 +161,17 @@ _SOURCE_EQUIVALENCE_TOLERANCE = 1e-8
 
 def _candidate_observations_are_equivalent(
     candidates: Sequence[GeometryEnergyCandidate],
+    *,
+    include_thermochemistry: bool = True,
 ) -> bool:
-    """Allow deterministic de-duplication only for numerically equal sources."""
+    """Allow deterministic de-duplication only for equivalent observations.
+
+    Electronic-energy selection and thermochemistry selection have different
+    observations.  A single-point frame can legitimately share the same
+    electronic energy as a frequency frame while carrying no thermochemistry
+    row.  Comparing those optional thermal fields during electronic selection
+    incorrectly turns an otherwise identical source set into ``ambiguous``.
+    """
 
     if len(candidates) < 2:
         return True
@@ -163,20 +179,24 @@ def _candidate_observations_are_equivalent(
     def observation(candidate: GeometryEnergyCandidate) -> tuple[float | None, ...]:
         frame = candidate.frame
         thermochemistry = candidate.thermochemistry
-        return (
-            frame.selected_energy_hartree,
-            thermochemistry.zpe_correction_hartree if thermochemistry is not None else None,
-            thermochemistry.thermal_energy_correction_hartree
-            if thermochemistry is not None
-            else None,
-            thermochemistry.thermal_enthalpy_correction_hartree
-            if thermochemistry is not None
-            else None,
-            thermochemistry.thermal_gibbs_correction_hartree
-            if thermochemistry is not None
-            else None,
-            thermochemistry.entropy_cal_mol_k if thermochemistry is not None else None,
-        )
+        values: tuple[float | None, ...] = (frame.selected_energy_hartree,)
+        if include_thermochemistry:
+            values += (
+                thermochemistry.zpe_correction_hartree
+                if thermochemistry is not None
+                else None,
+                thermochemistry.thermal_energy_correction_hartree
+                if thermochemistry is not None
+                else None,
+                thermochemistry.thermal_enthalpy_correction_hartree
+                if thermochemistry is not None
+                else None,
+                thermochemistry.thermal_gibbs_correction_hartree
+                if thermochemistry is not None
+                else None,
+                thermochemistry.entropy_cal_mol_k if thermochemistry is not None else None,
+            )
+        return values
 
     reference = observation(candidates[0])
     for candidate in candidates[1:]:
@@ -194,6 +214,10 @@ def _select_candidate(
     candidates: Sequence[GeometryEnergyCandidate],
     *,
     context: Callable[[GeometryEnergyCandidate], tuple[object, ...]],
+    include_thermochemistry: bool = True,
+    prefer_thermochemistry: bool = False,
+    protocol_identity: Callable[[CalculationProtocol | None], tuple[object, ...] | None]
+    | None = None,
 ) -> tuple[str, GeometryEnergyCandidate | None, list[UUID]]:
     if not candidates:
         return "missing", None, []
@@ -220,12 +244,26 @@ def _select_candidate(
     )
     if len(top_levels) != 1:
         return "ambiguous", None, top_candidate_ids
-    protocol_identities = {
-        _protocol_selection_identity(candidate.protocol) for candidate in non_dominated
-    }
+    identity_function = protocol_identity or _protocol_selection_identity
+    protocol_identities = {identity_function(candidate.protocol) for candidate in non_dominated}
     if len(protocol_identities) != 1:
         return "ambiguous", None, top_candidate_ids
-    if not _candidate_observations_are_equivalent(non_dominated):
+    if prefer_thermochemistry:
+        thermochemistry_candidates = [
+            candidate for candidate in non_dominated if candidate.thermochemistry is not None
+        ]
+        if thermochemistry_candidates:
+            # A Geometry can be shared by optimization frames and the final
+            # frequency frame.  When the electronic protocol is the same,
+            # the frequency frame is the source that also establishes the
+            # thermal correction.  Prefer that source for the electronic
+            # component; retain ambiguity when multiple thermal sources
+            # still disagree.
+            non_dominated = thermochemistry_candidates
+    if not _candidate_observations_are_equivalent(
+        non_dominated,
+        include_thermochemistry=include_thermochemistry,
+    ):
         return "ambiguous", None, top_candidate_ids
     return (
         "selected",
@@ -237,14 +275,18 @@ def _select_candidate(
 def _protocol_identity(protocol: CalculationProtocol | None) -> tuple[object, ...] | None:
     if protocol is None:
         return None
+    functional, dispersion = normalize_functional_and_dispersion(
+        protocol.functional,
+        protocol.dispersion_model,
+    )
     return (
         protocol.method_family,
         protocol.method,
         protocol.reference_method,
-        protocol.functional,
-        protocol.basis_set,
-        protocol.auxiliary_basis_set,
-        protocol.dispersion_model,
+        functional,
+        normalize_protocol_text(protocol.basis_set),
+        normalize_protocol_text(protocol.auxiliary_basis_set),
+        dispersion,
         protocol.solvation_model,
         protocol.solvent,
     )
@@ -256,8 +298,27 @@ def _protocol_selection_identity(protocol: CalculationProtocol | None) -> tuple[
     if protocol is None:
         return None
     software = getattr(protocol.qm_software, "value", protocol.qm_software)
+    normalized_spec_payload = dict(protocol.normalized_spec)
+    normalized_spec_payload.pop("source_protocol", None)
+    protocol_spec = normalized_spec_payload.get("protocol")
+    if isinstance(protocol_spec, Mapping):
+        canonical_protocol = dict(protocol_spec)
+        functional, dispersion = normalize_functional_and_dispersion(
+            protocol.functional,
+            protocol.dispersion_model,
+        )
+        canonical_protocol["functional"] = functional
+        if "basis_set" in canonical_protocol:
+            canonical_protocol["basis_set"] = normalize_protocol_text(protocol.basis_set)
+        if "auxiliary_basis_set" in canonical_protocol:
+            canonical_protocol["auxiliary_basis_set"] = normalize_protocol_text(
+                protocol.auxiliary_basis_set
+            )
+        if "dispersion_correction" in canonical_protocol:
+            canonical_protocol["dispersion_correction"] = dispersion
+        normalized_spec_payload["protocol"] = canonical_protocol
     normalized_spec = json.dumps(
-        protocol.normalized_spec,
+        normalized_spec_payload,
         sort_keys=True,
         separators=(",", ":"),
         default=str,
@@ -270,6 +331,28 @@ def _protocol_selection_identity(protocol: CalculationProtocol | None) -> tuple[
         tuple(protocol.task_requests),
         normalized_spec,
         *protocol_identity,
+    )
+
+
+def _electronic_protocol_selection_identity(
+    protocol: CalculationProtocol | None,
+) -> tuple[object, ...] | None:
+    """Identify the protocol dimensions that determine electronic energy.
+
+    Task-level route details (for example ``Opt`` versus a checkpoint-backed
+    ``Freq`` follow-up) do not change the electronic method identity.  They do
+    matter for thermochemistry provenance, so thermal selection continues to
+    use ``_protocol_selection_identity``.
+    """
+
+    if protocol is None:
+        return None
+    software = getattr(protocol.qm_software, "value", protocol.qm_software)
+    return (
+        software,
+        protocol.qm_software_version,
+        protocol.spec_schema_version,
+        _protocol_identity(protocol),
     )
 
 
@@ -311,6 +394,9 @@ def geometry_energy_composite(
             candidate.protocol.solvation_model if candidate.protocol is not None else None,
             candidate.protocol.solvent if candidate.protocol is not None else None,
         ),
+        include_thermochemistry=False,
+        prefer_thermochemistry=True,
+        protocol_identity=_electronic_protocol_selection_identity,
     )
     thermal_candidates = [
         candidate for candidate in candidates if candidate.thermochemistry is not None
@@ -469,6 +555,75 @@ def geometry_energy_composite(
     )
 
 
+def _thermodynamic_only_composite(
+    geometry_id: UUID,
+    candidates: Sequence[GeometryEnergyCandidate],
+) -> GeometryEnergyComposite:
+    """Select one complete source frame for TS thermochemistry.
+
+    A TS Geometry can legitimately contain an optimization/single-point frame
+    and several frequency frames.  The normal composite selector must reject
+    that mixed evidence when it cannot establish one unique electronic source,
+    but a TS-only profile only needs the complete thermochemistry observation.
+    Choose the lowest-G complete observation deterministically and keep its
+    protocol/frame provenance in the materialized profile.
+    """
+
+    complete_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.thermochemistry is not None
+        and candidate.thermochemistry.enthalpy_hartree is not None
+        and candidate.thermochemistry.gibbs_free_energy_hartree is not None
+        and candidate.thermochemistry.entropy_cal_mol_k is not None
+        and candidate.thermochemistry.temperature_kelvin is not None
+        and candidate.thermochemistry.pressure_atm is not None
+    ]
+    if not complete_candidates:
+        return geometry_energy_composite(geometry_id, candidates)
+    candidate = min(
+        complete_candidates,
+        key=lambda item: (
+            float(item.thermochemistry.gibbs_free_energy_hartree),  # type: ignore[union-attr]
+            protocol_level(item.protocol),
+            _frame_order(item.frame),
+        ),
+    )
+    thermochemistry = candidate.thermochemistry
+    assert thermochemistry is not None
+    protocol_identity = _protocol_identity(candidate.protocol)
+    base = geometry_energy_composite(geometry_id, [candidate])
+    source_frame_id = candidate.frame.id
+    view = base.view.model_copy(
+        update={
+            "electronic_level": (
+                base.view.electronic_level
+                or _level_view(protocol_identity)
+            ),
+            "thermochemistry_selection_status": "selected",
+            "thermochemistry_candidate_frame_ids": (
+                [source_frame_id] if source_frame_id is not None else []
+            ),
+            "thermochemistry_source_frame_id": source_frame_id,
+            "thermochemistry_protocol_id": (
+                candidate.protocol.id if candidate.protocol is not None else None
+            ),
+            "thermochemistry_level": _level_view(protocol_identity),
+            "temperature_kelvin": thermochemistry.temperature_kelvin,
+            "pressure_atm": thermochemistry.pressure_atm,
+            "enthalpy_hartree": float(thermochemistry.enthalpy_hartree),
+            "gibbs_free_energy_hartree": float(thermochemistry.gibbs_free_energy_hartree),
+            "entropy_cal_mol_k": float(thermochemistry.entropy_cal_mol_k),
+        }
+    )
+    return GeometryEnergyComposite(
+        view=view,
+        electronic_level=base.electronic_level or protocol_identity,
+        thermochemistry_level=protocol_identity,
+        thermodynamic_only=True,
+    )
+
+
 def geometry_energy_composites(
     geometry_ids: Iterable[UUID],
     rows: Iterable[
@@ -476,12 +631,14 @@ def geometry_energy_composites(
     ],
     *,
     source_frame_ids_by_geometry: Mapping[UUID, tuple[UUID | None, UUID | None]] | None = None,
+    thermodynamic_only_geometry_ids: Iterable[UUID] = (),
 ) -> dict[UUID, GeometryEnergyComposite]:
     candidates_by_geometry: dict[UUID, list[GeometryEnergyCandidate]] = defaultdict(list)
     for frame, protocol, thermochemistry in rows:
         candidates_by_geometry[frame.geometry_id].append(
             GeometryEnergyCandidate(frame, protocol, thermochemistry)
         )
+    thermodynamic_only_ids = set(thermodynamic_only_geometry_ids)
     return {
         geometry_id: geometry_energy_composite(
             geometry_id,
@@ -496,6 +653,11 @@ def geometry_energy_composites(
                 if source_frame_ids_by_geometry is not None
                 else None
             ),
+        )
+        if geometry_id not in thermodynamic_only_ids
+        else _thermodynamic_only_composite(
+            geometry_id,
+            candidates_by_geometry.get(geometry_id, []),
         )
         for geometry_id in geometry_ids
     }

@@ -248,6 +248,34 @@ def test_mapped_reaction_thermodynamics_keeps_reaction_without_transition_state(
     assert profile.activation is None
 
 
+def test_mapped_reaction_thermodynamics_materializes_ts_only_profile() -> None:
+    mapped_reaction_id = uuid4()
+    transition_state = _candidate(
+        topology_id=uuid4(),
+        enthalpy=-18.5,
+        gibbs=-19.25,
+        entropy=7.5,
+    )
+
+    result = build_mapped_reaction_thermodynamics(
+        mapped_reaction_id=mapped_reaction_id,
+        endpoint_requirements=[],
+        candidates_by_component={},
+        transition_state_candidates=[transition_state],
+    )
+
+    assert len(result.profiles) == 1
+    profile = result.profiles[0]
+    assert profile.reactants is None
+    assert profile.products is None
+    assert profile.activation is None
+    assert profile.reaction is None
+    assert profile.transition_state is not None
+    assert profile.transition_state.enthalpy_hartree == pytest.approx(-18.5)
+    assert profile.transition_state.gibbs_free_energy_hartree == pytest.approx(-19.25)
+    assert profile.transition_state.entropy_cal_mol_k == pytest.approx(7.5)
+
+
 def test_mapped_reaction_thermodynamics_keeps_all_source_keys() -> None:
     mapped_reaction_id = uuid4()
     reactant_participant = uuid4()

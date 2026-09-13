@@ -137,7 +137,7 @@ Chemistry policies are code-owned and versioned in
 
 | Policy | Current value | Meaning |
 | --- | --- | --- |
-| `CALCULATION_PROTOCOL_VERSION` | `calculation-protocol-v2` | calculation-protocol identity; normalized functional/dispersion suffix |
+| `CALCULATION_PROTOCOL_VERSION` | `calculation-protocol-v3` | calculation-protocol identity; case-insensitive canonical functional, basis, and dispersion fields |
 | `FORMULA_COMPOSITION_VERSION` | `formula-composition-v1` | formula/isotopic-composition identity |
 | `TOPOLOGY_IDENTITY_VERSION` | `topology-identity-v1` | strict molecular-graph identity |
 | `TOPOLOGY_SOURCE_ORDER_STEREO_IDENTITY_VERSION` | `topology-source-order-stereo-identity-v1` | source-order and stereo identity |

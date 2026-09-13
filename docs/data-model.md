@@ -106,7 +106,7 @@ abstraction policy、匹配 schema、原子对应和被抽象的 feature，便�
 
 | 配置 | 当前版本/值 | 语义 |
 | --- | --- | --- |
-| `CALCULATION_PROTOCOL_VERSION` | `calculation-protocol-v2` | 计算协议身份；统一 functional 与 dispersion_model 的色散后缀 |
+| `CALCULATION_PROTOCOL_VERSION` | `calculation-protocol-v3` | 计算协议身份；大小写无关地统一 functional、basis_set 与 dispersion_model |
 | `FORMULA_COMPOSITION_VERSION` | `formula-composition-v1` | 分子式/同位素组成身份 |
 | `TOPOLOGY_IDENTITY_VERSION` | `topology-identity-v1` | 严格分子图身份 |
 | `TOPOLOGY_SOURCE_ORDER_STEREO_IDENTITY_VERSION` | `topology-source-order-stereo-identity-v1` | 源原子顺序与立体身份 |
