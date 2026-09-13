@@ -663,16 +663,10 @@ def _logical_reaction_query_leaf_predicate(
         presence = mapped_reaction_has_thermodynamic_profile(
             scope,
             col(MappedReaction.id),
-            has_activation_gibbs_free_energy=(
-                field_name == "has_activation_gibbs_free_energy"
-            ),
-            has_reaction_gibbs_free_energy=(
-                field_name == "has_reaction_gibbs_free_energy"
-            ),
+            has_activation_gibbs_free_energy=(field_name == "has_activation_gibbs_free_energy"),
+            has_reaction_gibbs_free_energy=(field_name == "has_reaction_gibbs_free_energy"),
         )
-        mapped_screening_ids = mapped_screening_ids.where(
-            presence if value else ~presence
-        )
+        mapped_screening_ids = mapped_screening_ids.where(presence if value else ~presence)
         return col(LogicalReaction.id).in_(mapped_screening_ids)
     if field_name in {"minimum_mapped_reaction_count", "maximum_mapped_reaction_count"}:
         if isinstance(value, bool) or not isinstance(value, (str, int, float)):

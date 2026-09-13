@@ -238,7 +238,7 @@ def _requirements_by_component(
     requirements: Sequence[EndpointComponentRequirement],
 ) -> list[EndpointComponentRequirement]:
     coefficients: dict[tuple[str, UUID, UUID], int] = defaultdict(int)
-    allowed_topologies: dict[tuple[str, UUID, UUID], set[UUID] | None] = {}
+    allowed_topologies: dict[tuple[str, UUID, UUID], set[UUID]] = {}
     for requirement in requirements:
         key = (
             requirement.side,
@@ -329,15 +329,12 @@ def build_mapped_reaction_thermodynamics(
         else set()
     )
     reaction_keys = (
-        reactant_keys & product_keys
-        if reactant_requirements and product_requirements
-        else set()
+        reactant_keys & product_keys if reactant_requirements and product_requirements else set()
     )
     transition_state_keys = {
         key
         for candidate in transition_state_candidates
-        if _is_complete(candidate)
-        and (key := _source_key(candidate)) is not None
+        if _is_complete(candidate) and (key := _source_key(candidate)) is not None
     }
     activation_keys = reactant_keys & transition_state_keys
     # A TS calculation is a valid materialized source even when neither
@@ -359,20 +356,18 @@ def build_mapped_reaction_thermodynamics(
             if not compatible_ts_candidates:
                 continue
             transition_state_candidate = _minimum_gibbs_candidate(compatible_ts_candidates)
-            transition_state = _state([_transition_state_view(transition_state_candidate)])
+            transition_state_only = _state([_transition_state_view(transition_state_candidate)])
             profiles.append(
                 MappedReactionThermodynamicsProfile(
                     mapped_reaction_id=mapped_reaction_id,
                     policy_version=MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION,
                     electronic_level=_level_view(source_key[0]),
                     thermochemistry_level=_level_view(source_key[1]),
-                    level_of_theory=format_composite_level_of_theory(
-                        source_key[0], source_key[1]
-                    ),
+                    level_of_theory=format_composite_level_of_theory(source_key[0], source_key[1]),
                     temperature_kelvin=source_key[2],
                     pressure_atm=source_key[3],
                     reactants=None,
-                    transition_state=transition_state,
+                    transition_state=transition_state_only,
                     products=None,
                     activation=None,
                     reaction=None,
@@ -418,7 +413,7 @@ def build_mapped_reaction_thermodynamics(
                 if has_reaction
                 else None
             )
-            transition_state = None
+            transition_state: ThermodynamicStateView | None = None
             if has_activation:
                 if not compatible_ts_candidates:
                     continue

@@ -139,9 +139,7 @@ def calculation_protocol_record(
         # it in the JSON response is useful, but including original casing in
         # the hash would recreate one protocol per spelling.
         "normalized_spec": {
-            key: value
-            for key, value in normalized_spec.items()
-            if key != "source_protocol"
+            key: value for key, value in normalized_spec.items() if key != "source_protocol"
         },
     }
     protocol_hash = sha256(

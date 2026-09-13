@@ -182,9 +182,7 @@ def _candidate_observations_are_equivalent(
         values: tuple[float | None, ...] = (frame.selected_energy_hartree,)
         if include_thermochemistry:
             values += (
-                thermochemistry.zpe_correction_hartree
-                if thermochemistry is not None
-                else None,
+                thermochemistry.zpe_correction_hartree if thermochemistry is not None else None,
                 thermochemistry.thermal_energy_correction_hartree
                 if thermochemistry is not None
                 else None,
@@ -581,25 +579,35 @@ def _thermodynamic_only_composite(
     ]
     if not complete_candidates:
         return geometry_energy_composite(geometry_id, candidates)
-    candidate = min(
-        complete_candidates,
-        key=lambda item: (
-            float(item.thermochemistry.gibbs_free_energy_hartree),  # type: ignore[union-attr]
+
+    def candidate_sort_key(
+        item: GeometryEnergyCandidate,
+    ) -> tuple[float, tuple[int, int, int, str], tuple[str, str]]:
+        thermochemistry = item.thermochemistry
+        assert thermochemistry is not None
+        gibbs_free_energy_hartree = thermochemistry.gibbs_free_energy_hartree
+        assert gibbs_free_energy_hartree is not None
+        return (
+            float(gibbs_free_energy_hartree),
             protocol_level(item.protocol),
             _frame_order(item.frame),
-        ),
+        )
+
+    candidate = min(
+        complete_candidates,
+        key=candidate_sort_key,
     )
     thermochemistry = candidate.thermochemistry
     assert thermochemistry is not None
+    assert thermochemistry.enthalpy_hartree is not None
+    assert thermochemistry.gibbs_free_energy_hartree is not None
+    assert thermochemistry.entropy_cal_mol_k is not None
     protocol_identity = _protocol_identity(candidate.protocol)
     base = geometry_energy_composite(geometry_id, [candidate])
     source_frame_id = candidate.frame.id
     view = base.view.model_copy(
         update={
-            "electronic_level": (
-                base.view.electronic_level
-                or _level_view(protocol_identity)
-            ),
+            "electronic_level": (base.view.electronic_level or _level_view(protocol_identity)),
             "thermochemistry_selection_status": "selected",
             "thermochemistry_candidate_frame_ids": (
                 [source_frame_id] if source_frame_id is not None else []

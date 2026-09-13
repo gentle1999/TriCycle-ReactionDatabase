@@ -20,10 +20,7 @@ def _backfill_batch(session: Any, *, offset: int, batch_size: int) -> tuple[int,
     """Refresh one stable ID-ordered batch and return row/profile counts."""
 
     mapped_reactions = session.exec(
-        select(MappedReaction)
-        .order_by(col(MappedReaction.id))
-        .offset(offset)
-        .limit(batch_size)
+        select(MappedReaction).order_by(col(MappedReaction.id)).offset(offset).limit(batch_size)
     ).all()
     if not mapped_reactions:
         return 0, 0

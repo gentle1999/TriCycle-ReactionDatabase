@@ -1056,6 +1056,7 @@ def _profile_state_is_visible(
             ),
         )
     if scope.uses_project_owned_fast_path:
+
         def source_frame_is_visible(frame_id: Any) -> Any:
             """Check one selected frame through indexed primary-key joins."""
 
@@ -1145,8 +1146,10 @@ def _profile_state_is_visible(
             def source_frame_is_visible(frame_id: Any) -> Any:
                 return frame_id.in_(partial_complete_visible_frame_ids)
         else:
+
             def source_frame_is_visible(frame_id: Any) -> Any:
                 return frame_id.in_(visible_frame_ids(scope))
+
     source_is_visible = and_(
         has_all_source_provenance,
         electronic_source_frame_id.is_not(None),

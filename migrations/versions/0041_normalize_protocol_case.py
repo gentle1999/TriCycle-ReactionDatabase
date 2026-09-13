@@ -287,9 +287,7 @@ def _normalize_profiles(connection: sa.Connection) -> None:
                 item[0]["transition_state_gibbs_free_energy_hartree"] is None,
                 item[0]["transition_state"] is None,
                 item[0]["created_at"] is None,
-                item[0]["created_at"].isoformat()
-                if item[0]["created_at"] is not None
-                else "",
+                item[0]["created_at"].isoformat() if item[0]["created_at"] is not None else "",
                 str(item[0]["id"]),
             ),
         )

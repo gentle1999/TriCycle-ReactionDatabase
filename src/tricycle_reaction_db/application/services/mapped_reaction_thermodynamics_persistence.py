@@ -165,32 +165,29 @@ def _endpoint_geometries_by_participant(
         strict_topology_ids[participant_id] = strict_topology_id
 
     concrete_topology_ids_by_logical: dict[UUID, set[UUID]] = {
-        logical_participant_id: set()
-        for logical_participant_id in logical_participant_ids
+        logical_participant_id: set() for logical_participant_id in logical_participant_ids
     }
     if logical_participant_ids:
         memberships = session.exec(
             select(LogicalParticipantConcreteTopology).where(
-                col(
-                    LogicalParticipantConcreteTopology.logical_reaction_participant_id
-                ).in_(logical_participant_ids)
+                col(LogicalParticipantConcreteTopology.logical_reaction_participant_id).in_(
+                    logical_participant_ids
+                )
             )
         ).all()
         for membership in memberships:
             logical_participant_id = membership.logical_reaction_participant_id
             concrete_topology_id = membership.concrete_topology_id
-            if (
-                isinstance(logical_participant_id, UUID)
-                and isinstance(concrete_topology_id, UUID)
-            ):
+            if isinstance(logical_participant_id, UUID) and isinstance(concrete_topology_id, UUID):
                 concrete_topology_ids_by_logical.setdefault(logical_participant_id, set()).add(
                     concrete_topology_id
                 )
 
     allowed_topology_ids_by_participant: dict[UUID, set[UUID]] = {}
     logical_id_by_participant = {
-        _require_id(mapped_participant, label="MappedReactionParticipant"):
-        _require_id(logical_participant, label="LogicalReactionParticipant")
+        _require_id(mapped_participant, label="MappedReactionParticipant"): _require_id(
+            logical_participant, label="LogicalReactionParticipant"
+        )
         for mapped_participant, logical_participant in participant_rows
     }
     all_topology_ids: set[UUID] = set()
@@ -237,9 +234,7 @@ def _endpoint_geometries_by_participant(
         )
     ).all()
     strict_topologies_by_id = {
-        topology.id: topology
-        for topology in strict_topologies
-        if isinstance(topology.id, UUID)
+        topology.id: topology for topology in strict_topologies if isinstance(topology.id, UUID)
     }
     endpoint_compatible_search_specs: dict[UUID, MolecularTopology] = {}
     for participant_id in participant_ids:
@@ -258,10 +253,7 @@ def _endpoint_geometries_by_participant(
             select(MolecularTopology).where(
                 col(MolecularTopology.project_id) == project_id,
                 col(MolecularTopology.formula_id).in_(
-                    {
-                        topology.formula_id
-                        for topology in endpoint_compatible_search_specs.values()
-                    }
+                    {topology.formula_id for topology in endpoint_compatible_search_specs.values()}
                 ),
             )
         ).all()
@@ -317,9 +309,7 @@ def _endpoint_geometries_by_participant(
         strict_geometries = geometries_by_topology.get(strict_topology_id, [])
         selected = strict_geometries or [
             geometry
-            for topology_id in sorted(
-                allowed_topology_ids_by_participant[participant_id], key=str
-            )
+            for topology_id in sorted(allowed_topology_ids_by_participant[participant_id], key=str)
             if topology_id != strict_topology_id
             for geometry in geometries_by_topology.get(topology_id, [])
         ]
@@ -335,9 +325,7 @@ def _endpoint_geometries_by_participant(
         result[participant_id] = tuple(
             sorted(
                 {
-                    geometry.id: geometry
-                    for geometry in selected
-                    if geometry.id is not None
+                    geometry.id: geometry for geometry in selected if geometry.id is not None
                 }.values(),
                 key=lambda geometry: str(geometry.id),
             )
@@ -516,9 +504,9 @@ def _build_mapped_reaction_thermodynamics(
             if isinstance(geometry.topology_id, UUID)
         }
     for _, binding, geometry in binding_rows:
-        participant_id = binding.mapped_reaction_participant_id
-        if participant_id is not None and isinstance(geometry.topology_id, UUID):
-            endpoint_topology_ids_by_participant.setdefault(participant_id, set()).add(
+        binding_participant_id = binding.mapped_reaction_participant_id
+        if binding_participant_id is not None and isinstance(geometry.topology_id, UUID):
+            endpoint_topology_ids_by_participant.setdefault(binding_participant_id, set()).add(
                 geometry.topology_id
             )
     for mapped_participant, logical_participant in participant_rows:
@@ -579,9 +567,7 @@ def _build_mapped_reaction_thermodynamics(
                 )
             )
 
-    for participant_id, endpoint_geometries in (
-        endpoint_geometries_by_participant or {}
-    ).items():
+    for participant_id, endpoint_geometries in (endpoint_geometries_by_participant or {}).items():
         for geometry in endpoint_geometries:
             geometry_id = _require_id(geometry, label="Geometry")
             if (participant_id, geometry_id) in seen_endpoints:
@@ -614,9 +600,11 @@ def _materialize_profile_rows(
     for profile in result.profiles:
         transition_state = profile.transition_state
         products = profile.products
-        reactant_geometry_ids = {
-            selection.geometry_id for selection in profile.reactants.topologies
-        } if profile.reactants is not None else set()
+        reactant_geometry_ids = (
+            {selection.geometry_id for selection in profile.reactants.topologies}
+            if profile.reactants is not None
+            else set()
+        )
         transition_state_geometry_ids = (
             {selection.geometry_id for selection in transition_state.topologies}
             if transition_state is not None
@@ -695,9 +683,7 @@ def _materialize_profile_rows(
                     else None
                 ),
                 reactants_entropy_cal_mol_k=(
-                    profile.reactants.entropy_cal_mol_k
-                    if profile.reactants is not None
-                    else None
+                    profile.reactants.entropy_cal_mol_k if profile.reactants is not None else None
                 ),
                 transition_state_enthalpy_hartree=(
                     float(transition_state.enthalpy_hartree)
@@ -808,9 +794,11 @@ def refresh_mapped_reaction_thermodynamics(
     for profile in result.profiles:
         transition_state = profile.transition_state
         products = profile.products
-        reactant_geometry_ids = {
-            selection.geometry_id for selection in profile.reactants.topologies
-        } if profile.reactants is not None else set()
+        reactant_geometry_ids = (
+            {selection.geometry_id for selection in profile.reactants.topologies}
+            if profile.reactants is not None
+            else set()
+        )
         transition_state_geometry_ids = (
             {selection.geometry_id for selection in transition_state.topologies}
             if transition_state is not None
@@ -889,9 +877,7 @@ def refresh_mapped_reaction_thermodynamics(
                     else None
                 ),
                 reactants_entropy_cal_mol_k=(
-                    profile.reactants.entropy_cal_mol_k
-                    if profile.reactants is not None
-                    else None
+                    profile.reactants.entropy_cal_mol_k if profile.reactants is not None else None
                 ),
                 transition_state_enthalpy_hartree=(
                     float(transition_state.enthalpy_hartree)
@@ -1160,9 +1146,7 @@ def refresh_mapped_reactions_thermodynamics(
             mapped_reaction_id=mapped_reaction_id,
             participant_rows=participants_by_reaction[mapped_reaction_id],
             binding_rows=bindings_by_reaction[mapped_reaction_id],
-            endpoint_geometries_by_participant=endpoint_geometries_by_reaction[
-                mapped_reaction_id
-            ],
+            endpoint_geometries_by_participant=endpoint_geometries_by_reaction[mapped_reaction_id],
             transition_state_node_ids=frozenset(
                 transition_state_node_ids_by_reaction[mapped_reaction_id]
             ),
