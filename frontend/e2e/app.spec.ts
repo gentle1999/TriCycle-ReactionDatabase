@@ -1134,10 +1134,13 @@ test("mapped reaction shows every partial thermodynamic profile and level", asyn
   await expect(expansion.locator(".thermo-level").nth(0)).toHaveText("B3LYP-D3BJ/Def2SVP//wB97M-V/Def2TZVPP");
   await expect(expansion.locator(".thermo-level").nth(1)).toHaveText("B3LYP/Def2SVP");
   await expect(expansion.locator(".thermo-profile").nth(0).locator(".thermo-metrics > div")).toHaveCount(3);
-  await expect(expansion.locator(".thermo-profile").nth(1).locator(".thermo-metrics > div")).toHaveCount(3);
+  await expect(expansion.locator(".thermo-profile").nth(1).locator(".thermo-metrics > div")).toHaveCount(6);
   await expect(expansion.locator(".thermo-profile").nth(0)).toContainText("ΔG 反应");
   await expect(expansion.locator(".thermo-profile").nth(0)).not.toContainText("ΔG‡");
   await expect(expansion.locator(".thermo-profile").nth(1)).toContainText("ΔG‡");
+  await expect(expansion.locator(".thermo-profile").nth(1)).toContainText("TS H");
+  await expect(expansion.locator(".thermo-profile").nth(1)).toContainText("TS G");
+  await expect(expansion.locator(".thermo-profile").nth(1)).toContainText("TS S");
   await expect(expansion.locator(".thermo-profile").nth(1)).not.toContainText("ΔG 反应");
   const potentialEnergy = expansion.locator(".reaction-potential-energy");
   await expect(potentialEnergy).toBeVisible();
