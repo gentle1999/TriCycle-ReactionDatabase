@@ -54,6 +54,7 @@ from tricycle_reaction_db.application.dtos import (
 from tricycle_reaction_db.application.services._persistence import (
     LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
     _acquire_identity_locks,
+    _attach_or_reuse_entity,
     _attach_pending_entities,
     _fast_insert_enabled,
     _flush_new_entity,
@@ -2389,7 +2390,7 @@ def _persist_successful_inference(
     )
     _flush_new_entity(session, inference, label="TransitionStateInference")
     if _fast_insert_enabled(session):
-        session.add(inference)
+        _attach_or_reuse_entity(session, inference)
     if not defer_flush:
         _attach_pending_entities(session)
         session.flush()
@@ -2443,7 +2444,7 @@ def _add_failed_inference(
     )
     _flush_new_entity(session, failed_inference, label="TransitionStateInference")
     if _fast_insert_enabled(session):
-        session.add(failed_inference)
+        _attach_or_reuse_entity(session, failed_inference)
 
 
 def _persist_one_new_inference(

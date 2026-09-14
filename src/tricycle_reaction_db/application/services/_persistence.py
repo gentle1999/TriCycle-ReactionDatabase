@@ -128,6 +128,107 @@ def _fast_insert_enabled(session: Session) -> bool:
     return bool(session.info.get("tricycle_fast_insert", False))
 
 
+def _entity_identity_key(entity: object) -> Any | None:
+    """Return an ORM identity key even before a new row is attached.
+
+    SQLAlchemy does not populate ``InstanceState.key`` for a transient object,
+    including objects whose UUID primary key was assigned by the fast path.
+    Those objects still have a real database identity, so comparing only
+    ``state.key`` lets two instances with the same UUID enter ``Session.new``
+    and collide when the second one is attached.
+    """
+
+    state = cast(Any, sa_inspect(entity))
+    if state.key is not None:
+        return state.key
+    primary_key_values = tuple(
+        cast(Any, entity).__dict__.get(column.key) for column in state.mapper.primary_key
+    )
+    if not primary_key_values or any(value is None for value in primary_key_values):
+        return None
+    return state.mapper.identity_key_from_primary_key(primary_key_values)
+
+
+def _copy_entity_scalar_values(
+    target: object,
+    source: object,
+    *,
+    source_state: Any,
+) -> None:
+    """Copy loaded mapped columns without cascading either relationship graph."""
+
+    source_dict = cast(Any, source).__dict__
+    for column_property in source_state.mapper.column_attrs:
+        column_name = column_property.key
+        if column_name in source_dict:
+            setattr(target, column_name, source_dict[column_name])
+
+
+def _session_entity_for_identity(session: Session, entity: object) -> object:
+    identity_key = _entity_identity_key(entity)
+    if identity_key is None:
+        return entity
+    current = session.identity_map.get(identity_key)
+    if current is not None:
+        return current
+    current = next(
+        (
+            candidate
+            for candidate in session.new
+            if candidate is not entity and _entity_identity_key(candidate) == identity_key
+        ),
+        None,
+    )
+    if current is not None:
+        return current
+    return next(
+        (
+            candidate
+            for candidate in session.info.get("_fast_pending_entities", ())
+            if candidate is not entity and _entity_identity_key(candidate) == identity_key
+        ),
+        entity,
+    )
+
+
+def _canonicalize_entity_relationships(
+    session: Session,
+    entity: object,
+    *,
+    visited: set[int] | None = None,
+) -> None:
+    """Replace relationship references with this Session's canonical instances."""
+
+    visited = visited or set()
+    object_identity = id(entity)
+    if object_identity in visited:
+        return
+    visited.add(object_identity)
+    state = cast(Any, sa_inspect(entity))
+    entity_dict = cast(Any, entity).__dict__
+    for relationship in state.mapper.relationships:
+        related = entity_dict.get(relationship.key)
+        if related is None:
+            continue
+        if relationship.uselist:
+            related_items = list(related)
+            canonical_items = [
+                _session_entity_for_identity(session, item) for item in related_items
+            ]
+            for item in canonical_items:
+                _canonicalize_entity_relationships(session, item, visited=visited)
+            if any(
+                canonical is not original
+                for original, canonical in zip(related_items, canonical_items, strict=True)
+            ):
+                set_committed_value(entity, relationship.key, canonical_items)
+            continue
+        canonical = _session_entity_for_identity(session, related)
+        _canonicalize_entity_relationships(session, canonical, visited=visited)
+        if canonical is not related:
+            set_committed_value(entity, relationship.key, canonical)
+
+
 def _attach_or_reuse_entity[EntityT](session: Session, entity: EntityT) -> EntityT:
     """Attach an entity without creating a second instance for one identity.
 
@@ -140,16 +241,17 @@ def _attach_or_reuse_entity[EntityT](session: Session, entity: EntityT) -> Entit
     be cascaded across the two object graphs.
     """
 
-    state = cast(Any, sa_inspect(entity))
-    if state.key is not None:
-        current = session.identity_map.get(state.key)
+    identity_key = _entity_identity_key(entity)
+    if identity_key is not None:
+        current = _session_entity_for_identity(session, entity)
         if current is not None and current is not entity:
-            entity_dict = cast(Any, entity).__dict__
-            for column_property in state.mapper.column_attrs:
-                column_name = column_property.key
-                if column_name in entity_dict:
-                    setattr(current, column_name, entity_dict[column_name])
+            _copy_entity_scalar_values(
+                current,
+                entity,
+                source_state=cast(Any, sa_inspect(entity)),
+            )
             return cast(EntityT, current)
+    _canonicalize_entity_relationships(session, entity)
     session.add(entity)
     return entity
 
@@ -293,7 +395,7 @@ def _prepare_new_entity(
             if value is not None and entity_dict.get(local_key) is None:
                 object.__setattr__(entity, local_key, value)
     if attach:
-        session.add(entity)
+        _attach_or_reuse_entity(session, entity)
 
 
 def _attach_pending_entities(session: Session) -> None:
@@ -308,12 +410,16 @@ def _attach_pending_entities(session: Session) -> None:
             _bulk_insert_pending_entities(session)
         else:
             # A persistence window may contain detached identity holders and a
-            # canonical instance loaded by a later reconciliation query.  An
+            # canonical instance loaded by a later reconciliation query. An
             # unconditional ``add_all`` attempts to attach both objects and
             # raises when their identity keys are equal.  Reuse the identity
             # map entry while copying the holder's scalar values instead.
-            for entity in pending:
-                _attach_or_reuse_entity(session, entity)
+            session.info["_fast_pending_entities"] = pending
+            try:
+                for entity in pending:
+                    _attach_or_reuse_entity(session, entity)
+            finally:
+                session.info.pop("_fast_pending_entities", None)
 
 
 async def _copy_rows_to_postgresql(
@@ -360,6 +466,7 @@ def _bulk_insert_pending_entities(session: Session) -> None:
     grouped: dict[type[Any], list[Any]] = {}
     transient_entities: list[Any] = []
     seen_entity_objects: set[int] = set()
+    seen_entity_keys: set[Any] = set()
     for entity in pending:
         # A deferred flush may be requested more than once for the same
         # revision-local object (for example when a geometry is refined after
@@ -390,9 +497,28 @@ def _bulk_insert_pending_entities(session: Session) -> None:
         if state.pending:
             # Relationship assignment can attach a row through cascade before
             # it reaches this queue. Expunge that unflushed instance and treat
-            # it like every other deferred row.
+            # it like every other deferred row. This must happen before
+            # identity de-duplication so a duplicate pending object cannot be
+            # flushed later by the ORM after its Core row was inserted.
             session.expunge(entity)
             state = sa_inspect(entity)
+        identity_key = _entity_identity_key(entity)
+        if identity_key is not None:
+            # A single persistence window can discover the same client-side
+            # UUID through two relationship graphs. Core INSERT has no ORM
+            # identity map to collapse those distinct Python instances, so
+            # retain only the first row for one identity.
+            if identity_key in seen_entity_keys:
+                continue
+            current = session.identity_map.get(identity_key)
+            if current is not None and current is not entity:
+                _copy_entity_scalar_values(
+                    current,
+                    entity,
+                    source_state=cast(Any, sa_inspect(entity)),
+                )
+                continue
+            seen_entity_keys.add(identity_key)
         if state.transient or state.detached:
             transient_entities.append(entity)
             grouped.setdefault(type(entity), []).append(entity)
@@ -547,7 +673,7 @@ def _flush_shared_entity(
     if fast_insert and defer_if_fast:
         session.info.setdefault("_fast_pending_entities", []).append(entity)
     elif fast_insert:
-        session.add(entity)
+        entity = _attach_or_reuse_entity(session, entity)
     if not (defer_if_fast and fast_insert):
         session.flush([entity] if session.info.get("tricycle_fast_insert", False) else None)
     _require_id(entity, label=label)

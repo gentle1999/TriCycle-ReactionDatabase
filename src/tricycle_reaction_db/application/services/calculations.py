@@ -39,6 +39,7 @@ from tricycle_reaction_db.application.dtos.calculations import (
 from tricycle_reaction_db.application.services._persistence import (
     _acquire_identity_locks,
     _assert_record_matches,
+    _attach_or_reuse_entity,
     _attach_pending_entities,
     _fast_insert_enabled,
     _flush_new_entity,
@@ -343,7 +344,7 @@ def persist_parse_revision(
                 setattr(revision, field_name, expected)
                 source_identity_changed = True
         if source_identity_changed:
-            session.add(revision)
+            _attach_or_reuse_entity(session, revision)
             session.flush()
         if record.status is ParseStatus.PENDING:
             _assert_record_matches(
@@ -1211,7 +1212,7 @@ def finalize_parse_revision(
     revision.error_code = None
     revision.error_message = None
     revision.error_metadata = None
-    session.add(revision)
+    _attach_or_reuse_entity(session, revision)
     if not defer_flush:
         _attach_pending_entities(session)
         session.flush()

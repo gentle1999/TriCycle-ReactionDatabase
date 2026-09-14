@@ -21,6 +21,7 @@ from tricycle_reaction_db.application.dtos import (
 )
 from tricycle_reaction_db.application.services._persistence import (
     LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
+    _attach_or_reuse_entity,
     _attach_pending_entities,
 )
 from tricycle_reaction_db.application.services.calculations import (
@@ -734,10 +735,10 @@ def persist_molop_calculation_artifact(
             ):
                 segment.parse_completeness = ParseCompleteness.PARTIAL
                 segment.parse_diagnostics = segment_diagnostics
-                session.add(segment)
+                _attach_or_reuse_entity(session, segment)
             elif segment.parse_completeness is ParseCompleteness.PARTIAL:
                 segment.parse_diagnostics = segment_diagnostics
-                session.add(segment)
+                _attach_or_reuse_entity(session, segment)
 
         # A stereo projection warning does not make the frame unpersistable,
         # but it is still a file-level quality diagnostic. Surface it on the
@@ -763,7 +764,7 @@ def persist_molop_calculation_artifact(
             revision.error_message = str(failure)
             revision.error_metadata = failure.evidence()
             revision.completed_at = completed_at
-            session.add(revision)
+            _attach_or_reuse_entity(session, revision)
             raise failure
 
         # Batch ingestion can keep revision-local rows pending across files.
@@ -790,7 +791,7 @@ def persist_molop_calculation_artifact(
         if partial_parse:
             revision.parse_completeness = ParseCompleteness.PARTIAL
             revision.parse_diagnostics = [*revision.parse_diagnostics, *diagnostics]
-            session.add(revision)
+            _attach_or_reuse_entity(session, revision)
 
         finalize_parse_revision(
             session,
