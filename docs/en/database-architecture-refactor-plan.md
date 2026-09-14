@@ -5,14 +5,17 @@
 > Created: 2026-09-10
 >
 > Status: Batch A minimum fixes, project-scoped query boundaries, and the historical derived-data
-> cleanup are implemented in source/remote operations. Source and deployed migrations now reach
-> `0038_geometry_match_index`. The two-project full RustFS re-import is running from checkpoints;
-> final two-project acceptance remains in progress.
+> cleanup are implemented in source/remote operations. Manifest/ImportJob and explicit project
+> identity migrations are now in source, whose head is `0044`. The deployed revision and the
+> two-project full RustFS re-import still require separate verification; final acceptance remains
+> in progress.
 >
 > Review baseline: Git `522405a` plus the existing working-tree changes; 63 ORM tables.
 >
-> Latest migration in source: `0038_geometry_match_index`; it adds the project-local Geometry
-> candidate index and has been verified in the deployed database with `alembic current`.
+> Latest migration in source: `0044_project_identity_provenance`. Migration `0043` adds explicit
+> manifests and durable ImportJob/ImportJobItem state; `0044` adds project owner/creator and source,
+> model, and protocol context. Migration `0038` remains the previously deployed and verified
+> project-local Geometry candidate index.
 >
 > Scope: scientific facts, source authorization, thermodynamics, versions and integrity,
 > derived refreshes, geometry matching, and array storage.
@@ -58,6 +61,14 @@ fact rewrite; the deployment record for this round is listed separately.
   object, and reparses it; lease fencing prevents late results from overwriting newer attempts.
   The earlier convergence of 16 orphaned tasks is pre-reset evidence only; after the reset, a fresh
   checkpointed RustFS import is required and the old checkpoint cannot prove completion.
+- Manifest import boundary: `0043_durable_import_manifests` extends `UploadBatch` as the canonical
+  ImportJob, retaining archive/file hashes, archive-relative paths, selection/parse/materialization
+  state, and parse-revision references. Controlled staging rejects traversal, soft/hard links,
+  special files, implicit files outside the manifest, and changed hashes. MCP exposes project/job
+  controls without receiving tar bytes or arbitrary server paths.
+- Project identity: `0044_project_identity_provenance` persists owner, creator, data source, model
+  checkpoint, and calculation protocol for new projects. Legacy projects are best-effort backfilled
+  from their manager and retain a nullable compatibility boundary.
 - Verification: migration `0038` is deployed, readiness is healthy, and code-level unit, Ruff,
   compilation, and query-plan checks pass. The two-project re-import, final isolation audit, and
   complete post-reset counts remain in progress. Pre-reset counts such as `artifact_file=125355`
@@ -130,6 +141,107 @@ Fixed rules:
    `CalculationFrame`, Formula, Topology, Geometry, Reaction, and every derived edge must be
    accessed through the same ArtifactFile project ownership; equal content, graph, or reaction
    hashes must never reuse one derived row across projects.
+
+### 2.1 Raw-file staging and the single reparse path (fixed design)
+
+RustFS is the staging and integrity boundary for raw files, not a second parsing entry point.
+Once a file has been written to RustFS and PostgreSQL contains its `ArtifactFile`,
+`ArtifactIngestion`, and `staged` queue item, calculation-output processing must use the
+existing reparse logic. The batch worker's `reparse_batch` is only a grouping wrapper around
+the existing `upload_batch` pipeline:
+
+```text
+manifest/API staging
+    -> RustFS object + ArtifactFile/ArtifactIngestion(staged)
+    -> upload-worker lease
+    -> ArtifactUploadService.reparse_batch
+       -> RustFS bytes/hash verification (read existing objects only)
+       -> ArtifactUploadService.upload_batch
+          -> _run_molop_file_pipeline / shared MolOP process pool
+          -> single persistence consumer
+       -> ParseRevision/Frame/Inference persistence
+    -> UploadBatchItem terminal state
+```
+
+The fixed boundaries are:
+
+- `UploadBatchWorker._process_jobs` may only hand a leased window to `reparse_batch`;
+  `_process_pending` remains the single-file recovery compatibility path. Do not add a remote
+  parser, a second MolOP invocation, a second frame-materializing path, or a second persistence
+  transaction for RustFS objects. An already-staged object must not be uploaded again.
+- `reparse` is the only file-level parse/reparse service and `reparse_batch` is only its batch
+  scheduling wrapper. The wrapper reads/verifies existing objects and delegates MolOP, MolGR,
+  failed-ingestion finalization, and scientific-fact persistence to `upload_batch`. The worker
+  only claims/renews leases, invokes the service, and commits terminal queue state.
+- The local CLI, explicit single-file reparse, and durable worker may differ in source reads and
+  result queues, but they must share `_run_molop_file_pipeline` and the `upload_batch` boundary.
+  A local path versus a RustFS object must not change scientific parsing semantics.
+- `IMPORT_PIPELINE_WINDOW_FILES=64` is a local candidate window. The remote worker claims
+  `TRICYCLE_MAX_BATCH_FILES=64` staged jobs and groups them by project/user for `reparse_batch`.
+  `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` is retained for pending-ingestion recovery, not as a
+  second staged-parser queue.
+- `TRICYCLE_MOLOP_BATCH_N_JOBS=16` is the `_file_worker_submission_slots` admission limit for
+  one reusable `spawn` MolOP process pool. Sixteen file tasks share hot processes; a new pool is
+  not created for each file. Keep `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, and
+  `MKL_NUM_THREADS` at `1` unless a measured design change says otherwise.
+- The worker must not add its own database scheduler, second consumer, or alternate persistence
+  implementation around `reparse_batch`. The wrapper only reads/verifies RustFS objects and
+  splits the batch; `upload_batch` owns the shared parser pool, failed-ingestion cleanup, and
+  scientific-fact transaction. The worker only claims/renews leases, invokes the service, and
+  records terminal queue state.
+
+### 2.2 Bulk-import throughput invariants (regression guard)
+
+The previous high-throughput importer is the performance baseline for bulk ingestion. Project
+isolation, source authorization, and idempotency constraints may continue to improve, but the
+execution shape below must not change silently. Any change must measure byte throughput, CPU,
+database-stage timings, and failures on the same real file set and pass an architecture regression
+check before merge.
+
+| Boundary | Local CLI | RustFS durable reparse | What it must not be confused with |
+| --- | --- | --- | --- |
+| Parser admission | `TRICYCLE_MOLOP_BATCH_N_JOBS`, normally `16` on a dedicated host | The same shared pool and the same `16`-file admission limit | Not `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` or RustFS read concurrency |
+| Candidate/claim window | `IMPORT_PIPELINE_WINDOW_FILES=64` | Up to `TRICYCLE_MAX_BATCH_FILES=64` | Keeps the queue supplied; it is not the parser-process count |
+| Persistence hand-off | Internal `PERSISTENCE_PRELOAD_BATCH_SIZE=32` | The same `32` results, or when the result queue is temporarily empty | Must not wait for the whole claim before writing |
+| Commit/checkpoint | `IMPORT_COMMIT_BATCH_FILES`, default `16` | One `upload_batch` persistence window per actual worker claim (normally `64`) | The commit boundary does not control parser concurrency |
+
+The implementation invariants are:
+
+- `_run_molop_file_pipeline` must submit file work to one reusable, `spawn`-based
+  `ProcessPoolExecutor`; `_file_worker_submission_slots` is the only file-level parser admission
+  point. Do not restore a per-file process pool/executor or use native OpenMP/BLAS thread counts
+  as a substitute for file concurrency.
+- `upload_batch` has one bounded parser-result queue and one persistence consumer. Every 32 parsed
+  results (or when the queue is temporarily empty) are handed to `persist_parsed_files`, so parser
+  work and database writes overlap. Only the persistence-window boundary commits. Moving all
+  persistence until a 64-file claim completes reintroduces the fixed throughput regression.
+- For each project/user group, `reparse_batch` only reads and verifies existing RustFS objects,
+  then calls `upload_batch(..., persistence_batch_files=<files in this group>)`. Thus `64` on the
+  remote path is a claim/commit window, not a second parser queue and not 64 serial parses.
+- `TRICYCLE_UPLOAD_MAX_CONCURRENCY` controls only RustFS reads;
+  `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` is only for pending-ingestion recovery. Neither may
+  replace or be multiplied with MolOP file-level concurrency.
+- Durable reparse enables the `legacy bulk import` hot-path flag in the persistence session. It
+  applies only to the bulk-import transaction: topology-participant caches are reused by inferred
+  reaction SMILES, Geometry equivalence matching is one set-based query per persistence window,
+  and later per-file concrete-identity, logical-stereo/membership, and reverse mapped-reaction
+  reconciliation extensions are skipped. Required project ownership, project scope, and
+  scientific-fact constraints still apply; ordinary single-file/interactive reaction creation
+  must not use this shortcut.
+- A new derived check or enrichment must not insert per-file queries or reconciliation into this
+  bulk hot path. Make it a bounded batch/rebuildable refresh, or first prove that throughput and
+  failure isolation do not regress on the same fixture, and add an architecture regression test.
+
+The fixed relationship is therefore: 16 shared parser slots continuously take work, results are
+continuously handed to one persistence consumer in groups of 32, local imports commit configured
+microbatches, and the RustFS worker normally commits one 64-file claim. Changing any number or
+using one layer to control another requires updating this section, the development/deployment
+guides, and the corresponding tests first.
+
+Every change to the import path must answer whether it still goes through `reparse` and
+`_run_molop_file_pipeline`, and whether it only adds scheduling, lease, or resource control.
+If not, update this design and the corresponding architecture tests before introducing a
+parallel implementation.
 
 ## 3. Work Items and Acceptance
 

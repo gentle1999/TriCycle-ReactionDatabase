@@ -128,15 +128,36 @@ abstraction policy、匹配 schema、原子对应和被抽象的 feature，便�
 影响的 C=N E/Z 或其他邻接 stereo feature。新增或调整可翻转中心必须增加经过审查的规则
 和版本，不能通过环境变量静默改变持久化化学身份。
 
+## 项目身份与导入清单
+
+项目的 `slug` 是组织内稳定的 canonical slug，`name` 是展示名称；新建项目同时记录
+认证用户作为 `owner_user_id` 和 `created_by_user_id`。`data_source`、`model_checkpoint`
+和 `calculation_protocol` 保存创建时确认的来源、模型/checkpoint 与计算协议 JSON。
+历史项目允许这些身份字段暂为空，并由迁移或下一次显式管理操作补齐；这些字段不能由
+文件名或导入 worker 推断。
+
+归档导入必须先形成 `ArtifactManifest`。每个条目固定保存 `archive_sha256`、归档相对路径、
+受控 staging 路径、文件 SHA-256、大小、媒体类型、Gaussian 标记和选择状态。注册与启动前
+都会重新检查普通文件、路径 containment、链数和 SHA-256；只有 `selected` 条目进入导入，
+其他条目仍作为 filtered/rejected 记录保留。staging 路径是部署位置，不属于 manifest 身份
+摘要，因此移动 staging 根目录不会制造重复任务。
+
+数据库中的 `UploadBatch` 是 canonical `ImportJob`，`UploadBatchItem` 是 `ImportJobItem`；
+项目、归档、相对路径和文件 SHA-256 共同形成稳定 item 身份。MCP 只注册、启动、暂停、恢复、
+取消、重试和查询任务，不接收 tar 字节或任意服务器路径；文件字节仍由受控 staging worker
+读取。任务和条目状态、错误代码、artifact/revision 引用以及审计事件都持久化在数据库中。
+
 ## 导入与解析状态
 
 浏览器上传、批量上传、显式 reparse 和本地 `tricycle-import-artifacts` CLI 共用同一个
 application upload service；CLI 只把本地路径作为字节来源。浏览器批次采用服务端持久化队列：
 先写入 manifest，再逐文件把字节写入并核验 RustFS/S3，最后把 `UploadBatchItem` 推进到
-`staged`；独立的 `tricycle-upload-worker` 领取 staged 项并推进到 `processing`，调用
-`ArtifactUploadService.reparse`，再提交 `succeeded`/`failed`。MolOP 不在 HTTP 请求或浏览器
-生命周期内运行，因此刷新页面、切换路由、API 重启或 worker 重启都不会丢失已经 staged 的
-文件。对象、内容哈希、解析 revision 和科学事实都不可原地覆盖。
+`staged`；独立的 `tricycle-upload-worker` 每轮领取最多 64 个 staged 项，调用
+`ArtifactUploadService.reparse_batch`。该批量外壳只读取/校验已有 RustFS 对象，再委托既有
+`upload_batch`、共享 MolOP 进程池和单一持久化消费者，最后提交 `succeeded`/`failed`；不会再次
+上传对象或新增远程解析器。MolOP 不在 HTTP 请求或浏览器生命周期内运行，因此刷新页面、
+切换路由、API 重启或 worker 重启都不会丢失已经 staged 的文件。对象、内容哈希、解析 revision
+和科学事实都不可原地覆盖。
 
 上传批次条目状态的唯一流转为：
 

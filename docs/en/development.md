@@ -89,7 +89,7 @@ The default limits are documented in `.env.example`. In particular:
 | `TRICYCLE_QUERY_STATEMENT_TIMEOUT_MS` | `15000` | PostgreSQL statement budget per connection |
 | `TRICYCLE_SLOW_QUERY_THRESHOLD_MS` | `500` | Slow-query log threshold; parameters are redacted |
 | `TRICYCLE_UPLOAD_MAX_CONCURRENCY` | `8` | Concurrent HTTP upload requests per API process |
-| `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` | `2` | Concurrent MolOP files handled by the durable upload worker |
+| `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` | `2` | Maximum files in one durable queue claim |
 | `TRICYCLE_UPLOAD_WORKER_LEASE_SECONDS` | `3600` | Worker processing lease; heartbeats extend it and expiry permits recovery |
 | `TRICYCLE_UPLOAD_CLIENT_LEASE_SECONDS` | `900` | Recovery threshold for an interrupted HTTP staging request |
 | `TRICYCLE_UPLOAD_WORKER_POLL_INTERVAL_SECONDS` | `1` | Worker polling interval for staged items and expired leases |
@@ -160,13 +160,13 @@ sequenceDiagram
     participant U as ArtifactUploadService
     participant R as RustFS
     participant G as File-slot gate
-    participant P as File-local parser
+    participant P as Reusable MolOP pool
     participant W as Persistence consumer
     participant D as PostgreSQL
     participant C as JSONL checkpoint
 
     Note over F: ThreadPoolExecutor, internal cap 32
-    Note over G,P: n_jobs file slots; one spawn ProcessPoolExecutor(max_workers=1) per file
+    Note over G,P: n_jobs file slots; one reusable spawn ProcessPoolExecutor
     Note over P: OMP/OPENBLAS/MKL are normally set to 1 in the child
 
     I->>F: Discover paths and compute SHA-256
@@ -178,15 +178,14 @@ sequenceDiagram
             U->>R: Write and verify raw object
             R-->>U: Object ready
             U->>G: Wait for and acquire file slot
-            G->>P: Start isolated child process
+            G->>P: Submit parser/frame work
             P->>P: MolOP parse + frame post-processing
             alt Normal completion
                 P-->>G: Return frames/diagnostics
                 G-->>U: Release file slot
                 P-->>W: Put bounded result
             else Timeout or parse failure
-                P-->>G: Raise timeout/error
-                G->>P: Terminate only this file child
+                P-->>G: Raise timeout/error after safe cleanup
                 G-->>U: Release file slot
                 P-->>W: Put file failure result
             end
@@ -209,11 +208,12 @@ Read the boundaries in the diagram as follows:
 - `TRICYCLE_MOLOP_BATCH_N_JOBS` is a file-level admission semaphore: it limits
   how many files may enter parsing at once. Waiting for a slot does not consume
   the per-file parse timeout.
-- After a file acquires a slot, the production path creates a file-local,
-  `spawn`-based `ProcessPoolExecutor(max_workers=1)`. Thus `n_jobs=16` means
-  at most 16 file child processes are active; it does not create 16 children
-  inside every file task. A timeout terminates only that file child and frees
-  its slot, while other files continue.
+- After a file acquires a slot, the production path submits parser and frame
+  work to one reusable, `spawn`-based `ProcessPoolExecutor`. Thus `n_jobs=16`
+  means at most 16 file tasks enter the shared pool; a new pool is not created
+  for every artifact. Completed or failed work lets the candidate queue refill.
+  A cancelled or timed-out request releases its admission slot while already
+  submitted shared-pool work is drained by the pool.
 - `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, and `MKL_NUM_THREADS` bound native
   threads inside the child and should normally all be `1`. The candidate
   window and native-thread counts do not replace file-level slots.
@@ -224,10 +224,29 @@ Read the boundaries in the diagram as follows:
 
 Browser and remote API uploads skip the CLI fingerprint pool and local
 candidate queue: the API stores bytes in RustFS and marks the item `staged`,
-then the independent `upload-worker` claims jobs using
-`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` and enters the same file-level parser
-path. The worker-concurrency limit and `TRICYCLE_MOLOP_BATCH_N_JOBS` parser-slot
-limit are different controls and must not simply be multiplied.
+then the independent `upload-worker` claims a `TRICYCLE_MAX_BATCH_FILES` (64)
+window and groups it by project/user for `ArtifactUploadService.reparse_batch`.
+That wrapper only reads/verifies existing objects and delegates to the existing
+`upload_batch`, shared MolOP pool, and single persistence consumer. It does not
+upload objects again or introduce a second parser. `TRICYCLE_UPLOAD_MAX_CONCURRENCY`
+limits RustFS reads, `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` is retained for
+pending-ingestion recovery, and `TRICYCLE_MOLOP_BATCH_N_JOBS` limits shared-pool
+admission; these controls must not simply be multiplied.
+
+Keep the remote reparse boundaries separate from parser concurrency: the worker
+claims at most 64 staged files, and `reparse_batch` passes the actual number in
+the project/user group to `upload_batch` as one persistence commit window. Within
+that window, the same result queue and single consumer call `persist_parsed_files`
+for every 32 parsed results (or when the queue is temporarily empty); persistence
+must not wait until all 64 files have parsed. Thus `64` is the claim/commit window,
+while actual parser concurrency is controlled only by the shared MolOP pool's
+`TRICYCLE_MOLOP_BATCH_N_JOBS` (normally `16` on a dedicated host). The durable
+bulk/reparse transaction also uses the previous legacy bulk hot path: reaction-SMILES
+topology caching and one set-based Geometry match remain enabled, while later
+per-file concrete/logical/reverse reconciliation must not be inserted directly.
+Project scope and ownership constraints still apply. Update the architecture guide
+and remeasure byte throughput and failure isolation on the same real file set before
+changing these boundaries.
 
 ### Recommended import settings
 
@@ -288,20 +307,24 @@ Tune in this order:
   scales with source size. It isolates outliers rather than increasing speed;
   raise it for slow storage or many large files, and lower it only after
   checking the resulting failure rate.
-- Keep `TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE=true` and
-  `TRICYCLE_MOLOP_PARALLEL_FRAME_PERSISTENCE=true`. The first preserves frame
-  role/source-locator evidence; the second enables batched persistence and
-  throughput. Do not disable evidence just for a short-term speed gain.
+- Keep `TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE=false` for the previous
+  high-throughput bulk-import behavior. Set it to `true` for audit imports that
+  require frame-role/source-locator, source-span, or block-hash evidence and
+  accept the extra cost. Keep `TRICYCLE_MOLOP_PARALLEL_FRAME_PERSISTENCE=true`.
 
 Browser and remote API uploads use the independent durable `upload-worker`, so
-do not confuse its controls with the local `IMPORT_*` variables. Keep
-`TRICYCLE_UPLOAD_MAX_CONCURRENCY=8` for HTTP byte intake,
-`TRICYCLE_UPLOAD_WORKER_CONCURRENCY=2` for active durable files, and
-`TRICYCLE_UPLOAD_WORKER_STATEMENT_TIMEOUT_MS=120000` as the starting point. A
-dedicated compute host may use `TRICYCLE_MOLOP_BATCH_N_JOBS=16`, but start the
-durable worker at `2` and increase it only after checking CPU, memory, and
-database write latency; the limits are separate and must not simply be
-multiplied.
+do not confuse its controls with the local `IMPORT_*` variables.
+`TRICYCLE_UPLOAD_MAX_CONCURRENCY=8` limits RustFS reads and
+`TRICYCLE_MAX_BATCH_FILES=64` is the worker claim/commit window;
+`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` is only for pending-ingestion recovery.
+A dedicated compute host may use `TRICYCLE_MOLOP_BATCH_N_JOBS=16` for the
+shared parser pool, subject to CPU, memory, and database write-latency checks.
+
+The word “persistence” here means the worker claim's commit boundary; it does not
+serialize 64 files or change the internal 32-result hand-off. Local CLI
+`IMPORT_COMMIT_BATCH_FILES=16` still controls only local transaction/checkpoint
+frequency. These three numbers belong to parser admission, result hand-off, and
+commit boundaries respectively and must not substitute for one another.
 
 `TRICYCLE_MAX_UPLOAD_BYTES=64 MiB` is the per-file cap and also applies to local
 imports. `TRICYCLE_MAX_BATCH_FILES=64` and
@@ -315,6 +338,7 @@ unless there is an operational reason to change them.
 ```bash
 IMPORT_MODE=development \
 IMPORT_PROJECT_ID=00000000-0000-7000-8000-000000000201 \
+IMPORT_USER_ID=00000000-0000-0000-0000-000000000002 \
 IMPORT_ROOTS='/data/archive/reactions /data/archive/supplemental' \
 IMPORT_STATE_FILE=.tmp/artifact-import.jsonl \
 IMPORT_PIPELINE_WINDOW_FILES=64 \
@@ -323,10 +347,32 @@ IMPORT_STREAM_QUEUE_SIZE=64 \
 make import-artifacts
 ```
 
+For an extracted archive, use manifest mode. Generate the manifest with a
+trusted extractor, configure `TRICYCLE_IMPORT_STAGING_ROOT`, and pass an
+explicit importing user:
+
+```bash
+TRICYCLE_IMPORT_STAGING_ROOT=/data/staging \
+uv run tricycle-import-artifacts \
+  --project-id 00000000-0000-7000-8000-000000000201 \
+  --user-id 00000000-0000-0000-0000-000000000002 \
+  --manifest /data/staging/archive.manifest.json
+```
+
+Manifest mode registers a durable database ImportJob/ImportJobItem and imports
+only entries marked `selected`. Every entry is re-hashed before registration
+and startup. The configured staging root is mandatory; traversal, symlinks,
+hard links, special files, out-of-root paths, changed bytes, and files not in
+the manifest are rejected. Re-registering the same project manifest returns
+the existing job. MCP exposes `get_import_status`, `list_import_failures`,
+`retry_import_items`, `pause_import`, `resume_import`, and `cancel_import` for
+control and audit; it never transfers archive bytes.
+
 The append-only JSONL state file makes import resumable by path, size, mtime,
 and SHA-256. Source changes are re-imported. Use `--dry-run` to scan only.
-Production import requires `--user-id` or `IMPORT_USER_ID` belonging to a user
-with `artifact:upload` permission on the project.
+Every import requires `--user-id` or `IMPORT_USER_ID` belonging to a user with
+`artifact:upload` permission on the project. There is no implicit development
+user fallback.
 
 For `calculation_output`, unambiguous JSON/CSV/TSV/YAML/TOML, structure, and
 Markdown sidecars are skipped before MolOP. Unknown suffixes remain admissible

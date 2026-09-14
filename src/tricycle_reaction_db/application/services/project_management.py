@@ -76,8 +76,13 @@ class ProjectManagementService:
             organization_id=organization.id,
             organization_slug=organization.slug,
             organization_name=organization.name,
+            owner_user_id=project.owner_user_id,
+            created_by_user_id=project.created_by_user_id,
             slug=project.slug,
             name=project.name,
+            data_source=project.data_source,
+            model_checkpoint=project.model_checkpoint,
+            calculation_protocol=project.calculation_protocol,
             status=ProjectStatus(project.status),
             role=role,
             organization_role=organization_role,
@@ -213,8 +218,13 @@ class ProjectManagementService:
                 raise ProjectAccessDeniedError("organization admin permission required")
             project = Project(
                 organization_id=payload.organization_id,
+                owner_user_id=principal.user_id,
+                created_by_user_id=principal.user_id,
                 slug=payload.slug,
                 name=payload.name,
+                data_source=payload.data_source,
+                model_checkpoint=payload.model_checkpoint,
+                calculation_protocol=payload.calculation_protocol,
                 status=ProjectStatus.ACTIVE,
             )
             session.add(project)
@@ -250,7 +260,17 @@ class ProjectManagementService:
             entity_id=view.id,
             actor_user_id=principal.user_id,
             project_id=view.id,
-            metadata={"slug": view.slug, "name": view.name},
+            metadata={
+                "slug": view.slug,
+                "name": view.name,
+                "owner_user_id": str(view.owner_user_id) if view.owner_user_id else None,
+                "created_by_user_id": (
+                    str(view.created_by_user_id) if view.created_by_user_id else None
+                ),
+                "data_source": view.data_source,
+                "model_checkpoint": view.model_checkpoint,
+                "calculation_protocol": view.calculation_protocol,
+            },
         )
         return view
 

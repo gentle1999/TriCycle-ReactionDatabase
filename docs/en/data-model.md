@@ -161,6 +161,28 @@ to find dependent C=N E/Z or other neighboring stereo features. Adding or
 changing a reversible centre requires a reviewed rule and version; an
 environment variable must not silently change persisted chemical identity.
 
+## Project Identity and Import Manifests
+
+A project's `slug` is its stable canonical slug within an organization and `name` is its display
+name. New projects also persist the authenticated user as `owner_user_id` and
+`created_by_user_id`. `data_source`, `model_checkpoint`, and `calculation_protocol` retain the
+confirmed source, model/checkpoint, and calculation-protocol JSON at creation time. Legacy projects
+may keep these identity fields nullable until migration or an explicit management operation repairs
+them; an importer must never infer them from filenames.
+
+Archive imports first produce an `ArtifactManifest`. Each entry records `archive_sha256`, the
+archive-relative path, a controlled staging path, file SHA-256, size, media type, Gaussian
+classification, and selection status. Registration and start re-check regular-file status, path
+containment, link count, and SHA-256; only `selected` entries enter ingestion, while filtered/rejected
+entries remain recorded. The staging path is deployment placement rather than manifest identity, so
+relocating the staging root does not create a duplicate job.
+
+The database's `UploadBatch` is the canonical `ImportJob`, and `UploadBatchItem` is its
+`ImportJobItem`. Project, archive, relative path, and file SHA-256 form the stable item identity.
+MCP registers, starts, pauses, resumes, cancels, retries, and queries jobs; it does not receive tar
+bytes or arbitrary server paths. File bytes are read only by the controlled staging worker, and job
+state, item state, error codes, artifact/revision references, and audit events are durable.
+
 ## Ingestion and Parse States
 
 Browser uploads, batch uploads, explicit reparse, and the local
@@ -168,12 +190,14 @@ Browser uploads, batch uploads, explicit reparse, and the local
 CLI differs only by using local paths as its byte source. Browser batches are a
 server-owned durable queue: the manifest is written first, each file is written
 and verified in RustFS/S3, and its `UploadBatchItem` becomes `staged`. An
-independent `tricycle-upload-worker` claims staged items, runs
-`ArtifactUploadService.reparse`, and commits `succeeded` or `failed`. MolOP is
-not owned by the HTTP request or browser lifecycle, so a page reload, route
-change, API restart, or worker restart cannot discard a staged file. Object
-identity, content hash, parse revisions, and scientific facts are never
-overwritten in place.
+independent `tricycle-upload-worker` claims at most 64 staged items per window
+and calls `ArtifactUploadService.reparse_batch`. That batch wrapper only
+reads/verifies existing RustFS objects, then delegates to the existing
+`upload_batch`, shared MolOP pool, and single persistence consumer; it does not
+upload objects again or add a remote parser. MolOP is not owned by the HTTP
+request or browser lifecycle, so a page reload, route change, API restart, or
+worker restart cannot discard a staged file. Object identity, content hash,
+parse revisions, and scientific facts are never overwritten in place.
 
 The only upload-batch item state flow is:
 

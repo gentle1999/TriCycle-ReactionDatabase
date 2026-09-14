@@ -21,6 +21,7 @@ from tricycle_reaction_db.domain.enums import (
     QMSoftware,
     StorageStatus,
 )
+from tricycle_reaction_db.ingestion.manifest import normalize_relative_path
 from tricycle_reaction_db.ingestion.media_type import detect_artifact_media_type
 
 
@@ -65,6 +66,7 @@ def artifact_record_from_path(
     bucket: str,
     artifact_kind: ArtifactKind,
     storage_status: StorageStatus = StorageStatus.PENDING,
+    relative_path: str | None = None,
 ) -> ArtifactFileRecord:
     """Build a RustFS catalogue record without uploading the source file."""
 
@@ -72,6 +74,9 @@ def artifact_record_from_path(
     with path.open("rb") as stream:
         sample = stream.read(64 * 1024)
     media_type = detect_artifact_media_type(path.name, None, sample)
+    source_relative_path = (
+        normalize_relative_path(relative_path) if relative_path is not None else None
+    )
     return ArtifactFileRecord(
         bucket=bucket,
         object_key=f"raw/sha256/{content_sha256[:2]}/{content_sha256}",
@@ -79,6 +84,7 @@ def artifact_record_from_path(
         content_sha256=content_sha256,
         size_bytes=path.stat().st_size,
         original_filename=path.name,
+        source_relative_path=source_relative_path,
         media_type=media_type,
         artifact_kind=artifact_kind,
         storage_status=storage_status,

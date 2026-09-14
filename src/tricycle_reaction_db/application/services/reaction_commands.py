@@ -20,6 +20,7 @@ from tricycle_reaction_db.application.dtos import (
 )
 from tricycle_reaction_db.application.query_cost import enforce_structure_input_budget
 from tricycle_reaction_db.application.services._persistence import (
+    LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
     _project_owner_predicate,
     _require_id,
 )
@@ -347,11 +348,20 @@ def _create_reaction(
         precomputed_topology_records=precomputed_topology_records,
     )
     mapping_complete = _has_complete_mapping(components)
-    logical_components = _logicalize_components(
-        session,
-        components,
-        topology_context=topology_context,
-    )
+    if session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
+        # The previous batch importer used the MolGR endpoint topologies as
+        # the logical reaction identities. Keep its hot path for durable
+        # reparses; stereo abstraction/membership expansion remains enabled
+        # for ordinary reaction creation.
+        logical_components = [
+            replace(component, logical_topology=component.topology) for component in components
+        ]
+    else:
+        logical_components = _logicalize_components(
+            session,
+            components,
+            topology_context=topology_context,
+        )
     identities = [
         (component.side, component.logical_topology or component.topology, 1)
         for component in logical_components
@@ -385,7 +395,11 @@ def _create_reaction(
                 side=component.side,
                 participant_index=component.template_index,
             ),
-            candidate_topologies=(component.topology,),
+            candidate_topologies=(
+                ()
+                if session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False)
+                else (component.topology,)
+            ),
         )
     validate_logical_reaction(logical_reaction)
 

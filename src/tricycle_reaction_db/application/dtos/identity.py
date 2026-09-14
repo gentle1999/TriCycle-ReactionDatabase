@@ -1,6 +1,7 @@
 """Authenticated-user and project-access views."""
 
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -79,6 +80,9 @@ class ProjectCreate(BaseModel):
     organization_id: UUID
     slug: str = Field(min_length=1, max_length=128, pattern=_SLUG_PATTERN)
     name: str = Field(min_length=1, max_length=512)
+    data_source: dict[str, Any] = Field(default_factory=dict)
+    model_checkpoint: dict[str, Any] = Field(default_factory=dict)
+    calculation_protocol: dict[str, Any] = Field(default_factory=dict)
 
 
 class ProjectUpdate(BaseModel):
@@ -96,8 +100,13 @@ class ProjectView(BaseModel):
     organization_id: UUID
     organization_slug: str
     organization_name: str
+    owner_user_id: UUID | None = None
+    created_by_user_id: UUID | None = None
     slug: str
     name: str
+    data_source: dict[str, Any] = Field(default_factory=dict)
+    model_checkpoint: dict[str, Any] = Field(default_factory=dict)
+    calculation_protocol: dict[str, Any] = Field(default_factory=dict)
     status: ProjectStatus
     role: ProjectRole | None = None
     organization_role: OrganizationRole | None = None

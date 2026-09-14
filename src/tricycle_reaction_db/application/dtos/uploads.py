@@ -1,7 +1,7 @@
 """DTOs for authenticated artifact ingestion and durable upload queues."""
 
 from datetime import datetime
-from pathlib import PurePosixPath
+from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID
 
@@ -11,11 +11,15 @@ from tricycle_reaction_db.domain.enums import (
     ArtifactIngestionStatus,
     ArtifactKind,
     ArtifactVisibility,
+    ImportMaterializationStatus,
+    ImportParseStatus,
+    ImportSelectionStatus,
     StorageStatus,
     TransitionStateInferenceStatus,
     UploadBatchItemStatus,
     UploadBatchStatus,
 )
+from tricycle_reaction_db.ingestion.manifest import normalize_relative_path
 
 
 class TransitionStateInferenceView(BaseModel):
@@ -115,6 +119,10 @@ class UploadBatchFileCreate(BaseModel):
     relative_path: str = Field(min_length=1, max_length=4096)
     size_bytes: int = Field(ge=0)
     media_type: str = Field(default="application/octet-stream", min_length=1, max_length=255)
+    expected_file_sha256: str | None = Field(default=None, min_length=64, max_length=64)
+    staged_file_path: str | None = Field(default=None, min_length=1, max_length=16_384)
+    is_gaussian_log: bool = False
+    selection_status: ImportSelectionStatus = ImportSelectionStatus.SELECTED
 
     @field_validator("original_filename")
     @classmethod
@@ -127,11 +135,30 @@ class UploadBatchFileCreate(BaseModel):
     @field_validator("relative_path")
     @classmethod
     def validate_relative_path(cls, value: str) -> str:
-        normalized = value.strip().replace("\\", "/")
-        path = PurePosixPath(normalized)
-        if not normalized or path.is_absolute() or ".." in path.parts:
-            raise ValueError("relative_path must stay within the selected directory")
-        return str(path)
+        try:
+            return normalize_relative_path(value)
+        except ValueError as error:
+            raise ValueError("relative_path must stay within the selected directory") from error
+
+    @field_validator("expected_file_sha256")
+    @classmethod
+    def validate_expected_hash(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().casefold()
+        if len(normalized) != 64 or any(char not in "0123456789abcdef" for char in normalized):
+            raise ValueError("expected_file_sha256 must be a SHA-256 hex digest")
+        return normalized
+
+    @field_validator("staged_file_path")
+    @classmethod
+    def validate_staged_file_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not Path(normalized).is_absolute() or "\x00" in normalized:
+            raise ValueError("staged_file_path must be an absolute local path")
+        return normalized
 
 
 class UploadBatchCreate(BaseModel):
@@ -140,7 +167,20 @@ class UploadBatchCreate(BaseModel):
     project_id: UUID
     artifact_kind: ArtifactKind = ArtifactKind.CALCULATION_OUTPUT
     shared_metadata: dict[str, Any] = Field(default_factory=dict)
+    archive_sha256: str | None = Field(default=None, min_length=64, max_length=64)
+    manifest_sha256: str | None = Field(default=None, min_length=64, max_length=64)
+    manifest_schema_version: str | None = Field(default=None, min_length=1, max_length=64)
     files: list[UploadBatchFileCreate] = Field(min_length=1, max_length=100_000)
+
+    @field_validator("archive_sha256", "manifest_sha256")
+    @classmethod
+    def validate_batch_hash(cls, value: str | None, info: Any) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().casefold()
+        if len(normalized) != 64 or any(char not in "0123456789abcdef" for char in normalized):
+            raise ValueError(f"{info.field_name} must be a SHA-256 hex digest")
+        return normalized
 
     @model_validator(mode="after")
     def validate_unique_files(self) -> "UploadBatchCreate":
@@ -170,6 +210,9 @@ class UploadBatchView(BaseModel):
     artifact_kind: ArtifactKind
     status: UploadBatchStatus
     shared_metadata: dict[str, Any]
+    archive_sha256: str | None = None
+    manifest_sha256: str | None = None
+    manifest_schema_version: str | None = None
     total_count: int = Field(ge=1)
     total_bytes: int = Field(ge=0)
     succeeded_count: int = Field(ge=0)
@@ -205,6 +248,12 @@ class UploadBatchItemView(BaseModel):
     attempt_count: int = Field(ge=0)
     processing_attempt_count: int = Field(default=0, ge=0)
     content_sha256: str | None = None
+    expected_file_sha256: str | None = None
+    is_gaussian_log: bool = False
+    selection_status: ImportSelectionStatus = ImportSelectionStatus.SELECTED
+    parse_status: ImportParseStatus = ImportParseStatus.NOT_STARTED
+    materialization_status: ImportMaterializationStatus = ImportMaterializationStatus.NOT_STARTED
+    parse_revision_id: UUID | None = None
     artifact_file_id: UUID | None = None
     ingestion_status: ArtifactIngestionStatus | None = None
     ingestion_error_message: str | None = None

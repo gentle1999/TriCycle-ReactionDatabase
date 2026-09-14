@@ -5,9 +5,9 @@
 > Current physical-schema reference. The Chinese counterpart contains the full
 > ERD and table-by-table inventory; SQL identifiers are identical in both pages.
 >
-> Current schema: Alembic `0037_project_owned_calculation_protocol`. The ORM inventory contains
-> 64 tables, 778 columns, 101 foreign keys, 77 UNIQUE constraints, 202 CHECK constraints,
-> and 171 indexes.
+> Current schema: Alembic `0044_project_identity_provenance`. The ORM inventory contains
+> 64 tables, 794 columns, 104 foreign keys, 77 UNIQUE constraints, 209 CHECK constraints,
+> and 176 indexes.
 
 ## Storage Boundaries
 

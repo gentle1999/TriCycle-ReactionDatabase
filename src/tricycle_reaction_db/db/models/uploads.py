@@ -9,6 +9,7 @@ import numpy.typing as npt
 from pydantic import ConfigDict
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     Column,
     DateTime,
@@ -29,6 +30,9 @@ from tricycle_reaction_db.db.types import NumpyArray
 from tricycle_reaction_db.domain.enums import (
     ArtifactIngestionStatus,
     ArtifactKind,
+    ImportMaterializationStatus,
+    ImportParseStatus,
+    ImportSelectionStatus,
     TransitionStateEndpointDirection,
     TransitionStateInferenceStatus,
     UploadBatchItemStatus,
@@ -60,6 +64,21 @@ class UploadBatch(SQLModel, table=True):
             "succeeded_count + failed_count + cancelled_count + uploading_count + "
             "staged_count + processing_count <= total_count",
             name="ck_upload_batch_counts_lte_total",
+        ),
+        CheckConstraint(
+            "archive_sha256 IS NULL OR archive_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_upload_batch_archive_sha256_hex",
+        ),
+        CheckConstraint(
+            "manifest_sha256 IS NULL OR manifest_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_upload_batch_manifest_sha256_hex",
+        ),
+        Index(
+            "uq_upload_batch_project_manifest",
+            "project_id",
+            "manifest_sha256",
+            unique=True,
+            postgresql_where=text("manifest_sha256 IS NOT NULL"),
         ),
         Index(
             "ix_upload_batch_owner_created",
@@ -110,6 +129,12 @@ class UploadBatch(SQLModel, table=True):
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default="{}"),
     )
+    # UploadBatch is the canonical durable import job. Nullable values keep
+    # legacy web batches readable while manifest registrations get a stable
+    # content identity for idempotent replay.
+    archive_sha256: str | None = Field(default=None, max_length=64, nullable=True)
+    manifest_sha256: str | None = Field(default=None, max_length=64, nullable=True)
+    manifest_schema_version: str | None = Field(default=None, max_length=64, nullable=True)
     total_count: int = Field(nullable=False)
     total_bytes: int = Field(sa_type=BigInteger, nullable=False)
     succeeded_count: int = Field(
@@ -155,6 +180,24 @@ class UploadBatchItem(SQLModel, table=True):
         CheckConstraint(
             "content_sha256 IS NULL OR content_sha256 ~ '^[0-9a-f]{64}$'",
             name="ck_upload_batch_item_content_sha256_hex",
+        ),
+        CheckConstraint(
+            "expected_file_sha256 IS NULL OR expected_file_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_upload_batch_item_expected_sha256_hex",
+        ),
+        CheckConstraint(
+            "selection_status IN ('selected', 'filtered', 'rejected')",
+            name="ck_upload_batch_item_selection_status",
+        ),
+        CheckConstraint(
+            "parse_status IN ("
+            "'not_started', 'pending', 'succeeded', 'partial', 'filtered', 'failed'"
+            ")",
+            name="ck_upload_batch_item_parse_status",
+        ),
+        CheckConstraint(
+            "materialization_status IN ('not_started', 'pending', 'succeeded', 'failed')",
+            name="ck_upload_batch_item_materialization_status",
         ),
         Index(
             "ix_upload_batch_item_batch_status_position",
@@ -220,6 +263,32 @@ class UploadBatchItem(SQLModel, table=True):
         sa_column=Column(Integer, nullable=False, server_default="0"),
     )
     content_sha256: str | None = Field(default=None, max_length=64, nullable=True)
+    # Expected identity comes from the manifest; content_sha256 is populated
+    # from the bytes actually accepted by the storage service.
+    expected_file_sha256: str | None = Field(default=None, max_length=64, nullable=True)
+    staged_file_path: str | None = Field(default=None, sa_type=Text, nullable=True)
+    is_gaussian_log: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default="false"),
+    )
+    selection_status: str = Field(
+        default=ImportSelectionStatus.SELECTED.value,
+        sa_column=Column(String(32), nullable=False, server_default="selected"),
+    )
+    parse_status: str = Field(
+        default=ImportParseStatus.NOT_STARTED.value,
+        sa_column=Column(String(32), nullable=False, server_default="not_started"),
+    )
+    materialization_status: str = Field(
+        default=ImportMaterializationStatus.NOT_STARTED.value,
+        sa_column=Column(String(32), nullable=False, server_default="not_started"),
+    )
+    parse_revision_id: UUID | None = Field(
+        default=None,
+        foreign_key="parse_revision.id",
+        ondelete="SET NULL",
+        index=True,
+    )
     worker_lease_id: UUID | None = Field(default=None)
     worker_lease_expires_at: datetime | None = Field(
         default=None,
@@ -513,8 +582,17 @@ class TransitionStateEndpoint(SQLModel, table=True):
     topology: "MolecularTopology" = Relationship(back_populates="transition_state_endpoints")
 
 
+# ``UploadBatch``/``UploadBatchItem`` are the original public names.  These
+# aliases make the durable queue explicit in import-oriented code without
+# creating a second set of tables or state transitions.
+ImportJob = UploadBatch
+ImportJobItem = UploadBatchItem
+
+
 __all__ = [
     "ArtifactIngestion",
+    "ImportJob",
+    "ImportJobItem",
     "TransitionStateEndpoint",
     "TransitionStateInference",
     "UploadBatch",

@@ -70,6 +70,8 @@ from tricycle_reaction_db.db.models.storage import (
 )
 from tricycle_reaction_db.db.models.uploads import (
     ArtifactIngestion,
+    ImportJob,
+    ImportJobItem,
     TransitionStateEndpoint,
     TransitionStateInference,
     UploadBatch,
@@ -82,6 +84,8 @@ __all__ = [
     "AtomicPopulationSeries",
     "ArtifactFile",
     "ArtifactIngestion",
+    "ImportJob",
+    "ImportJobItem",
     "AuditEvent",
     "AuthSession",
     "McpAccessToken",

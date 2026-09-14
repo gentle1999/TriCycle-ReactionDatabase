@@ -39,18 +39,34 @@ def test_settings_accept_psycopg_database_url() -> None:
     settings = Settings(_env_file=None)
 
     assert settings.database_url.startswith("postgresql+psycopg://")
+    assert settings.database_pool_size == 5
+    assert settings.database_max_overflow == 10
+    assert settings.database_pool_timeout_seconds == 30.0
     assert settings.api_port == 8000
-    assert settings.molop_capture_source_evidence is True
+    assert settings.molop_capture_source_evidence is False
     assert settings.molop_parallel_frame_persistence is True
     assert settings.molop_file_parse_timeout_seconds == 60.0
 
 
-def test_molop_source_evidence_can_be_disabled_for_legacy_fast_ingestion(
+def test_database_pool_settings_can_match_worker_concurrency() -> None:
+    settings = Settings(
+        _env_file=None,
+        database_pool_size=16,
+        database_max_overflow=16,
+        database_pool_timeout_seconds=60.0,
+    )
+
+    assert settings.database_pool_size == 16
+    assert settings.database_max_overflow == 16
+    assert settings.database_pool_timeout_seconds == 60.0
+
+
+def test_molop_source_evidence_can_be_enabled_for_audit_ingestion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE", "false")
+    monkeypatch.setenv("TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE", "true")
 
-    assert Settings(_env_file=None).molop_capture_source_evidence is False
+    assert Settings(_env_file=None).molop_capture_source_evidence is True
 
 
 def test_molop_parallel_frame_persistence_can_be_disabled(

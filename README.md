@@ -161,6 +161,7 @@ instead of receiving browser-spooled files.
 ```bash
 IMPORT_MODE=development \
 IMPORT_PROJECT_ID=<project-uuid> \
+IMPORT_USER_ID=<user-uuid> \
 IMPORT_ROOTS='/data/calculations /data/supplemental' \
 IMPORT_STATE_FILE=.tmp/artifact-import.jsonl \
 IMPORT_PIPELINE_WINDOW_FILES=64 \
@@ -168,6 +169,24 @@ IMPORT_COMMIT_BATCH_FILES=16 \
 IMPORT_STREAM_QUEUE_SIZE=64 \
 make import-artifacts
 ```
+
+For an extracted archive, use manifest mode. Generate the manifest with a
+trusted extractor, configure the operator-owned staging root, and pass an
+explicit importing user:
+
+```bash
+TRICYCLE_IMPORT_STAGING_ROOT=/data/staging \
+uv run tricycle-import-artifacts \
+  --project-id <project-uuid> \
+  --user-id <user-uuid> \
+  --manifest /data/staging/archive.manifest.json
+```
+
+The manifest records the archive hash, relative path, staged path, file hash,
+size, media type, Gaussian classification, and selection status. Paths are
+validated below the configured staging root; links, special files, changed
+bytes, and files outside the manifest are rejected. Re-registering the same
+manifest is idempotent and returns the existing durable import job.
 
 The checkpoint is append-only and makes the import resumable using source path,
 size, mtime, and SHA-256. Files that contain no recoverable calculation frames
@@ -219,6 +238,7 @@ Frequently changed settings include:
 | `TRICYCLE_AUTH_MODE` | `development` locally, `oidc` in production |
 | `TRICYCLE_OIDC_*` | OIDC issuer, audience, JWKS, and browser client settings |
 | `TRICYCLE_MOLOP_BATCH_N_JOBS` | Bounded file parser worker count |
+| `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` | Maximum files per durable queue claim |
 | `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS` | Per-file parsing baseline timeout |
 | `TRICYCLE_QUERY_STATEMENT_TIMEOUT_MS` | PostgreSQL statement timeout for query traffic |
 | `TRICYCLE_STRUCTURE_CANDIDATE_LIMIT` | Upper bound before expensive structure post-processing |

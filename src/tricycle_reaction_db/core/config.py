@@ -63,10 +63,18 @@ class Settings(BaseSettings):
         le=16 * 1024 * 1024 * 1024 * 1024,
     )
     max_upload_metadata_bytes: int = Field(default=16 * 1024, ge=128, le=1024 * 1024)
+    # MCP manifest controls may read only from this operator-configured root;
+    # clients cannot widen it by submitting an arbitrary server path.
+    import_staging_root: Path | None = None
     database_url: str = (
         "postgresql+psycopg://example_user:example-local-password@127.0.0.1:5432/"
         "example_reaction_db"
     )
+    # Size the shared SQLAlchemy pool explicitly when the durable worker is
+    # configured to process more than the conservative default batch.
+    database_pool_size: int = Field(default=5, ge=1, le=256)
+    database_max_overflow: int = Field(default=10, ge=0, le=512)
+    database_pool_timeout_seconds: float = Field(default=30.0, gt=0.0, le=600.0)
     query_statement_timeout_ms: int = Field(default=15_000, ge=100, le=300_000)
     slow_query_threshold_ms: int = Field(default=500, ge=1, le=300_000)
     graphql_max_query_characters: int = Field(default=20_000, ge=100, le=1_000_000)
@@ -87,12 +95,10 @@ class Settings(BaseSettings):
     # orphaned, which leaves a long-running parser enough time to finish.
     upload_pending_recovery_seconds: int = Field(default=900, ge=60, le=86_400)
     upload_worker_concurrency: int = Field(default=2, ge=1, le=32)
-    # MolOP 0.2.12 collects frame roles and source locators without implicitly
-    # reconstructing molecular graphs. Keep evidence enabled so optimization
-    # frames retain their initial/intermediate/terminal role during ingestion.
-    # Deployments may still disable it explicitly for legacy fast-ingestion
-    # behavior, but those frames cannot provide MolOP's evidence-derived role.
-    molop_capture_source_evidence: bool = True
+    # Source spans and block hashes are expensive for large calculation logs.
+    # Keep them opt-in for normal/high-throughput ingestion; audit and
+    # reproducibility imports can enable them explicitly.
+    molop_capture_source_evidence: bool = False
     # Fast ingestion batches revision-local frame rows in one transaction.
     # Evidence capture no longer disables deferred topology reconstruction.
     molop_parallel_frame_persistence: bool = True
@@ -226,6 +232,15 @@ class Settings(BaseSettings):
         if not normalized or not Path(normalized).is_absolute():
             raise ValueError("CA bundle must be an absolute PEM path")
         return normalized
+
+    @field_validator("import_staging_root")
+    @classmethod
+    def require_absolute_import_staging_root(cls, value: Path | None) -> Path | None:
+        if value is None:
+            return None
+        if not value.is_absolute():
+            raise ValueError("import_staging_root must be an absolute path")
+        return value
 
     @field_validator("molop_batch_n_jobs")
     @classmethod

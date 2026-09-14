@@ -81,12 +81,20 @@ async def test_authenticated_user_can_create_an_organization_and_first_project()
                 organization_id=organization.id,
                 slug="first-project",
                 name="First Project",
+                data_source={"archive": "gaussian-2026-09"},
+                model_checkpoint={"name": "rxnresid", "sha256": "a" * 64},
+                calculation_protocol={"method": "wb97xd", "basis": "def2-svp"},
             ),
             owner,
         )
         created_project_id = project.id
         assert project.organization_id == organization.id
         assert project.role is ProjectRole.MANAGER
+        assert project.owner_user_id == owner.user_id
+        assert project.created_by_user_id == owner.user_id
+        assert project.data_source == {"archive": "gaussian-2026-09"}
+        assert project.model_checkpoint == {"name": "rxnresid", "sha256": "a" * 64}
+        assert project.calculation_protocol == {"method": "wb97xd", "basis": "def2-svp"}
 
         with pytest.raises(
             OrganizationManagementConflictError,

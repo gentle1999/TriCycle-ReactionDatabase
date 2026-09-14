@@ -49,7 +49,6 @@ from tricycle_reaction_db.db.models import MappedReactionNodeGeometry
 from tricycle_reaction_db.domain.enums import (
     ArtifactIngestionStatus,
     ArtifactKind,
-    FrameRole,
     StorageStatus,
 )
 from tricycle_reaction_db.domain.identity import DEVELOPMENT_USER_ID, SYSTEM_PROJECT_ID
@@ -254,13 +253,13 @@ def test_frame_failure_diagnostic_keeps_specific_error_code_and_evidence() -> No
     assert diagnostic["metadata"] == {"failure_boundary": "canonical_atom_order_projection"}
 
 
-def test_source_evidence_does_not_disable_fast_ingestion(
+def test_source_evidence_disables_fast_ingestion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = Settings(_env_file=None, molop_capture_source_evidence=True)
     monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
     assert settings.molop_capture_source_evidence
-    assert _fast_molop_ingestion_enabled()
+    assert not _fast_molop_ingestion_enabled()
 
 
 def test_slim_chem_file_retains_source_frame_count() -> None:
@@ -305,7 +304,7 @@ async def test_file_pipeline_timeout_isolated_to_one_file(monkeypatch: pytest.Mo
         await asyncio.sleep(1)
         return None
 
-    monkeypatch.setattr(upload_module, "_run_isolated_molop_file", slow_file)
+    monkeypatch.setattr(upload_module, "_run_molop_file_parser", slow_file)
     with pytest.raises(MolOPFileParseTimeoutError, match="exceeded 0.01s"):
         await _run_molop_file_pipeline(b"source", "slow.log")
 
@@ -355,7 +354,11 @@ async def test_file_pipeline_timeout_releases_slot_for_next_file(
             await asyncio.sleep(1)
         return f"parsed:{filename}"
 
-    monkeypatch.setattr(upload_module, "_run_isolated_molop_file", fake_file)
+    async def passthrough_frames(parsed: object, **__: object) -> object:
+        return parsed
+
+    monkeypatch.setattr(upload_module, "_run_molop_file_parser", fake_file)
+    monkeypatch.setattr(upload_module, "_process_parsed_artifact_frames", passthrough_frames)
     file_slots = asyncio.Semaphore(1)
     slow_task = asyncio.create_task(
         _run_molop_file_pipeline(b"slow", "slow.log", file_slots=file_slots)
@@ -384,7 +387,7 @@ async def test_file_timeout_does_not_shutdown_shared_molop_pool(
         await asyncio.sleep(1)
         return None
 
-    monkeypatch.setattr(upload_module, "_run_isolated_molop_file", slow_file)
+    monkeypatch.setattr(upload_module, "_run_molop_file_parser", slow_file)
     monkeypatch.setattr(
         upload_module,
         "_shutdown_molop_process_pool_sync",
@@ -525,17 +528,19 @@ def test_fast_molop_parse_defers_topology_reconstruction_until_materialization()
     assert parsed.source_frame_count == 23
     assert parsed.frame_records == ()
     assert parsed.inferences == ()
-    assert parsed.chem_file.source_segments
-    assert parsed.chem_file[0].frame_role == FrameRole.INITIAL.value
-    assert parsed.chem_file[9].frame_role == FrameRole.TERMINAL.value
+    # The throughput profile deliberately leaves source spans/block hashes out
+    # of the parsed DTO. Audit imports opt into source evidence explicitly.
+    assert parsed.chem_file.source_segments == []
+    assert parsed.chem_file[0].frame_role is None
+    assert parsed.chem_file[9].frame_role is None
     assert all(frame.topology_reconstruction_status is None for frame in parsed.chem_file)
 
     materialized = _materialize_parsed_artifacts([parsed])[0]
     assert len(materialized.frame_records) == 23
     assert len(materialized.inferences) == 1
-    assert materialized.frame_records[0].frame.frame_role is FrameRole.INITIAL
-    assert materialized.frame_records[9].frame.frame_role is FrameRole.TERMINAL
-    assert materialized.frame_records[22].frame.frame_role is FrameRole.TERMINAL
+    assert materialized.frame_records[0].frame.frame_role.value == "single_point"
+    assert materialized.frame_records[9].frame.frame_role.value == "single_point"
+    assert materialized.frame_records[22].frame.frame_role.value == "single_point"
     assert all(
         frame.topology_reconstruction_status in {"succeeded", "suspicious_fallback"}
         for frame in materialized.chem_file

@@ -245,8 +245,8 @@ DELETE 保留 `retired` tombstone，RustFS 临时故障时可重复请求继续�
 统一拆分并录入所有 MolOP 帧；检测到
 TS 帧时额外创建或复用同一反应，并保存 TS CalculationFrame 到反应的推断溯源。
 格式由 MolOP probe 从内容识别；文件名、扩展名、目录结构、manifest 和上传顺序都不参与
-化学身份。批量请求按文件在 RustFS、MolOP 和数据库之间流水推进：RustFS 写入完成即提交
-该文件的单文件 MolOP 进程池任务，解析结果由单一有界数据库消费者顺序持久化；最终请求仍在
+化学身份。批量请求按文件在 RustFS、MolOP 和数据库之间流水推进：RustFS 写入完成即把文件
+提交到可复用的共享 MolOP 进程池，解析结果由单一有界数据库消费者顺序持久化；最终请求仍在
 同一个数据库事务中提交。每个文件使用独立 savepoint，一个文件失败不会回滚其他文件，整批
 结果最后只提交一次。
 生产 OIDC 用户首次登录后才进入本地用户目录；首次 system administrator 需要部署侧将该
@@ -462,7 +462,7 @@ writer endpoint 对应用呈现为同一个逻辑 engine，节点数量不会变
 | `TRICYCLE_READ_RATE_LIMIT_REQUESTS` | `10000` | 登录态、目录、详情、GraphQL 等只读请求数 |
 | `TRICYCLE_UPLOAD_RATE_LIMIT_REQUESTS` | `1000` | Artifact 上传、批量上传、验证和重解析请求数 |
 | `TRICYCLE_UPLOAD_MAX_CONCURRENCY` | `8` | 单个 API 进程内同时处理的上传请求数 |
-| `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` | `2` | 独立 upload-worker 同时运行的 MolOP 文件数 |
+| `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` | `2` | durable upload-worker 单次数据库领取的最大文件数 |
 | `TRICYCLE_UPLOAD_WORKER_LEASE_SECONDS` | `3600` | worker 处理 lease 的有效期；worker 用心跳续租，过期后可被重新领取 |
 | `TRICYCLE_UPLOAD_CLIENT_LEASE_SECONDS` | `900` | HTTP 上传 lease 的恢复阈值；请求中断后超过此时间可回到队列 |
 | `TRICYCLE_UPLOAD_WORKER_POLL_INTERVAL_SECONDS` | `1` | upload-worker 轮询 staged 项和过期 lease 的间隔 |
@@ -472,7 +472,7 @@ writer endpoint 对应用呈现为同一个逻辑 engine，节点数量不会变
 | `TRICYCLE_QUERY_RATE_LIMIT_WINDOW_SECONDS` | `60` | 限流窗口秒数 |
 | `TRICYCLE_STRUCTURE_QUERY_MAX_CHARACTERS` | `16384` | SMILES/SMARTS/reaction 输入长度上限 |
 | `TRICYCLE_STRUCTURE_CANDIDATE_LIMIT` | `50000` | 需要逐候选后处理的最大关系行数 |
-| `TRICYCLE_MOLOP_BATCH_N_JOBS` | `2` | 同时处理的文件级 MolOP worker 数；每个文件使用可终止的独立 worker，`-1` 在开发环境使用全部可用 CPU，生产环境必须显式限界 |
+| `TRICYCLE_MOLOP_BATCH_N_JOBS` | `2` | 同时处理的文件级 MolOP worker 数；使用可复用的 `spawn` 进程池，`-1` 在开发环境使用全部可用 CPU，生产环境必须显式限界 |
 | `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS` | `60` | 10 MiB 文件的 MolOP 解析与 MolGR 帧重建基准时长；更大文件按体积等比例放大，较小文件至少使用该基准；超时文件单独失败，批次继续处理 |
 
 描述符、Murcko scaffold、手性和匹配次数等逐候选计算必须先通过 Formula、
@@ -562,7 +562,7 @@ sequenceDiagram
     participant C as JSONL checkpoint
 
     Note over F: ThreadPoolExecutor，内部上限 32
-    Note over G,P: n_jobs 个文件槽位；每个文件使用一个 spawn ProcessPoolExecutor(max_workers=1)
+    Note over G,P: n_jobs 个文件槽位；所有文件共享一个 spawn ProcessPoolExecutor
     Note over P: 子进程内 OMP/OPENBLAS/MKL 通常都设为 1
 
     I->>F: 递归发现文件，计算 SHA-256
@@ -574,15 +574,14 @@ sequenceDiagram
             U->>R: 写入并校验原始对象
             R-->>U: object ready
             U->>G: 等待并获取文件槽位
-            G->>P: 启动单文件隔离子进程
+            G->>P: 提交到可复用 MolOP 进程池
             P->>P: MolOP 解析 + frame 后处理
             alt 正常完成
                 P-->>G: 返回 frames/diagnostics
                 G-->>U: 释放文件槽位
                 P-->>W: 放入有界结果队列
             else 超时或解析失败
-                P-->>G: 抛出 timeout/error
-                G->>P: 仅终止当前文件子进程
+                P-->>G: 安全清理后抛出 timeout/error
                 G-->>U: 释放文件槽位
                 P-->>W: 放入该文件失败结果
             end
@@ -601,11 +600,22 @@ sequenceDiagram
 
 - 指纹线程池只负责发现文件和读取 SHA-256，内部上限为 `32`；它不是 MolOP 解析池。`IMPORT_STREAM_QUEUE_SIZE` 只限制指纹结果到候选窗口之间的缓冲。
 - `TRICYCLE_MOLOP_BATCH_N_JOBS` 实际上是文件级 admission semaphore：最多允许多少个文件同时进入解析阶段。文件在等待槽位时不消耗单文件 parse timeout。
-- 文件获得槽位后，生产解析路径为该文件创建一个 `spawn` 的 `ProcessPoolExecutor(max_workers=1)`。因此 `n_jobs=16` 表示最多 16 个文件级子进程同时工作，不表示每个文件再创建 16 个子进程。超时只终止当前文件的子进程并释放槽位，其他文件继续运行。
+- 文件获得槽位后，生产解析路径把 parser/frame 任务提交到一个可复用的 `spawn` 进程池。因此 `n_jobs=16` 表示最多 16 个文件任务进入共享池，不会为每个文件重复创建进程池；文件完成或失败后，候选队列继续补位。取消或超时只结束该文件的请求任务，已提交的共享池任务由池自行排空。
 - 子进程内部的 OpenMP/BLAS native thread 由 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS` 和 `MKL_NUM_THREADS` 控制；推荐都设为 `1`。候选窗口和 native thread 数都不会替代文件级槽位。
 - 每个导入批次只有一个有界持久化消费者，结果队列和 `IMPORT_COMMIT_BATCH_FILES` 共同形成数据库写入背压。提交微批后才追加并 `fsync` checkpoint；单文件失败不会回滚已经提交的其他文件。
 
-浏览器或远程 API 路径不经过 Import CLI 的指纹线程池和本地候选队列：API 先把字节写入 RustFS 并将条目标记为 `staged`，独立 `upload-worker` 按 `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 领取任务，再进入同一套文件级解析槽位和单文件隔离进程。也就是说，`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 限制 durable 队列的活动文件数，`TRICYCLE_MOLOP_BATCH_N_JOBS` 限制解析进程的文件槽位，两者不是同一个参数，也不能简单相乘。
+浏览器或远程 API 路径不经过 Import CLI 的指纹线程池和本地候选队列：API 先把字节写入 RustFS 并将条目标记为 `staged`，独立 `upload-worker` 每轮领取 `TRICYCLE_MAX_BATCH_FILES`（当前为 64）个文件，按项目/用户交给 `ArtifactUploadService.reparse_batch`。该方法只读取并校验已有对象，然后委托现有 `upload_batch`、共享 MolOP 进程池和单一持久化消费者；不会再次上传，也不会建立第二套解析路径。`TRICYCLE_UPLOAD_MAX_CONCURRENCY` 限制 RustFS 读取槽位，`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 只用于 pending-ingestion 恢复，`TRICYCLE_MOLOP_BATCH_N_JOBS` 限制共享解析池准入，三者不能简单相乘。
+
+远程 reparse 的批次边界必须与解析并发分开理解：worker 每轮最多领取 64 个 staged
+文件，`reparse_batch` 将本次 project/user 分组的实际文件数传给 `upload_batch` 作为一次
+持久化提交窗口；窗口内部仍由同一个结果队列和单一消费者每 32 个解析结果（或队列暂时
+为空）调用一次 `persist_parsed_files`，不能等到 64 个文件全部解析完成后才写数据库。
+因此 `64` 只表示领取/提交窗口，实际解析并发仍只由共享 MolOP 池的
+`TRICYCLE_MOLOP_BATCH_N_JOBS`（专用主机通常为 `16`）决定。该 durable bulk/reparse
+事务还使用上一版的 legacy bulk 热路径：reaction SMILES topology 缓存和单次 set-based
+Geometry 匹配保持开启，后来增加的逐文件 concrete/logical/reverse reconciliation 不得
+直接插入；项目范围和所有权约束仍然必须执行。修改这些边界前必须同步更新架构说明并用同一
+批真实文件复测字节吞吐和失败隔离。
 
 #### 推荐的导入超参数
 
@@ -644,9 +654,13 @@ make import-artifacts
 - `IMPORT_COMMIT_BATCH_FILES` 只控制一次持久化事务和检查点频率，不控制解析并发。`16` 是稳定起点；遇到锁竞争、statement timeout 或数据库内存压力时降到 `8`，只有数据库有余量且提交频率成为瓶颈时才尝试 `32`。
 - `IMPORT_MAX_TRANSIENT_RETRIES=3` 建议保持不变。它只用于死锁、序列化冲突、连接瞬断等瞬态错误；提高它不能修复持续性错误，只会延长失败恢复时间。
 - `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS=60` 是 10 MiB 文件的基准预算，并随源文件大小放大；它是异常文件隔离参数，不是提速参数。慢磁盘或大文件较多时提高，想更快跳过异常文件时降低，但应先确认失败率。
-- `TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE=true` 和 `TRICYCLE_MOLOP_PARALLEL_FRAME_PERSISTENCE=true` 建议保持开启。前者关系到 frame role/source locator 等解析证据，后者用于批量持久化和吞吐；不要为了短期速度关闭前者。
+- `TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE=false` 是上一版高吞吐导入的默认值，适合大规模普通导入；需要 frame role/source locator、source span 和 block hash 等审计证据时显式设为 `true`，并接受额外开销。`TRICYCLE_MOLOP_PARALLEL_FRAME_PERSISTENCE=true` 应保持开启。
 
-浏览器和远程 API 上传使用独立的 durable `upload-worker`，参数不要与本地导入的 `IMPORT_*` 混用。推荐保持 `TRICYCLE_UPLOAD_MAX_CONCURRENCY=8`（只限制 HTTP 字节接收）、`TRICYCLE_UPLOAD_WORKER_CONCURRENCY=2`（同时处理的 durable 文件数）和 `TRICYCLE_UPLOAD_WORKER_STATEMENT_TIMEOUT_MS=120000`。专用算力主机可以把 `TRICYCLE_MOLOP_BATCH_N_JOBS` 调到 `16`，但 `upload-worker` 仍建议从 `2` 开始，并根据 CPU、内存和数据库写入延迟逐步增加；它们分别限制解析槽位和队列中的活动文件，不能简单相乘。
+浏览器和远程 API 上传使用独立的 durable `upload-worker`，参数不要与本地导入的 `IMPORT_*` 混用。`TRICYCLE_UPLOAD_MAX_CONCURRENCY=8` 限制 RustFS 读取；`TRICYCLE_MAX_BATCH_FILES=64` 是 worker 的领取/持久化窗口；`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 仅用于旧 pending-ingestion 恢复。专用算力主机可以把共享解析池 `TRICYCLE_MOLOP_BATCH_N_JOBS` 调到 `16`，并根据 CPU、内存和数据库写入延迟复测。
+
+这里的“持久化窗口”是 worker claim 的提交边界，不代表 64 个文件串行处理，也不改变
+内部 32 个结果的持续交接规则；本地 CLI 的 `IMPORT_COMMIT_BATCH_FILES=16` 仍只控制
+本地事务/检查点频率。三种数字分别属于解析准入、结果交接和提交边界，不能互相替代。
 
 `TRICYCLE_MAX_UPLOAD_BYTES=64 MiB` 是单文件上限，本地导入也会执行；`TRICYCLE_MAX_BATCH_FILES=64` 和 `TRICYCLE_MAX_BATCH_BYTES=512 MiB` 是 HTTP 批次保护，不是本地导入的吞吐参数。只有在专用内网压测或可信批量客户端中，并且反向代理 body limit、RustFS、PostgreSQL 都已验证有余量时，才临时提高批次上限到例如 `1024` 文件 / `1 GiB`；不要为普通公网 API 修改这些默认值。`TRICYCLE_UPLOAD_WORKER_LEASE_SECONDS=3600`、`TRICYCLE_UPLOAD_CLIENT_LEASE_SECONDS=900` 和轮询间隔 `1` 秒属于故障恢复参数，保持默认值即可。
 
@@ -655,9 +669,30 @@ make import-artifacts
 ```bash
 uv run tricycle-import-artifacts \
   --project-id 00000000-0000-7000-8000-000000000201 \
+  --user-id 00000000-0000-0000-0000-000000000002 \
   --state-file .tmp/artifact-import.jsonl \
   /data/archive/reactions /data/archive/supplemental
 ```
+
+归档解压后的推荐入口是 manifest 模式。先由受控 extractor 生成包含归档
+SHA-256、相对路径、staging 路径、文件 SHA-256、大小、媒体类型、Gaussian
+标记和选择状态的 JSON manifest，再配置 `TRICYCLE_IMPORT_STAGING_ROOT`：
+
+```bash
+TRICYCLE_IMPORT_STAGING_ROOT=/data/staging \
+uv run tricycle-import-artifacts \
+  --project-id 00000000-0000-7000-8000-000000000201 \
+  --user-id 00000000-0000-0000-0000-000000000002 \
+  --manifest /data/staging/archive.manifest.json
+```
+
+manifest 模式把文件清单注册为数据库中的 durable ImportJob/ImportJobItem，
+只会导入 `selection_status=selected` 的条目。服务端会在注册和启动前重新
+计算所有条目的 SHA-256，并拒绝 staging 根目录外的路径、符号链接、硬链接、
+特殊文件、路径穿越、文件大小或内容变化；清单外新增文件不会被递归隐式导入。
+重复注册同一项目的同一 manifest 返回已有任务。任务状态和失败项通过
+MCP 的 `get_import_status`、`list_import_failures`、`retry_import_items`、
+`pause_import`、`resume_import` 和 `cancel_import` 控制。
 
 参数说明：
 
@@ -670,7 +705,10 @@ uv run tricycle-import-artifacts \
 - 默认导入 `calculation_output`，可用 `--artifact-kind input|workflow_manifest|auxiliary` 覆盖。
 - `--state-file` 是追加写入的 JSONL 检查点。重复执行会按路径、大小、mtime 和 SHA-256 跳过已成功文件；文件发生变化后会重新导入。
 - 使用 `--dry-run` 只扫描并输出统计，不写数据库或对象存储。
-- 生产环境必须显式提供 `--user-id`，该用户需要目标项目的 `artifact:upload` 权限。
+- 所有环境都必须显式提供 `--user-id`，该用户需要目标项目的 `artifact:upload` 权限；
+  不再默认使用 development user。
+- `--manifest` 与目录递归模式互斥；manifest 模式不接受 suffix filter 或 JSONL
+  `--state-file`，因为清单选择和 ImportJob 状态是唯一控制面。
 - Makefile 对应变量为 `IMPORT_INCLUDE_SUFFIXES`、`IMPORT_EXCLUDE_SUFFIXES` 和
   `IMPORT_MAX_TRANSIENT_RETRIES`；前两个变量使用空格分隔的后缀列表。
 
@@ -679,6 +717,7 @@ uv run tricycle-import-artifacts \
 ```bash
 IMPORT_MODE=development \
 IMPORT_PROJECT_ID=00000000-0000-7000-8000-000000000201 \
+IMPORT_USER_ID=00000000-0000-0000-0000-000000000002 \
 IMPORT_ROOTS='/data/archive/reactions /data/archive/supplemental' \
 IMPORT_STATE_FILE=.tmp/artifact-import.jsonl \
 make import-artifacts

@@ -20,6 +20,7 @@ from tricycle_reaction_db.application.dtos.chemistry import (
     NormalizedTopologyRecord,
 )
 from tricycle_reaction_db.application.services._persistence import (
+    LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
     _acquire_identity_locks,
     _assert_record_matches,
     _flush_shared_entity,
@@ -164,9 +165,6 @@ class GeometryPersistenceContext:
     # (reaction -> existing Geometry) lookup as well as the normal Geometry ->
     # existing reaction lookup.
     mapped_reactions_to_reconcile: dict[UUID, MappedReaction] = field(default_factory=dict)
-    # Concrete topologies are resolved after the batch's deferred TS reactions
-    # have been flushed, so a Geometry arriving before its logical template is
-    # not missed and the frame loop does not repeat the same global lookup.
     topologies_to_resolve_reactions: set[UUID] = field(default_factory=set)
     # TS inference commonly repeats the same strict endpoint reaction across
     # files. The cache key is a digest of the mapped reaction plus the strict
@@ -667,6 +665,10 @@ def _register_topology_upstreams(
     return upstreams
 
 
+def _legacy_bulk_import_enabled(session: Session) -> bool:
+    return bool(session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False))
+
+
 def _preload_molecular_topologies(
     session: Session,
     records: Sequence[NormalizedTopologyRecord],
@@ -881,7 +883,8 @@ def _preload_molecular_topologies(
             topology_derivation=topology_derivation,
         )
         context.topologies[context_key] = persisted
-        _register_topology_upstreams(session, topology, context=context)
+        if not _legacy_bulk_import_enabled(session):
+            _register_topology_upstreams(session, topology, context=context)
 
 
 def persist_molecular_topology(
@@ -903,7 +906,7 @@ def persist_molecular_topology(
             record.topology.is_stereo_abstraction_upstream,
             context=context,
         )
-        if register_upstream:
+        if register_upstream and not _legacy_bulk_import_enabled(session):
             _register_topology_upstreams(session, cached.topology, context=context)
         return cached
 
@@ -1044,7 +1047,7 @@ def persist_molecular_topology(
     )
     if context is not None:
         context.topologies[context_key] = persisted
-    if register_upstream:
+    if register_upstream and not _legacy_bulk_import_enabled(session):
         _register_topology_upstreams(session, topology, context=context)
     return persisted
 
@@ -1079,19 +1082,6 @@ def persist_molecular_geometry(
         record.geometry.geometry_hash,
         record.charge,
         record.multiplicity,
-    )
-    # Serialize tolerance-equivalence decisions for this topology/electronic
-    # state across concurrent transactions.  The database uniqueness
-    # constraint is exact, while the reuse decision is tolerance-based.
-    _acquire_identity_locks(
-        session,
-        (
-            "geometry-equivalence",
-            topology_id,
-            record.geometry.canonicalization_version,
-            record.charge,
-            record.multiplicity,
-        ),
     )
     geometry = context.geometries_by_hash.get(geometry_key) if context is not None else None
     equivalent_match = False
@@ -1308,31 +1298,6 @@ def preload_molecular_geometry_context(
         records_by_key.setdefault(key, (record, coordinate_decimal_places))
     if not keys:
         return
-    # Hold these locks before taking the database snapshot below. Otherwise
-    # two concurrent upload transactions can both observe an empty candidate
-    # set and create hash-distinct but tolerance-equivalent Geometry rows.
-    _acquire_identity_locks(
-        session,
-        *sorted(
-            {
-                (
-                    "geometry-equivalence",
-                    topology_id,
-                    canonicalization_version,
-                    charge,
-                    multiplicity,
-                )
-                for (
-                    topology_id,
-                    canonicalization_version,
-                    _geometry_hash,
-                    charge,
-                    multiplicity,
-                ) in keys
-            },
-            key=str,
-        ),
-    )
     geometry_columns = cast(Any, Geometry)
     exact_inputs = (
         text(
@@ -1479,8 +1444,15 @@ def preload_molecular_geometry_context(
         """
     )
     connection = session.connection()
-    for start in range(0, len(input_rows), GEOMETRY_MATCH_INPUT_BATCH_SIZE):
-        chunk = input_rows[start : start + GEOMETRY_MATCH_INPUT_BATCH_SIZE]
+    # The previous bulk importer evaluated one claim-sized set in one
+    # PostgreSQL statement.  Keep that shape for the worker's legacy batch
+    # path; the bounded chunks remain important for interactive/non-bulk
+    # requests whose input set may be much larger than one claim.
+    match_batch_size = (
+        len(input_rows) if _legacy_bulk_import_enabled(session) else GEOMETRY_MATCH_INPUT_BATCH_SIZE
+    )
+    for start in range(0, len(input_rows), match_batch_size):
+        chunk = input_rows[start : start + match_batch_size]
         matches = connection.execute(
             statement,
             {

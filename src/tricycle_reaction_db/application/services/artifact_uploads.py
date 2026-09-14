@@ -45,9 +45,11 @@ from tricycle_reaction_db.application.dtos import (
     ArtifactValidationInferenceView,
     ArtifactValidationResult,
     CreateReactionCommand,
+    NormalizedTopologyRecord,
     TransitionStateInferenceView,
 )
 from tricycle_reaction_db.application.services._persistence import (
+    LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
     _acquire_identity_locks,
     _attach_pending_entities,
     _bulk_insert_pending_entities,
@@ -122,6 +124,7 @@ from tricycle_reaction_db.ingestion import (
     normalize_topology,
     normalize_topology_with_mapping,
 )
+from tricycle_reaction_db.ingestion.manifest import normalize_relative_path
 from tricycle_reaction_db.storage.rustfs import (
     RustFSObjectStore,
     RustFSSettings,
@@ -131,7 +134,10 @@ from tricycle_reaction_db.storage.rustfs import (
 
 MOLOP_VERSION = version("molop")
 logger = logging.getLogger(__name__)
-PERSISTENCE_PRELOAD_BATCH_SIZE = 16
+# Keep the persistence window used by the previous high-throughput importer.
+# The worker claim window is 64 files, so 32 gives the shared transaction two
+# bounded preload/write windows without doubling the database boundary count.
+PERSISTENCE_PRELOAD_BATCH_SIZE = 32
 # MolGR reconstruction is CPU-heavy and each frame crosses a process boundary.
 # Larger chunks amortize pickle/future overhead while retaining enough tasks to
 # keep all configured workers busy across a multi-file batch.
@@ -325,6 +331,11 @@ class ArtifactUploadPayload:
     spool_path: Path | None = None
     error_code: str | None = None
     error_message: str | None = None
+    # Optional manifest identity. These values are checked against the bytes
+    # after the source has been inspected, immediately before persistence.
+    relative_path: str | None = None
+    expected_sha256: str | None = None
+    expected_size_bytes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -732,13 +743,10 @@ def _file_worker_submission_slots() -> asyncio.Semaphore:
 
 
 def _fast_molop_ingestion_enabled() -> bool:
-    """Return whether deferred MolGR work and batched frame writes are enabled.
+    """Return whether deferred MolGR work and batched frame writes are enabled."""
 
-    MolOP 0.2.12 source evidence is collected during parsing without forcing
-    topology reconstruction, so evidence capture does not disable this path.
-    """
-
-    return get_settings().molop_parallel_frame_persistence
+    settings = get_settings()
+    return not settings.molop_capture_source_evidence and settings.molop_parallel_frame_persistence
 
 
 def _get_molop_process_pool(n_jobs: int) -> ProcessPoolExecutor:
@@ -983,11 +991,11 @@ async def _run_molop_file_pipeline(
     submission_slots: asyncio.Semaphore | None = None,
     file_slots: asyncio.Semaphore | None = None,
 ) -> _ParsedArtifact:
-    """Parse and reconstruct one file under one end-to-end time budget.
+    """Parse and reconstruct one file through the shared MolOP pipeline.
 
-    Production work is isolated per file so a timed-out synchronous parser can
-    be terminated without affecting other files. Hooked parser/frame functions
-    retain the legacy path for tests and integrations.
+    The file slot bounds submissions while the reusable process pool keeps its
+    workers hot across the whole queue. Hooked parser/frame functions retain
+    the legacy path for tests and integrations.
     """
 
     timeout_seconds = _molop_file_parse_timeout_seconds(source)
@@ -1000,8 +1008,9 @@ async def _run_molop_file_pipeline(
         acquired_file_slot = True
         async with asyncio.timeout(timeout_seconds):
             # Keep test/extension hooks and the legacy public parser wrapper
-            # intact. Production calls use the file-local worker so a timeout
-            # never terminates another upload's parser.
+            # intact. Production calls use the reusable MolOP pool, matching
+            # the batch importer: the file semaphore bounds submissions while
+            # the process pool keeps its workers hot across the whole queue.
             if (
                 _run_molop_file_parser is not _ORIGINAL_RUN_MOLOP_FILE_PARSER
                 or _run_molop_source_parser is not _ORIGINAL_RUN_MOLOP_SOURCE_PARSER
@@ -1014,10 +1023,14 @@ async def _run_molop_file_pipeline(
                         submission_slots or asyncio.Semaphore(_frame_submission_limit())
                     ),
                 )
-            return await _run_isolated_molop_file(
+            parsed = await _run_molop_source_parser(
                 source,
                 filename,
                 artifact_sha256=artifact_sha256,
+            )
+            return await _process_parsed_artifact_frames(
+                parsed,
+                submission_slots=(submission_slots or asyncio.Semaphore(_frame_submission_limit())),
             )
 
     except TimeoutError as error:
@@ -3074,7 +3087,15 @@ def _resolve_and_bind_transition_state_reaction(
 ) -> tuple[UUID, UUID]:
     """Create the mapped endpoint reaction and bind its TS coordinate evidence."""
 
-    if topology_context is not None:
+    legacy_bulk_import = bool(session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False))
+    if topology_context is not None and legacy_bulk_import:
+        # The previous importer keyed repeated TS inferences by their mapped
+        # reaction string. Keep that cheap cache on the bulk path; strict
+        # endpoint-aware keys remain enabled for ordinary/single-file writes.
+        strict_records = ()
+        cache_key = inferred.reaction_smiles
+        cached_reaction_ids = topology_context.inferred_reaction_ids_by_key.get(cache_key)
+    elif topology_context is not None:
         # Build the strict records before consulting either cache. A mapped
         # reaction string is only one part of the identity: different MolGR
         # endpoint stereochemistry can otherwise reuse the first reaction row.
@@ -3092,7 +3113,9 @@ def _resolve_and_bind_transition_state_reaction(
                 topology_context.inferred_reaction_topology_records_by_key.get(cache_key)
             )
             if cached_participant_records is None:
-                precomputed_topology_records = tuple(strict_records[2:])
+                precomputed_topology_records: tuple[NormalizedTopologyRecord, ...] | None = (
+                    None if legacy_bulk_import else tuple(strict_records[2:])
+                )
             else:
                 # Preserve the explicit empty sentinel used by preload when
                 # normalization failed. Passing it through makes the
@@ -3697,11 +3720,17 @@ def _persist_parsed_artifact(
         started_at=started_at,
         completed_at=completed_at,
         force_new_revision=force_new_revision,
+        # A forced retry still creates a brand-new ParseRevision and all of its
+        # revision-local rows.  It is therefore safe to use the same deferred
+        # frame queue as a first parse; ``force_new_revision`` only changes the
+        # revision identity policy, not the batching policy.  Disabling this
+        # path for retries silently changed the durable worker to one-frame-at-
+        # a-time ORM writes.
         fast_insert=(
-            _fast_molop_ingestion_enabled() and not existing_revision_ids and not force_new_revision
+            _fast_molop_ingestion_enabled() and (not existing_revision_ids or force_new_revision)
         ),
         parallel_frame_persistence=(
-            _fast_molop_ingestion_enabled() and not existing_revision_ids and not force_new_revision
+            _fast_molop_ingestion_enabled() and (not existing_revision_ids or force_new_revision)
         ),
         geometry_context=active_geometry_context,
         preload_geometry_context=preload_geometry_context,
@@ -4251,9 +4280,6 @@ def _run_persist_parsed_artifact_savepoint(
     """
 
     typed_session = cast(Session, session)
-    context = kwargs.get("geometry_context")
-    context_snapshot = _snapshot_inference_context(context)
-    pending_snapshot = list(typed_session.info.get("_fast_pending_entities", ()))
     # ``_persist_parsed_artifact`` enables fast insertion internally and
     # restores the session flag before returning.  Batch callers identify this
     # mode by deferring reconciliation, so inspect the configured fast-path
@@ -4262,9 +4288,17 @@ def _run_persist_parsed_artifact_savepoint(
     fast_mode = typed_session.info.get("tricycle_fast_insert", False) or (
         kwargs.get("defer_reconciliation", False) and _fast_molop_ingestion_enabled()
     )
+    # Keep the previous high-throughput path allocation-free at the file
+    # boundary.  The snapshots are only needed when a real savepoint is used;
+    # taking them in fast mode copies the growing geometry/inference context
+    # for every parsed file and reintroduces the regression this helper avoids.
+    if fast_mode:
+        return _persist_parsed_artifact(typed_session, **kwargs)
+
+    context = kwargs.get("geometry_context")
+    context_snapshot = _snapshot_inference_context(context)
+    pending_snapshot = list(typed_session.info.get("_fast_pending_entities", ()))
     try:
-        if fast_mode:
-            return _persist_parsed_artifact(typed_session, **kwargs)
         with typed_session.begin_nested():
             return _persist_parsed_artifact(typed_session, **kwargs)
     except Exception:
@@ -4584,6 +4618,11 @@ def _run_preload_batch_persistence_state(
     *,
     ingestion_ids: list[UUID],
 ) -> tuple[dict[UUID, ArtifactIngestion], dict[UUID, set[UUID]]]:
+    # Keep the batch transaction on the same hot path as the previous local
+    # importer.  Newer correctness/reconciliation features remain available
+    # to single-file and explicitly non-bulk calls, while the durable worker
+    # reparse uses the proven shared batch semantics.
+    cast(Session, session).info[LEGACY_BULK_IMPORT_SESSION_INFO_KEY] = True
     return _preload_batch_persistence_state(cast(Session, session), ingestion_ids=ingestion_ids)
 
 
@@ -4620,12 +4659,26 @@ class ArtifactUploadService:
         artifact_kind: ArtifactKind,
         project_id: UUID,
         user_id: UUID,
+        relative_path: str | None = None,
+        expected_sha256: str | None = None,
+        expected_size_bytes: int | None = None,
     ) -> _PreparedCalculationUpload | ArtifactUploadResult:
         """Reserve and store an upload, leaving calculation parsing for the caller."""
 
         settings = RustFSSettings()
         started_at = datetime.now(UTC)
         digest = sha256(payload).hexdigest()
+        if expected_size_bytes is not None and len(payload) != expected_size_bytes:
+            raise ArtifactUploadConflictError("uploaded artifact does not match the manifest size")
+        if expected_sha256 is not None and digest != expected_sha256.casefold():
+            raise ArtifactUploadConflictError(
+                "uploaded artifact does not match the manifest SHA-256"
+            )
+        source_relative_path = (
+            normalize_relative_path(relative_path)
+            if relative_path is not None
+            else Path(filename).name
+        )
         object_key = time_partitioned_content_addressed_key(
             payload,
             uploaded_at=started_at,
@@ -4641,6 +4694,7 @@ class ArtifactUploadService:
             content_sha256=digest,
             size_bytes=len(payload),
             original_filename=Path(filename).name,
+            source_relative_path=source_relative_path,
             media_type=resolved_media_type,
             artifact_kind=artifact_kind,
             storage_status=StorageStatus.PENDING,
@@ -4732,6 +4786,9 @@ class ArtifactUploadService:
         artifact_kind: ArtifactKind,
         project_id: UUID,
         user_id: UUID,
+        relative_path: str | None = None,
+        expected_sha256: str | None = None,
+        expected_size_bytes: int | None = None,
     ) -> ArtifactUploadResult:
         """Persist bytes and an ingestion reservation without running MolOP.
 
@@ -4758,6 +4815,9 @@ class ArtifactUploadService:
             artifact_kind=artifact_kind,
             project_id=project_id,
             user_id=user_id,
+            relative_path=relative_path,
+            expected_sha256=expected_sha256,
+            expected_size_bytes=expected_size_bytes,
         )
         if isinstance(prepared, ArtifactUploadResult):
             return prepared
@@ -4781,6 +4841,9 @@ class ArtifactUploadService:
         artifact_kind: ArtifactKind,
         project_id: UUID,
         user_id: UUID,
+        relative_path: str | None = None,
+        expected_sha256: str | None = None,
+        expected_size_bytes: int | None = None,
     ) -> ArtifactUploadResult:
         if not payload:
             raise ArtifactUploadError("uploaded artifact is empty")
@@ -4798,6 +4861,9 @@ class ArtifactUploadService:
             artifact_kind=artifact_kind,
             project_id=project_id,
             user_id=user_id,
+            relative_path=relative_path,
+            expected_sha256=expected_sha256,
+            expected_size_bytes=expected_size_bytes,
         )
         if isinstance(prepared, ArtifactUploadResult):
             return prepared
@@ -4987,7 +5053,11 @@ class ArtifactUploadService:
                             cast(Session, sync_session),
                             ingestion_id=resolved_ingestion_id,
                             error=parse_error,
-                            error_code=getattr(parse_error, "error_code", "molop_reparse_failed"),
+                            error_code=getattr(
+                                parse_error,
+                                "error_code",
+                                "molop_reparse_failed",
+                            ),
                             completed_at=datetime.now(UTC),
                             error_metadata=_parse_failure_metadata(parse_error),
                             expected_worker_lease_id=processing_lease_id,
@@ -5066,6 +5136,190 @@ class ArtifactUploadService:
                     )
                     await session.commit()
             raise ArtifactUploadError(str(error) or type(error).__name__) from error
+
+    @classmethod
+    async def reparse_batch(
+        cls,
+        *,
+        artifact_ids: Sequence[UUID],
+        user_id: UUID,
+    ) -> dict[UUID, ArtifactUploadResult | Exception]:
+        """Reparse staged objects through the existing bounded batch pipeline.
+
+        The durable worker has already completed the RustFS hand-off. This
+        method only downloads and verifies those objects, then delegates all
+        MolOP, MolGR, and database work to ``upload_batch``. The parser claim
+        window remains 64 files, and a worker claim is kept as one persistence
+        window to preserve the previous high-throughput importer cadence. In
+        particular, it does not create a second parser or a second persistence
+        consumer; the shared process pool and batched writer are the same path
+        used by the local importer.
+        """
+
+        ordered_ids = tuple(dict.fromkeys(artifact_ids))
+        if not ordered_ids:
+            return {}
+
+        async with session_factory() as session:
+            artifacts = (
+                await session.exec(
+                    select(ArtifactFile).where(col(ArtifactFile.id).in_(ordered_ids))
+                )
+            ).all()
+        artifacts_by_id = {
+            artifact_id: artifact
+            for artifact in artifacts
+            if (artifact_id := artifact.id) is not None
+        }
+        results: dict[UUID, ArtifactUploadResult | Exception] = {}
+        valid_artifacts: list[ArtifactFile] = []
+        project_id: UUID | None = None
+        for artifact_id in ordered_ids:
+            artifact = artifacts_by_id.get(artifact_id)
+            if artifact is None:
+                results[artifact_id] = ArtifactUploadError("artifact not found")
+                continue
+            if artifact.artifact_kind is not ArtifactKind.CALCULATION_OUTPUT:
+                results[artifact_id] = ArtifactUploadError(
+                    "only calculation output artifacts can be reparsed"
+                )
+                continue
+            if artifact.storage_status is not StorageStatus.AVAILABLE:
+                results[artifact_id] = ArtifactUploadError(
+                    "artifact bytes are not available for reparse"
+                )
+                continue
+            if project_id is None:
+                project_id = artifact.project_id
+            elif artifact.project_id != project_id:
+                results[artifact_id] = ArtifactUploadError(
+                    "a reparse batch cannot span multiple projects"
+                )
+                continue
+            valid_artifacts.append(artifact)
+
+        if not valid_artifacts or project_id is None:
+            return results
+
+        settings = get_settings()
+        artifact_chunks: list[list[ArtifactFile]] = []
+        current_chunk: list[ArtifactFile] = []
+        current_bytes = 0
+        for artifact in valid_artifacts:
+            if artifact.size_bytes > settings.max_batch_bytes:
+                artifact_id = _require_id(artifact, label="ArtifactFile")
+                results[artifact_id] = ArtifactUploadError(
+                    "artifact exceeds the configured reparse batch byte budget"
+                )
+                continue
+            if current_chunk and (
+                len(current_chunk) >= settings.max_batch_files
+                or current_bytes + artifact.size_bytes > settings.max_batch_bytes
+            ):
+                artifact_chunks.append(current_chunk)
+                current_chunk = []
+                current_bytes = 0
+            current_chunk.append(artifact)
+            current_bytes += artifact.size_bytes
+        if current_chunk:
+            artifact_chunks.append(current_chunk)
+
+        download_slots = asyncio.Semaphore(max(1, settings.upload_max_concurrency))
+
+        async def load_payload(artifact: ArtifactFile) -> ArtifactUploadPayload | Exception:
+            artifact_id = _require_id(artifact, label="ArtifactFile")
+            try:
+                async with download_slots:
+                    payload = await asyncio.to_thread(
+                        cls._load_payload,
+                        RustFSSettings().model_copy(update={"bucket": artifact.bucket}),
+                        artifact.object_key,
+                    )
+                if len(payload) != artifact.size_bytes:
+                    raise ArtifactUploadError(
+                        "stored artifact bytes do not match database identity"
+                    )
+                if sha256(payload).hexdigest() != artifact.content_sha256:
+                    raise ArtifactUploadError(
+                        "stored artifact bytes do not match database identity"
+                    )
+                _require_upload_size(payload)
+                return ArtifactUploadPayload(
+                    filename=artifact.original_filename,
+                    media_type=artifact.media_type,
+                    payload=payload,
+                    relative_path=artifact.source_relative_path,
+                    expected_sha256=artifact.content_sha256,
+                    expected_size_bytes=artifact.size_bytes,
+                )
+            except Exception as error:
+                results[artifact_id] = error
+                return error
+
+        for artifact_chunk in artifact_chunks:
+            loaded = await asyncio.gather(*(load_payload(artifact) for artifact in artifact_chunk))
+            upload_files: list[tuple[UUID, ArtifactUploadPayload]] = []
+            upload_artifacts: list[ArtifactFile] = []
+            for artifact, payload_or_error in zip(artifact_chunk, loaded, strict=True):
+                if isinstance(payload_or_error, Exception):
+                    continue
+                upload_artifacts.append(artifact)
+                upload_files.append((_require_id(artifact, label="ArtifactFile"), payload_or_error))
+            if not upload_files:
+                continue
+            try:
+                batch_result = await cls.upload_batch(
+                    files=[payload for _, payload in upload_files],
+                    artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+                    project_id=project_id,
+                    user_id=user_id,
+                    # Keep one persistence consumer/window for the durable
+                    # worker claim, just as the previous local importer did
+                    # for a completed claim. The process pool remains shared
+                    # and capped independently by molop_batch_n_jobs.
+                    persistence_batch_files=len(upload_files),
+                    reparse_failed_ingestions=True,
+                )
+            except Exception as error:
+                for artifact in upload_artifacts:
+                    results[_require_id(artifact, label="ArtifactFile")] = error
+                continue
+            logger.warning(
+                "reparse batch completed project=%s files=%d bytes=%d succeeded=%d failed=%d "
+                "total_ms=%.1f parse_ms=%.1f molgr_ms=%.1f persist_wall_ms=%.1f "
+                "persist_db_ms=%.1f persist_parts_ms=preload:%.1f write:%.1f "
+                "flush:%.1f deferred:%.1f reconcile:%.1f result:%.1f commit:%.1f "
+                "locks=%d/%d/%d",
+                project_id,
+                batch_result.total_count,
+                sum(artifact.size_bytes for artifact in upload_artifacts),
+                batch_result.succeeded_count,
+                batch_result.failed_count,
+                batch_result.timings_ms.get("total_ms", 0.0),
+                batch_result.timings_ms.get("molop_parse_ms", 0.0),
+                batch_result.timings_ms.get("molgr_frame_reconstruction_ms", 0.0),
+                batch_result.timings_ms.get("persist_pipeline_wall_ms", 0.0),
+                batch_result.timings_ms.get("persist_db_ms", 0.0),
+                batch_result.timings_ms.get("persist_preload_db_ms", 0.0),
+                batch_result.timings_ms.get("persist_write_db_ms", 0.0),
+                batch_result.timings_ms.get("persist_flush_initial_ms", 0.0),
+                batch_result.timings_ms.get("persist_deferred_inferences_ms", 0.0),
+                batch_result.timings_ms.get("persist_reconcile_geometry_ms", 0.0),
+                batch_result.timings_ms.get("persist_result_db_ms", 0.0),
+                batch_result.timings_ms.get("persist_commit_db_ms", 0.0),
+                int(batch_result.timings_ms.get("advisory_lock_calls", 0.0)),
+                int(batch_result.timings_ms.get("advisory_lock_requested_ids", 0.0)),
+                int(batch_result.timings_ms.get("advisory_lock_uncached_ids", 0.0)),
+            )
+            for artifact, item in zip(upload_artifacts, batch_result.items, strict=True):
+                artifact_id = _require_id(artifact, label="ArtifactFile")
+                if item.result is not None:
+                    results[artifact_id] = item.result
+                else:
+                    results[artifact_id] = ArtifactUploadError(
+                        item.error_message or item.error_code or "artifact reparse failed"
+                    )
+        return results
 
     @classmethod
     async def fail_pending_ingestion(
@@ -5197,6 +5451,20 @@ class ArtifactUploadService:
                 )
                 if not inspected.size_bytes:
                     raise ArtifactUploadError("uploaded artifact is empty")
+                if (
+                    file.expected_size_bytes is not None
+                    and inspected.size_bytes != file.expected_size_bytes
+                ):
+                    raise ArtifactUploadConflictError(
+                        "uploaded artifact does not match the manifest size"
+                    )
+                if (
+                    file.expected_sha256 is not None
+                    and inspected.content_sha256 != file.expected_sha256.casefold()
+                ):
+                    raise ArtifactUploadConflictError(
+                        "uploaded artifact does not match the manifest SHA-256"
+                    )
                 started_at = datetime.now(UTC)
                 resolved_media_type = detect_artifact_media_type(
                     file.filename,
@@ -5216,6 +5484,11 @@ class ArtifactUploadService:
                     content_sha256=inspected.content_sha256,
                     size_bytes=inspected.size_bytes,
                     original_filename=Path(file.filename).name,
+                    source_relative_path=(
+                        normalize_relative_path(file.relative_path)
+                        if file.relative_path is not None
+                        else Path(file.filename).name
+                    ),
                     media_type=resolved_media_type,
                     artifact_kind=artifact_kind,
                     storage_status=StorageStatus.PENDING,
@@ -5238,10 +5511,14 @@ class ArtifactUploadService:
             return reservations, items
 
         # Preparation acquires one content lock per unique source and, for
-        # calculation outputs, one ingestion lock per artifact.  Keep this
-        # transaction bounded independently of the parser window so a large
-        # request cannot exhaust PostgreSQL's advisory-lock shared memory.
-        preparation_batch_size = PERSISTENCE_PRELOAD_BATCH_SIZE
+        # calculation outputs, one ingestion lock per artifact.  The durable
+        # worker reparses an already-materialized claim, so it should retain
+        # the previous single preparation transaction for that claim.  New
+        # upload requests can still be split into small transactions before
+        # the object-store/parser pipeline starts.
+        preparation_batch_size = (
+            len(candidates) if reparse_failed_ingestions else PERSISTENCE_PRELOAD_BATCH_SIZE
+        )
         for offset in range(0, len(candidates), preparation_batch_size):
             candidate_batch = candidates[offset : offset + preparation_batch_size]
             async with session_factory() as session:
@@ -5405,11 +5682,12 @@ class ArtifactUploadService:
         """Prepare once, then advance files through an asynchronous pipeline.
 
         Each RustFS completion queues that file behind the shared file-worker
-        limit. The file gets a private, killable MolOP worker; if its deadline
-        expires only that worker is terminated and the next queued file can
-        acquire the released slot. A single bounded consumer writes parse
-        results to the database; the final transaction remains atomic for the
-        request. ``reparse_failed_ingestions`` reopens existing failed or
+        limit and submits it to the reusable MolOP process pool. A single
+        bounded consumer writes parse results to the database; the parser
+        queue stays shared while database commits are bounded to release
+        project-scoped advisory locks. Geometry/reaction reconciliation runs
+        once per claim-sized context, after its deferred reaction rows have
+        been flushed. ``reparse_failed_ingestions`` reopens existing failed or
         partial parse records so a retry runs MolOP instead of only confirming
         the stored content-addressed object.
         """
@@ -5580,11 +5858,15 @@ class ArtifactUploadService:
             parsed: _ParsedArtifact | Exception
             molop_started_at = perf_counter()
             try:
-                parsed = await _run_molop_file_pipeline(
+                # Match the previous high-throughput importer exactly: queue
+                # every parser future into the reusable MolOP pool first.  A
+                # per-file admission semaphore makes frame conversion consume
+                # the same pool before later parser futures are submitted and
+                # leaves the pool intermittently idle on large files.
+                parsed = await _run_molop_source_parser(
                     reservation.source,
                     files[index].filename,
                     artifact_sha256=reservation.content_sha256,
-                    submission_slots=frame_submission_slots,
                 )
             except Exception as error:
                 parsed = error
@@ -5601,18 +5883,25 @@ class ArtifactUploadService:
                 )
                 molop_file_parse_elapsed_ms += (molop_finished_at - molop_started_at) * 1000
             if isinstance(parsed, _ParsedArtifact):
-                # The helper above includes deferred MolGR frame conversion.
-                # Keep the aggregate timing compatible with existing metrics.
+                molgr_started_at = perf_counter()
+                try:
+                    parsed = await _process_parsed_artifact_frames(
+                        parsed,
+                        submission_slots=frame_submission_slots,
+                    )
+                except Exception as error:
+                    parsed = error
+                molgr_finished_at = perf_counter()
                 async with storage_completion_lock:
                     molgr_reconstruction_phase_started_at = min(
-                        molgr_reconstruction_phase_started_at or molop_started_at,
-                        molop_started_at,
+                        molgr_reconstruction_phase_started_at or molgr_started_at,
+                        molgr_started_at,
                     )
                     molgr_reconstruction_phase_finished_at = max(
-                        molgr_reconstruction_phase_finished_at or molop_finished_at,
-                        molop_finished_at,
+                        molgr_reconstruction_phase_finished_at or molgr_finished_at,
+                        molgr_finished_at,
                     )
-                    molgr_reconstruction_elapsed_ms += (molop_finished_at - molop_started_at) * 1000
+                    molgr_reconstruction_elapsed_ms += (molgr_finished_at - molgr_started_at) * 1000
             nonlocal_parse_finished_at = perf_counter()
             # The consumer records the first/last parser completion to expose
             # MolOP wall time separately from database persistence time.
@@ -5642,9 +5931,9 @@ class ArtifactUploadService:
             await pipeline_result_queue.put(result)
 
         pipeline_tasks = [
-            # Tasks waiting on ``_file_worker_slots`` form the file queue. A
-            # timeout terminates only the current task's one-worker executor;
-            # releasing its slot lets the next queued file start immediately.
+            # Tasks waiting on ``_file_worker_slots`` form the file queue. The
+            # shared parser pool consumes the admitted work while the next
+            # queued file waits for a released admission slot.
             asyncio.create_task(enqueue_pipeline_result(index, reservation))
             for index, reservation in prepared.items()
         ]
@@ -5654,10 +5943,12 @@ class ArtifactUploadService:
             if reservation.ingestion_id is not None and not reservation.skip_parse:
                 parse_indices.append(index)
 
-        # Parser workers and persistence are deliberately decoupled.  A
-        # database session is opened only while a completed microbatch is
-        # being persisted; parser queue backpressure must never keep an idle
-        # PostgreSQL transaction open for the lifetime of the upload batch.
+        # Keep the old importer execution shape: one claim window owns one
+        # shared parser queue and one SQLAlchemy persistence consumer. The
+        # database transaction is bounded below so project-scoped advisory
+        # locks are released regularly; each committed window gets a fresh
+        # GeometryPersistenceContext as well, so ORM objects and reconciliation
+        # caches never cross a transaction boundary.
         persistence_pipeline_started = perf_counter()
         parse_errors_by_index: dict[int, Exception] = {}
         parse_failure_metadata_by_index: dict[int, dict[str, Any]] = {}
@@ -5666,7 +5957,6 @@ class ArtifactUploadService:
         completion_by_ingestion_id: dict[UUID, _IngestionCompletion] = {}
         pending_preload: list[tuple[int, _ParsedArtifact]] = []
         pending_completed_indices: list[int] = []
-        pending_duplicate_indices: set[int] = set()
         committed_callback_indices: set[int] = set()
         no_frame_indices: set[int] = set()
         persistence_ingestions_by_id: dict[UUID, ArtifactIngestion] = {}
@@ -5680,6 +5970,9 @@ class ArtifactUploadService:
             "uncached_ids": 0,
             "prefixes": {},
         }
+        geometry_context: GeometryPersistenceContext = GeometryPersistenceContext(
+            project_id=project_id
+        )
 
         def normalize_parser_result(parser_result: Any) -> _ParsedArtifact | Exception:
             if isinstance(parser_result, (_ParsedArtifact, Exception)):
@@ -5715,42 +6008,49 @@ class ArtifactUploadService:
                 return
             pending_preload.append((local_index, parsed))
 
-        async def commit_persistence_microbatch(
-            completed_indices: list[int],
-            parsed_files: list[tuple[int, _ParsedArtifact]],
-        ) -> None:
-            """Persist and commit one window using a short-lived session."""
-
-            nonlocal persist_preload_elapsed_ms, persist_write_elapsed_ms
-            nonlocal persist_inferred_reaction_cache_hits
-            if not completed_indices:
-                return
-
+        parse_pipeline_started = persistence_pipeline_started
+        local_index_by_original = {
+            original_index: local_index for local_index, original_index in enumerate(parse_indices)
+        }
+        async with (
+            _pipeline_task_lifecycle(
+                pipeline_tasks,
+                on_abort=recover_aborted_batch,
+            ),
+            session_factory() as session,
+        ):
+            preload_started = perf_counter()
             ingestion_ids = [
-                _require_prepared_ingestion_id(prepared[index])
-                for index in completed_indices
-                if prepared[index].ingestion_id is not None
+                _require_prepared_ingestion_id(prepared[original_index])
+                for original_index in parse_indices
             ]
-            callback_indices: list[int] = []
-            async with session_factory() as session:
-                preload_started = perf_counter()
-                (
-                    batch_ingestions,
-                    batch_revision_ids,
-                ) = await session.run_sync(
-                    partial(
-                        _run_preload_batch_persistence_state,
-                        ingestion_ids=ingestion_ids,
+            (
+                persistence_ingestions_by_id,
+                persistence_revision_ids_by_artifact_id,
+            ) = await session.run_sync(
+                partial(
+                    _run_preload_batch_persistence_state,
+                    ingestion_ids=ingestion_ids,
+                )
+            )
+            await session.run_sync(_run_disable_autoflush)
+            geometry_context = GeometryPersistenceContext(project_id=project_id)
+            deferred_inferences: list[_DeferredArtifactInferences] = []
+            persist_preload_elapsed_ms = (perf_counter() - preload_started) * 1000
+
+            async def persist_parsed_files(
+                parsed_files: list[tuple[int, _ParsedArtifact]],
+            ) -> None:
+                nonlocal persist_preload_elapsed_ms, persist_write_elapsed_ms
+                if not parsed_files:
+                    return
+                inference_topology_records: list[Any] = []
+                legacy_bulk_import = bool(
+                    cast(Any, session).sync_session.info.get(
+                        LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
+                        False,
                     )
                 )
-                persistence_ingestions_by_id.update(batch_ingestions)
-                persistence_revision_ids_by_artifact_id.update(batch_revision_ids)
-                await session.run_sync(_run_disable_autoflush)
-                geometry_context = GeometryPersistenceContext(project_id=project_id)
-                deferred_inferences: list[_DeferredArtifactInferences] = []
-                persist_preload_elapsed_ms += (perf_counter() - preload_started) * 1000
-
-                inference_topology_records: list[Any] = []
                 for _, parsed in parsed_files:
                     for inferred in parsed.inferences:
                         if not isinstance(inferred, _SuccessfulInference):
@@ -5758,16 +6058,36 @@ class ArtifactUploadService:
                         cache_key: str | None = None
                         cached: tuple[Any, ...] | None = None
                         try:
-                            base_records = tuple(_inference_topology_records(inferred))
-                            cache_key = _inference_reaction_cache_key(inferred, base_records)
-                            cached = geometry_context.inferred_reaction_topology_records_by_key.get(
-                                cache_key
-                            )
-                            records = (
-                                _inference_topology_records(inferred, reaction_records=cached)
-                                if cached is not None
-                                else list(base_records)
-                            )
+                            if legacy_bulk_import:
+                                cache_key = inferred.reaction_smiles
+                                cached = (
+                                    geometry_context.inferred_reaction_topology_records_by_key.get(
+                                        cache_key
+                                    )
+                                )
+                                records = _inference_topology_records(
+                                    inferred,
+                                    reaction_records=cached,
+                                )
+                            else:
+                                base_records = tuple(_inference_topology_records(inferred))
+                                cache_key = _inference_reaction_cache_key(
+                                    inferred,
+                                    base_records,
+                                )
+                                cached = (
+                                    geometry_context.inferred_reaction_topology_records_by_key.get(
+                                        cache_key
+                                    )
+                                )
+                                records = (
+                                    _inference_topology_records(
+                                        inferred,
+                                        reaction_records=cached,
+                                    )
+                                    if cached is not None
+                                    else list(base_records)
+                                )
                             inference_topology_records.extend(records)
                             if cached is None and len(records) > 2:
                                 geometry_context.inferred_reaction_topology_records_by_key.setdefault(
@@ -5779,93 +6099,113 @@ class ArtifactUploadService:
                                 inferred.file_frame_index,
                                 exc_info=True,
                             )
-                            # Do not silently fall back to RDKit-normalized
-                            # participant topologies: that path can erase
-                            # MolGR radical state.  An empty sentinel makes
-                            # persistence reject this inference explicitly.
+                            # Do not silently replace a MolGR topology with
+                            # an RDKit-normalized participant. Persistence
+                            # will record the inference failure explicitly.
                             if cached is None:
                                 if cache_key is None:
                                     cache_key = _inference_reaction_cache_key(inferred)
                                 geometry_context.inferred_reaction_topology_records_by_key[
                                     cache_key
                                 ] = ()
-                if parsed_files:
-                    preload_started = perf_counter()
-                    await session.run_sync(
-                        partial(
-                            _run_preload_molecular_geometry_context,
-                            parsed_artifacts=[parsed for _, parsed in parsed_files],
-                            context=geometry_context,
-                            topology_records=inference_topology_records,
-                        )
+                preload_started = perf_counter()
+                await session.run_sync(
+                    partial(
+                        _run_preload_molecular_geometry_context,
+                        parsed_artifacts=[parsed for _, parsed in parsed_files],
+                        context=geometry_context,
+                        topology_records=inference_topology_records,
                     )
-                    persist_preload_elapsed_ms += (perf_counter() - preload_started) * 1000
-                    for local_index, parsed in parsed_files:
-                        original_index = parse_indices[local_index]
-                        reservation = prepared[original_index]
-                        ingestion_id = _require_prepared_ingestion_id(reservation)
-                        ingestion = batch_ingestions[ingestion_id]
-                        write_started = perf_counter()
-                        try:
-                            revision_id, revision_created = await session.run_sync(
-                                partial(
-                                    _run_persist_parsed_artifact_savepoint,
-                                    ingestion_id=ingestion_id,
-                                    parsed=parsed,
-                                    started_at=reservation.started_at,
-                                    completed_at=datetime.now(UTC),
-                                    geometry_context=geometry_context,
-                                    force_new_revision=reservation.force_new_revision,
-                                    preload_geometry_context=False,
-                                    ingestion=ingestion,
-                                    existing_revision_ids=batch_revision_ids[
+                )
+                persist_preload_elapsed_ms += (perf_counter() - preload_started) * 1000
+                for local_index, parsed in parsed_files:
+                    original_index = parse_indices[local_index]
+                    reservation = prepared[original_index]
+                    ingestion_id = _require_prepared_ingestion_id(reservation)
+                    ingestion = persistence_ingestions_by_id[ingestion_id]
+                    write_started = perf_counter()
+                    try:
+                        revision_id, revision_created = await session.run_sync(
+                            partial(
+                                _run_persist_parsed_artifact_savepoint,
+                                ingestion_id=ingestion_id,
+                                parsed=parsed,
+                                started_at=reservation.started_at,
+                                completed_at=datetime.now(UTC),
+                                geometry_context=geometry_context,
+                                force_new_revision=reservation.force_new_revision,
+                                preload_geometry_context=False,
+                                ingestion=ingestion,
+                                existing_revision_ids=(
+                                    persistence_revision_ids_by_artifact_id[
                                         ingestion.artifact_file_id
-                                    ],
-                                    defer_ingestion_completion=True,
-                                    defer_reconciliation=True,
-                                    deferred_inferences=deferred_inferences,
-                                )
+                                    ]
+                                ),
+                                defer_ingestion_completion=True,
+                                defer_reconciliation=True,
+                                deferred_inferences=deferred_inferences,
                             )
-                        except Exception as error:
-                            parse_errors_by_index[original_index] = error
-                            parse_failure_metadata_by_index[original_index] = (
-                                _parse_failure_metadata(error, parsed=parsed)
-                            )
-                            parse_source_counts_by_index[original_index] = (
-                                parsed.source_frame_count,
-                                len(parsed.inferences),
-                            )
-                            continue
+                        )
+                    except Exception as error:
+                        parse_errors_by_index[original_index] = error
+                        parse_failure_metadata_by_index[original_index] = _parse_failure_metadata(
+                            error, parsed=parsed
+                        )
+                        parse_source_counts_by_index[original_index] = (
+                            parsed.source_frame_count,
+                            len(parsed.inferences),
+                        )
                         persist_write_elapsed_ms += (perf_counter() - write_started) * 1000
-                        persisted_revisions_by_index[original_index] = (
-                            revision_id,
-                            revision_created,
-                        )
-                        (
-                            artifact_diagnostics,
-                            failed_frame_count,
-                            parse_completeness,
-                        ) = session.info.get("_molop_artifact_diagnostics", {}).get(
-                            ingestion_id,
-                            ((), 0, ParseCompleteness.COMPLETE),
-                        )
-                        completion_by_ingestion_id[ingestion_id] = _IngestionCompletion(
-                            parse_revision_id=revision_id,
-                            parse_revision_created=revision_created,
-                            source_frame_count=parsed.source_frame_count,
-                            transition_state_frame_count=len(parsed.inferences),
-                            source_format=parsed.source_format,
-                            completed_at=datetime.now(UTC),
-                            parse_completeness=(
-                                ParseCompleteness.PARTIAL
-                                if parse_completeness is ParseCompleteness.PARTIAL
-                                else ParseCompleteness.COMPLETE
-                            ),
-                            parse_diagnostics=tuple(artifact_diagnostics),
-                        )
+                        continue
+                    persist_write_elapsed_ms += (perf_counter() - write_started) * 1000
+                    persisted_revisions_by_index[original_index] = (
+                        revision_id,
+                        revision_created,
+                    )
+                    (
+                        artifact_diagnostics,
+                        _failed_frame_count,
+                        parse_completeness,
+                    ) = session.info.get("_molop_artifact_diagnostics", {}).get(
+                        ingestion_id,
+                        ((), 0, ParseCompleteness.COMPLETE),
+                    )
+                    completion_by_ingestion_id[ingestion_id] = _IngestionCompletion(
+                        parse_revision_id=revision_id,
+                        parse_revision_created=revision_created,
+                        source_frame_count=parsed.source_frame_count,
+                        transition_state_frame_count=len(parsed.inferences),
+                        source_format=parsed.source_format,
+                        completed_at=datetime.now(UTC),
+                        parse_completeness=(
+                            ParseCompleteness.PARTIAL
+                            if parse_completeness is ParseCompleteness.PARTIAL
+                            else ParseCompleteness.COMPLETE
+                        ),
+                        parse_diagnostics=tuple(artifact_diagnostics),
+                    )
 
-                # Storage and parser failures are durable outcomes of this
-                # window too; record them before building response items.
+            async def commit_persistence_window(
+                completed_indices: list[int],
+            ) -> None:
+                """Flush one bounded window and release its identity locks.
+
+                The parser queue and process pool remain shared for the
+                whole claim window.  Only the database transaction is
+                bounded: project-scoped identity locks are PostgreSQL
+                transaction locks, so retaining one transaction for all
+                64 files eventually exhausts ``max_locks_per_transaction``.
+                A fresh Geometry context per committed window keeps the
+                reconciliation graph and transaction-local candidate index
+                bounded after the commit.
+                """
+
+                nonlocal geometry_context, deferred_inferences
+                nonlocal persist_inferred_reaction_cache_hits, persist_write_elapsed_ms
+                if not completed_indices:
+                    return
+
+                window_write_started = perf_counter()
                 for original_index in completed_indices:
                     parse_error = parse_errors_by_index.get(original_index)
                     if parse_error is None:
@@ -5873,8 +6213,8 @@ class ArtifactUploadService:
                     reservation = prepared[original_index]
                     if reservation.ingestion_id is None:
                         continue
-                    ingestion = batch_ingestions[_require_prepared_ingestion_id(reservation)]
-                    persist_write_started = perf_counter()
+                    ingestion_id = _require_prepared_ingestion_id(reservation)
+                    ingestion = persistence_ingestions_by_id[ingestion_id]
                     await session.run_sync(
                         partial(
                             cast(
@@ -5883,7 +6223,7 @@ class ArtifactUploadService:
                                 if original_index in no_frame_indices
                                 else _run_mark_ingestion_failed,
                             ),
-                            ingestion_id=_require_prepared_ingestion_id(reservation),
+                            ingestion_id=ingestion_id,
                             error=parse_error,
                             error_code=(
                                 "artifact_storage_failed"
@@ -5917,7 +6257,6 @@ class ArtifactUploadService:
                             ),
                         )
                     )
-                    persist_write_elapsed_ms += (perf_counter() - persist_write_started) * 1000
 
                 window_stored = {
                     prepared[index].artifact_id: (prepared[index].object_key, stored[index])
@@ -5936,28 +6275,14 @@ class ArtifactUploadService:
                         (perf_counter() - storage_db_started) * 1000
                     )
 
-                new_deferred = deferred_inferences
-                persist_write_started = perf_counter()
                 flush_started = perf_counter()
-                # The next phase creates TS reactions from the already
-                # persisted endpoint Topology objects.  The raw bulk flush
-                # deliberately detaches fast-path rows; that is safe for
-                # revision-local leaves, but not for shared Formula/Topology
-                # identities retained by ``geometry_context``.  Keeping this
-                # barrier attached prevents a later relationship cascade from
-                # trying to attach a second ORM instance for the same UUID.
-                bulk_diagnostics = await session.run_sync(_run_flush_attached)
+                bulk_diagnostics = await session.run_sync(_run_flush)
                 timings["persist_flush_initial_ms"] = (
                     timings.get("persist_flush_initial_ms", 0.0)
                     + (perf_counter() - flush_started) * 1000
                 )
                 if isinstance(bulk_diagnostics, dict):
-                    for key in (
-                        "pending",
-                        "transient",
-                        "prepare_ms",
-                        "execute_ms",
-                    ):
+                    for key in ("pending", "transient", "prepare_ms", "execute_ms"):
                         metric_key = (
                             f"persist_bulk_{key}_rows"
                             if key in {"pending", "transient"}
@@ -5966,29 +6291,25 @@ class ArtifactUploadService:
                         timings[metric_key] = timings.get(metric_key, 0.0) + float(
                             cast(Any, bulk_diagnostics.get(key, 0))
                         )
-                if new_deferred:
+
+                if deferred_inferences:
                     inference_started = perf_counter()
                     await session.run_sync(
                         partial(
                             _run_persist_deferred_inferences,
-                            deferred_inferences=new_deferred,
+                            deferred_inferences=deferred_inferences,
                             topology_context=geometry_context,
-                            defer_thermodynamic_refresh=True,
                         )
                     )
                     timings["persist_deferred_inferences_ms"] = (
                         timings.get("persist_deferred_inferences_ms", 0.0)
                         + (perf_counter() - inference_started) * 1000
                     )
-                    # Failed inferences and the last successful inference
-                    # may still have rows in the fast-insert queue.  Make the
-                    # reaction participants visible before reconciliation.
+                    # Inference persistence can queue additional rows after
+                    # the initial revision-local flush. Make them visible
+                    # before the reconciliation barrier.
                     await session.run_sync(_run_flush)
 
-                # Geometry reconciliation must run after deferred reactions
-                # and participants are durable in this transaction.  Running
-                # it before inference persistence can permanently miss the
-                # newly-created endpoint participants.
                 reconcile_started = perf_counter()
                 await session.run_sync(
                     partial(
@@ -6015,6 +6336,7 @@ class ArtifactUploadService:
                     parse_revision_created_by_ingestion_id[ingestion_id] = (
                         persisted_revision[1] if persisted_revision is not None else None
                     )
+
                 if parse_revision_by_ingestion_id:
                     result_started = perf_counter()
                     await session.run_sync(_run_flush)
@@ -6062,105 +6384,39 @@ class ArtifactUploadService:
                             ),
                         )
 
-                for original_index in completed_indices:
-                    if original_index in item_by_index:
-                        continue
-                    reservation = prepared[original_index]
-                    if reservation.duplicate_of is not None:
-                        source_item = item_by_index.get(reservation.duplicate_of)
-                        if source_item is not None:
-                            item_by_index[original_index] = source_item.model_copy(
-                                update={"filename": files[original_index].filename}
-                            )
-                        else:
-                            pending_duplicate_indices.add(original_index)
-                    elif reservation.ingestion_id is None or reservation.skip_parse:
-                        stored_result = (
-                            cls._batch_result_for_stored_artifact(
-                                reservation,
-                                artifact_kind=artifact_kind,
-                            )
-                            if original_index not in storage_errors
-                            else None
-                        )
-                        item_by_index[original_index] = ArtifactBatchUploadItem(
-                            filename=files[original_index].filename,
-                            succeeded=(
-                                stored_result is not None
-                                and stored_result.ingestion_status
-                                not in {
-                                    ArtifactIngestionStatus.FAILED,
-                                    ArtifactIngestionStatus.FILTERED,
-                                }
-                            ),
-                            result=stored_result,
-                            error_code=(
-                                "artifact_storage_failed"
-                                if original_index in storage_errors
-                                else None
-                            ),
-                            error_message=(
-                                str(storage_errors[original_index])
-                                if original_index in storage_errors
-                                else None
-                            ),
-                        )
-
                 commit_started = perf_counter()
                 await session.commit()
                 timings["persist_commit_db_ms"] = (
                     timings.get("persist_commit_db_ms", 0.0)
                     + (perf_counter() - commit_started) * 1000
                 )
-                persist_write_elapsed_ms += (perf_counter() - persist_write_started) * 1000
-
-                resolved_duplicate_indices: list[int] = []
-                if pending_duplicate_indices:
-                    for original_index in tuple(pending_duplicate_indices):
-                        reservation = prepared[original_index]
-                        source_index = reservation.duplicate_of
-                        if source_index is None:
-                            continue
-                        source_item = item_by_index.get(source_index)
-                        if source_item is not None:
-                            item_by_index[original_index] = source_item.model_copy(
-                                update={"filename": files[original_index].filename}
-                            )
-                            pending_duplicate_indices.discard(original_index)
-                            resolved_duplicate_indices.append(original_index)
-
-                if on_file_committed is not None:
-                    callback_indices = [
-                        original_index
-                        for original_index in (*completed_indices, *resolved_duplicate_indices)
-                        if original_index not in committed_callback_indices
-                        and original_index in item_by_index
-                    ]
+                persist_inferred_reaction_cache_hits += (
+                    geometry_context.inferred_reaction_cache_hits
+                )
                 lock_stats = await session.run_sync(
                     lambda sync_session: dict(
                         cast(Session, sync_session).info.get("_identity_lock_stats", {})
                     )
                 )
+                advisory_lock_stats["calls"] = int(lock_stats.get("calls", 0))
+                advisory_lock_stats["requested_ids"] = int(lock_stats.get("requested_ids", 0))
+                advisory_lock_stats["uncached_ids"] = int(lock_stats.get("uncached_ids", 0))
+                advisory_lock_stats["prefixes"] = dict(lock_stats.get("prefixes", {}))
+                if on_file_committed is not None:
+                    for original_index in window_parse_indices:
+                        item = item_by_index.get(original_index)
+                        if item is not None:
+                            await on_file_committed(original_index, item)
+                            committed_callback_indices.add(original_index)
+                persist_write_elapsed_ms += (perf_counter() - window_write_started) * 1000
 
-            persist_inferred_reaction_cache_hits += geometry_context.inferred_reaction_cache_hits
-            advisory_lock_stats["calls"] += int(lock_stats.get("calls", 0))
-            advisory_lock_stats["requested_ids"] += int(lock_stats.get("requested_ids", 0))
-            advisory_lock_stats["uncached_ids"] += int(lock_stats.get("uncached_ids", 0))
-            prefixes = advisory_lock_stats["prefixes"]
-            for prefix, count in lock_stats.get("prefixes", {}).items():
-                prefixes[prefix] = prefixes.get(prefix, 0) + int(count)
-            if on_file_committed is not None:
-                for original_index in callback_indices:
-                    item = item_by_index.get(original_index)
-                    if item is not None:
-                        await on_file_committed(original_index, item)
-                        committed_callback_indices.add(original_index)
+                # Deferred inference work has been persisted in this
+                # transaction. Do not carry ORM objects or reconciliation
+                # caches across the commit; the next window preloads its
+                # own bounded project context.
+                deferred_inferences = []
+                geometry_context = GeometryPersistenceContext(project_id=project_id)
 
-        parse_pipeline_started = persistence_pipeline_started
-        local_index_by_original = {
-            original_index: local_index for local_index, original_index in enumerate(parse_indices)
-        }
-        async with _pipeline_task_lifecycle(pipeline_tasks, on_abort=recover_aborted_batch):
             for _ in pipeline_tasks:
                 index, storage_error, parsed = await pipeline_result_queue.get()
                 pending_completed_indices.append(index)
@@ -6173,21 +6429,34 @@ class ArtifactUploadService:
                     local_index = local_index_by_original.get(index)
                 if storage_error is None and local_index is not None:
                     await persist_completed_file(local_index, parsed)
+                    # Keep parsing and database work overlapped inside the
+                    # same claim transaction.  The previous importer fed
+                    # the shared persistence consumer every preload-sized
+                    # group instead of waiting for the whole claim to
+                    # finish; only the commit boundary remains claim-sized.
+                    if pending_preload and (
+                        len(pending_preload) >= PERSISTENCE_PRELOAD_BATCH_SIZE
+                        or pipeline_result_queue.empty()
+                    ):
+                        parsed_batch = pending_preload.copy()
+                        pending_preload.clear()
+                        await persist_parsed_files(parsed_batch)
                 if len(pending_completed_indices) >= persistence_batch_files:
-                    completed = pending_completed_indices.copy()
+                    completed_batch = pending_completed_indices.copy()
                     pending_completed_indices.clear()
                     parsed_batch = pending_preload.copy()
                     pending_preload.clear()
-                    await commit_persistence_microbatch(completed, parsed_batch)
+                    await persist_parsed_files(parsed_batch)
+                    await commit_persistence_window(completed_batch)
 
             await asyncio.gather(*pipeline_tasks)
-
             if pending_completed_indices:
-                completed = pending_completed_indices.copy()
+                completed_batch = pending_completed_indices.copy()
                 pending_completed_indices.clear()
                 parsed_batch = pending_preload.copy()
                 pending_preload.clear()
-                await commit_persistence_microbatch(completed, parsed_batch)
+                await persist_parsed_files(parsed_batch)
+                await commit_persistence_window(completed_batch)
 
         timings["molop_parse_ms"] = (
             (parse_phase_finished_at - parse_phase_started_at) * 1000

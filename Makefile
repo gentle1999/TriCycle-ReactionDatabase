@@ -226,10 +226,13 @@ seed-da-bench:
 
 import-artifacts:
 	@test -n "$(IMPORT_PROJECT_ID)" || (echo "set IMPORT_PROJECT_ID to a project UUID" >&2; exit 2)
-	@test -n "$(IMPORT_ROOTS)" || (echo "set IMPORT_ROOTS='path/to/file-or-directory ...'" >&2; exit 2)
+	@test -n "$(IMPORT_USER_ID)" || (echo "set IMPORT_USER_ID to an authenticated user UUID" >&2; exit 2)
+	@test -n "$(IMPORT_ROOTS)$(IMPORT_MANIFEST)" || (echo "set IMPORT_ROOTS or IMPORT_MANIFEST" >&2; exit 2)
+	@test -z "$(IMPORT_ROOTS)" || test -z "$(IMPORT_MANIFEST)" || (echo "set only one of IMPORT_ROOTS and IMPORT_MANIFEST" >&2; exit 2)
 	$(IMPORT_RUNTIME_ENV) uv run tricycle-import-artifacts \
 		--project-id "$(IMPORT_PROJECT_ID)" \
-		$(if $(IMPORT_USER_ID),--user-id "$(IMPORT_USER_ID)",) \
+		--user-id "$(IMPORT_USER_ID)" \
+		$(if $(IMPORT_MANIFEST),--manifest "$(IMPORT_MANIFEST)",) \
 		$(if $(IMPORT_ARTIFACT_KIND),--artifact-kind "$(IMPORT_ARTIFACT_KIND)",) \
 		$(foreach suffix,$(IMPORT_INCLUDE_SUFFIXES),--include-suffix "$(suffix)") \
 		$(foreach suffix,$(IMPORT_EXCLUDE_SUFFIXES),--exclude-suffix "$(suffix)") \

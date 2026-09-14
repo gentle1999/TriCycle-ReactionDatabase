@@ -28,6 +28,7 @@ class ArtifactSummary(QueryView):
     created_at: datetime | None = None
     visibility: str
     original_filename: str
+    source_relative_path: str | None = None
     content_sha256: str
     size_bytes: int
     media_type: str

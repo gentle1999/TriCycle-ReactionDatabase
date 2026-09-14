@@ -5,8 +5,10 @@ from typing import Any
 import pytest
 from mcp.types import TextContent
 
-from tricycle_reaction_db.api.mcp import QueryGuardMiddleware, mcp_server
+from tricycle_reaction_db.api.mcp import QueryGuardMiddleware, _mcp_success, mcp_server
+from tricycle_reaction_db.application.dtos import ProjectView
 from tricycle_reaction_db.application.rate_limits import RateLimitBackendUnavailable
+from tricycle_reaction_db.domain.enums import ProjectStatus
 
 
 async def _call(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -17,7 +19,7 @@ async def _call(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_mcp_exposes_nexusx_four_layer_tools() -> None:
+async def test_mcp_exposes_query_and_import_control_tools() -> None:
     tools = await mcp_server.list_tools()
 
     assert {tool.name for tool in tools} == {
@@ -25,6 +27,88 @@ async def test_mcp_exposes_nexusx_four_layer_tools() -> None:
         "describe_compose_schema",
         "describe_compose_method",
         "compose_query",
+        "create_project",
+        "register_import_manifest",
+        "start_import_job",
+        "get_import_status",
+        "list_import_failures",
+        "retry_import_items",
+        "pause_import",
+        "resume_import",
+        "cancel_import",
+    }
+
+
+@pytest.mark.asyncio
+async def test_mcp_control_tools_require_transport_authentication() -> None:
+    result = await _call(
+        "start_import_job", {"import_job_id": "00000000-0000-7000-8000-000000000701"}
+    )
+
+    assert result == {
+        "success": False,
+        "error": {
+            "code": "authentication_required",
+            "message": "authenticated MCP principal is required",
+        },
+    }
+
+
+def test_mcp_success_serializes_nested_pydantic_payloads() -> None:
+    project_id = "00000000-0000-7000-8000-000000000702"
+    project = ProjectView.model_validate(
+        {
+            "id": project_id,
+            "organization_id": "00000000-0000-7000-8000-000000000703",
+            "organization_slug": "example-org",
+            "organization_name": "Example Organization",
+            "slug": "example-project",
+            "name": "Example Project",
+            "status": ProjectStatus.ACTIVE,
+        }
+    )
+
+    result = _mcp_success({"job": project, "items": [project]})
+
+    assert result["data"] == {
+        "job": {
+            "id": project_id,
+            "organization_id": "00000000-0000-7000-8000-000000000703",
+            "organization_slug": "example-org",
+            "organization_name": "Example Organization",
+            "owner_user_id": None,
+            "created_by_user_id": None,
+            "slug": "example-project",
+            "name": "Example Project",
+            "data_source": {},
+            "model_checkpoint": {},
+            "calculation_protocol": {},
+            "status": "active",
+            "role": None,
+            "organization_role": None,
+            "permissions": [],
+            "created_at": None,
+        },
+        "items": [
+            {
+                "id": project_id,
+                "organization_id": "00000000-0000-7000-8000-000000000703",
+                "organization_slug": "example-org",
+                "organization_name": "Example Organization",
+                "owner_user_id": None,
+                "created_by_user_id": None,
+                "slug": "example-project",
+                "name": "Example Project",
+                "data_source": {},
+                "model_checkpoint": {},
+                "calculation_protocol": {},
+                "status": "active",
+                "role": None,
+                "organization_role": None,
+                "permissions": [],
+                "created_at": None,
+            }
+        ],
     }
 
 

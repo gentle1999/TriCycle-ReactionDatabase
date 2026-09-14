@@ -236,6 +236,7 @@ async def _project(
     session: AsyncSession,
     spec: BootstrapSpec,
     organization: Organization,
+    owner_user_id: UUID,
 ) -> Project:
     if organization.id is None:
         raise RuntimeError("database did not assign bootstrap organization UUID")
@@ -256,6 +257,8 @@ async def _project(
         project = Project(
             id=expected_id,
             organization_id=organization.id,
+            owner_user_id=owner_user_id,
+            created_by_user_id=owner_user_id,
             slug=spec.project_slug,
             name=spec.project_name,
             status=ProjectStatus.ACTIVE,
@@ -268,6 +271,8 @@ async def _project(
         project.slug = spec.project_slug
         project.name = spec.project_name
         project.status = ProjectStatus.ACTIVE
+        project.owner_user_id = project.owner_user_id or owner_user_id
+        project.created_by_user_id = project.created_by_user_id or owner_user_id
     return project
 
 
@@ -326,7 +331,9 @@ async def bootstrap(spec: BootstrapSpec) -> BootstrapResult:
         system_user = await _system_user(session, spec)
         administrator = await _administrator(session, spec)
         organization = await _organization(session, spec)
-        project = await _project(session, spec, organization)
+        if administrator.id is None:
+            raise RuntimeError("database did not assign bootstrap administrator UUID")
+        project = await _project(session, spec, organization, administrator.id)
         await _membership(
             session,
             organization=organization,

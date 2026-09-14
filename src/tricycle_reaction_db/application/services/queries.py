@@ -1149,6 +1149,7 @@ def _artifact_summary(
         created_at=artifact.created_at,
         visibility=_enum_value(artifact.visibility),
         original_filename=artifact.original_filename,
+        source_relative_path=artifact.source_relative_path,
         content_sha256=artifact.content_sha256,
         size_bytes=artifact.size_bytes,
         media_type=artifact.media_type,

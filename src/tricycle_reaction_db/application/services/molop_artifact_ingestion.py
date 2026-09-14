@@ -19,7 +19,10 @@ from tricycle_reaction_db.application.dtos import (
     CalculationSegmentRecord,
     ParseRevisionCompletionRecord,
 )
-from tricycle_reaction_db.application.services._persistence import _attach_pending_entities
+from tricycle_reaction_db.application.services._persistence import (
+    LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
+    _attach_pending_entities,
+)
 from tricycle_reaction_db.application.services.calculations import (
     finalize_parse_revision,
     persist_atomic_population_series,
@@ -65,16 +68,10 @@ from tricycle_reaction_db.application.services.reaction_geometry_reconciliation 
     reconcile_geometry_with_reactions,
     reconcile_mapped_reaction_with_geometries,
 )
-from tricycle_reaction_db.application.services.reaction_mapping_resolution import (
-    ensure_mapped_reactions_for_concrete_topology,
-    ensure_mapped_reactions_for_logical_reaction,
-)
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
     CalculationFrame,
     ElectronicState,
-    LogicalReaction,
-    MolecularTopology,
     ParseRevision,
 )
 from tricycle_reaction_db.domain.enums import (
@@ -492,7 +489,9 @@ def persist_molop_calculation_artifact(
             )
         if preload_geometry_context:
             preload_snapshot = _snapshot_geometry_context(active_geometry_context)
-            pending_snapshot = list(session.info.get("_fast_pending_entities", ()))
+            pending_snapshot: list[Any] | None = list(
+                session.info.get("_fast_pending_entities", ())
+            )
             try:
                 preload_scope = nullcontext() if effective_fast_insert else session.begin_nested()
                 with preload_scope:
@@ -599,9 +598,25 @@ def persist_molop_calculation_artifact(
                 diagnostics.extend(frame_diagnostics)
             for record in segment_frames:
                 file_frame_index = record.frame.file_frame_index
-                frame_snapshot = _snapshot_geometry_context(active_geometry_context)
-                pending_snapshot = list(session.info.get("_fast_pending_entities", ()))
-                array_counts_snapshot = dict(array_counts)
+                # The old high-throughput path deliberately did not copy the
+                # entire, growing GeometryPersistenceContext for every frame.
+                # In the deferred fast path those copies turn persistence into
+                # O(frames * context-size), which is especially costly for a
+                # long-running 64-file worker window.  The normal/audit path
+                # keeps the per-frame savepoint snapshot; the fast path relies
+                # on the enclosing batch transaction and parser-side frame
+                # diagnostics instead of paying that copy on every success.
+                frame_snapshot = (
+                    None
+                    if effective_fast_insert
+                    else _snapshot_geometry_context(active_geometry_context)
+                )
+                pending_snapshot = (
+                    None
+                    if effective_fast_insert
+                    else list(session.info.get("_fast_pending_entities", ()))
+                )
+                array_counts_snapshot = None if effective_fast_insert else dict(array_counts)
                 persisted_frame: CalculationFrame | None = None
                 try:
                     # Fast ingestion defers all INSERTs to the batch flush;
@@ -692,11 +707,13 @@ def persist_molop_calculation_artifact(
                         if isinstance(segment_frames_collection, list):
                             with suppress(ValueError):
                                 segment_frames_collection.remove(persisted_frame)
-                    _restore_geometry_context(active_geometry_context, frame_snapshot)
-                    if effective_fast_insert:
+                    if frame_snapshot is not None:
+                        _restore_geometry_context(active_geometry_context, frame_snapshot)
+                    if pending_snapshot is not None:
                         session.info["_fast_pending_entities"] = pending_snapshot
-                    array_counts.clear()
-                    array_counts.update(array_counts_snapshot)
+                    if array_counts_snapshot is not None:
+                        array_counts.clear()
+                        array_counts.update(array_counts_snapshot)
                     diagnostic = _frame_failure_diagnostic(
                         file_frame_index=file_frame_index,
                         segment_index=segment.segment_index,
@@ -830,64 +847,6 @@ def reconcile_molop_geometry_context(
         reconciliation_cache = ReconciliationBatchCache()
     context.reconciliation_cache = reconciliation_cache
 
-    # Deferred TS inference creates its first mapped reaction while the fast
-    # insert queue is still active.  Once that queue is flushed, expand each
-    # affected logical reaction across every already-materialized concrete DAG
-    # member.  Temporarily use the regular persistence path for this small
-    # reaction graph so each newly-created mapping is immediately visible to
-    # the fixed-point expansion.
-    logical_reaction_ids = {
-        mapped_reaction.logical_reaction_id
-        for mapped_reaction in (
-            *tuple(context.mapped_reactions_by_id.values()),
-            *tuple(context.mapped_reactions_to_reconcile.values()),
-        )
-        if isinstance(mapped_reaction.logical_reaction_id, UUID)
-    }
-    previous_fast_insert = session.info.get("tricycle_fast_insert", False)
-    previous_autoflush = session.autoflush
-    session.info["tricycle_fast_insert"] = False
-    session.autoflush = True
-    processed_reaction_topology_ids: set[UUID] = set()
-    try:
-        for logical_reaction_id in sorted(logical_reaction_ids, key=str):
-            logical_reaction = session.get(LogicalReaction, logical_reaction_id)
-            if logical_reaction is not None and logical_reaction.project_id == project_id:
-                ensure_mapped_reactions_for_logical_reaction(
-                    session,
-                    logical_reaction,
-                    topology_context=context,
-                    reconciliation_cache=reconciliation_cache,
-                    refresh_thermodynamics=False,
-                    processed_topology_ids=processed_reaction_topology_ids,
-                )
-    finally:
-        session.autoflush = previous_autoflush
-        session.info["tricycle_fast_insert"] = previous_fast_insert
-
-    for topology_id in context.topologies_to_resolve_reactions:
-        topology = session.get(MolecularTopology, topology_id)
-        if topology is None:
-            topology = next(
-                (
-                    candidate
-                    for candidate in (
-                        *tuple(session.new),
-                        *tuple(session.info.get("_fast_pending_entities", ())),
-                    )
-                    if isinstance(candidate, MolecularTopology) and candidate.id == topology_id
-                ),
-                None,
-            )
-        if topology is not None and topology.project_id == project_id:
-            ensure_mapped_reactions_for_concrete_topology(
-                session,
-                topology,
-                topology_context=context,
-                reconciliation_cache=reconciliation_cache,
-                refresh_thermodynamics=False,
-                skip_topology_ids=processed_reaction_topology_ids,
-            )
     _attach_pending_entities(session)
     session.flush()
     reconciliation_cache.thermodynamic_property_geometry_ids.update(reconcilable_ids)
@@ -917,21 +876,24 @@ def reconcile_molop_geometry_context(
                     mapped_reactions_by_id=context.mapped_reactions_by_id,
                     cache=reconciliation_cache,
                 )
-        # A mapped reaction may have been created after its endpoint Geometry
-        # rows were persisted by an earlier ingestion microbatch. The normal
-        # Geometry pass cannot discover that ordering, so explicitly perform
-        # the reverse lookup for every reaction registered during this batch.
-        for mapped_reaction in context.mapped_reactions_to_reconcile.values():
-            mapped_reaction_id = mapped_reaction.id
-            if mapped_reaction_id is None:
-                continue
-            reconcile_mapped_reaction_with_geometries(
-                session,
-                mapped_reaction,
-                refresh_thermodynamics=False,
-                cache=reconciliation_cache,
-            )
-            reconciliation_cache.affected_reactions_by_id[mapped_reaction_id] = mapped_reaction
+        if not session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
+            # A mapped reaction may have been created after its endpoint
+            # Geometry rows were persisted by an earlier ingestion microbatch.
+            # The normal Geometry pass cannot discover that ordering, so
+            # explicitly perform the reverse lookup for every reaction
+            # registered during this batch.  The legacy bulk importer keeps
+            # the previous one-way reconciliation barrier on its hot path.
+            for mapped_reaction in context.mapped_reactions_to_reconcile.values():
+                mapped_reaction_id = mapped_reaction.id
+                if mapped_reaction_id is None:
+                    continue
+                reconcile_mapped_reaction_with_geometries(
+                    session,
+                    mapped_reaction,
+                    refresh_thermodynamics=False,
+                    cache=reconciliation_cache,
+                )
+                reconciliation_cache.affected_reactions_by_id[mapped_reaction_id] = mapped_reaction
         _attach_pending_entities(session)
         session.flush()
         refresh_mapped_reactions_thermodynamics(

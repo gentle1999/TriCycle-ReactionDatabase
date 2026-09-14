@@ -27,6 +27,7 @@ class ArtifactFileRecord(BaseModel):
     content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     size_bytes: int = Field(ge=0)
     original_filename: str
+    source_relative_path: str | None = None
     media_type: str
     artifact_kind: ArtifactKind
     storage_status: StorageStatus

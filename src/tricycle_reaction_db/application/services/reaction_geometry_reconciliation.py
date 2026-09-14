@@ -17,6 +17,7 @@ from tricycle_reaction_db.application.dtos import (
     MappedReactionNodeRecord,
 )
 from tricycle_reaction_db.application.services._persistence import (
+    LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
     _acquire_identity_locks,
     _require_id,
 )
@@ -1002,49 +1003,53 @@ def reconcile_geometry_with_reactions(
         if mapped_reaction is not None:
             affected_reactions[participant.mapped_reaction_id] = mapped_reaction
 
-    # A Geometry may be the source-compatible concrete member for a mapped
-    # participant whose strict topology was reconstructed only from a TS
-    # endpoint.  Such a mapping has no exact participant binding by design, so
-    # the topology-indexed reverse lookup above cannot mark it dirty.  The
-    # membership relation is the audited bridge for the thermodynamic fallback
-    # loader; refresh every mapped reaction that can consume this member.
-    logical_member_reactions = session.exec(
-        select(MappedReaction)
-        .join(
-            MappedReactionParticipant,
-            col(MappedReactionParticipant.mapped_reaction_id) == col(MappedReaction.id),
-        )
-        .join(
-            LogicalParticipantConcreteTopology,
-            col(LogicalParticipantConcreteTopology.logical_reaction_participant_id)
-            == col(MappedReactionParticipant.logical_reaction_participant_id),
-        )
-        .where(
-            col(MappedReaction.project_id) == project_id,
-            col(LogicalParticipantConcreteTopology.concrete_topology_id) == geometry.topology_id,
-        )
-        # ``mapped_reaction.reaction`` is a PostgreSQL custom type without an
-        # equality operator, so a full-row DISTINCT cannot be planned.  The
-        # joins can produce several rows for one mapping; PostgreSQL DISTINCT
-        # ON the UUID primary key removes only that join multiplicity without
-        # comparing the custom reaction column.
-        .distinct(col(MappedReaction.id))
-    ).all()
-    for mapped_reaction in logical_member_reactions:
-        mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
-        affected_reactions[mapped_reaction_id] = mapped_reaction
+    if not session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
+        # A Geometry may be the source-compatible concrete member for a mapped
+        # participant whose strict topology was reconstructed only from a TS
+        # endpoint.  Such a mapping has no exact participant binding by design,
+        # so the topology-indexed reverse lookup above cannot mark it dirty.
+        # The membership relation is the audited bridge for the thermodynamic
+        # fallback loader; refresh every mapped reaction that can consume this
+        # member.
+        logical_member_reactions = session.exec(
+            select(MappedReaction)
+            .join(
+                MappedReactionParticipant,
+                col(MappedReactionParticipant.mapped_reaction_id) == col(MappedReaction.id),
+            )
+            .join(
+                LogicalParticipantConcreteTopology,
+                col(LogicalParticipantConcreteTopology.logical_reaction_participant_id)
+                == col(MappedReactionParticipant.logical_reaction_participant_id),
+            )
+            .where(
+                col(MappedReaction.project_id) == project_id,
+                col(LogicalParticipantConcreteTopology.concrete_topology_id)
+                == geometry.topology_id,
+            )
+            # ``mapped_reaction.reaction`` is a PostgreSQL custom type without
+            # an equality operator, so a full-row DISTINCT cannot be planned.
+            # The joins can produce several rows for one mapping; PostgreSQL
+            # DISTINCT ON the UUID primary key removes only that join
+            # multiplicity without comparing the custom reaction column.
+            .distinct(col(MappedReaction.id))
+        ).all()
+        for mapped_reaction in logical_member_reactions:
+            mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
+            affected_reactions[mapped_reaction_id] = mapped_reaction
 
-    # An endpoint/source topology mismatch cannot be bound as a node Geometry,
-    # but a newly eligible source Geometry must still invalidate the derived
-    # thermodynamic profile.  The persistence loader will accept it only if it
-    # is the unique eligible endpoint-compatible source for that participant.
-    for mapped_reaction in _endpoint_compatible_mapped_reactions(
-        session,
-        geometry,
-        project_id=project_id,
-    ):
-        mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
-        affected_reactions[mapped_reaction_id] = mapped_reaction
+        # An endpoint/source topology mismatch cannot be bound as a node
+        # Geometry, but a newly eligible source Geometry must still invalidate
+        # the derived thermodynamic profile.  The persistence loader will
+        # accept it only if it is the unique eligible endpoint-compatible source
+        # for that participant.
+        for mapped_reaction in _endpoint_compatible_mapped_reactions(
+            session,
+            geometry,
+            project_id=project_id,
+        ):
+            mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
+            affected_reactions[mapped_reaction_id] = mapped_reaction
     if cache is None:
         for mapped_reaction in affected_reactions.values():
             refresh_mapped_reaction_thermodynamics(session, mapped_reaction)
@@ -1486,22 +1491,23 @@ def bind_transition_state_frame(
     mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
     if cache is not None:
         cache.affected_reactions_by_id[mapped_reaction_id] = mapped_reaction
-    sibling_reactions = session.exec(
-        select(MappedReaction).where(
-            MappedReaction.logical_reaction_id == mapped_reaction.logical_reaction_id,
-            MappedReaction.id != mapped_reaction_id,
-            MappedReaction.project_id == project_id,
-        )
-    ).all()
-    for sibling_reaction in sibling_reactions:
-        share_mapped_reaction_evidence(
-            session,
-            source_mapped_reaction=mapped_reaction,
-            target_mapped_reaction=sibling_reaction,
-            cache=cache,
-        )
-        if cache is None and refresh_thermodynamics:
-            refresh_mapped_reaction_thermodynamics(session, sibling_reaction)
+    if not session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
+        sibling_reactions = session.exec(
+            select(MappedReaction).where(
+                MappedReaction.logical_reaction_id == mapped_reaction.logical_reaction_id,
+                MappedReaction.id != mapped_reaction_id,
+                MappedReaction.project_id == project_id,
+            )
+        ).all()
+        for sibling_reaction in sibling_reactions:
+            share_mapped_reaction_evidence(
+                session,
+                source_mapped_reaction=mapped_reaction,
+                target_mapped_reaction=sibling_reaction,
+                cache=cache,
+            )
+            if cache is None and refresh_thermodynamics:
+                refresh_mapped_reaction_thermodynamics(session, sibling_reaction)
     if refresh_thermodynamics:
         refresh_mapped_reaction_thermodynamics(session, mapped_reaction)
         if cache is not None:

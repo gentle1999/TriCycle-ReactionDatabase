@@ -370,7 +370,7 @@ TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS=60
 
 上面的 `2` 是同时承载交互式 API、upload-worker 和导入任务时的保守起点。专用算力主机上，吞吐优先的第一组实验可以把 `TRICYCLE_MOLOP_BATCH_N_JOBS` 提高到 `16`，同时保持 `OMP_NUM_THREADS=1`、`OPENBLAS_NUM_THREADS=1` 和 `MKL_NUM_THREADS=1`；本地 `make import-artifacts` 再配合 `IMPORT_PIPELINE_WINDOW_FILES=64`、`IMPORT_STREAM_QUEUE_SIZE=64`、`IMPORT_COMMIT_BATCH_FILES=16` 和 `IMPORT_MAX_TRANSIENT_RETRIES=3`。内存或数据库压力较大时从 `4–8 / 32 / 32 / 8` 开始。每次只调整一组参数，并用同一批真实文件观察总耗时、内存峰值、数据库写入延迟和失败重试次数。
 
-`TRICYCLE_MOLOP_BATCH_N_JOBS` 是进程级文件解析槽位；三个 native thread 变量控制每个槽位内部的 OpenMP/BLAS 线程，不能用增大 native thread 数代替文件级并发。`IMPORT_*` 只属于宿主机直接导入命令，不会自动成为 Compose 服务环境变量。浏览器/远程上传仍建议从 `TRICYCLE_UPLOAD_WORKER_CONCURRENCY=2`、`TRICYCLE_UPLOAD_MAX_CONCURRENCY=8` 和 `TRICYCLE_UPLOAD_WORKER_STATEMENT_TIMEOUT_MS=120000` 开始。完整的场景表、HTTP 请求上限和调参边界见[开发环境：推荐的导入超参数](development.md#推荐的导入超参数)。
+`TRICYCLE_MOLOP_BATCH_N_JOBS` 是共享进程池的文件解析准入上限；三个 native thread 变量控制每个槽位内部的 OpenMP/BLAS 线程，不能用增大 native thread 数代替文件级并发。生产路径使用可复用的 `spawn` MolOP 进程池，文件完成或超时后释放准入槽位，后续任务继续从同一个池排队执行。`IMPORT_*` 只属于宿主机直接导入命令，不会自动成为 Compose 服务环境变量。RustFS 暂存完成后，浏览器/远程上传由 worker 按最多 64 个文件领取窗口调用 `ArtifactUploadService.reparse_batch`；它只读取并校验已有 RustFS 对象，再委托既有 `upload_batch`、共享 MolOP 进程池和单一持久化消费者，不重复上传或新增解析器。`upload_batch` 内部每 32 个解析结果（或结果队列暂时为空）就交给持久化消费者，但 durable worker 通常以本次 64 文件 claim 作为提交窗口；这两个数字都不控制 16 个 MolOP 解析槽位。批量路径保持上一版的 legacy bulk 热路径，不能把逐文件 concrete/logical/reverse reconciliation 直接加回。`TRICYCLE_UPLOAD_MAX_CONCURRENCY` 只限制 RustFS 读取槽位，`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 只用于兼容的 pending-ingestion 恢复，`TRICYCLE_MOLOP_BATCH_N_JOBS` 限制解析准入。完整的场景表、HTTP 请求上限和调参边界见[开发环境：推荐的导入超参数](development.md#推荐的导入超参数)。
 
 Voyager 使用 NexusX 6.1.2 的 `ComposedErManager` member cluster/color。当前所有数据库实体
 属于同一个 PostgreSQL 逻辑 engine，因此配置中只有一个数据库 cluster；即使
@@ -709,8 +709,8 @@ API 默认只监听 127.0.0.1:8000，由反向代理对外提供 HTTPS。`infra/
 其中一个 worker。若未来引入 Prometheus multiprocess 聚合，同机多 worker 仍必须按
 先用 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS` 和 `MKL_NUM_THREADS` 限制每个 MolOP
 进程内部的原生线程池，再用“Uvicorn worker 数 × `TRICYCLE_MOLOP_BATCH_N_JOBS`”评估
-MolOP 解析进程的 CPU 和内存；
-MolOP 解析并发由解析进程池 worker 数控制；请求不会再经过额外的 slot 闸门。
+MolOP 解析进程的 CPU 和内存。`TRICYCLE_MOLOP_BATCH_N_JOBS` 是唯一的文件级解析准入
+上限；请求/worker 的 `reparse` 任务窗口和数据库连接准入不能替代或复制这条解析路径。
 生产不得设置 `TRICYCLE_MOLOP_BATCH_N_JOBS=-1`。
 
 ## 12. 定时任务、备份与验收

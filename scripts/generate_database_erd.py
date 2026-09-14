@@ -25,7 +25,7 @@ from sqlalchemy.sql.sqltypes import Enum, Uuid
 
 from tricycle_reaction_db.db.models import metadata
 
-SCHEMA_REVISION = "0037_project_owned_calculation_protocol"
+SCHEMA_REVISION = "0044_project_identity_provenance"
 OUTPUT_PATH = Path(__file__).parents[1] / "docs" / "database-erd.md"
 
 POSTGRESQL_GROUPS = {

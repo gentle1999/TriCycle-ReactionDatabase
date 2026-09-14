@@ -1,9 +1,9 @@
 # 数据库实体关系图
 
-> 当前 schema：Alembic `0037_project_owned_calculation_protocol`
+> 当前 schema：Alembic `0044_project_identity_provenance`
 > 生成来源：`tricycle_reaction_db.db.models.metadata`
-> 完整性：64 张表、778 个列、
-> 101 条外键约束，未省略物理表、列或 FK。
+> 完整性：64 张表、794 个列、
+> 104 条外键约束，未省略物理表、列或 FK。
 
 本文区分物理持久化后端和进程内对象。RustFS 与 PostgreSQL 不共享事务；
 `artifact_file` 只保存 RustFS locator、内容 hash 和状态，原始逻辑字节不进入
@@ -140,7 +140,7 @@ flowchart TB
 
 ## 全量物理 ERD
 
-下图逐列展开全部 64 张 PostgreSQL 表，并为 101 条外键约束各生成一条关系线。
+下图逐列展开全部 64 张 PostgreSQL 表，并为 104 条外键约束各生成一条关系线。
 关系标签是子表 FK 列名；复合 FK 使用 `__` 连接列名。`nullable` 表示列允许
 SQL `NULL`。单列唯一键标为 `UK`；复合 UNIQUE、CHECK 和 index 在后续清单中
 逐表计数，并以 SQLModel/Alembic 定义为权威。
@@ -216,7 +216,9 @@ erDiagram
     artifact_file ||--o{ parse_revision : artifact_file_id
     parse_revision o|--o{ parse_revision : reparse_of_id
     calculation_frame ||--o| polarizability_result : frame_id
+    user_account o|--o{ project : created_by_user_id
     organization ||--o{ project : organization_id
+    user_account o|--o{ project : owner_user_id
     user_account ||--o{ project_invitation : invited_by_user_id
     project ||--o{ project_invitation : project_id
     project ||--o{ project_membership : project_id
@@ -246,6 +248,7 @@ erDiagram
     project ||--o{ upload_batch : project_id
     artifact_file o|--o{ upload_batch_item : artifact_file_id
     upload_batch ||--o{ upload_batch_item : batch_id
+    parse_revision o|--o{ upload_batch_item : parse_revision_id
     calculation_frame ||--o| vibration_result : frame_id
     artifact_file ||--o| workflow_manifest : artifact_file_id
     workflow_manifest o|--o{ workflow_manifest : manifest_key__supersedes_id
@@ -337,8 +340,13 @@ erDiagram
         uuid id PK
         datetime created_at
         uuid organization_id FK
+        uuid owner_user_id FK "nullable"
+        uuid created_by_user_id FK "nullable"
         string slug
         text name
+        jsonb data_source
+        jsonb model_checkpoint
+        jsonb calculation_protocol
         enum status
     }
     storage_garbage_collection_run {
@@ -368,6 +376,7 @@ erDiagram
         string content_sha256
         bigint size_bytes
         text original_filename
+        text source_relative_path "nullable"
         string media_type
         enum artifact_kind
         enum storage_status
@@ -460,6 +469,9 @@ erDiagram
         enum artifact_kind
         enum status
         jsonb shared_metadata
+        string archive_sha256 "nullable"
+        string manifest_sha256 "nullable"
+        string manifest_schema_version "nullable"
         integer total_count
         bigint total_bytes
         integer succeeded_count
@@ -563,28 +575,6 @@ erDiagram
         datetime started_at "nullable"
         datetime completed_at "nullable"
     }
-    upload_batch_item {
-        uuid id PK
-        datetime created_at
-        datetime updated_at
-        uuid batch_id FK
-        uuid client_file_id
-        integer position
-        text original_filename
-        text relative_path
-        bigint size_bytes
-        string media_type
-        enum status
-        integer attempt_count
-        integer processing_attempt_count
-        string content_sha256 "nullable"
-        uuid worker_lease_id "nullable"
-        datetime worker_lease_expires_at "nullable"
-        uuid artifact_file_id FK "nullable"
-        string error_code "nullable"
-        text error_message "nullable"
-        jsonb metadata_json
-    }
     workflow_manifest {
         uuid id PK
         datetime created_at
@@ -685,12 +675,12 @@ erDiagram
         jsonb thermochemistry_level
         float temperature_kelvin
         float pressure_atm
-        jsonb reactants
+        jsonb reactants "nullable"
         jsonb transition_state "nullable"
         jsonb products "nullable"
-        float reactants_enthalpy_hartree
-        float reactants_gibbs_free_energy_hartree
-        float reactants_entropy_cal_mol_k
+        float reactants_enthalpy_hartree "nullable"
+        float reactants_gibbs_free_energy_hartree "nullable"
+        float reactants_entropy_cal_mol_k "nullable"
         float transition_state_enthalpy_hartree "nullable"
         float transition_state_gibbs_free_energy_hartree "nullable"
         float transition_state_entropy_cal_mol_k "nullable"
@@ -727,6 +717,35 @@ erDiagram
         jsonb reconstruction_metadata
         string provenance_schema_version
         string provenance_hash
+    }
+    upload_batch_item {
+        uuid id PK
+        datetime created_at
+        datetime updated_at
+        uuid batch_id FK
+        uuid client_file_id
+        integer position
+        text original_filename
+        text relative_path
+        bigint size_bytes
+        string media_type
+        enum status
+        integer attempt_count
+        integer processing_attempt_count
+        string content_sha256 "nullable"
+        string expected_file_sha256 "nullable"
+        text staged_file_path "nullable"
+        boolean is_gaussian_log
+        string selection_status
+        string parse_status
+        string materialization_status
+        uuid parse_revision_id FK "nullable"
+        uuid worker_lease_id "nullable"
+        datetime worker_lease_expires_at "nullable"
+        uuid artifact_file_id FK "nullable"
+        string error_code "nullable"
+        text error_message "nullable"
+        jsonb metadata_json
     }
     calculation_frame {
         uuid id PK
@@ -1161,11 +1180,11 @@ erDiagram
 ## Schema 完整性清单
 
 - `64` tables；
-- `778` columns；
-- `101` FK；
+- `794` columns；
+- `104` FK；
 - `77` UNIQUE；
-- `202` CHECK；
-- `171` indexes。
+- `209` CHECK；
+- `176` indexes。
 
 | table | columns | FK constraints | UNIQUE constraints | CHECK constraints | indexes |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -1179,30 +1198,30 @@ erDiagram
 | `external_identity` | 8 | 1 | 1 | 0 | 1 |
 | `mcp_access_token` | 8 | 1 | 0 | 0 | 5 |
 | `organization_membership` | 5 | 2 | 1 | 1 | 3 |
-| `project` | 6 | 1 | 1 | 2 | 2 |
+| `project` | 11 | 3 | 1 | 2 | 4 |
 | `storage_garbage_collection_run` | 13 | 1 | 0 | 6 | 3 |
-| `artifact_file` | 16 | 2 | 1 | 5 | 11 |
+| `artifact_file` | 17 | 2 | 1 | 5 | 11 |
 | `audit_event` | 8 | 2 | 0 | 0 | 4 |
 | `calculation_protocol` | 19 | 1 | 1 | 2 | 4 |
 | `logical_reaction` | 9 | 1 | 1 | 2 | 7 |
 | `molecular_formula` | 11 | 1 | 1 | 4 | 3 |
 | `project_invitation` | 13 | 2 | 0 | 1 | 7 |
 | `project_membership` | 5 | 2 | 1 | 1 | 3 |
-| `upload_batch` | 16 | 2 | 0 | 6 | 4 |
+| `upload_batch` | 19 | 2 | 0 | 8 | 5 |
 | `artifact_ingestion` | 16 | 1 | 1 | 7 | 2 |
 | `mapped_reaction` | 17 | 2 | 2 | 3 | 10 |
 | `molecular_topology` | 19 | 2 | 1 | 8 | 7 |
 | `parse_revision` | 34 | 2 | 1 | 11 | 4 |
-| `upload_batch_item` | 20 | 2 | 2 | 6 | 7 |
 | `workflow_manifest` | 12 | 2 | 3 | 6 | 2 |
 | `calculation_segment` | 23 | 2 | 2 | 12 | 2 |
-| `geometry` | 15 | 2 | 1 | 4 | 4 |
+| `geometry` | 15 | 2 | 1 | 4 | 5 |
 | `logical_reaction_participant` | 8 | 2 | 1 | 4 | 3 |
 | `manifest_artifact_binding` | 14 | 3 | 1 | 8 | 4 |
 | `mapped_reaction_node` | 6 | 1 | 3 | 2 | 2 |
-| `mapped_reaction_thermodynamic_profile` | 31 | 1 | 1 | 4 | 2 |
+| `mapped_reaction_thermodynamic_profile` | 31 | 1 | 1 | 5 | 2 |
 | `molecular_topology_abstraction` | 7 | 3 | 1 | 1 | 4 |
 | `molecular_topology_derivation` | 9 | 2 | 2 | 1 | 2 |
+| `upload_batch_item` | 27 | 3 | 2 | 10 | 8 |
 | `calculation_frame` | 66 | 3 | 3 | 38 | 9 |
 | `logical_participant_concrete_topology` | 7 | 2 | 1 | 1 | 2 |
 | `mapped_reaction_edge` | 8 | 4 | 2 | 2 | 5 |

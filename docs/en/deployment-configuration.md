@@ -76,6 +76,22 @@ small completed-result commit microbatch. The parse timeout is 60 seconds for a
 10 MiB input and scales proportionally; timeout advances only that worker to the
 next queued file. Never use `TRICYCLE_MOLOP_BATCH_N_JOBS=-1` in production.
 
+After RustFS staging, browser and remote imports use the batch form of the
+existing `ArtifactUploadService.reparse` path. The worker claims a 64-file
+window and `reparse_batch` only reads/verifies existing RustFS objects before
+delegating to the existing `upload_batch`, shared MolOP process pool, and single
+persistence consumer. It does not upload the object again or add a remote
+parser. `TRICYCLE_UPLOAD_MAX_CONCURRENCY` limits RustFS reads,
+`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` is retained for pending-ingestion
+recovery, and `TRICYCLE_MOLOP_BATCH_N_JOBS` is the shared parser-pool admission
+limit. Inside `upload_batch`, every 32 parsed results (or a temporarily empty
+result queue) are handed to the persistence consumer, while the durable worker
+normally uses the 64-file claim as the commit window. Neither boundary changes
+the 16-file parser admission target, and these controls must not be multiplied.
+The bulk path keeps the previous legacy hot-path behavior; per-file
+concrete/logical/reverse reconciliation must not be inserted there without a
+same-fixture throughput regression check.
+
 Scale API capacity through separate nodes behind Caddy and shared Redis rate
 limiting. Do not use multiple Uvicorn workers on one metrics listener without a
 Prometheus multiprocess design.

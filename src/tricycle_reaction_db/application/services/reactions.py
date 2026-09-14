@@ -25,6 +25,7 @@ from tricycle_reaction_db.application.dtos.reactions import (
     WorkflowManifestRecord,
 )
 from tricycle_reaction_db.application.services._persistence import (
+    LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
     _acquire_identity_locks,
     _assert_record_matches,
     _attach_pending_entities,
@@ -1293,6 +1294,25 @@ def persist_logical_reaction_participant(
                     "LogicalReactionParticipant identity resolved to different role: "
                     f"{participant.role!r} != {record.role!r}"
                 )
+        if not session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
+            from tricycle_reaction_db.application.services.reaction_topology_membership import (
+                ensure_logical_participant_concrete_memberships,
+            )
+
+            ensure_logical_participant_concrete_memberships(
+                session,
+                participant,
+                candidate_topologies=candidate_topologies,
+            )
+        return participant
+
+    participant = LogicalReactionParticipant(
+        logical_reaction=reaction,
+        topology=topology,
+        **record.model_dump(),
+    )
+    _flush_new_entity(session, participant, label="LogicalReactionParticipant")
+    if not session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
         from tricycle_reaction_db.application.services.reaction_topology_membership import (
             ensure_logical_participant_concrete_memberships,
         )
@@ -1302,23 +1322,6 @@ def persist_logical_reaction_participant(
             participant,
             candidate_topologies=candidate_topologies,
         )
-        return participant
-
-    participant = LogicalReactionParticipant(
-        logical_reaction=reaction,
-        topology=topology,
-        **record.model_dump(),
-    )
-    _flush_new_entity(session, participant, label="LogicalReactionParticipant")
-    from tricycle_reaction_db.application.services.reaction_topology_membership import (
-        ensure_logical_participant_concrete_memberships,
-    )
-
-    ensure_logical_participant_concrete_memberships(
-        session,
-        participant,
-        candidate_topologies=candidate_topologies,
-    )
     return participant
 
 
@@ -1467,7 +1470,9 @@ def persist_mapped_reaction(
         # row, also lock and check the concrete topology + atom-map identity.
         # This is the important idempotency barrier for mappings transferred
         # through the logical-topology DAG.
-        if concrete_topology_ids_by_template is not None:
+        if concrete_topology_ids_by_template is not None and not session.info.get(
+            LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False
+        ):
             concrete_identity = mapped_reaction_concrete_identity_for_templates(
                 session,
                 reaction,
@@ -1525,11 +1530,12 @@ def persist_mapped_reaction(
                 mapped_smiles=precomputed_mapped_smiles_by_template[component_key],
                 concrete_topology=concrete_topologies_by_key[component_key],
             )
-        _register_mapped_reaction_concrete_identity(
-            session,
-            mapped_reaction,
-            topology_context=topology_context,
-        )
+        if not session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
+            _register_mapped_reaction_concrete_identity(
+                session,
+                mapped_reaction,
+                topology_context=topology_context,
+            )
         return mapped_reaction
 
     # A mapped reaction must preserve the atom sequence from the trusted
@@ -1704,15 +1710,16 @@ def persist_mapped_reaction_participant(
             "mapped participant concrete topology must share the mapped reaction project"
         )
     concrete_topology_id = _require_id(concrete_topology, label="MolecularTopology")
-    from tricycle_reaction_db.application.services.reaction_topology_membership import (
-        persist_logical_participant_concrete_topology,
-    )
+    if not session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
+        from tricycle_reaction_db.application.services.reaction_topology_membership import (
+            persist_logical_participant_concrete_topology,
+        )
 
-    persist_logical_participant_concrete_topology(
-        session,
-        logical_participant,
-        concrete_topology,
-    )
+        persist_logical_participant_concrete_topology(
+            session,
+            logical_participant,
+            concrete_topology,
+        )
     if mapped_smiles_for_topology(concrete_topology, atom_map_numbers) != mapped_smiles:
         raise ValueError("mapped participant SMILES does not match its Topology atom maps")
     _acquire_identity_locks(

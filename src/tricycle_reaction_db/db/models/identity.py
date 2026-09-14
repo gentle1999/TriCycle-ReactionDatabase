@@ -181,8 +181,37 @@ class Project(SQLModel, table=True):
         index=True,
         nullable=False,
     )
+    # Nullable for projects created before the explicit project-identity
+    # contract was introduced. New application-created projects always set
+    # both fields to the authenticated creator/owner.
+    owner_user_id: UUID | None = Field(
+        default=None,
+        foreign_key="user_account.id",
+        ondelete="RESTRICT",
+        index=True,
+        nullable=True,
+    )
+    created_by_user_id: UUID | None = Field(
+        default=None,
+        foreign_key="user_account.id",
+        ondelete="RESTRICT",
+        index=True,
+        nullable=True,
+    )
     slug: str = Field(max_length=128, nullable=False)
     name: str = Field(sa_type=Text, nullable=False)
+    data_source: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default="{}"),
+    )
+    model_checkpoint: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default="{}"),
+    )
+    calculation_protocol: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default="{}"),
+    )
     status: ProjectStatus = Field(
         default=ProjectStatus.ACTIVE,
         sa_column=Column(

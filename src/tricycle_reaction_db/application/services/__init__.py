@@ -105,6 +105,12 @@ from tricycle_reaction_db.application.services.depictions import (
     get_transition_state_mode_dof_depiction,
 )
 from tricycle_reaction_db.application.services.graphql_catalog import GraphQLCatalogService
+from tricycle_reaction_db.application.services.import_jobs import (
+    ImportJobConflictError,
+    ImportJobError,
+    ImportJobNotFoundError,
+    ImportJobService,
+)
 from tricycle_reaction_db.application.services.invitations import (
     InvitationConflictError,
     InvitationError,
@@ -261,6 +267,10 @@ __all__ = [
     "InvitationError",
     "InvitationNotFoundError",
     "InvitationService",
+    "ImportJobConflictError",
+    "ImportJobError",
+    "ImportJobNotFoundError",
+    "ImportJobService",
     "AuthorizationService",
     "ArtifactQueryService",
     "ArtifactIngestionQueryService",

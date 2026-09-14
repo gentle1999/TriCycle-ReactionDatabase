@@ -10,11 +10,13 @@ from hashlib import sha256
 from uuid import UUID, uuid4
 
 from sqlalchemy import and_, func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from tricycle_reaction_db.application.dtos import (
     UploadBatchCreate,
+    UploadBatchFileCreate,
     UploadBatchItemPage,
     UploadBatchItemView,
     UploadBatchPage,
@@ -40,6 +42,9 @@ from tricycle_reaction_db.db.session import session_factory
 from tricycle_reaction_db.domain.enums import (
     ArtifactIngestionStatus,
     ArtifactKind,
+    ImportMaterializationStatus,
+    ImportParseStatus,
+    ImportSelectionStatus,
     StorageStatus,
     UploadBatchItemStatus,
     UploadBatchStatus,
@@ -150,6 +155,9 @@ def _batch_view(batch: UploadBatch) -> UploadBatchView:
         artifact_kind=batch.artifact_kind,
         status=batch.status,
         shared_metadata=batch.shared_metadata,
+        archive_sha256=batch.archive_sha256,
+        manifest_sha256=batch.manifest_sha256,
+        manifest_schema_version=batch.manifest_schema_version,
         total_count=batch.total_count,
         total_bytes=batch.total_bytes,
         succeeded_count=batch.succeeded_count,
@@ -182,6 +190,12 @@ def _item_view(
         attempt_count=item.attempt_count,
         processing_attempt_count=item.processing_attempt_count,
         content_sha256=item.content_sha256,
+        expected_file_sha256=item.expected_file_sha256,
+        is_gaussian_log=item.is_gaussian_log,
+        selection_status=ImportSelectionStatus(item.selection_status),
+        parse_status=ImportParseStatus(item.parse_status),
+        materialization_status=ImportMaterializationStatus(item.materialization_status),
+        parse_revision_id=item.parse_revision_id,
         artifact_file_id=item.artifact_file_id,
         ingestion_status=ingestion.status if ingestion is not None else ingestion_status,
         ingestion_error_message=(
@@ -246,12 +260,72 @@ def _finish_batch_if_terminal(batch: UploadBatch) -> None:
         batch.status = UploadBatchStatus.COMPLETED
 
 
+async def _refresh_manifest_paths(
+    session: AsyncSession,
+    batch: UploadBatch,
+    files: list[UploadBatchFileCreate],
+    *,
+    user_id: UUID,
+    now: datetime,
+) -> None:
+    """Refresh pending manifest paths when an operator relocates staging.
+
+    Only the manifest owner may update paths, and terminal raw/parse results
+    keep the path that was actually used for their completed attempt.
+    """
+
+    if batch.created_by_user_id != user_id:
+        return
+    existing_items = (
+        await session.exec(select(UploadBatchItem).where(col(UploadBatchItem.batch_id) == batch.id))
+    ).all()
+    files_by_client_id = {file.client_file_id: file for file in files}
+    updated = False
+    for item in existing_items:
+        incoming = files_by_client_id.get(item.client_file_id)
+        if (
+            incoming is not None
+            and item.status in {UploadBatchItemStatus.QUEUED, UploadBatchItemStatus.FAILED}
+            and incoming.staged_file_path is not None
+            and item.staged_file_path != incoming.staged_file_path
+        ):
+            item.staged_file_path = incoming.staged_file_path
+            item.updated_at = now
+            session.add(item)
+            updated = True
+    if updated:
+        batch.updated_at = now
+        session.add(batch)
+        await session.commit()
+        await session.refresh(batch)
+
+
 class UploadBatchService:
     """Manage a server-visible queue without combining file bodies into one request."""
 
     @staticmethod
-    async def create(payload: UploadBatchCreate, *, user_id: UUID) -> UploadBatchView:
+    async def create(
+        payload: UploadBatchCreate,
+        *,
+        user_id: UUID,
+        manifest_registration: bool = False,
+    ) -> UploadBatchView:
         settings = get_settings()
+        if not manifest_registration and (
+            payload.archive_sha256 is not None
+            or payload.manifest_sha256 is not None
+            or payload.manifest_schema_version is not None
+            or any(
+                file.expected_file_sha256 is not None
+                or file.staged_file_path is not None
+                or file.is_gaussian_log
+                or file.selection_status is not ImportSelectionStatus.SELECTED
+                for file in payload.files
+            )
+        ):
+            raise UploadBatchConflictError(
+                "manifest metadata must be registered through the import-job control plane"
+            )
         if len(payload.files) > settings.max_upload_queue_files:
             raise UploadBatchLimitError(
                 f"upload queue exceeds the {settings.max_upload_queue_files}-file limit"
@@ -291,14 +365,45 @@ class UploadBatchService:
         )
         now = datetime.now(UTC)
         async with session_factory() as session:
+            if payload.manifest_sha256 is not None:
+                existing = (
+                    await session.exec(
+                        select(UploadBatch).where(
+                            col(UploadBatch.project_id) == payload.project_id,
+                            col(UploadBatch.manifest_sha256) == payload.manifest_sha256,
+                        )
+                    )
+                ).first()
+                if existing is not None:
+                    if existing.artifact_kind is not payload.artifact_kind:
+                        raise UploadBatchConflictError(
+                            "manifest is already registered with a different artifact kind"
+                        )
+                    await _refresh_manifest_paths(
+                        session,
+                        existing,
+                        payload.files,
+                        user_id=user_id,
+                        now=now,
+                    )
+                    return _batch_view(existing)
+            selected_count = sum(
+                file.selection_status is ImportSelectionStatus.SELECTED for file in payload.files
+            )
             batch = UploadBatch(
                 project_id=payload.project_id,
                 created_by_user_id=user_id,
                 artifact_kind=payload.artifact_kind,
-                status=UploadBatchStatus.ACTIVE,
+                status=(
+                    UploadBatchStatus.ACTIVE if selected_count else UploadBatchStatus.COMPLETED
+                ),
                 shared_metadata=payload.shared_metadata,
+                archive_sha256=payload.archive_sha256,
+                manifest_sha256=payload.manifest_sha256,
+                manifest_schema_version=payload.manifest_schema_version,
                 total_count=len(payload.files),
                 total_bytes=total_bytes,
+                cancelled_count=len(payload.files) - selected_count,
                 updated_at=now,
             )
             session.add(batch)
@@ -314,13 +419,64 @@ class UploadBatchService:
                         relative_path=file.relative_path,
                         size_bytes=file.size_bytes,
                         media_type=file.media_type,
+                        expected_file_sha256=file.expected_file_sha256,
+                        staged_file_path=file.staged_file_path,
+                        is_gaussian_log=file.is_gaussian_log,
+                        selection_status=file.selection_status.value,
+                        parse_status=(
+                            ImportParseStatus.FILTERED.value
+                            if file.selection_status is not ImportSelectionStatus.SELECTED
+                            else ImportParseStatus.NOT_STARTED.value
+                        ),
+                        materialization_status=ImportMaterializationStatus.NOT_STARTED.value,
+                        status=(
+                            UploadBatchItemStatus.QUEUED
+                            if file.selection_status is ImportSelectionStatus.SELECTED
+                            else UploadBatchItemStatus.CANCELLED
+                        ),
+                        error_code=(
+                            "manifest_not_selected"
+                            if file.selection_status is not ImportSelectionStatus.SELECTED
+                            else None
+                        ),
+                        error_message=(
+                            "manifest entry is explicitly excluded from import"
+                            if file.selection_status is not ImportSelectionStatus.SELECTED
+                            else None
+                        ),
                         metadata_json=payload.shared_metadata,
                         updated_at=now,
                     )
                     for position, file in enumerate(payload.files)
                 ]
             )
-            await session.commit()
+            try:
+                await session.commit()
+            except IntegrityError as error:
+                await session.rollback()
+                if payload.manifest_sha256 is not None:
+                    existing = (
+                        await session.exec(
+                            select(UploadBatch).where(
+                                col(UploadBatch.project_id) == payload.project_id,
+                                col(UploadBatch.manifest_sha256) == payload.manifest_sha256,
+                            )
+                        )
+                    ).first()
+                    if existing is not None:
+                        if existing.artifact_kind is not payload.artifact_kind:
+                            raise UploadBatchConflictError(
+                                "manifest is already registered with a different artifact kind"
+                            ) from error
+                        await _refresh_manifest_paths(
+                            session,
+                            existing,
+                            payload.files,
+                            user_id=user_id,
+                            now=now,
+                        )
+                        return _batch_view(existing)
+                raise UploadBatchConflictError("upload batch identity already exists") from error
             await session.refresh(batch)
             return _batch_view(batch)
 
@@ -491,18 +647,28 @@ class UploadBatchService:
                 and artifact.project_id == batch.project_id
                 and artifact.artifact_kind is batch.artifact_kind
                 and artifact.size_bytes == item.size_bytes
-                and (item.content_sha256 is None or artifact.content_sha256 == item.content_sha256)
+                and (
+                    (item.content_sha256 is None or artifact.content_sha256 == item.content_sha256)
+                    and (
+                        item.expected_file_sha256 is None
+                        or artifact.content_sha256 == item.expected_file_sha256
+                    )
+                )
                 and artifact.storage_status is StorageStatus.AVAILABLE
             ):
                 return artifact
-        if item.content_sha256 is None:
+        # A manifest expectation is authoritative.  ``content_sha256`` may be
+        # a stale digest from an earlier failed attempt and must not prevent
+        # recovery from a valid object with the registered identity.
+        expected_sha256 = item.expected_file_sha256 or item.content_sha256
+        if expected_sha256 is None:
             return None
         return (
             await session.exec(
                 select(ArtifactFile)
                 .where(
                     col(ArtifactFile.project_id) == batch.project_id,
-                    col(ArtifactFile.content_sha256) == item.content_sha256,
+                    col(ArtifactFile.content_sha256) == expected_sha256,
                     col(ArtifactFile.size_bytes) == item.size_bytes,
                     col(ArtifactFile.artifact_kind) == batch.artifact_kind,
                     col(ArtifactFile.storage_status) == StorageStatus.AVAILABLE,
@@ -563,7 +729,13 @@ class UploadBatchService:
             if batch.status is UploadBatchStatus.CANCELLED:
                 if upload_result is not None:
                     item.artifact_file_id = upload_result.artifact_id
+                    item.parse_revision_id = upload_result.parse_revision_id
                 item.status = UploadBatchItemStatus.CANCELLED
+                item.materialization_status = (
+                    ImportMaterializationStatus.SUCCEEDED.value
+                    if upload_result is not None
+                    else ImportMaterializationStatus.FAILED.value
+                )
                 batch.cancelled_count += 1
                 item.error_code = None
                 item.error_message = None
@@ -572,6 +744,8 @@ class UploadBatchService:
                 item.artifact_file_id = None
                 ingestion = None
                 item.status = UploadBatchItemStatus.FAILED
+                item.parse_status = ImportParseStatus.FAILED.value
+                item.materialization_status = ImportMaterializationStatus.FAILED.value
                 batch.failed_count += 1
                 item.error_code = (
                     getattr(error, "error_code", None) or "artifact_stage_failed"
@@ -586,11 +760,14 @@ class UploadBatchService:
                 progress_phase = "failed"
             else:
                 item.artifact_file_id = upload_result.artifact_id
+                item.parse_revision_id = upload_result.parse_revision_id
+                item.materialization_status = ImportMaterializationStatus.SUCCEEDED.value
                 if upload_result.ingestion_id is not None:
                     ingestion = await session.get(ArtifactIngestion, upload_result.ingestion_id)
                 ingestion_status = upload_result.ingestion_status
                 if ingestion_status is ArtifactIngestionStatus.PENDING:
                     item.status = UploadBatchItemStatus.STAGED
+                    item.parse_status = ImportParseStatus.PENDING.value
                     batch.staged_count += 1
                     item.error_code = None
                     item.error_message = None
@@ -600,6 +777,11 @@ class UploadBatchService:
                     ArtifactIngestionStatus.FILTERED,
                 }:
                     item.status = UploadBatchItemStatus.FAILED
+                    item.parse_status = (
+                        ImportParseStatus.FILTERED.value
+                        if ingestion_status is ArtifactIngestionStatus.FILTERED
+                        else ImportParseStatus.FAILED.value
+                    )
                     batch.failed_count += 1
                     item.error_code = (
                         ingestion.error_code if ingestion is not None else "ingestion_failed"
@@ -612,6 +794,7 @@ class UploadBatchService:
                     progress_phase = "failed"
                 else:
                     item.status = UploadBatchItemStatus.SUCCEEDED
+                    item.parse_status = ImportParseStatus.SUCCEEDED.value
                     batch.succeeded_count += 1
                     item.error_code = None
                     item.error_message = None
@@ -694,7 +877,7 @@ class UploadBatchService:
         content_sha256_by_client_id = {
             client_file_id: cls._payload_sha256(upload) for client_file_id, upload in files
         }
-        pending: list[tuple[UUID, ArtifactUploadPayload, str]] = []
+        pending: list[tuple[UUID, ArtifactUploadPayload, str, str, str | None, int]] = []
         views_by_client_id: dict[UUID, UploadBatchItemView] = {}
         async with session_factory() as session:
             batch = await _owned_batch(session, batch_id, user_id, lock=True)
@@ -758,6 +941,25 @@ class UploadBatchService:
                     raise UploadBatchConflictError("upload batch file is already being uploaded")
                 if item.status is UploadBatchItemStatus.CANCELLED:
                     raise UploadBatchConflictError("cancelled upload batch files cannot be retried")
+                expected_sha256 = item.expected_file_sha256
+                actual_sha256 = content_sha256_by_client_id[client_file_id]
+                if expected_sha256 is not None and actual_sha256 != expected_sha256:
+                    if item.status is UploadBatchItemStatus.FAILED:
+                        batch.failed_count = max(0, batch.failed_count - 1)
+                    item.status = UploadBatchItemStatus.FAILED
+                    item.parse_status = ImportParseStatus.FAILED.value
+                    item.materialization_status = ImportMaterializationStatus.FAILED.value
+                    item.error_code = "manifest_file_hash_mismatch"
+                    item.error_message = (
+                        "uploaded file SHA-256 does not match the registered manifest"
+                    )
+                    item.content_sha256 = actual_sha256
+                    item.updated_at = now
+                    batch.failed_count += 1
+                    batch.updated_at = now
+                    session.add(item)
+                    views_by_client_id[client_file_id] = _item_view(item)
+                    continue
                 if batch.status is UploadBatchStatus.CANCELLED:
                     raise UploadBatchConflictError("cancelled upload batches cannot receive files")
                 if batch.status is UploadBatchStatus.PAUSED:
@@ -772,7 +974,9 @@ class UploadBatchService:
                 item.media_type = resolved_media_type
                 item.status = UploadBatchItemStatus.UPLOADING
                 item.attempt_count += 1
-                item.content_sha256 = content_sha256_by_client_id[client_file_id]
+                item.content_sha256 = actual_sha256
+                item.materialization_status = ImportMaterializationStatus.PENDING.value
+                item.parse_status = ImportParseStatus.NOT_STARTED.value
                 item.error_code = None
                 item.error_message = None
                 item.worker_lease_id = None
@@ -786,7 +990,16 @@ class UploadBatchService:
                 item.updated_at = now
                 batch.uploading_count += 1
                 pending_count += 1
-                pending.append((client_file_id, upload, resolved_media_type))
+                pending.append(
+                    (
+                        client_file_id,
+                        upload,
+                        resolved_media_type,
+                        item.relative_path,
+                        item.expected_file_sha256,
+                        item.size_bytes,
+                    )
+                )
                 session.add(item)
 
             if pending_count:
@@ -800,7 +1013,14 @@ class UploadBatchService:
 
         # Each stage operation is independent.  A failed object store request
         # becomes one failed queue item, while all other files remain usable.
-        for client_file_id, upload, resolved_media_type in pending:
+        for (
+            client_file_id,
+            upload,
+            resolved_media_type,
+            relative_path,
+            expected_sha256,
+            expected_size_bytes,
+        ) in pending:
             try:
                 staged = await ArtifactUploadService.stage(
                     payload=cls._payload_bytes(upload),
@@ -809,6 +1029,9 @@ class UploadBatchService:
                     artifact_kind=artifact_kind,
                     project_id=project_id,
                     user_id=user_id,
+                    relative_path=relative_path,
+                    expected_sha256=expected_sha256,
+                    expected_size_bytes=expected_size_bytes,
                 )
             except asyncio.CancelledError:
                 await cls._finish_staged_item(
@@ -857,10 +1080,14 @@ class UploadBatchService:
                 batch.failed_count = max(0, batch.failed_count - 1)
                 if await cls._link_recovered_artifact(session, batch, item):
                     item.status = UploadBatchItemStatus.STAGED
+                    item.parse_status = ImportParseStatus.PENDING.value
+                    item.materialization_status = ImportMaterializationStatus.SUCCEEDED.value
                     batch.staged_count += 1
                     phase = "staged"
                 else:
                     item.status = UploadBatchItemStatus.QUEUED
+                    item.parse_status = ImportParseStatus.NOT_STARTED.value
+                    item.materialization_status = ImportMaterializationStatus.NOT_STARTED.value
                     phase = "queued"
                 item.error_code = None
                 item.error_message = None
@@ -901,10 +1128,14 @@ class UploadBatchService:
             batch.failed_count = max(0, batch.failed_count - 1)
             if artifact_available:
                 item.status = UploadBatchItemStatus.STAGED
+                item.parse_status = ImportParseStatus.PENDING.value
+                item.materialization_status = ImportMaterializationStatus.SUCCEEDED.value
                 batch.staged_count += 1
                 phase = "staged"
             else:
                 item.status = UploadBatchItemStatus.QUEUED
+                item.parse_status = ImportParseStatus.NOT_STARTED.value
+                item.materialization_status = ImportMaterializationStatus.NOT_STARTED.value
                 phase = "queued"
             item.error_code = None
             item.error_message = None
@@ -1215,24 +1446,31 @@ class UploadBatchService:
 
             if batch.status is UploadBatchStatus.CANCELLED:
                 item.status = UploadBatchItemStatus.CANCELLED
+                item.parse_status = ImportParseStatus.FAILED.value
                 batch.cancelled_count += 1
                 phase = "cancelled"
                 error_code = "upload_cancelled"
                 error_message = "批次已取消，服务端已停止处理此文件"
             elif await UploadBatchService._link_recovered_artifact(session, batch, item):
                 item.status = UploadBatchItemStatus.STAGED
+                item.parse_status = ImportParseStatus.PENDING.value
+                item.materialization_status = ImportMaterializationStatus.SUCCEEDED.value
                 batch.staged_count += 1
                 phase = "staged"
                 error_code = "worker_interrupted"
                 error_message = "处理进程中断，文件仍保留在服务端等待重试"
             elif was_processing:
                 item.status = UploadBatchItemStatus.FAILED
+                item.parse_status = ImportParseStatus.FAILED.value
+                item.materialization_status = ImportMaterializationStatus.FAILED.value
                 batch.failed_count += 1
                 phase = "failed"
                 error_code = "processing_artifact_unavailable"
                 error_message = "处理租约失效且服务端文件不可用"
             else:
                 item.status = UploadBatchItemStatus.QUEUED
+                item.parse_status = ImportParseStatus.NOT_STARTED.value
+                item.materialization_status = ImportMaterializationStatus.NOT_STARTED.value
                 phase = "queued"
                 error_code = "upload_interrupted"
                 error_message = "上传请求中断，文件已返回等待队列"
@@ -1277,6 +1515,8 @@ class UploadBatchService:
                 item_id = _required_uuid(item.id, "UploadBatchItem")
                 if item.artifact_file_id is None:
                     item.status = UploadBatchItemStatus.FAILED
+                    item.parse_status = ImportParseStatus.FAILED.value
+                    item.materialization_status = ImportMaterializationStatus.FAILED.value
                     item.error_code = "staged_artifact_missing"
                     item.error_message = "staged queue item has no artifact reference"
                     item.metadata_json = _with_upload_progress(
@@ -1294,6 +1534,7 @@ class UploadBatchService:
                     continue
                 lease_id = uuid4()
                 item.status = UploadBatchItemStatus.PROCESSING
+                item.parse_status = ImportParseStatus.PENDING.value
                 item.processing_attempt_count += 1
                 item.worker_lease_id = lease_id
                 item.worker_lease_expires_at = now + timedelta(
@@ -1424,8 +1665,16 @@ class UploadBatchService:
             item.worker_lease_expires_at = None
             if upload_result is not None:
                 item.artifact_file_id = upload_result.artifact_id
+                item.parse_revision_id = upload_result.parse_revision_id
+                item.materialization_status = ImportMaterializationStatus.SUCCEEDED.value
             if failed:
                 item.status = UploadBatchItemStatus.FAILED
+                item.parse_status = (
+                    ImportParseStatus.FILTERED.value
+                    if upload_result is not None
+                    and upload_result.ingestion_status is ArtifactIngestionStatus.FILTERED
+                    else ImportParseStatus.FAILED.value
+                )
                 batch.failed_count += 1
                 item.error_code = (
                     getattr(error, "error_code", None)
@@ -1444,6 +1693,12 @@ class UploadBatchService:
                 phase = "failed"
             else:
                 item.status = UploadBatchItemStatus.SUCCEEDED
+                item.parse_status = (
+                    ImportParseStatus.PARTIAL.value
+                    if upload_result is not None
+                    and upload_result.ingestion_status is ArtifactIngestionStatus.PARTIAL
+                    else ImportParseStatus.SUCCEEDED.value
+                )
                 batch.succeeded_count += 1
                 item.error_code = None
                 item.error_message = None

@@ -1,12 +1,17 @@
-"""NexusX four-layer progressive-disclosure MCP transport."""
+"""NexusX query transport and authenticated import/project control tools."""
 
+import logging
 from collections.abc import Awaitable, Callable
+from datetime import date, datetime
+from enum import Enum
 from typing import Any, cast
+from uuid import UUID
 
 from fastmcp.server.middleware import Middleware as FastMCPMiddleware
 from fastmcp.server.middleware import MiddlewareContext
 from fastmcp.tools import ToolResult
 from nexusx import create_use_case_graphql_mcp_server  # type: ignore[import-untyped]
+from pydantic import BaseModel, ValidationError
 from starlette.middleware import Middleware as ASGIMiddleware
 from starlette.responses import JSONResponse
 from starlette.types import Receive, Scope, Send
@@ -16,6 +21,7 @@ from tricycle_reaction_db.api.query_guards import (
     project_scoped_use_case_methods,
     validate_graphql_project_scope,
 )
+from tricycle_reaction_db.application.dtos import ProjectCreate
 from tricycle_reaction_db.application.query_cost import (
     QueryBudgetExceeded,
     QueryProjectScopeRequired,
@@ -29,6 +35,7 @@ from tricycle_reaction_db.application.rate_limits import (
     create_rate_limiter,
 )
 from tricycle_reaction_db.application.services.authentication import (
+    AuthenticatedPrincipal,
     AuthenticationError,
     AuthenticationService,
     current_principal,
@@ -38,10 +45,29 @@ from tricycle_reaction_db.application.services.authentication import (
     set_current_principal,
     set_request_context_active,
 )
+from tricycle_reaction_db.application.services.authorization import ProjectAccessDeniedError
+from tricycle_reaction_db.application.services.import_jobs import (
+    ImportJobConflictError,
+    ImportJobNotFoundError,
+    ImportJobService,
+)
+from tricycle_reaction_db.application.services.project_management import (
+    ProjectManagementConflictError,
+    ProjectManagementNotFoundError,
+    ProjectManagementService,
+)
+from tricycle_reaction_db.application.services.upload_batches import (
+    UploadBatchConflictError,
+    UploadBatchLimitError,
+    UploadBatchNotFoundError,
+)
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.core.observability import MCP_ACTIVE_CONNECTIONS, RATE_LIMIT_DECISIONS
+from tricycle_reaction_db.domain.enums import ArtifactKind
+from tricycle_reaction_db.ingestion.manifest import ArtifactManifest
 
 ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
+logger = logging.getLogger(__name__)
 
 
 class MCPAuthenticationMiddleware:
@@ -245,6 +271,218 @@ mcp_server = create_use_case_graphql_mcp_server(
     apps=[config],
     name=get_settings().mcp_server_name,
 )
+
+
+def _mcp_success(data: Any) -> dict[str, Any]:
+    def to_json(value: Any) -> Any:
+        if isinstance(value, BaseModel):
+            return value.model_dump(mode="json")
+        if isinstance(value, dict):
+            return {str(key): to_json(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return [to_json(item) for item in value]
+        if isinstance(value, (UUID, datetime, date, Enum)):
+            return value.value if isinstance(value, Enum) else str(value)
+        return value
+
+    return {"success": True, "data": to_json(data)}
+
+
+def _mcp_error(code: str, message: str) -> dict[str, Any]:
+    return {"success": False, "error": {"code": code, "message": message}}
+
+
+def _mcp_principal() -> AuthenticatedPrincipal | None:
+    principal = current_principal()
+    if principal is None:
+        return None
+    return principal
+
+
+def _mcp_exception(error: Exception) -> dict[str, Any]:
+    """Map control-plane failures to a stable MCP response envelope."""
+
+    if isinstance(error, AuthenticationError):
+        return _mcp_error("authentication_required", str(error))
+    if isinstance(error, ValidationError):
+        return _mcp_error("invalid_argument", str(error))
+    if isinstance(error, ValueError):
+        return _mcp_error("invalid_argument", str(error))
+    if isinstance(
+        error, (ProjectManagementNotFoundError, ImportJobNotFoundError, UploadBatchNotFoundError)
+    ):
+        return _mcp_error("not_found", str(error))
+    if isinstance(error, ProjectAccessDeniedError):
+        return _mcp_error("forbidden", str(error))
+    if isinstance(
+        error,
+        (
+            ProjectManagementConflictError,
+            ImportJobConflictError,
+            UploadBatchConflictError,
+            UploadBatchLimitError,
+        ),
+    ):
+        return _mcp_error("conflict", str(error))
+    logger.exception("MCP control operation failed", exc_info=error)
+    return _mcp_error("internal_error", "MCP control operation failed")
+
+
+def _require_mcp_principal() -> AuthenticatedPrincipal:
+    principal = _mcp_principal()
+    if principal is None:
+        raise AuthenticationError("authenticated MCP principal is required")
+    return principal
+
+
+@mcp_server.tool(name="create_project")  # type: ignore[untyped-decorator]
+async def create_project(
+    organization_id: str,
+    slug: str,
+    name: str,
+    data_source: dict[str, Any] | None = None,
+    model_checkpoint: dict[str, Any] | None = None,
+    calculation_protocol: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create a canonical project owned by the authenticated organization user."""
+
+    try:
+        principal = _require_mcp_principal()
+        payload = ProjectCreate(
+            organization_id=UUID(organization_id),
+            slug=slug,
+            name=name,
+            data_source=data_source or {},
+            model_checkpoint=model_checkpoint or {},
+            calculation_protocol=calculation_protocol or {},
+        )
+        return _mcp_success(await ProjectManagementService.create_project(payload, principal))
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="register_import_manifest")  # type: ignore[untyped-decorator]
+async def register_import_manifest(
+    project_id: str,
+    manifest: dict[str, Any],
+    artifact_kind: ArtifactKind = ArtifactKind.CALCULATION_OUTPUT,
+) -> dict[str, Any]:
+    """Register an operator-staged manifest; file bytes never cross MCP."""
+
+    try:
+        principal = _require_mcp_principal()
+        parsed_manifest = ArtifactManifest.model_validate(manifest)
+        return _mcp_success(
+            await ImportJobService.register_manifest(
+                parsed_manifest,
+                project_id=UUID(project_id),
+                user_id=principal.user_id,
+                artifact_kind=artifact_kind,
+            )
+        )
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="start_import_job")  # type: ignore[untyped-decorator]
+async def start_import_job(import_job_id: str) -> dict[str, Any]:
+    """Start or continue a registered import job from its configured staging root."""
+
+    try:
+        principal = _require_mcp_principal()
+        return _mcp_success(
+            await ImportJobService.start(UUID(import_job_id), user_id=principal.user_id)
+        )
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="get_import_status")  # type: ignore[untyped-decorator]
+async def get_import_status(import_job_id: str) -> dict[str, Any]:
+    """Return durable job and item state for the authenticated owner."""
+
+    try:
+        principal = _require_mcp_principal()
+        return _mcp_success(
+            await ImportJobService.status(UUID(import_job_id), user_id=principal.user_id)
+        )
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="list_import_failures")  # type: ignore[untyped-decorator]
+async def list_import_failures(import_job_id: str) -> dict[str, Any]:
+    """List only failed items, including durable error codes and details."""
+
+    try:
+        principal = _require_mcp_principal()
+        return _mcp_success(
+            await ImportJobService.failures(UUID(import_job_id), user_id=principal.user_id)
+        )
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="retry_import_items")  # type: ignore[untyped-decorator]
+async def retry_import_items(
+    import_job_id: str,
+    item_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Retry selected failed items, or all failed items when item_ids is omitted."""
+
+    try:
+        principal = _require_mcp_principal()
+        parsed_item_ids = None if item_ids is None else [UUID(item_id) for item_id in item_ids]
+        return _mcp_success(
+            await ImportJobService.retry_items(
+                UUID(import_job_id),
+                item_ids=parsed_item_ids,
+                user_id=principal.user_id,
+            )
+        )
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="pause_import")  # type: ignore[untyped-decorator]
+async def pause_import(import_job_id: str) -> dict[str, Any]:
+    """Pause new file staging for an import job."""
+
+    try:
+        principal = _require_mcp_principal()
+        return _mcp_success(
+            await ImportJobService.pause(UUID(import_job_id), user_id=principal.user_id)
+        )
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="resume_import")  # type: ignore[untyped-decorator]
+async def resume_import(import_job_id: str) -> dict[str, Any]:
+    """Resume a paused import job and continue staging queued files."""
+
+    try:
+        principal = _require_mcp_principal()
+        return _mcp_success(
+            await ImportJobService.resume(UUID(import_job_id), user_id=principal.user_id)
+        )
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="cancel_import")  # type: ignore[untyped-decorator]
+async def cancel_import(import_job_id: str) -> dict[str, Any]:
+    """Cancel an import job while preserving its audit trail."""
+
+    try:
+        principal = _require_mcp_principal()
+        return _mcp_success(
+            await ImportJobService.cancel(UUID(import_job_id), user_id=principal.user_id)
+        )
+    except Exception as error:
+        return _mcp_exception(error)
+
+
 mcp_server.add_middleware(QueryGuardMiddleware())
 mcp_http_app = mcp_server.http_app(
     path="/",

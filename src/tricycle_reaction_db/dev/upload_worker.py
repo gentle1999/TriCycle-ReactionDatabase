@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import suppress
+from uuid import UUID
 
+from tricycle_reaction_db.application.dtos import ArtifactUploadResult
 from tricycle_reaction_db.application.services.artifact_uploads import (
     ArtifactUploadService,
     close_molop_process_pool,
@@ -90,6 +92,60 @@ class UploadBatchWorker:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
 
+    async def _process_jobs(self, jobs: list[UploadProcessingJob]) -> None:
+        """Reparse one claim window with one shared batch persistence pipeline."""
+
+        if not jobs:
+            return
+        # A claim can contain more than one active batch.  Keep those batches
+        # separate because ``upload_batch`` has one project-scoped persistence
+        # context, while starting one heartbeat per claimed item keeps leases
+        # alive when the groups are drained sequentially.
+        groups: dict[tuple[UUID, UUID], list[UploadProcessingJob]] = {}
+        for job in jobs:
+            groups.setdefault((job.batch_id, job.user_id), []).append(job)
+
+        finished_by_item = {job.item_id: asyncio.Event() for job in jobs}
+        heartbeats = [
+            asyncio.create_task(self._renew_until_done(job, finished_by_item[job.item_id]))
+            for job in jobs
+        ]
+        try:
+            for group in groups.values():
+                group_results: dict[UUID, ArtifactUploadResult | Exception]
+                try:
+                    group_results = await ArtifactUploadService.reparse_batch(
+                        artifact_ids=[job.artifact_file_id for job in group],
+                        user_id=group[0].user_id,
+                    )
+                except Exception as error:
+                    group_results = {job.artifact_file_id: error for job in group}
+
+                for job in group:
+                    result = group_results.get(job.artifact_file_id)
+                    try:
+                        if isinstance(result, Exception):
+                            await UploadBatchService.finish_processing(job, error=result)
+                        elif result is None:
+                            await UploadBatchService.finish_processing(
+                                job,
+                                error=RuntimeError("artifact reparse returned no result"),
+                            )
+                        else:
+                            await UploadBatchService.finish_processing(job, result=result)
+                    except Exception:
+                        logger.exception(
+                            "failed to record upload worker batch result batch=%s item=%s",
+                            job.batch_id,
+                            job.item_id,
+                        )
+                    finally:
+                        finished_by_item[job.item_id].set()
+        finally:
+            for heartbeat in heartbeats:
+                heartbeat.cancel()
+            await asyncio.gather(*heartbeats, return_exceptions=True)
+
     async def _renew_pending_until_done(
         self,
         job: PendingIngestionJob,
@@ -160,10 +216,14 @@ class UploadBatchWorker:
             try:
                 await UploadBatchService.recover_stale()
                 jobs = await UploadBatchService.claim_processing(
-                    limit=settings.upload_worker_concurrency,
+                    # Keep the parser pool fed with a bounded file queue. The
+                    # pool itself remains limited by ``molop_batch_n_jobs``;
+                    # claiming only that many files would make a slow file
+                    # pause replenishment and leave workers idle.
+                    limit=settings.max_batch_files,
                 )
                 if jobs:
-                    await asyncio.gather(*(self._process(job) for job in jobs))
+                    await self._process_jobs(jobs)
                     continue
                 pending_jobs = await UploadBatchService.claim_pending_ingestions(
                     limit=settings.upload_worker_concurrency,

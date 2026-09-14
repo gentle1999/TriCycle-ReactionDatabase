@@ -19,6 +19,8 @@ from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.util import await_only
 from sqlmodel import Session
 
+LEGACY_BULK_IMPORT_SESSION_INFO_KEY = "tricycle_legacy_bulk_import"
+
 _FAST_INSERT_SAFE_LOCK_NAMES = frozenset(
     {
         "calculation_frame_segment",

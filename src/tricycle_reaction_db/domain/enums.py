@@ -122,6 +122,34 @@ class UploadBatchItemStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class ImportSelectionStatus(StrEnum):
+    """Whether a manifest entry is eligible for ingestion."""
+
+    SELECTED = "selected"
+    FILTERED = "filtered"
+    REJECTED = "rejected"
+
+
+class ImportParseStatus(StrEnum):
+    """File-level parse state retained alongside the durable upload state."""
+
+    NOT_STARTED = "not_started"
+    PENDING = "pending"
+    SUCCEEDED = "succeeded"
+    PARTIAL = "partial"
+    FILTERED = "filtered"
+    FAILED = "failed"
+
+
+class ImportMaterializationStatus(StrEnum):
+    """Raw ArtifactFile/RustFS materialization state for one manifest item."""
+
+    NOT_STARTED = "not_started"
+    PENDING = "pending"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
 class TransitionStateInferenceStatus(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
@@ -353,6 +381,9 @@ __all__ = [
     "EnergyQuantitySemantics",
     "FrameRole",
     "GeometryAssignmentKind",
+    "ImportMaterializationStatus",
+    "ImportParseStatus",
+    "ImportSelectionStatus",
     "ManifestArtifactRole",
     "OptimizationStatus",
     "OrganizationRole",

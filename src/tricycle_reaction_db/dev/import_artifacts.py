@@ -27,9 +27,16 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
     ArtifactUploadService,
     close_molop_process_pool,
 )
+from tricycle_reaction_db.application.services.import_jobs import ImportJobService
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.session import engine
 from tricycle_reaction_db.domain.enums import ArtifactIngestionStatus, ArtifactKind
+from tricycle_reaction_db.ingestion.manifest import (
+    ArtifactManifest,
+    ManifestError,
+    load_manifest,
+    validate_manifest_staging,
+)
 
 HASH_CHUNK_BYTES = 1024 * 1024
 MAX_FINGERPRINT_WORKERS = 32
@@ -70,6 +77,12 @@ class ImportCandidate:
     path: Path
     size_bytes: int
     mtime_ns: int
+    relative_path: str | None = None
+    archive_sha256: str | None = None
+    file_sha256: str | None = None
+    media_type: str | None = None
+    is_gaussian_log: bool | None = None
+    selection_status: str = "selected"
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,27 +264,40 @@ def discover_files(
     include_suffixes: Collection[str] | None = None,
     exclude_suffixes: Collection[str] | None = None,
     exclude_name_globs: Collection[str] | None = None,
+    strict_security: bool = False,
     discovery_stats: dict[str, int] | None = None,
 ) -> list[ImportCandidate]:
     """Return regular files below roots in deterministic order.
 
-    Symlinks are ignored so an import root cannot unexpectedly walk outside the
-    explicitly selected tree. Passing a symlink as a root is still allowed and
-    resolves that root once before scanning.
+    Symlinks are ignored in the legacy discovery mode so an import root cannot
+    unexpectedly walk outside the explicitly selected tree. Manifest-backed
+    imports use ``strict_security=True`` or the dedicated staging validator,
+    which rejects links, hard links, and special files instead of silently
+    skipping them.
     """
 
     candidates: dict[Path, ImportCandidate] = {}
     for raw_root in roots:
+        if strict_security and raw_root.is_symlink():
+            raise ValueError(f"import root must not be a symbolic link: {raw_root}")
         root = raw_root.expanduser().resolve()
         if not root.exists():
             raise ValueError(f"import path does not exist: {raw_root}")
+        root_is_file = root.is_file()
         paths = [root] if root.is_file() else root.rglob("*")
         for path in paths:
-            if path.is_symlink() or not path.is_file():
+            if path.is_symlink():
+                if strict_security:
+                    raise ValueError(f"import path must not be a symbolic link: {path}")
+                continue
+            if not path.is_file():
                 continue
             if discovery_stats is not None:
                 discovery_stats["scanned"] = discovery_stats.get("scanned", 0) + 1
             resolved = path.resolve()
+            stat = resolved.stat()
+            if strict_security and stat.st_nlink != 1:
+                raise ValueError(f"import path must not be a hard link: {resolved}")
             if artifact_kind is not None and not is_importable_file(
                 resolved,
                 artifact_kind=artifact_kind,
@@ -282,12 +308,50 @@ def discover_files(
                 if discovery_stats is not None:
                     discovery_stats["excluded"] = discovery_stats.get("excluded", 0) + 1
                 continue
-            stat = resolved.stat()
+            relative_path = resolved.name if root_is_file else resolved.relative_to(root).as_posix()
             candidates.setdefault(
                 resolved,
-                ImportCandidate(path=resolved, size_bytes=stat.st_size, mtime_ns=stat.st_mtime_ns),
+                ImportCandidate(
+                    path=resolved,
+                    size_bytes=stat.st_size,
+                    mtime_ns=stat.st_mtime_ns,
+                    relative_path=relative_path,
+                    media_type=_media_type(resolved),
+                    is_gaussian_log=_normalized_suffix(resolved) == ".log",
+                ),
             )
     return sorted(candidates.values(), key=lambda item: item.path.as_posix().casefold())
+
+
+def candidates_from_manifest(
+    manifest: ArtifactManifest | Path,
+    *,
+    staging_root: Path,
+) -> list[ImportCandidate]:
+    """Create import candidates only for selected, verified manifest entries."""
+
+    resolved_manifest = load_manifest(manifest) if isinstance(manifest, Path) else manifest
+    try:
+        entries = validate_manifest_staging(resolved_manifest, staging_root=staging_root)
+    except ManifestError:
+        raise
+    candidates: list[ImportCandidate] = []
+    for entry, path in entries:
+        stat = path.stat()
+        candidates.append(
+            ImportCandidate(
+                path=path,
+                size_bytes=entry.size_bytes,
+                mtime_ns=stat.st_mtime_ns,
+                relative_path=entry.relative_path,
+                archive_sha256=entry.archive_sha256,
+                file_sha256=entry.file_sha256,
+                media_type=entry.media_type,
+                is_gaussian_log=entry.is_gaussian_log,
+                selection_status=entry.selection_status,
+            )
+        )
+    return candidates
 
 
 def iter_batches(
@@ -366,6 +430,52 @@ class ImportState:
                     if not isinstance(source, str) or not source:
                         raise ValueError(f"import state line {line_number} has no source")
                     self._records[source] = record
+                    identity = record.get("identity")
+                    if isinstance(identity, str) and identity:
+                        self._records[identity] = record
+
+    @staticmethod
+    def _identity(
+        *,
+        project_id: UUID,
+        artifact_kind: ArtifactKind,
+        archive_sha256: str | None,
+        relative_path: str | None,
+        file_sha256: str,
+    ) -> str | None:
+        if not archive_sha256 or not relative_path:
+            return None
+        return json.dumps(
+            [
+                str(project_id),
+                artifact_kind.value,
+                archive_sha256.casefold(),
+                relative_path,
+                file_sha256.casefold(),
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def _lookup(
+        self,
+        path: Path,
+        *,
+        project_id: UUID,
+        artifact_kind: ArtifactKind,
+        fingerprint: ImportFingerprint,
+        archive_sha256: str | None,
+        relative_path: str | None,
+        file_sha256: str | None,
+    ) -> dict[str, Any] | None:
+        identity = self._identity(
+            project_id=project_id,
+            artifact_kind=artifact_kind,
+            archive_sha256=archive_sha256,
+            relative_path=relative_path,
+            file_sha256=file_sha256 or fingerprint.sha256,
+        )
+        return self._records.get(identity) if identity is not None else self._records.get(str(path))
 
     def succeeded(
         self,
@@ -374,15 +484,29 @@ class ImportState:
         project_id: UUID,
         artifact_kind: ArtifactKind,
         fingerprint: ImportFingerprint,
+        archive_sha256: str | None = None,
+        relative_path: str | None = None,
+        file_sha256: str | None = None,
     ) -> bool:
-        record = self._records.get(str(path))
+        record = self._lookup(
+            path,
+            project_id=project_id,
+            artifact_kind=artifact_kind,
+            fingerprint=fingerprint,
+            archive_sha256=archive_sha256,
+            relative_path=relative_path,
+            file_sha256=file_sha256,
+        )
         return bool(
             record
             and record.get("status") == "succeeded"
             and record.get("project_id") == str(project_id)
             and record.get("artifact_kind") == artifact_kind.value
             and record.get("size_bytes") == fingerprint.size_bytes
-            and record.get("mtime_ns") == fingerprint.mtime_ns
+            and (
+                (archive_sha256 is not None and relative_path is not None)
+                or record.get("mtime_ns") == fingerprint.mtime_ns
+            )
             and record.get("sha256") == fingerprint.sha256
         )
 
@@ -393,8 +517,19 @@ class ImportState:
         project_id: UUID,
         artifact_kind: ArtifactKind,
         fingerprint: ImportFingerprint,
+        archive_sha256: str | None = None,
+        relative_path: str | None = None,
+        file_sha256: str | None = None,
     ) -> bool:
-        record = self._records.get(str(path))
+        record = self._lookup(
+            path,
+            project_id=project_id,
+            artifact_kind=artifact_kind,
+            fingerprint=fingerprint,
+            archive_sha256=archive_sha256,
+            relative_path=relative_path,
+            file_sha256=file_sha256,
+        )
         return bool(
             record
             and record.get("status") in {"succeeded", "filtered"}
@@ -407,13 +542,19 @@ class ImportState:
             and record.get("project_id") == str(project_id)
             and record.get("artifact_kind") == artifact_kind.value
             and record.get("size_bytes") == fingerprint.size_bytes
-            and record.get("mtime_ns") == fingerprint.mtime_ns
+            and (
+                (archive_sha256 is not None and relative_path is not None)
+                or record.get("mtime_ns") == fingerprint.mtime_ns
+            )
             and record.get("sha256") == fingerprint.sha256
         )
 
     def append(self, record: dict[str, Any]) -> None:
         source = record["source"]
         self._records[source] = record
+        identity = record.get("identity")
+        if isinstance(identity, str) and identity:
+            self._records[identity] = record
         if self.path is None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -527,9 +668,29 @@ def _record(
     ingestion_status: str | None = None,
     error: str | None = None,
 ) -> dict[str, Any]:
+    relative_path = candidate.relative_path or candidate.path.name
+    identity = ImportState._identity(
+        project_id=project_id,
+        artifact_kind=artifact_kind,
+        archive_sha256=candidate.archive_sha256,
+        relative_path=relative_path,
+        file_sha256=candidate.file_sha256 or fingerprint.sha256,
+    )
     return {
         "source": str(candidate.path),
         "filename": candidate.path.name,
+        "relative_path": relative_path,
+        "staged_file_path": str(candidate.path),
+        "archive_sha256": candidate.archive_sha256,
+        "file_sha256": candidate.file_sha256 or fingerprint.sha256,
+        "media_type": candidate.media_type or _media_type(candidate.path),
+        "is_gaussian_log": (
+            candidate.is_gaussian_log
+            if candidate.is_gaussian_log is not None
+            else _normalized_suffix(candidate.path) == ".log"
+        ),
+        "selection_status": candidate.selection_status,
+        "identity": identity,
         "project_id": str(project_id),
         "artifact_kind": artifact_kind.value,
         "size_bytes": fingerprint.size_bytes,
@@ -594,6 +755,9 @@ async def import_files(
                 project_id=project_id,
                 artifact_kind=artifact_kind,
                 fingerprint=fingerprint,
+                archive_sha256=candidate.archive_sha256,
+                relative_path=candidate.relative_path,
+                file_sha256=candidate.file_sha256,
             ):
                 summary = summary.add(ImportSummary(skipped=1))
                 continue
@@ -619,12 +783,40 @@ async def import_files(
         transient_retry: int = 0,
     ) -> ImportSummary:
         batch_started = perf_counter()
+        changed_manifest_files = [
+            candidate
+            for candidate in batch
+            if candidate.file_sha256 is not None
+            and (
+                fingerprints[candidate].sha256 != candidate.file_sha256.casefold()
+                or fingerprints[candidate].size_bytes != candidate.size_bytes
+            )
+        ]
+        if changed_manifest_files:
+            for candidate in changed_manifest_files:
+                state.append(
+                    _record(
+                        candidate,
+                        fingerprints[candidate],
+                        project_id=project_id,
+                        artifact_kind=artifact_kind,
+                        status="failed",
+                        error="manifest_file_changed",
+                    )
+                )
+            return ImportSummary(
+                attempted=len(changed_manifest_files),
+                failed=len(changed_manifest_files),
+            )
         payloads = [
             ArtifactUploadPayload(
                 filename=candidate.path.name,
-                media_type=_media_type(candidate.path),
+                media_type=candidate.media_type or _media_type(candidate.path),
                 payload=None,
                 spool_path=candidate.path,
+                relative_path=candidate.relative_path,
+                expected_sha256=candidate.file_sha256,
+                expected_size_bytes=candidate.size_bytes,
             )
             for candidate in batch
         ]
@@ -902,6 +1094,9 @@ async def import_files(
                     project_id=project_id,
                     artifact_kind=artifact_kind,
                     fingerprint=fingerprint,
+                    archive_sha256=candidate.archive_sha256,
+                    relative_path=candidate.relative_path,
+                    file_sha256=candidate.file_sha256,
                 ):
                     skipped_count += 1
                 else:
@@ -976,15 +1171,24 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "roots",
-        nargs="+",
+        nargs="*",
         type=Path,
         help="files or directories to import recursively",
+    )
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        help=(
+            "validated JSON manifest for a staged archive; when supplied, only selected "
+            "manifest entries are registered"
+        ),
     )
     parser.add_argument("--project-id", required=True, type=UUID)
     parser.add_argument(
         "--user-id",
         type=UUID,
-        help="authenticated project user; defaults to development user",
+        required=True,
+        help="authenticated project user with artifact:upload permission",
     )
     parser.add_argument(
         "--artifact-kind",
@@ -1063,12 +1267,70 @@ def _parser() -> argparse.ArgumentParser:
 
 async def _run(args: argparse.Namespace) -> int:
     settings = get_settings()
-    user_id = args.user_id or settings.development_user_id
-    if settings.environment == "production" and args.user_id is None:
-        raise ValueError("--user-id is required when TRICYCLE_ENVIRONMENT=production")
+    user_id = args.user_id
+    if bool(args.manifest) == bool(args.roots):
+        raise ValueError("provide exactly one of --manifest or one or more import roots")
     artifact_kind = ArtifactKind(args.artifact_kind)
     started_at = perf_counter()
     metrics = ImportMetrics()
+
+    if args.manifest is not None:
+        if settings.import_staging_root is None:
+            raise ValueError("TRICYCLE_IMPORT_STAGING_ROOT is required for --manifest")
+        if any(
+            (
+                args.include_suffix,
+                args.exclude_suffix,
+                args.exclude_name_glob,
+                args.state_file,
+            )
+        ):
+            raise ValueError(
+                "--manifest cannot be combined with suffix filters or --state-file; "
+                "manifest selection is authoritative"
+            )
+        manifest = load_manifest(args.manifest)
+        if args.dry_run:
+            candidates = candidates_from_manifest(
+                manifest,
+                staging_root=settings.import_staging_root,
+            )
+            summary = await import_files(
+                candidates,
+                project_id=args.project_id,
+                user_id=user_id,
+                artifact_kind=artifact_kind,
+                state=ImportState(None),
+                dry_run=True,
+                metrics=metrics,
+            )
+            payload = {
+                "mode": "manifest-dry-run",
+                "manifest_entry_count": len(manifest.entries),
+                "selected_entry_count": len(candidates),
+                "summary": asdict(summary),
+                "timings": metrics.as_dict(total_ms=(perf_counter() - started_at) * 1000),
+            }
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return 0
+
+        registered = await ImportJobService.register_manifest(
+            manifest,
+            project_id=args.project_id,
+            user_id=user_id,
+            artifact_kind=artifact_kind,
+        )
+        started = await ImportJobService.start(registered.id, user_id=user_id)
+        payload = {
+            "mode": "manifest",
+            "manifest_entry_count": len(manifest.entries),
+            "registered_job": registered.model_dump(mode="json"),
+            "job": started.model_dump(mode="json"),
+            "timings": {"total_ms": round((perf_counter() - started_at) * 1000, 3)},
+        }
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 1 if started.failed_count else 0
+
     discover_started = perf_counter()
     discovery_stats: dict[str, int] = {}
     candidates = discover_files(
