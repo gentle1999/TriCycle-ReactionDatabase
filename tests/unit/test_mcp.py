@@ -1,14 +1,48 @@
+import base64
 import json
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
+from uuid import UUID
 
 import pytest
 from mcp.types import TextContent
 
+from tricycle_reaction_db.api import mcp as mcp_module
 from tricycle_reaction_db.api.mcp import QueryGuardMiddleware, _mcp_success, mcp_server
-from tricycle_reaction_db.application.dtos import ProjectView
+from tricycle_reaction_db.application.dtos import (
+    OrganizationAccessView,
+    OrganizationMemberView,
+    ProjectView,
+    UploadBatchItemView,
+    UploadBatchView,
+)
 from tricycle_reaction_db.application.rate_limits import RateLimitBackendUnavailable
-from tricycle_reaction_db.domain.enums import ProjectStatus
+from tricycle_reaction_db.application.services.artifact_upload_types import (
+    ArtifactUploadPayload,
+)
+from tricycle_reaction_db.application.services.authentication import (
+    AuthenticatedPrincipal,
+    reset_current_principal,
+    set_current_principal,
+)
+from tricycle_reaction_db.application.services.upload_batches import StagedUploadSubmission
+from tricycle_reaction_db.domain.enums import (
+    ArtifactIngestionStatus,
+    ArtifactKind,
+    ImportMaterializationStatus,
+    ImportParseStatus,
+    OrganizationRole,
+    OrganizationStatus,
+    ProjectStatus,
+    UploadBatchItemStatus,
+    UploadBatchStatus,
+)
+from tricycle_reaction_db.domain.identity import (
+    DEVELOPMENT_IDENTITY_ISSUER,
+    DEVELOPMENT_IDENTITY_SUBJECT,
+    DEVELOPMENT_USER_ID,
+)
 
 
 async def _call(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -18,8 +52,80 @@ async def _call(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     return json.loads(content.text)
 
 
+async def _call_as_development_user(
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    principal = AuthenticatedPrincipal(
+        user_id=DEVELOPMENT_USER_ID,
+        display_name="Development User",
+        primary_email="developer@localhost",
+        is_service_account=False,
+        issuer=DEVELOPMENT_IDENTITY_ISSUER,
+        subject=DEVELOPMENT_IDENTITY_SUBJECT,
+    )
+    token = set_current_principal(principal)
+    try:
+        return await _call(tool_name, arguments)
+    finally:
+        reset_current_principal(token)
+
+
+def _staged_submission(
+    *,
+    project_id: UUID,
+    filename: str,
+    payload: bytes,
+    artifact_id: UUID,
+) -> StagedUploadSubmission:
+    now = datetime.now(UTC)
+    batch_id = UUID("00000000-0000-7000-8000-000000000720")
+    batch = UploadBatchView(
+        id=batch_id,
+        created_at=now,
+        updated_at=now,
+        project_id=project_id,
+        created_by_user_id=DEVELOPMENT_USER_ID,
+        artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+        status=UploadBatchStatus.ACTIVE,
+        shared_metadata={},
+        total_count=1,
+        total_bytes=len(payload),
+        succeeded_count=0,
+        failed_count=0,
+        cancelled_count=0,
+        uploading_count=0,
+        staged_count=1,
+        processing_count=0,
+    )
+    item = UploadBatchItemView(
+        id=UUID("00000000-0000-7000-8000-000000000721"),
+        batch_id=batch_id,
+        created_at=now,
+        updated_at=now,
+        client_file_id=UUID("00000000-0000-7000-8000-000000000722"),
+        position=0,
+        original_filename=filename,
+        relative_path=filename,
+        size_bytes=len(payload),
+        media_type="text/plain",
+        status=UploadBatchItemStatus.STAGED,
+        attempt_count=1,
+        processing_attempt_count=0,
+        content_sha256=None,
+        expected_file_sha256=None,
+        parse_status=ImportParseStatus.PENDING,
+        materialization_status=ImportMaterializationStatus.SUCCEEDED,
+        artifact_file_id=artifact_id,
+        ingestion_id=UUID("00000000-0000-7000-8000-000000000723"),
+        ingestion_status=ArtifactIngestionStatus.PENDING,
+        metadata={},
+    )
+    return StagedUploadSubmission(batch=batch, items=(item,))
+
+
 @pytest.mark.asyncio
-async def test_mcp_exposes_query_and_import_control_tools() -> None:
+async def test_mcp_exposes_query_management_and_import_tools() -> None:
     tools = await mcp_server.list_tools()
 
     assert {tool.name for tool in tools} == {
@@ -27,7 +133,25 @@ async def test_mcp_exposes_query_and_import_control_tools() -> None:
         "describe_compose_schema",
         "describe_compose_method",
         "compose_query",
+        "list_organizations",
+        "create_organization",
+        "list_organization_members",
+        "upsert_organization_member",
+        "remove_organization_member",
         "create_project",
+        "list_projects",
+        "get_project",
+        "update_project",
+        "list_project_members",
+        "upsert_project_member",
+        "remove_project_member",
+        "list_project_invitations",
+        "create_project_invitation",
+        "revoke_project_invitation",
+        "resend_project_invitation",
+        "accept_project_invitation",
+        "list_project_audit",
+        "upload_calculation_log",
         "register_import_manifest",
         "start_import_job",
         "get_import_status",
@@ -52,6 +176,253 @@ async def test_mcp_control_tools_require_transport_authentication() -> None:
             "message": "authenticated MCP principal is required",
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_mcp_organization_tools_use_the_authenticated_user_and_org_services(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization_id = UUID("00000000-0000-7000-8000-000000000710")
+    member_id = UUID("00000000-0000-7000-8000-000000000711")
+    observed: dict[str, Any] = {}
+
+    async def list_organizations(user_id: UUID) -> list[OrganizationAccessView]:
+        observed["list_user_id"] = user_id
+        return [
+            OrganizationAccessView(
+                id=organization_id,
+                slug="research",
+                name="Research",
+                status=OrganizationStatus.ACTIVE,
+                role=OrganizationRole.OWNER,
+                can_create_projects=True,
+            )
+        ]
+
+    async def create_organization(payload: Any, principal: AuthenticatedPrincipal) -> Any:
+        observed["create_payload"] = payload
+        observed["create_principal"] = principal
+        return OrganizationAccessView(
+            id=organization_id,
+            slug=payload.slug,
+            name=payload.name,
+            status=OrganizationStatus.ACTIVE,
+            role=OrganizationRole.OWNER,
+            can_create_projects=True,
+        )
+
+    async def upsert_member(
+        requested_organization_id: UUID,
+        payload: Any,
+        principal: AuthenticatedPrincipal,
+    ) -> OrganizationMemberView:
+        observed["member_organization_id"] = requested_organization_id
+        observed["member_payload"] = payload
+        observed["member_principal"] = principal
+        return OrganizationMemberView(
+            user_id=payload.user_id,
+            display_name="New Member",
+            primary_email="member@example.test",
+            role=payload.role,
+        )
+
+    async def remove_member(
+        requested_organization_id: UUID,
+        user_id: UUID,
+        principal: AuthenticatedPrincipal,
+    ) -> None:
+        observed["remove"] = (requested_organization_id, user_id, principal)
+
+    monkeypatch.setattr(
+        mcp_module.AuthorizationService,
+        "organization_accesses",
+        staticmethod(list_organizations),
+    )
+    monkeypatch.setattr(
+        mcp_module.OrganizationManagementService,
+        "create_organization",
+        staticmethod(create_organization),
+    )
+    monkeypatch.setattr(
+        mcp_module.OrganizationManagementService,
+        "upsert_member",
+        staticmethod(upsert_member),
+    )
+    monkeypatch.setattr(
+        mcp_module.OrganizationManagementService,
+        "remove_member",
+        staticmethod(remove_member),
+    )
+
+    listed = await _call_as_development_user("list_organizations", {})
+    created = await _call_as_development_user(
+        "create_organization",
+        {"slug": "research", "name": "Research"},
+    )
+    member = await _call_as_development_user(
+        "upsert_organization_member",
+        {
+            "organization_id": str(organization_id),
+            "user_id": str(member_id),
+            "role": "admin",
+        },
+    )
+    removed = await _call_as_development_user(
+        "remove_organization_member",
+        {"organization_id": str(organization_id), "user_id": str(member_id)},
+    )
+
+    assert listed["data"][0]["id"] == str(organization_id)
+    assert created["data"]["role"] == "owner"
+    assert observed["list_user_id"] == DEVELOPMENT_USER_ID
+    assert observed["create_payload"].slug == "research"
+    assert observed["create_principal"].user_id == DEVELOPMENT_USER_ID
+    assert observed["member_organization_id"] == organization_id
+    assert observed["member_payload"].role is OrganizationRole.ADMIN
+    assert observed["member_principal"].user_id == DEVELOPMENT_USER_ID
+    assert member["data"]["user_id"] == str(member_id)
+    assert removed["data"]["removed"] is True
+    assert observed["remove"][:2] == (organization_id, member_id)
+
+
+@pytest.mark.asyncio
+async def test_mcp_calculation_upload_decodes_base64_and_delegates_project_authentication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id = UUID("00000000-0000-7000-8000-000000000712")
+    payload = b"%chk=calculation\n#p wb97xd/def2-svp\n"
+    observed: dict[str, Any] = {}
+
+    async def create_and_stage(**kwargs: Any) -> StagedUploadSubmission:
+        observed.update(kwargs)
+        files = kwargs["files"]
+        assert isinstance(files, list)
+        assert len(files) == 1
+        upload = files[0]
+        assert isinstance(upload, ArtifactUploadPayload)
+        return _staged_submission(
+            project_id=project_id,
+            filename=upload.filename,
+            payload=upload.payload or b"",
+            artifact_id=UUID("00000000-0000-7000-8000-000000000713"),
+        )
+
+    monkeypatch.setattr(
+        mcp_module.UploadBatchService,
+        "create_and_stage",
+        staticmethod(create_and_stage),
+    )
+
+    result = await _call_as_development_user(
+        "upload_calculation_log",
+        {
+            "project_id": str(project_id),
+            "filename": "calculation.log",
+            "content_base64": base64.b64encode(payload).decode("ascii"),
+            "media_type": "text/plain",
+        },
+    )
+
+    assert result == {
+        "success": True,
+        "data": {
+            "batch": {
+                "id": "00000000-0000-7000-8000-000000000720",
+                "created_at": result["data"]["batch"]["created_at"],
+                "updated_at": result["data"]["batch"]["updated_at"],
+                "project_id": str(project_id),
+                "created_by_user_id": str(DEVELOPMENT_USER_ID),
+                "artifact_kind": "calculation_output",
+                "status": "active",
+                "shared_metadata": {},
+                "archive_sha256": None,
+                "manifest_sha256": None,
+                "manifest_schema_version": None,
+                "total_count": 1,
+                "total_bytes": len(payload),
+                "succeeded_count": 0,
+                "failed_count": 0,
+                "cancelled_count": 0,
+                "uploading_count": 0,
+                "staged_count": 1,
+                "processing_count": 0,
+            },
+            "item": {
+                "id": "00000000-0000-7000-8000-000000000721",
+                "batch_id": "00000000-0000-7000-8000-000000000720",
+                "created_at": result["data"]["item"]["created_at"],
+                "updated_at": result["data"]["item"]["updated_at"],
+                "client_file_id": "00000000-0000-7000-8000-000000000722",
+                "position": 0,
+                "original_filename": "calculation.log",
+                "relative_path": "calculation.log",
+                "size_bytes": len(payload),
+                "media_type": "text/plain",
+                "status": "staged",
+                "attempt_count": 1,
+                "processing_attempt_count": 0,
+                "content_sha256": None,
+                "expected_file_sha256": None,
+                "is_gaussian_log": False,
+                "selection_status": "selected",
+                "parse_status": "pending",
+                "materialization_status": "succeeded",
+                "parse_revision_id": None,
+                "artifact_file_id": "00000000-0000-7000-8000-000000000713",
+                "ingestion_id": "00000000-0000-7000-8000-000000000723",
+                "ingestion_status": "pending",
+                "ingestion_error_message": None,
+                "error_code": None,
+                "error_message": None,
+                "metadata": {},
+            },
+        },
+    }
+    assert observed == {
+        "files": [
+            ArtifactUploadPayload(
+                filename="calculation.log",
+                media_type="text/plain",
+                payload=payload,
+                relative_path=None,
+                expected_sha256=None,
+                expected_size_bytes=None,
+            )
+        ],
+        "artifact_kind": ArtifactKind.CALCULATION_OUTPUT,
+        "project_id": project_id,
+        "user_id": DEVELOPMENT_USER_ID,
+    }
+
+
+@pytest.mark.asyncio
+async def test_mcp_calculation_upload_rejects_invalid_base64_before_service_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    async def create_and_stage(**_: Any) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(
+        mcp_module.UploadBatchService,
+        "create_and_stage",
+        staticmethod(create_and_stage),
+    )
+
+    result = await _call_as_development_user(
+        "upload_calculation_log",
+        {
+            "project_id": "00000000-0000-7000-8000-000000000714",
+            "filename": "calculation.log",
+            "content_base64": "not-base64",
+        },
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "invalid_argument"
+    assert called is False
 
 
 def test_mcp_success_serializes_nested_pydantic_payloads() -> None:

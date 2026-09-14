@@ -1,5 +1,7 @@
-"""NexusX query transport and authenticated import/project control tools."""
+"""NexusX query transport and authenticated organization/project control tools."""
 
+import base64
+import binascii
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime
@@ -21,7 +23,14 @@ from tricycle_reaction_db.api.query_guards import (
     project_scoped_use_case_methods,
     validate_graphql_project_scope,
 )
-from tricycle_reaction_db.application.dtos import ProjectCreate
+from tricycle_reaction_db.application.dtos import (
+    OrganizationCreate,
+    OrganizationMemberUpsert,
+    ProjectCreate,
+    ProjectInvitationCreate,
+    ProjectMemberUpsert,
+    ProjectUpdate,
+)
 from tricycle_reaction_db.application.query_cost import (
     QueryBudgetExceeded,
     QueryProjectScopeRequired,
@@ -34,6 +43,13 @@ from tricycle_reaction_db.application.rate_limits import (
     RateLimitBackendUnavailable,
     create_rate_limiter,
 )
+from tricycle_reaction_db.application.services.artifact_uploads import (
+    ArtifactUploadConflictError,
+    ArtifactUploadError,
+    ArtifactUploadLimitError,
+    ArtifactUploadPayload,
+)
+from tricycle_reaction_db.application.services.audit import AuditService
 from tricycle_reaction_db.application.services.authentication import (
     AuthenticatedPrincipal,
     AuthenticationError,
@@ -45,11 +61,26 @@ from tricycle_reaction_db.application.services.authentication import (
     set_current_principal,
     set_request_context_active,
 )
-from tricycle_reaction_db.application.services.authorization import ProjectAccessDeniedError
+from tricycle_reaction_db.application.services.authorization import (
+    AuthorizationService,
+    ProjectAccessDeniedError,
+)
 from tricycle_reaction_db.application.services.import_jobs import (
     ImportJobConflictError,
     ImportJobNotFoundError,
     ImportJobService,
+)
+from tricycle_reaction_db.application.services.invitations import (
+    InvitationConflictError,
+    InvitationError,
+    InvitationNotFoundError,
+    InvitationService,
+)
+from tricycle_reaction_db.application.services.organization_management import (
+    OrganizationManagementAccessDeniedError,
+    OrganizationManagementConflictError,
+    OrganizationManagementNotFoundError,
+    OrganizationManagementService,
 )
 from tricycle_reaction_db.application.services.project_management import (
     ProjectManagementConflictError,
@@ -60,10 +91,16 @@ from tricycle_reaction_db.application.services.upload_batches import (
     UploadBatchConflictError,
     UploadBatchLimitError,
     UploadBatchNotFoundError,
+    UploadBatchService,
 )
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.core.observability import MCP_ACTIVE_CONNECTIONS, RATE_LIMIT_DECISIONS
-from tricycle_reaction_db.domain.enums import ArtifactKind
+from tricycle_reaction_db.domain.enums import (
+    ArtifactKind,
+    OrganizationRole,
+    ProjectRole,
+    ProjectStatus,
+)
 from tricycle_reaction_db.ingestion.manifest import ArtifactManifest
 
 ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
@@ -309,21 +346,38 @@ def _mcp_exception(error: Exception) -> dict[str, Any]:
     if isinstance(error, ValueError):
         return _mcp_error("invalid_argument", str(error))
     if isinstance(
-        error, (ProjectManagementNotFoundError, ImportJobNotFoundError, UploadBatchNotFoundError)
+        error,
+        (
+            ProjectManagementNotFoundError,
+            ImportJobNotFoundError,
+            UploadBatchNotFoundError,
+            InvitationNotFoundError,
+            OrganizationManagementNotFoundError,
+        ),
     ):
         return _mcp_error("not_found", str(error))
-    if isinstance(error, ProjectAccessDeniedError):
+    if isinstance(
+        error,
+        (ProjectAccessDeniedError, OrganizationManagementAccessDeniedError, PermissionError),
+    ):
         return _mcp_error("forbidden", str(error))
+    if isinstance(error, ArtifactUploadLimitError):
+        return _mcp_error("payload_too_large", str(error))
     if isinstance(
         error,
         (
+            OrganizationManagementConflictError,
             ProjectManagementConflictError,
+            InvitationConflictError,
             ImportJobConflictError,
             UploadBatchConflictError,
             UploadBatchLimitError,
+            ArtifactUploadConflictError,
         ),
     ):
         return _mcp_error("conflict", str(error))
+    if isinstance(error, (ArtifactUploadError, InvitationError)):
+        return _mcp_error("invalid_argument", str(error))
     logger.exception("MCP control operation failed", exc_info=error)
     return _mcp_error("internal_error", "MCP control operation failed")
 
@@ -333,6 +387,104 @@ def _require_mcp_principal() -> AuthenticatedPrincipal:
     if principal is None:
         raise AuthenticationError("authenticated MCP principal is required")
     return principal
+
+
+def _decode_mcp_payload(content_base64: str) -> bytes:
+    """Decode one MCP file payload while enforcing the configured byte budget."""
+
+    encoded = content_base64.strip()
+    if not encoded:
+        raise ValueError("content_base64 must not be empty")
+    maximum_encoded_length = 4 * ((get_settings().max_upload_bytes + 2) // 3)
+    if len(encoded) > maximum_encoded_length:
+        raise ArtifactUploadLimitError(
+            f"encoded calculation log exceeds the {get_settings().max_upload_bytes}-byte limit"
+        )
+    try:
+        payload = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, UnicodeError, ValueError) as error:
+        raise ValueError("content_base64 must be valid standard base64") from error
+    if not payload:
+        raise ValueError("uploaded calculation log is empty")
+    return payload
+
+
+@mcp_server.tool(name="list_organizations")  # type: ignore[untyped-decorator]
+async def list_organizations() -> dict[str, Any]:
+    """List active organizations visible to the authenticated user."""
+
+    try:
+        principal = _require_mcp_principal()
+        return _mcp_success(await AuthorizationService.organization_accesses(principal.user_id))
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="create_organization")  # type: ignore[untyped-decorator]
+async def create_organization(slug: str, name: str) -> dict[str, Any]:
+    """Create an organization and make the authenticated user its owner."""
+
+    try:
+        principal = _require_mcp_principal()
+        payload = OrganizationCreate(slug=slug, name=name)
+        return _mcp_success(
+            await OrganizationManagementService.create_organization(payload, principal)
+        )
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="list_organization_members")  # type: ignore[untyped-decorator]
+async def list_organization_members(organization_id: str) -> dict[str, Any]:
+    """List members of an organization visible to the authenticated user."""
+
+    try:
+        principal = _require_mcp_principal()
+        return _mcp_success(
+            await OrganizationManagementService.list_members(UUID(organization_id), principal)
+        )
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="upsert_organization_member")  # type: ignore[untyped-decorator]
+async def upsert_organization_member(
+    organization_id: str,
+    user_id: str,
+    role: OrganizationRole = OrganizationRole.MEMBER,
+) -> dict[str, Any]:
+    """Add an organization member or change its role; owner/admin access is required."""
+
+    try:
+        principal = _require_mcp_principal()
+        payload = OrganizationMemberUpsert(user_id=UUID(user_id), role=role)
+        return _mcp_success(
+            await OrganizationManagementService.upsert_member(
+                UUID(organization_id),
+                payload,
+                principal,
+            )
+        )
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="remove_organization_member")  # type: ignore[untyped-decorator]
+async def remove_organization_member(organization_id: str, user_id: str) -> dict[str, Any]:
+    """Remove an organization member while preserving the last-owner safeguard."""
+
+    try:
+        principal = _require_mcp_principal()
+        await OrganizationManagementService.remove_member(
+            UUID(organization_id),
+            UUID(user_id),
+            principal,
+        )
+        return _mcp_success(
+            {"removed": True, "organization_id": organization_id, "user_id": user_id}
+        )
+    except Exception as error:
+        return _mcp_exception(error)
 
 
 @mcp_server.tool(name="create_project")  # type: ignore[untyped-decorator]
@@ -357,6 +509,254 @@ async def create_project(
             calculation_protocol=calculation_protocol or {},
         )
         return _mcp_success(await ProjectManagementService.create_project(payload, principal))
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="list_projects")  # type: ignore[untyped-decorator]
+async def list_projects(
+    organization_id: str | None = None,
+    include_archived: bool = False,
+) -> dict[str, Any]:
+    """List projects visible to the authenticated user, optionally by organization."""
+
+    try:
+        principal = _require_mcp_principal()
+        requested_organization_id = UUID(organization_id) if organization_id is not None else None
+        projects = await ProjectManagementService.list_projects(
+            principal,
+            include_archived=include_archived,
+        )
+        if requested_organization_id is not None:
+            projects = [
+                project
+                for project in projects
+                if project.organization_id == requested_organization_id
+            ]
+        return _mcp_success(projects)
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="get_project")  # type: ignore[untyped-decorator]
+async def get_project(project_id: str) -> dict[str, Any]:
+    """Get one project visible to the authenticated user."""
+
+    try:
+        principal = _require_mcp_principal()
+        return _mcp_success(await ProjectManagementService.get_project(UUID(project_id), principal))
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="update_project")  # type: ignore[untyped-decorator]
+async def update_project(
+    project_id: str,
+    slug: str | None = None,
+    name: str | None = None,
+    status: ProjectStatus | None = None,
+) -> dict[str, Any]:
+    """Update a project; the caller must be its manager or organization admin."""
+
+    try:
+        principal = _require_mcp_principal()
+        payload = ProjectUpdate(slug=slug, name=name, status=status)
+        return _mcp_success(
+            await ProjectManagementService.update_project(UUID(project_id), payload, principal)
+        )
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="list_project_members")  # type: ignore[untyped-decorator]
+async def list_project_members(project_id: str) -> dict[str, Any]:
+    """List members of a project for a project manager or organization admin."""
+
+    try:
+        principal = _require_mcp_principal()
+        return _mcp_success(
+            await ProjectManagementService.list_members(UUID(project_id), principal)
+        )
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="upsert_project_member")  # type: ignore[untyped-decorator]
+async def upsert_project_member(
+    project_id: str,
+    user_id: str,
+    role: ProjectRole = ProjectRole.VIEWER,
+) -> dict[str, Any]:
+    """Add a project member or change its role."""
+
+    try:
+        principal = _require_mcp_principal()
+        payload = ProjectMemberUpsert(user_id=UUID(user_id), role=role)
+        return _mcp_success(
+            await ProjectManagementService.upsert_member(UUID(project_id), payload, principal)
+        )
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="remove_project_member")  # type: ignore[untyped-decorator]
+async def remove_project_member(project_id: str, user_id: str) -> dict[str, Any]:
+    """Remove a project member while preserving the last-manager safeguard."""
+
+    try:
+        principal = _require_mcp_principal()
+        await ProjectManagementService.remove_member(
+            UUID(project_id),
+            UUID(user_id),
+            principal,
+        )
+        return _mcp_success({"removed": True, "project_id": project_id, "user_id": user_id})
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="list_project_invitations")  # type: ignore[untyped-decorator]
+async def list_project_invitations(project_id: str) -> dict[str, Any]:
+    """List invitations for a project manager or organization admin."""
+
+    try:
+        principal = _require_mcp_principal()
+        return _mcp_success(await InvitationService.list(UUID(project_id), principal))
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="create_project_invitation")  # type: ignore[untyped-decorator]
+async def create_project_invitation(
+    project_id: str,
+    email: str,
+    role: ProjectRole = ProjectRole.VIEWER,
+    expires_in_days: int = 7,
+) -> dict[str, Any]:
+    """Invite a user to a project and return its one-time acceptance token and URL."""
+
+    try:
+        principal = _require_mcp_principal()
+        payload = ProjectInvitationCreate(
+            email=email,
+            role=role,
+            expires_in_days=expires_in_days,
+        )
+        return _mcp_success(
+            await InvitationService.create(
+                UUID(project_id),
+                payload,
+                principal,
+                frontend_url=get_settings().oidc_frontend_url,
+            )
+        )
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="revoke_project_invitation")  # type: ignore[untyped-decorator]
+async def revoke_project_invitation(project_id: str, invitation_id: str) -> dict[str, Any]:
+    """Revoke an unaccepted project invitation."""
+
+    try:
+        principal = _require_mcp_principal()
+        await InvitationService.revoke(UUID(project_id), UUID(invitation_id), principal)
+        return _mcp_success({"revoked": True, "invitation_id": invitation_id})
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="resend_project_invitation")  # type: ignore[untyped-decorator]
+async def resend_project_invitation(project_id: str, invitation_id: str) -> dict[str, Any]:
+    """Regenerate and resend an unaccepted project invitation."""
+
+    try:
+        principal = _require_mcp_principal()
+        return _mcp_success(
+            await InvitationService.resend(
+                UUID(project_id),
+                UUID(invitation_id),
+                principal,
+                frontend_url=get_settings().oidc_frontend_url,
+            )
+        )
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="accept_project_invitation")  # type: ignore[untyped-decorator]
+async def accept_project_invitation(invitation_token: str) -> dict[str, Any]:
+    """Accept an invitation when its email matches the authenticated user."""
+
+    try:
+        principal = _require_mcp_principal()
+        return _mcp_success(await InvitationService.accept(invitation_token, principal))
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="list_project_audit")  # type: ignore[untyped-decorator]
+async def list_project_audit(
+    project_id: str,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """List the audit trail for a project manager or organization admin."""
+
+    try:
+        if limit < 1 or limit > 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        if offset < 0:
+            raise ValueError("offset must be non-negative")
+        principal = _require_mcp_principal()
+        return _mcp_success(
+            await AuditService.list_events(
+                principal,
+                project_id=UUID(project_id),
+                limit=limit,
+                offset=offset,
+            )
+        )
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="upload_calculation_log")  # type: ignore[untyped-decorator]
+async def upload_calculation_log(
+    project_id: str,
+    filename: str,
+    content_base64: str,
+    media_type: str = "application/octet-stream",
+    relative_path: str | None = None,
+    expected_sha256: str | None = None,
+    expected_size_bytes: int | None = None,
+) -> dict[str, Any]:
+    """Stage one Gaussian/ORCA calculation log for durable worker parsing."""
+
+    try:
+        principal = _require_mcp_principal()
+        payload = _decode_mcp_payload(content_base64)
+        submission = await UploadBatchService.create_and_stage(
+            files=[
+                ArtifactUploadPayload(
+                    filename=filename,
+                    media_type=media_type,
+                    payload=payload,
+                    relative_path=relative_path,
+                    expected_sha256=expected_sha256,
+                    expected_size_bytes=expected_size_bytes,
+                )
+            ],
+            artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+            project_id=UUID(project_id),
+            user_id=principal.user_id,
+        )
+        return _mcp_success(
+            {
+                "batch": submission.batch,
+                "item": submission.items[0],
+            }
+        )
     except Exception as error:
         return _mcp_exception(error)
 

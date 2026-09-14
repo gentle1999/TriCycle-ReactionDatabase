@@ -1,5 +1,6 @@
 import asyncio
 import ssl
+from datetime import UTC, datetime
 from urllib.parse import parse_qs, urlparse
 from uuid import UUID
 
@@ -13,17 +14,15 @@ from tricycle_reaction_db.api.app import create_app
 from tricycle_reaction_db.api.routes import auth as auth_routes
 from tricycle_reaction_db.api.routes import uploads as upload_routes
 from tricycle_reaction_db.application.dtos import (
-    ArtifactBatchUploadItem,
-    ArtifactBatchUploadResult,
     ArtifactPreview,
-    ArtifactUploadResult,
     ArtifactValidationResult,
+    UploadBatchItemView,
+    UploadBatchView,
 )
 from tricycle_reaction_db.application.services import (
     ArtifactContentService,
     ArtifactDownload,
     ArtifactForbiddenError,
-    ArtifactUploadService,
     AuthenticatedPrincipal,
     AuthenticationError,
     AuthenticationService,
@@ -31,15 +30,106 @@ from tricycle_reaction_db.application.services import (
 from tricycle_reaction_db.application.services import authentication as authentication_module
 from tricycle_reaction_db.application.services.artifact_uploads import (
     ArtifactUploadError,
-    ArtifactUploadLimitError,
+    ArtifactUploadPayload,
+    ArtifactUploadService,
+)
+from tricycle_reaction_db.application.services.upload_batches import (
+    StagedUploadSubmission,
+    UploadBatchLimitError,
+    UploadBatchService,
 )
 from tricycle_reaction_db.core.config import Settings
-from tricycle_reaction_db.domain.enums import ArtifactKind, StorageStatus
+from tricycle_reaction_db.domain.enums import (
+    ArtifactIngestionStatus,
+    ArtifactKind,
+    ImportMaterializationStatus,
+    ImportParseStatus,
+    UploadBatchItemStatus,
+    UploadBatchStatus,
+)
 from tricycle_reaction_db.domain.identity import DEVELOPMENT_USER_ID
 
 PUBLIC_ARTIFACT_ID = UUID("00000000-0000-7000-8000-000000000601")
 PROJECT_ARTIFACT_ID = UUID("00000000-0000-7000-8000-000000000602")
 PUBLIC_PROJECT_ID = UUID("00000000-0000-7000-8000-000000000603")
+
+
+def _staged_submission(
+    files: list[ArtifactUploadPayload],
+    *,
+    project_id: UUID,
+    artifact_kind: ArtifactKind,
+    artifact_ids: list[UUID] | None = None,
+) -> StagedUploadSubmission:
+    now = datetime.now(UTC)
+    batch_id = UUID("00000000-0000-7000-8000-000000000650")
+    is_calculation = artifact_kind is ArtifactKind.CALCULATION_OUTPUT
+    items = [
+        UploadBatchItemView(
+            id=UUID(int=0x650 + position),
+            batch_id=batch_id,
+            created_at=now,
+            updated_at=now,
+            client_file_id=UUID(int=0x750 + position),
+            position=position,
+            original_filename=file.filename,
+            relative_path=file.relative_path or file.filename,
+            size_bytes=(
+                len(file.payload)
+                if file.payload is not None
+                else file.spool_path.stat().st_size
+                if file.spool_path is not None
+                else 0
+            ),
+            media_type=file.media_type,
+            status=(
+                UploadBatchItemStatus.STAGED
+                if is_calculation
+                else UploadBatchItemStatus.SUCCEEDED
+            ),
+            attempt_count=1,
+            processing_attempt_count=0,
+            content_sha256=None,
+            expected_file_sha256=None,
+            is_gaussian_log=False,
+            parse_status=(
+                ImportParseStatus.PENDING
+                if is_calculation
+                else ImportParseStatus.SUCCEEDED
+            ),
+            materialization_status=ImportMaterializationStatus.SUCCEEDED,
+            artifact_file_id=(
+                artifact_ids[position]
+                if artifact_ids is not None
+                else UUID(int=0x850 + position)
+            ),
+            ingestion_id=UUID(int=0x950 + position) if is_calculation else None,
+            ingestion_status=ArtifactIngestionStatus.PENDING if is_calculation else None,
+            error_code=None,
+            error_message=None,
+            metadata={},
+        )
+        for position, file in enumerate(files)
+    ]
+    batch = UploadBatchView(
+        id=batch_id,
+        created_at=now,
+        updated_at=now,
+        project_id=project_id,
+        created_by_user_id=DEVELOPMENT_USER_ID,
+        artifact_kind=artifact_kind,
+        status=UploadBatchStatus.ACTIVE if is_calculation else UploadBatchStatus.COMPLETED,
+        shared_metadata={},
+        total_count=len(items),
+        total_bytes=sum(item.size_bytes for item in items),
+        succeeded_count=0 if is_calculation else len(items),
+        failed_count=0,
+        cancelled_count=0,
+        uploading_count=0,
+        staged_count=len(items) if is_calculation else 0,
+        processing_count=0,
+    )
+    return StagedUploadSubmission(batch=batch, items=tuple(items))
 
 
 async def _reject_authentication(_: str | None) -> None:
@@ -598,21 +688,25 @@ async def test_authenticated_artifact_upload_uses_unified_endpoint(
     project_id = UUID("00000000-0000-7000-8000-000000000201")
     artifact_id = UUID("00000000-0000-7000-8000-000000000603")
 
-    async def upload(**values: object) -> ArtifactUploadResult:
-        assert values["payload"] == b"supporting data\n"
-        assert values["filename"] == "notes.txt"
+    async def create_and_stage(**values: object) -> StagedUploadSubmission:
+        files = values["files"]
+        assert isinstance(files, list)
+        assert len(files) == 1
+        upload = files[0]
+        assert isinstance(upload, ArtifactUploadPayload)
+        assert upload.payload == b"supporting data\n"
+        assert upload.filename == "notes.txt"
         assert values["project_id"] == project_id
         assert values["user_id"] == DEVELOPMENT_USER_ID
         assert values["artifact_kind"] is ArtifactKind.AUXILIARY
-        return ArtifactUploadResult(
-            artifact_id=artifact_id,
+        return _staged_submission(
+            files,
+            project_id=project_id,
             artifact_kind=ArtifactKind.AUXILIARY,
-            storage_status=StorageStatus.AVAILABLE,
-            inferred_reaction_count=0,
-            inferences=[],
+            artifact_ids=[artifact_id],
         )
 
-    monkeypatch.setattr(ArtifactUploadService, "upload", staticmethod(upload))
+    monkeypatch.setattr(UploadBatchService, "create_and_stage", staticmethod(create_and_stage))
     async with AsyncClient(
         transport=ASGITransport(app=create_app()),
         base_url="http://test",
@@ -623,20 +717,10 @@ async def test_authenticated_artifact_upload_uses_unified_endpoint(
             files={"file": ("notes.txt", b"supporting data\n", "text/plain")},
         )
 
-    assert response.status_code == 200
-    assert response.json() == {
-        "artifact_id": str(artifact_id),
-        "artifact_kind": "auxiliary",
-        "storage_status": "available",
-        "ingestion_id": None,
-        "parse_revision_id": None,
-        "parse_revision_created": None,
-        "ingestion_status": None,
-        "source_frame_count": None,
-        "transition_state_frame_count": None,
-        "inferred_reaction_count": 0,
-        "inferences": [],
-    }
+    assert response.status_code == 202
+    assert response.json()["batch"]["status"] == "completed"
+    assert response.json()["item"]["artifact_file_id"] == str(artifact_id)
+    assert response.json()["item"]["status"] == "succeeded"
 
 
 @pytest.mark.asyncio
@@ -644,13 +728,12 @@ async def test_authenticated_artifact_uploads_are_processed_concurrently(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project_id = UUID("00000000-0000-7000-8000-000000000201")
-    artifact_id = UUID("00000000-0000-7000-8000-000000000603")
     release = asyncio.Event()
     active = 0
     peak = 0
     started = 0
 
-    async def upload(**_: object) -> ArtifactUploadResult:
+    async def create_and_stage(**values: object) -> StagedUploadSubmission:
         nonlocal active, peak, started
         active += 1
         started += 1
@@ -659,17 +742,17 @@ async def test_authenticated_artifact_uploads_are_processed_concurrently(
             release.set()
         try:
             await asyncio.wait_for(release.wait(), timeout=1)
-            return ArtifactUploadResult(
-                artifact_id=artifact_id,
+            files = values["files"]
+            assert isinstance(files, list)
+            return _staged_submission(
+                files,
+                project_id=project_id,
                 artifact_kind=ArtifactKind.AUXILIARY,
-                storage_status=StorageStatus.AVAILABLE,
-                inferred_reaction_count=0,
-                inferences=[],
             )
         finally:
             active -= 1
 
-    monkeypatch.setattr(ArtifactUploadService, "upload", staticmethod(upload))
+    monkeypatch.setattr(UploadBatchService, "create_and_stage", staticmethod(create_and_stage))
     async with AsyncClient(
         transport=ASGITransport(app=create_app()),
         base_url="http://test",
@@ -685,7 +768,7 @@ async def test_authenticated_artifact_uploads_are_processed_concurrently(
             )
         )
 
-    assert [response.status_code for response in responses] == [200, 200, 200]
+    assert [response.status_code for response in responses] == [202, 202, 202]
     assert peak == 3
 
 
@@ -695,7 +778,7 @@ async def test_authenticated_batch_upload_preserves_each_raw_file(
 ) -> None:
     project_id = UUID("00000000-0000-7000-8000-000000000201")
 
-    async def upload_batch(**values: object) -> ArtifactBatchUploadResult:
+    async def create_and_stage(**values: object) -> StagedUploadSubmission:
         files = values["files"]
         assert isinstance(files, list)
         assert [item.filename for item in files] == ["first.log", "second.orcaout"]
@@ -706,25 +789,13 @@ async def test_authenticated_batch_upload_preserves_each_raw_file(
             b"gaussian\n",
             b"orca\n",
         ]
-        return ArtifactBatchUploadResult(
-            total_count=2,
-            succeeded_count=1,
-            failed_count=1,
-            source_frame_count=3,
-            transition_state_frame_count=1,
-            inferred_reaction_count=1,
-            items=[
-                ArtifactBatchUploadItem(filename="first.log", succeeded=True),
-                ArtifactBatchUploadItem(
-                    filename="second.orcaout",
-                    succeeded=False,
-                    error_code="molop_parse_failed",
-                    error_message="invalid output",
-                ),
-            ],
+        return _staged_submission(
+            files,
+            project_id=project_id,
+            artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
         )
 
-    monkeypatch.setattr(ArtifactUploadService, "upload_batch", staticmethod(upload_batch))
+    monkeypatch.setattr(UploadBatchService, "create_and_stage", staticmethod(create_and_stage))
     async with AsyncClient(
         transport=ASGITransport(app=create_app()),
         base_url="http://test",
@@ -738,12 +809,11 @@ async def test_authenticated_batch_upload_preserves_each_raw_file(
             ],
         )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     body = response.json()
-    assert body["total_count"] == 2
-    assert body["succeeded_count"] == body["inferred_reaction_count"] == 1
-    assert body["failed_count"] == 1
-    assert body["items"][1]["error_code"] == "molop_parse_failed"
+    assert body["batch"]["total_count"] == 2
+    assert body["batch"]["staged_count"] == 2
+    assert [item["status"] for item in body["items"]] == ["staged", "staged"]
 
 
 @pytest.mark.asyncio
@@ -791,10 +861,10 @@ async def test_authenticated_batch_upload_rejects_resource_limits(
     )
     monkeypatch.setattr(upload_routes, "get_settings", lambda: settings)
 
-    async def fail_if_called(**_: object) -> ArtifactBatchUploadResult:
+    async def fail_if_called(**_: object) -> StagedUploadSubmission:
         raise AssertionError("resource-rejected batch reached the upload service")
 
-    monkeypatch.setattr(ArtifactUploadService, "upload_batch", staticmethod(fail_if_called))
+    monkeypatch.setattr(UploadBatchService, "create_and_stage", staticmethod(fail_if_called))
     async with AsyncClient(
         transport=ASGITransport(app=create_app()),
         base_url="http://test",
@@ -814,10 +884,10 @@ async def test_authenticated_batch_upload_rejects_resource_limits(
 async def test_batch_route_preserves_service_level_limit_as_http_413(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def reject_after_route_preflight(**_: object) -> ArtifactBatchUploadResult:
-        raise ArtifactUploadLimitError("upload batch exceeds the service byte limit")
+    async def reject_after_route_preflight(**_: object) -> StagedUploadSubmission:
+        raise UploadBatchLimitError("upload batch exceeds the service byte limit")
 
-    monkeypatch.setattr(ArtifactUploadService, "upload_batch", reject_after_route_preflight)
+    monkeypatch.setattr(UploadBatchService, "create_and_stage", reject_after_route_preflight)
     async with AsyncClient(
         transport=ASGITransport(app=create_app()),
         base_url="http://test",
@@ -836,10 +906,10 @@ async def test_batch_route_preserves_service_level_limit_as_http_413(
 async def test_batch_route_returns_processing_error_as_http_422(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def reject_after_route_preflight(**_: object) -> ArtifactBatchUploadResult:
+    async def reject_after_route_preflight(**_: object) -> StagedUploadSubmission:
         raise ArtifactUploadError("one calculation file could not be parsed")
 
-    monkeypatch.setattr(ArtifactUploadService, "upload_batch", reject_after_route_preflight)
+    monkeypatch.setattr(UploadBatchService, "create_and_stage", reject_after_route_preflight)
     async with AsyncClient(
         transport=ASGITransport(app=create_app()),
         base_url="http://test",
@@ -896,30 +966,30 @@ async def test_authenticated_reparse_uses_stored_artifact_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     artifact_id = UUID("00000000-0000-7000-8000-000000000603")
-    revision_id = UUID("00000000-0000-7000-8000-000000000604")
 
-    async def reparse(**values: object) -> ArtifactUploadResult:
-        assert values == {
-            "artifact_id": artifact_id,
-            "user_id": DEVELOPMENT_USER_ID,
-        }
-        return ArtifactUploadResult(
-            artifact_id=artifact_id,
+    async def enqueue_reparse(*args: object, **values: object) -> StagedUploadSubmission:
+        assert args == (artifact_id,)
+        assert values == {"user_id": DEVELOPMENT_USER_ID}
+        return _staged_submission(
+            [
+                ArtifactUploadPayload(
+                    filename="calculation.log",
+                    media_type="application/octet-stream",
+                    payload=b"already stored",
+                )
+            ],
+            project_id=PUBLIC_PROJECT_ID,
             artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
-            storage_status=StorageStatus.AVAILABLE,
-            parse_revision_id=revision_id,
-            parse_revision_created=False,
-            inferred_reaction_count=0,
-            inferences=[],
+            artifact_ids=[artifact_id],
         )
 
-    monkeypatch.setattr(ArtifactUploadService, "reparse", staticmethod(reparse))
+    monkeypatch.setattr(UploadBatchService, "enqueue_reparse", staticmethod(enqueue_reparse))
     async with AsyncClient(
         transport=ASGITransport(app=create_app()),
         base_url="http://test",
     ) as client:
         response = await client.post(f"/api/artifacts/{artifact_id}/reparse")
 
-    assert response.status_code == 200
-    assert response.json()["parse_revision_id"] == str(revision_id)
-    assert response.json()["parse_revision_created"] is False
+    assert response.status_code == 202
+    assert response.json()["item"]["artifact_file_id"] == str(artifact_id)
+    assert response.json()["item"]["status"] == "staged"

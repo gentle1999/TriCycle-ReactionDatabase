@@ -90,9 +90,11 @@ class Settings(BaseSettings):
     upload_worker_poll_interval_seconds: float = Field(default=1.0, gt=0.05, le=300.0)
     upload_worker_lease_seconds: int = Field(default=3_600, ge=60, le=86_400)
     upload_client_lease_seconds: int = Field(default=900, ge=60, le=86_400)
-    # A synchronous/legacy importer has no UploadBatch row to wake the worker.
-    # Only pending ingestions older than this grace period are considered
-    # orphaned, which leaves a long-running parser enough time to finish.
+    # Compatibility recovery for calculation ingestions created before the
+    # durable UploadBatch queue. Current API, MCP, and local-import paths all
+    # create an active queue item and are claimed through claim_processing().
+    # Only unowned pending ingestions older than this grace period are treated
+    # as legacy orphans.
     upload_pending_recovery_seconds: int = Field(default=900, ge=60, le=86_400)
     upload_worker_concurrency: int = Field(default=2, ge=1, le=32)
     # Source spans and block hashes are expensive for large calculation logs.

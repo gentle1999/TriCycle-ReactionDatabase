@@ -1,4 +1,4 @@
-"""Import an on-disk artifact tree directly into PostgreSQL and RustFS."""
+"""Stage an on-disk artifact tree into RustFS for durable worker processing."""
 
 from __future__ import annotations
 
@@ -22,15 +22,12 @@ from uuid import UUID
 
 from sqlalchemy import event
 
-from tricycle_reaction_db.application.services.artifact_uploads import (
-    ArtifactUploadPayload,
-    ArtifactUploadService,
-    close_molop_process_pool,
-)
+from tricycle_reaction_db.application.services.artifact_upload_types import ArtifactUploadPayload
 from tricycle_reaction_db.application.services.import_jobs import ImportJobService
+from tricycle_reaction_db.application.services.upload_batches import UploadBatchService
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.session import engine
-from tricycle_reaction_db.domain.enums import ArtifactIngestionStatus, ArtifactKind
+from tricycle_reaction_db.domain.enums import ArtifactKind
 from tricycle_reaction_db.ingestion.manifest import (
     ArtifactManifest,
     ManifestError,
@@ -40,11 +37,9 @@ from tricycle_reaction_db.ingestion.manifest import (
 
 HASH_CHUNK_BYTES = 1024 * 1024
 MAX_FINGERPRINT_WORKERS = 32
-# Parsing concurrency, the queued candidate window, and persistence commit
-# frequency are independent controls.  The defaults deliberately stay below
-# PostgreSQL's usual advisory-lock budget; callers can increase them, while
-# transient database resource failures are still handled by adaptive retries.
-IMPORT_COMMIT_BATCH_FILES = 16
+# The local importer only controls discovery/fingerprinting and queue chunking.
+# MolOP concurrency is owned by the durable upload worker, not this process.
+IMPORT_COMMIT_BATCH_FILES = 16  # retained as a CLI compatibility option
 IMPORT_PIPELINE_WINDOW_FILES = 64
 IMPORT_STREAM_QUEUE_SIZE = 64
 IMPORT_MAX_TRANSIENT_RETRIES = 3
@@ -97,20 +92,22 @@ class ImportSummary:
     scanned: int = 0
     skipped: int = 0
     attempted: int = 0
+    staged: int = 0
     succeeded: int = 0
     filtered: int = 0
     failed: int = 0
-    bytes_succeeded: int = 0
+    bytes_staged: int = 0
 
     def add(self, other: ImportSummary) -> ImportSummary:
         return ImportSummary(
             scanned=self.scanned + other.scanned,
             skipped=self.skipped + other.skipped,
             attempted=self.attempted + other.attempted,
+            staged=self.staged + other.staged,
             succeeded=self.succeeded + other.succeeded,
             filtered=self.filtered + other.filtered,
             failed=self.failed + other.failed,
-            bytes_succeeded=self.bytes_succeeded + other.bytes_succeeded,
+            bytes_staged=self.bytes_staged + other.bytes_staged,
         )
 
 
@@ -532,7 +529,7 @@ class ImportState:
         )
         return bool(
             record
-            and record.get("status") in {"succeeded", "filtered"}
+            and record.get("status") in {"staged", "succeeded", "filtered"}
             # A partial ingestion has a successful upload reservation but not
             # a complete TS inference set.  It must remain retryable after a
             # persistence fix; older state files recorded it as
@@ -667,6 +664,8 @@ def _record(
     artifact_id: UUID | None = None,
     ingestion_status: str | None = None,
     error: str | None = None,
+    batch_id: UUID | None = None,
+    item_id: UUID | None = None,
 ) -> dict[str, Any]:
     relative_path = candidate.relative_path or candidate.path.name
     identity = ImportState._identity(
@@ -698,6 +697,8 @@ def _record(
         "sha256": fingerprint.sha256,
         "status": status,
         "artifact_id": str(artifact_id) if artifact_id else None,
+        "batch_id": str(batch_id) if batch_id else None,
+        "item_id": str(item_id) if item_id else None,
         "ingestion_status": ingestion_status,
         "error": error,
     }
@@ -730,6 +731,8 @@ async def import_files(
         raise ValueError("max_transient_retries must be non-negative")
     if transient_retry_backoff_seconds < 0:
         raise ValueError("transient_retry_backoff_seconds must be non-negative")
+    settings = get_settings()
+    batch_limit_files = min(pipeline_window_files, settings.max_batch_files)
     summary = ImportSummary(scanned=len(candidates))
     workers = fingerprint_workers or min(MAX_FINGERPRINT_WORKERS, max(4, os.cpu_count() or 4))
     if workers < 1:
@@ -767,7 +770,7 @@ async def import_files(
         return summary.add(
             ImportSummary(
                 attempted=len(pending),
-                bytes_succeeded=sum(candidate.size_bytes for candidate, _ in pending),
+                bytes_staged=sum(candidate.size_bytes for candidate, _ in pending),
             )
         )
 
@@ -821,134 +824,20 @@ async def import_files(
             for candidate in batch
         ]
         print(
-            f"importing {len(batch)} files ({sum(item.size_bytes for item in batch)} bytes)",
+            f"staging {len(batch)} files ({sum(item.size_bytes for item in batch)} bytes)",
             file=sys.stderr,
         )
-        checkpointed_indices: set[int] = set()
-
-        async def checkpoint(index: int, item: Any) -> None:
-            """Append a source checkpoint immediately after its DB commit."""
-
-            # A database resource failure is an adaptive-control signal, not
-            # the final outcome for this source.  The retry path below writes
-            # the checkpoint only after the smaller attempt succeeds or is
-            # exhausted.
-            if _item_is_retryable(item):
-                return
-            candidate = batch[index]
-            fingerprint = fingerprints[candidate]
-            filtered = (
-                (
-                    item.result is not None
-                    and item.result.ingestion_status is ArtifactIngestionStatus.FILTERED
-                )
-                or item.error_code == "no_calculation_frames"
-                or (item.result is not None and item.result.source_frame_count == 0)
-            )
-            status = "filtered" if filtered else "succeeded" if item.succeeded else "failed"
-            state.append(
-                _record(
-                    candidate,
-                    fingerprint,
-                    project_id=project_id,
-                    artifact_kind=artifact_kind,
-                    status=status,
-                    artifact_id=item.result.artifact_id if item.result is not None else None,
-                    ingestion_status=(
-                        item.result.ingestion_status.value
-                        if item.result is not None and item.result.ingestion_status is not None
-                        else None
-                    ),
-                    error=item.error_message,
-                )
-            )
-            checkpointed_indices.add(index)
-
         try:
             service_started = perf_counter()
-            result = await ArtifactUploadService.upload_batch(
+            submission = await UploadBatchService.create_and_stage(
                 files=payloads,
                 artifact_kind=artifact_kind,
                 project_id=project_id,
                 user_id=user_id,
-                on_file_committed=checkpoint,
-                streaming=True,
-                persistence_batch_files=commit_batch_files,
-                enforce_batch_file_limit=False,
-                reparse_failed_ingestions=True,
+                shared_metadata={"source": "tricycle-import-artifacts"},
             )
             service_elapsed_ms = (perf_counter() - service_started) * 1000
-            metrics.add_phase_timing("upload_batch_service_ms", service_elapsed_ms)
-            for phase, elapsed_ms in result.timings_ms.items():
-                metrics.add_phase_timing(f"upload_batch_{phase}", elapsed_ms)
-            metrics.steps.append(
-                {
-                    "batch_size": len(batch),
-                    "source_bytes": sum(item.size_bytes for item in batch),
-                    "elapsed_ms": round((perf_counter() - batch_started) * 1000, 3),
-                    "service_elapsed_ms": round(service_elapsed_ms, 3),
-                    "succeeded": result.succeeded_count,
-                    "failed": result.failed_count,
-                    "timings_ms": {
-                        key: round(value, 3) for key, value in sorted(result.timings_ms.items())
-                    },
-                }
-            )
-        except ValueError as error:
-            if len(batch) > 1:
-                midpoint = len(batch) // 2
-                metrics.adaptive_batch_split_count += 1
-                print(
-                    f"batch failed ({error}); retrying as {midpoint} and "
-                    f"{len(batch) - midpoint} files",
-                    file=sys.stderr,
-                )
-                first = await import_batch(batch[:midpoint])
-                second = await import_batch(batch[midpoint:])
-                return first.add(second)
-            candidate = batch[0]
-            state.append(
-                _record(
-                    candidate,
-                    fingerprints[candidate],
-                    project_id=project_id,
-                    artifact_kind=artifact_kind,
-                    status="failed",
-                    error=str(error) or type(error).__name__,
-                )
-            )
-            return ImportSummary(attempted=1, failed=1)
         except Exception as error:
-            if is_retryable_import_error(error):
-                if len(batch) > 1:
-                    midpoint = len(batch) // 2
-                    metrics.adaptive_batch_split_count += 1
-                    print(
-                        f"transient batch failure ({error}); retrying as {midpoint} and "
-                        f"{len(batch) - midpoint} files",
-                        file=sys.stderr,
-                    )
-                    first = await import_batch(batch[:midpoint])
-                    second = await import_batch(batch[midpoint:])
-                    return first.add(second)
-                if transient_retry < max_transient_retries:
-                    metrics.transient_retry_count += 1
-                    delay = transient_retry_backoff_seconds * (2**transient_retry)
-                    if delay:
-                        await asyncio.sleep(delay)
-                    return await import_batch(batch, transient_retry=transient_retry + 1)
-                candidate = batch[0]
-                state.append(
-                    _record(
-                        candidate,
-                        fingerprints[candidate],
-                        project_id=project_id,
-                        artifact_kind=artifact_kind,
-                        status="failed",
-                        error=str(error) or type(error).__name__,
-                    )
-                )
-                return ImportSummary(attempted=1, failed=1)
             message = str(error) or type(error).__name__
             for candidate in batch:
                 state.append(
@@ -961,101 +850,65 @@ async def import_files(
                         error=message,
                     )
                 )
-            raise
-
-        batch_summary = ImportSummary()
-        retryable_candidates: list[ImportCandidate] = []
-        retryable_errors: dict[ImportCandidate, str | None] = {}
-        for index, (candidate, item) in enumerate(zip(batch, result.items, strict=True)):
-            fingerprint = fingerprints[candidate]
-            artifact_id = item.result.artifact_id if item.result is not None else None
-            filtered = (
-                (
-                    item.result is not None
-                    and item.result.ingestion_status is ArtifactIngestionStatus.FILTERED
-                )
-                or item.error_code == "no_calculation_frames"
-                or (item.result is not None and item.result.source_frame_count == 0)
-            )
-            if _item_is_retryable(item):
-                retryable_candidates.append(candidate)
-                retryable_errors[candidate] = item.error_message
-                continue
-            if filtered:
-                batch_summary = batch_summary.add(ImportSummary(attempted=1, filtered=1))
-                status = "filtered"
-            elif item.succeeded:
-                batch_summary = batch_summary.add(
-                    ImportSummary(
-                        attempted=1,
-                        succeeded=1,
-                        bytes_succeeded=candidate.size_bytes,
-                    )
-                )
-                status = "succeeded"
+            return ImportSummary(attempted=len(batch), failed=len(batch))
+        staged_count = 0
+        failed_count = 0
+        filtered_count = 0
+        staged_bytes = 0
+        for candidate, item in zip(batch, submission.items, strict=True):
+            item_status = getattr(item.status, "value", str(item.status))
+            parse_status = getattr(item.parse_status, "value", str(item.parse_status))
+            if parse_status == "filtered":
+                filtered_count += 1
+                checkpoint_status = "filtered"
+            elif item_status in {"staged", "processing", "succeeded"}:
+                staged_count += 1
+                staged_bytes += candidate.size_bytes
+                checkpoint_status = "staged"
             else:
-                batch_summary = batch_summary.add(ImportSummary(attempted=1, failed=1))
-                status = "failed"
-            if index not in checkpointed_indices:
-                state.append(
-                    _record(
-                        candidate,
-                        fingerprint,
-                        project_id=project_id,
-                        artifact_kind=artifact_kind,
-                        status=status,
-                        artifact_id=artifact_id,
-                        ingestion_status=(
-                            item.result.ingestion_status.value
-                            if item.result is not None and item.result.ingestion_status is not None
-                            else None
-                        ),
-                        error=item.error_message,
-                    )
+                failed_count += 1
+                checkpoint_status = "failed"
+            state.append(
+                _record(
+                    candidate,
+                    fingerprints[candidate],
+                    project_id=project_id,
+                    artifact_kind=artifact_kind,
+                    status=checkpoint_status,
+                    artifact_id=item.artifact_file_id,
+                    batch_id=submission.batch.id,
+                    item_id=item.id,
+                    ingestion_status=(
+                        item.ingestion_status.value if item.ingestion_status is not None else None
+                    ),
+                    error=item.error_message,
                 )
-        if not retryable_candidates:
-            return batch_summary
-
-        # A result-level resource error is handled like an exception-level
-        # resource error.  Retry only those files and halve the retry batch so
-        # successful files do not get reparsed and a large lock footprint
-        # converges to a safe size.
-        if len(retryable_candidates) > 1:
-            midpoint = len(retryable_candidates) // 2
-            metrics.adaptive_batch_split_count += 1
-            first = await import_batch(retryable_candidates[:midpoint])
-            second = await import_batch(retryable_candidates[midpoint:])
-            return batch_summary.add(first).add(second)
-        if transient_retry < max_transient_retries:
-            metrics.transient_retry_count += 1
-            delay = transient_retry_backoff_seconds * (2**transient_retry)
-            if delay:
-                await asyncio.sleep(delay)
-            return batch_summary.add(
-                await import_batch(retryable_candidates, transient_retry=transient_retry + 1)
             )
-
-        candidate = retryable_candidates[0]
-        state.append(
-            _record(
-                candidate,
-                fingerprints[candidate],
-                project_id=project_id,
-                artifact_kind=artifact_kind,
-                status="failed",
-                error=(
-                    retryable_errors.get(candidate)
-                    or "transient database/storage error exhausted retries"
-                ),
-            )
+        metrics.add_phase_timing("queue_stage_ms", service_elapsed_ms)
+        metrics.steps.append(
+            {
+                "batch_id": str(submission.batch.id),
+                "batch_size": len(batch),
+                "source_bytes": sum(item.size_bytes for item in batch),
+                "elapsed_ms": round((perf_counter() - batch_started) * 1000, 3),
+                "service_elapsed_ms": round(service_elapsed_ms, 3),
+                "staged": staged_count,
+                "filtered": filtered_count,
+                "failed": failed_count,
+            }
         )
-        return batch_summary.add(ImportSummary(attempted=1, failed=1))
+        return ImportSummary(
+            attempted=len(batch),
+            staged=staged_count,
+            filtered=filtered_count,
+            failed=failed_count,
+            bytes_staged=staged_bytes,
+        )
 
     # Feed candidates through a bounded discovery/fingerprint queue. The
-    # consumer collects an independent pipeline window, whose files become the
-    # parser's waiting task pool. On-disk imports do not use HTTP request batch
-    # limits as processing boundaries; the shared service still enforces the
-    # per-file upload limit.
+    # consumer collects queue-sized staging windows. This process performs no
+    # MolOP work; the durable upload worker claims the resulting staged items
+    # and uses its one shared parser pool.
     candidate_queue: asyncio.Queue[tuple[ImportCandidate, ImportFingerprint] | None] = (
         asyncio.Queue(maxsize=stream_queue_size)
     )
@@ -1127,25 +980,35 @@ async def import_files(
     batches_started_at = perf_counter()
     producer_task = asyncio.create_task(produce_candidates())
     producer_finished = False
+    pending_candidate: tuple[ImportCandidate, ImportFingerprint] | None = None
     try:
         while not producer_finished:
-            first = await candidate_queue.get()
+            first = pending_candidate or await candidate_queue.get()
+            pending_candidate = None
             if first is None:
                 producer_finished = True
                 break
 
             batch_with_fingerprints = [first]
-            while len(batch_with_fingerprints) < pipeline_window_files:
+            batch_bytes = first[0].size_bytes
+            while len(batch_with_fingerprints) < batch_limit_files:
                 next_item = await candidate_queue.get()
                 if next_item is None:
                     producer_finished = True
                     break
+                if (
+                    batch_with_fingerprints
+                    and batch_bytes + next_item[0].size_bytes > settings.max_batch_bytes
+                ):
+                    pending_candidate = next_item
+                    break
                 batch_with_fingerprints.append(next_item)
+                batch_bytes += next_item[0].size_bytes
 
             batch = [candidate for candidate, _ in batch_with_fingerprints]
             summary = summary.add(await import_batch(batch))
             print(
-                f"committed {len(batch)} files ({sum(item.size_bytes for item in batch)} bytes)",
+                f"queued {len(batch)} files ({sum(item.size_bytes for item in batch)} bytes)",
                 file=sys.stderr,
             )
     finally:
@@ -1167,7 +1030,9 @@ async def import_files(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Import files directly into the configured PostgreSQL/RustFS services.",
+        description=(
+            "Stage files in the configured RustFS queue for durable worker processing."
+        ),
     )
     parser.add_argument(
         "roots",
@@ -1231,7 +1096,7 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         default=IMPORT_COMMIT_BATCH_FILES,
         help=(
-            "number of completed files per local persistence commit "
+            "legacy queue-window compatibility value "
             f"(default: {IMPORT_COMMIT_BATCH_FILES})"
         ),
     )
@@ -1240,7 +1105,7 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         default=IMPORT_PIPELINE_WINDOW_FILES,
         help=(
-            "number of candidate files queued into each parser pipeline window "
+            "number of candidate files staged in each queue window "
             f"(default: {IMPORT_PIPELINE_WINDOW_FILES})"
         ),
     )
@@ -1258,7 +1123,7 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         default=IMPORT_MAX_TRANSIENT_RETRIES,
         help=(
-            "maximum retries for transient database/storage failures on one file "
+            "legacy compatibility value for transient staging failures "
             f"(default: {IMPORT_MAX_TRANSIENT_RETRIES})"
         ),
     )
@@ -1351,26 +1216,23 @@ async def _run(args: argparse.Namespace) -> int:
     )
     metrics.add_step_timing("discover", (perf_counter() - discover_started) * 1000)
     state = ImportState(args.state_file)
-    try:
-        summary = await import_files(
-            candidates,
-            project_id=args.project_id,
-            user_id=user_id,
-            artifact_kind=artifact_kind,
-            state=state,
-            dry_run=args.dry_run,
-            commit_batch_files=args.commit_batch_files,
-            pipeline_window_files=args.pipeline_window_files,
-            stream_queue_size=args.stream_queue_size,
-            max_transient_retries=args.max_transient_retries,
-            metrics=metrics,
-        )
-        payload = asdict(summary)
-        payload["timings"] = metrics.as_dict(total_ms=(perf_counter() - started_at) * 1000)
-        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-        return 1 if summary.failed else 0
-    finally:
-        await close_molop_process_pool()
+    summary = await import_files(
+        candidates,
+        project_id=args.project_id,
+        user_id=user_id,
+        artifact_kind=artifact_kind,
+        state=state,
+        dry_run=args.dry_run,
+        commit_batch_files=args.commit_batch_files,
+        pipeline_window_files=args.pipeline_window_files,
+        stream_queue_size=args.stream_queue_size,
+        max_transient_retries=args.max_transient_retries,
+        metrics=metrics,
+    )
+    payload = asdict(summary)
+    payload["timings"] = metrics.as_dict(total_ms=(perf_counter() - started_at) * 1000)
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    return 1 if summary.failed else 0
 
 
 def main() -> None:

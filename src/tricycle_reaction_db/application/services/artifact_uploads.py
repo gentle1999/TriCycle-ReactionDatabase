@@ -176,7 +176,6 @@ from tricycle_reaction_db.ingestion.manifest import normalize_relative_path
 from tricycle_reaction_db.storage.rustfs import (
     RustFSObjectStore,
     RustFSSettings,
-    time_partitioned_content_addressed_key,
     time_partitioned_content_addressed_key_for_sha256,
 )
 
@@ -228,15 +227,12 @@ _molop_process_pool: ProcessPoolExecutor | None = None
 _molop_process_pool_workers: int | None = None
 _molop_process_pool_pid: int | None = None
 _molop_process_pool_lock = threading.Lock()
-_frame_process_pool: ProcessPoolExecutor | None = None
-_frame_process_pool_workers: int | None = None
-_frame_process_pool_pid: int | None = None
-_frame_process_pool_lock = threading.Lock()
 _storage_process_pool: ProcessPoolExecutor | None = None
 _storage_process_pool_workers: int | None = None
 _storage_process_pool_pid: int | None = None
 _storage_process_pool_lock = threading.Lock()
 _file_worker_slots: tuple[asyncio.AbstractEventLoop, int, asyncio.Semaphore] | None = None
+_rustfs_download_slots: tuple[asyncio.AbstractEventLoop, int, asyncio.Semaphore] | None = None
 
 # A storage-pool child handles many files over its lifetime. Recreating a
 # boto3 client and performing a bucket HEAD for every file adds a large fixed
@@ -247,8 +243,8 @@ _storage_worker_store_key: tuple[Any, ...] | None = None
 _storage_worker_bucket_ready = False
 
 
-def _initialize_frame_process_worker() -> None:
-    """Configure MolGR once when a frame-pool child starts."""
+def _initialize_molop_process_worker() -> None:
+    """Configure MolGR once when a shared MolOP child starts."""
 
     configure_molecular_graph_reconstruction()
     molopconfig.prewarm_topologies = False
@@ -397,6 +393,21 @@ def _file_worker_submission_slots() -> asyncio.Semaphore:
     return _file_worker_slots[2]
 
 
+def _rustfs_download_submission_slots() -> asyncio.Semaphore:
+    """Share RustFS download admission across all concurrent worker groups."""
+
+    global _rustfs_download_slots
+    loop = asyncio.get_running_loop()
+    workers = max(1, get_settings().upload_max_concurrency)
+    if (
+        _rustfs_download_slots is None
+        or _rustfs_download_slots[0] is not loop
+        or _rustfs_download_slots[1] != workers
+    ):
+        _rustfs_download_slots = (loop, workers, asyncio.Semaphore(workers))
+    return _rustfs_download_slots[2]
+
+
 def _fast_molop_ingestion_enabled() -> bool:
     """Return whether deferred MolGR work and batched frame writes are enabled."""
 
@@ -423,7 +434,7 @@ def _get_molop_process_pool(n_jobs: int) -> ProcessPoolExecutor:
             max_workers=workers,
             mp_context=multiprocessing.get_context("spawn"),
             max_tasks_per_child=100,
-            initializer=_initialize_frame_process_worker,
+            initializer=_initialize_molop_process_worker,
         )
         _molop_process_pool_workers = workers
         _molop_process_pool_pid = pid
@@ -431,16 +442,6 @@ def _get_molop_process_pool(n_jobs: int) -> ProcessPoolExecutor:
     if previous_pool is not None:
         previous_pool.shutdown(wait=True, cancel_futures=True)
     return process_pool
-
-
-def _get_frame_process_pool(n_jobs: int) -> ProcessPoolExecutor:
-    """Return the shared file/frame pool for MolOP-stage work."""
-
-    # File parsing and frame reconstruction are different task granularities,
-    # but they are both CPU-bound MolOP-stage work. Sharing workers prevents
-    # two independent ``n_jobs`` process sets from duplicating RSS and startup
-    # cost while the stages overlap in the batch pipeline.
-    return _get_molop_process_pool(n_jobs)
 
 
 def _get_storage_process_pool(n_jobs: int) -> ProcessPoolExecutor:
@@ -491,23 +492,16 @@ def _shutdown_molop_process_pool_sync() -> None:
 
 
 def _shutdown_upload_stage_pools_sync() -> None:
-    """Stop frame and RustFS pools owned by this API worker."""
+    """Stop the RustFS storage pool owned by this API worker."""
 
-    global _frame_process_pool, _frame_process_pool_workers, _frame_process_pool_pid
     global _storage_process_pool, _storage_process_pool_workers, _storage_process_pool_pid
-    with _frame_process_pool_lock:
-        frame_pool = _frame_process_pool
-        _frame_process_pool = None
-        _frame_process_pool_workers = None
-        _frame_process_pool_pid = None
     with _storage_process_pool_lock:
         storage_pool = _storage_process_pool
         _storage_process_pool = None
         _storage_process_pool_workers = None
         _storage_process_pool_pid = None
-    for pool in (frame_pool, storage_pool):
-        if pool is not None:
-            pool.shutdown(wait=True, cancel_futures=False)
+    if storage_pool is not None:
+        storage_pool.shutdown(wait=True, cancel_futures=False)
 
 
 async def _run_molop_source_parser(
@@ -1037,7 +1031,7 @@ def _materialize_parsed_artifacts(
     """Process deferred frames through the dedicated frame process pool."""
 
     materialized: dict[int, _ParsedArtifact] = {}
-    pool = _get_frame_process_pool(get_settings().molop_batch_n_jobs)
+    pool = _get_molop_process_pool(get_settings().molop_batch_n_jobs)
     for parsed in parsed_artifacts:
         if parsed.frame_records:
             materialized[id(parsed)] = parsed
@@ -1141,7 +1135,7 @@ async def _process_parsed_artifact_frames(
     if parsed.frame_records:
         return parsed
     chem_file = parsed.chem_file
-    pool = _get_frame_process_pool(get_settings().molop_batch_n_jobs)
+    pool = _get_molop_process_pool(get_settings().molop_batch_n_jobs)
     loop = asyncio.get_running_loop()
 
     frame_inputs = tuple(
@@ -3714,7 +3708,7 @@ class ArtifactUploadService:
     async def _prepare_upload(
         cls,
         *,
-        payload: bytes,
+        payload: bytes | Path,
         filename: str,
         media_type: str,
         artifact_kind: ArtifactKind,
@@ -3723,13 +3717,28 @@ class ArtifactUploadService:
         relative_path: str | None = None,
         expected_sha256: str | None = None,
         expected_size_bytes: int | None = None,
+        inspected: _InspectedUploadSource | None = None,
     ) -> _PreparedCalculationUpload | ArtifactUploadResult:
         """Reserve and store an upload, leaving calculation parsing for the caller."""
 
         settings = RustFSSettings()
         started_at = datetime.now(UTC)
-        digest = sha256(payload).hexdigest()
-        if expected_size_bytes is not None and len(payload) != expected_size_bytes:
+        if inspected is None:
+            inspected = _inspect_upload_source(
+                ArtifactUploadPayload(
+                    filename=filename,
+                    media_type=media_type,
+                    payload=payload if isinstance(payload, bytes) else None,
+                    spool_path=payload if isinstance(payload, Path) else None,
+                ),
+                maximum_size=get_settings().max_upload_bytes,
+            )
+        source = inspected.source
+        digest = inspected.content_sha256
+        size_bytes = inspected.size_bytes
+        if not size_bytes:
+            raise ArtifactUploadError("uploaded artifact is empty")
+        if expected_size_bytes is not None and size_bytes != expected_size_bytes:
             raise ArtifactUploadConflictError("uploaded artifact does not match the manifest size")
         if expected_sha256 is not None and digest != expected_sha256.casefold():
             raise ArtifactUploadConflictError(
@@ -3740,12 +3749,16 @@ class ArtifactUploadService:
             if relative_path is not None
             else Path(filename).name
         )
-        object_key = time_partitioned_content_addressed_key(
-            payload,
+        object_key = time_partitioned_content_addressed_key_for_sha256(
+            digest,
             uploaded_at=started_at,
             prefix="uploads",
         )
-        resolved_media_type = detect_artifact_media_type(filename, media_type, payload)
+        resolved_media_type = detect_artifact_media_type(
+            filename,
+            media_type,
+            inspected.media_probe,
+        )
         record = ArtifactFileRecord(
             project_id=project_id,
             created_by_user_id=user_id,
@@ -3753,7 +3766,7 @@ class ArtifactUploadService:
             bucket=settings.bucket,
             object_key=object_key,
             content_sha256=digest,
-            size_bytes=len(payload),
+            size_bytes=size_bytes,
             original_filename=Path(filename).name,
             source_relative_path=source_relative_path,
             media_type=resolved_media_type,
@@ -3776,11 +3789,13 @@ class ArtifactUploadService:
                 cls._store_payload,
                 settings,
                 object_key,
-                payload,
+                source,
                 resolved_media_type,
+                content_sha256=digest,
+                size_bytes=size_bytes,
                 check_existing_object=check_existing_object,
             )
-            if stored.size != len(payload) or stored.sha256 != digest:
+            if stored.size != size_bytes or stored.sha256 != digest:
                 raise ArtifactUploadError(
                     f"RustFS metadata mismatch for s3://{stored.bucket}/{stored.key}"
                 )
@@ -3828,8 +3843,8 @@ class ArtifactUploadService:
             object_key=object_key,
             ingestion_id=ingestion_id,
             started_at=started_at,
-            source=payload,
-            size_bytes=len(payload),
+            source=source,
+            size_bytes=size_bytes,
             media_type=resolved_media_type,
             content_sha256=digest,
             retired_reservation=retired_reservation,
@@ -3860,17 +3875,8 @@ class ArtifactUploadService:
         the upload worker through :meth:`reparse`.
         """
 
-        if not payload:
-            raise ArtifactUploadError("uploaded artifact is empty")
-        _require_upload_size(payload)
-        _require_decompressed_upload_size(payload, filename)
-        await AuthorizationService.require_project_permission(
-            user_id,
-            project_id,
-            ProjectPermission.ARTIFACT_UPLOAD,
-        )
-        prepared = await cls._prepare_upload(
-            payload=payload,
+        return await cls.stage_source(
+            source=payload,
             filename=filename,
             media_type=media_type,
             artifact_kind=artifact_kind,
@@ -3879,6 +3885,56 @@ class ArtifactUploadService:
             relative_path=relative_path,
             expected_sha256=expected_sha256,
             expected_size_bytes=expected_size_bytes,
+        )
+
+    @classmethod
+    async def stage_source(
+        cls,
+        *,
+        source: bytes | Path,
+        filename: str,
+        media_type: str,
+        artifact_kind: ArtifactKind,
+        project_id: UUID,
+        user_id: UUID,
+        relative_path: str | None = None,
+        expected_sha256: str | None = None,
+        expected_size_bytes: int | None = None,
+    ) -> ArtifactUploadResult:
+        """Stage bytes or an on-disk source without starting MolOP.
+
+        Local importers and multipart handlers may already own a spool file.
+        Inspect its identity once, then stream that same path directly to
+        RustFS.  The path is never sent to MolOP from this request; the durable
+        queue worker downloads the stored object and owns the later parse.
+        """
+
+        await AuthorizationService.require_project_permission(
+            user_id,
+            project_id,
+            ProjectPermission.ARTIFACT_UPLOAD,
+        )
+        inspected = await asyncio.to_thread(
+            _inspect_upload_source,
+            ArtifactUploadPayload(
+                filename=filename,
+                media_type=media_type,
+                payload=source if isinstance(source, bytes) else None,
+                spool_path=source if isinstance(source, Path) else None,
+            ),
+            maximum_size=get_settings().max_upload_bytes,
+        )
+        prepared = await cls._prepare_upload(
+            payload=source,
+            filename=filename,
+            media_type=media_type,
+            artifact_kind=artifact_kind,
+            project_id=project_id,
+            user_id=user_id,
+            relative_path=relative_path,
+            expected_sha256=expected_sha256,
+            expected_size_bytes=expected_size_bytes,
+            inspected=inspected,
         )
         if isinstance(prepared, ArtifactUploadResult):
             return prepared
@@ -4204,6 +4260,7 @@ class ArtifactUploadService:
         *,
         artifact_ids: Sequence[UUID],
         user_id: UUID,
+        force_reparse: bool = False,
     ) -> dict[UUID, ArtifactUploadResult | Exception]:
         """Reparse staged objects through the existing bounded batch pipeline.
 
@@ -4285,7 +4342,10 @@ class ArtifactUploadService:
         if current_chunk:
             artifact_chunks.append(current_chunk)
 
-        download_slots = asyncio.Semaphore(max(1, settings.upload_max_concurrency))
+        # Several claimed project/user groups may be reparsed concurrently by
+        # the worker. Use one loop-wide gate so their RustFS reads do not each
+        # allocate a full upload_max_concurrency window.
+        download_slots = _rustfs_download_submission_slots()
 
         async def load_payload(artifact: ArtifactFile) -> ArtifactUploadPayload | Exception:
             artifact_id = _require_id(artifact, label="ArtifactFile")
@@ -4340,6 +4400,7 @@ class ArtifactUploadService:
                     # and capped independently by molop_batch_n_jobs.
                     persistence_batch_files=len(upload_files),
                     reparse_failed_ingestions=True,
+                    force_reparse=force_reparse,
                 )
             except Exception as error:
                 for artifact in upload_artifacts:
@@ -4473,6 +4534,7 @@ class ArtifactUploadService:
         user_id: UUID,
         source_inspections: Mapping[int, _InspectedUploadSource] | None = None,
         reparse_failed_ingestions: bool = False,
+        force_reparse: bool = False,
     ) -> tuple[
         dict[int, _PreparedCalculationUpload],
         dict[int, ArtifactBatchUploadItem],
@@ -4630,13 +4692,16 @@ class ArtifactUploadService:
                             ingestion_id = _require_id(ingestion, label="ArtifactIngestion")
                             ingestion_status = ingestion.status
                             retry_failed = (
-                                reparse_failed_ingestions
+                                (reparse_failed_ingestions or force_reparse)
                                 and not created
-                                and ingestion.status
-                                in {
-                                    ArtifactIngestionStatus.FAILED,
-                                    ArtifactIngestionStatus.PARTIAL,
-                                }
+                                and (
+                                    force_reparse
+                                    or ingestion.status
+                                    in {
+                                        ArtifactIngestionStatus.FAILED,
+                                        ArtifactIngestionStatus.PARTIAL,
+                                    }
+                                )
                             )
                             if retry_failed:
                                 # Reopen the durable ingestion reservation. Existing
@@ -4739,6 +4804,7 @@ class ArtifactUploadService:
         persistence_batch_files: int = PERSISTENCE_PRELOAD_BATCH_SIZE,
         enforce_batch_file_limit: bool = True,
         reparse_failed_ingestions: bool = False,
+        force_reparse: bool = False,
     ) -> ArtifactBatchUploadResult:
         """Prepare once, then advance files through an asynchronous pipeline.
 
@@ -4786,6 +4852,7 @@ class ArtifactUploadService:
             user_id=user_id,
             source_inspections=source_inspections,
             reparse_failed_ingestions=reparse_failed_ingestions,
+            force_reparse=force_reparse,
         )
         timings["prepare_db_ms"] = (perf_counter() - phase_started) * 1000
 

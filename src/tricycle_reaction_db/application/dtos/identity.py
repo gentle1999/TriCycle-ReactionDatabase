@@ -74,6 +74,23 @@ class OrganizationCreate(BaseModel):
         return value.strip()
 
 
+class OrganizationMemberView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    user_id: UUID
+    display_name: str
+    primary_email: str | None = None
+    role: OrganizationRole
+    created_at: datetime | None = None
+
+
+class OrganizationMemberUpsert(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    user_id: UUID
+    role: OrganizationRole = OrganizationRole.MEMBER
+
+
 class ProjectCreate(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -270,6 +287,8 @@ __all__ = [
     "CurrentUserView",
     "OrganizationAccessView",
     "OrganizationCreate",
+    "OrganizationMemberUpsert",
+    "OrganizationMemberView",
     "AuthConfigView",
     "AuditEventView",
     "IdentityView",

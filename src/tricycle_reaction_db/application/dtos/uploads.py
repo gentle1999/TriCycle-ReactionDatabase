@@ -236,6 +236,7 @@ class UploadBatchItemView(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     id: UUID
+    batch_id: UUID
     created_at: datetime
     updated_at: datetime
     client_file_id: UUID
@@ -255,6 +256,7 @@ class UploadBatchItemView(BaseModel):
     materialization_status: ImportMaterializationStatus = ImportMaterializationStatus.NOT_STARTED
     parse_revision_id: UUID | None = None
     artifact_file_id: UUID | None = None
+    ingestion_id: UUID | None = None
     ingestion_status: ArtifactIngestionStatus | None = None
     ingestion_error_message: str | None = None
     error_code: str | None = None
@@ -271,10 +273,30 @@ class UploadBatchItemPage(BaseModel):
     offset: int = Field(ge=0)
 
 
+class ArtifactUploadAccepted(BaseModel):
+    """One upload accepted for asynchronous RustFS staging and parsing."""
+
+    model_config = ConfigDict(frozen=True)
+
+    batch: UploadBatchView
+    item: UploadBatchItemView
+
+
+class ArtifactBatchUploadAccepted(BaseModel):
+    """A group of uploads accepted for asynchronous RustFS staging and parsing."""
+
+    model_config = ConfigDict(frozen=True)
+
+    batch: UploadBatchView
+    items: list[UploadBatchItemView]
+
+
 __all__ = [
+    "ArtifactBatchUploadAccepted",
     "ArtifactBatchUploadItem",
     "ArtifactBatchUploadResult",
     "ArtifactMetadataUpdate",
+    "ArtifactUploadAccepted",
     "ArtifactUploadResult",
     "ArtifactValidationInferenceView",
     "ArtifactValidationResult",

@@ -97,10 +97,11 @@ class UploadBatchWorker:
 
         if not jobs:
             return
-        # A claim can contain more than one active batch.  Keep those batches
+        # A claim can contain more than one active batch. Keep those batches
         # separate because ``upload_batch`` has one project-scoped persistence
-        # context, while starting one heartbeat per claimed item keeps leases
-        # alive when the groups are drained sequentially.
+        # context. Run the groups concurrently so every session feeds the same
+        # parser pool instead of making one batch wait behind another batch's
+        # database flush.
         groups: dict[tuple[UUID, UUID], list[UploadProcessingJob]] = {}
         for job in jobs:
             groups.setdefault((job.batch_id, job.user_id), []).append(job)
@@ -110,37 +111,40 @@ class UploadBatchWorker:
             asyncio.create_task(self._renew_until_done(job, finished_by_item[job.item_id]))
             for job in jobs
         ]
-        try:
-            for group in groups.values():
-                group_results: dict[UUID, ArtifactUploadResult | Exception]
-                try:
-                    group_results = await ArtifactUploadService.reparse_batch(
-                        artifact_ids=[job.artifact_file_id for job in group],
-                        user_id=group[0].user_id,
-                    )
-                except Exception as error:
-                    group_results = {job.artifact_file_id: error for job in group}
+        async def process_group(group: list[UploadProcessingJob]) -> None:
+            group_results: dict[UUID, ArtifactUploadResult | Exception]
+            try:
+                group_results = await ArtifactUploadService.reparse_batch(
+                    artifact_ids=[job.artifact_file_id for job in group],
+                    user_id=group[0].user_id,
+                    force_reparse=True,
+                )
+            except Exception as error:
+                group_results = {job.artifact_file_id: error for job in group}
 
-                for job in group:
-                    result = group_results.get(job.artifact_file_id)
-                    try:
-                        if isinstance(result, Exception):
-                            await UploadBatchService.finish_processing(job, error=result)
-                        elif result is None:
-                            await UploadBatchService.finish_processing(
-                                job,
-                                error=RuntimeError("artifact reparse returned no result"),
-                            )
-                        else:
-                            await UploadBatchService.finish_processing(job, result=result)
-                    except Exception:
-                        logger.exception(
-                            "failed to record upload worker batch result batch=%s item=%s",
-                            job.batch_id,
-                            job.item_id,
+            for job in group:
+                result = group_results.get(job.artifact_file_id)
+                try:
+                    if isinstance(result, Exception):
+                        await UploadBatchService.finish_processing(job, error=result)
+                    elif result is None:
+                        await UploadBatchService.finish_processing(
+                            job,
+                            error=RuntimeError("artifact reparse returned no result"),
                         )
-                    finally:
-                        finished_by_item[job.item_id].set()
+                    else:
+                        await UploadBatchService.finish_processing(job, result=result)
+                except Exception:
+                    logger.exception(
+                        "failed to record upload worker batch result batch=%s item=%s",
+                        job.batch_id,
+                        job.item_id,
+                    )
+                finally:
+                    finished_by_item[job.item_id].set()
+
+        try:
+            await asyncio.gather(*(process_group(group) for group in groups.values()))
         finally:
             for heartbeat in heartbeats:
                 heartbeat.cancel()

@@ -183,6 +183,28 @@ token；撤销后原值立即失效。对应 API 为：
 状态，并只允许该 token 访问 `/mcp/`，不会把它当作通用 REST/GraphQL 凭据。生产模式的 MCP
 请求必须携带 MCP token 或由受信任的 OIDC access token 认证。
 
+#### MCP 组织、项目和计算日志操作
+
+MCP token 是用户级凭据，不绑定固定组织、项目或静态 scope。每次调用都会按 token 对应的
+用户重新读取当前组织/项目成员关系，因此用户被加入或移除组织后，MCP 权限会同步变化；
+撤销 token 也会立即生效。所有以下工具都要求有效 MCP/OIDC 身份，业务权限由服务层再次校验。
+
+| 范围 | MCP 工具 | 权限边界 |
+| --- | --- | --- |
+| 组织 | `list_organizations`、`create_organization` | 列出当前用户可见组织；创建后当前用户自动成为 owner |
+| 组织成员 | `list_organization_members`、`upsert_organization_member`、`remove_organization_member` | 成员可查看；owner/admin 可管理；不能移除或降级最后一个 owner |
+| 项目 | `create_project`、`list_projects`、`get_project`、`update_project` | 创建要求组织 owner/admin；修改要求项目 manager 或组织 admin |
+| 项目成员 | `list_project_members`、`upsert_project_member`、`remove_project_member` | 项目 manager 或组织 admin；服务层保留最后一个 project manager |
+| 项目邀请 | `list_project_invitations`、`create_project_invitation`、`revoke_project_invitation`、`resend_project_invitation`、`accept_project_invitation` | 项目 manager 或组织 admin；接受邀请仍校验登录邮箱匹配 |
+| 审计 | `list_project_audit` | 项目 manager 或组织 admin |
+| 计算日志 | `upload_calculation_log` | 需要目标项目 `artifact:upload`；只在请求中完成大小、授权和 RustFS 暂存，MolOP/持久化由 worker 异步完成 |
+
+`upload_calculation_log` 接收标准 Base64 的 `content_base64`，不接受 Data URL 前缀，单文件上限
+沿用 `TRICYCLE_MAX_UPLOAD_BYTES`（默认 64 MiB）。调用返回的是 durable `UploadBatch` 和
+item 的 `staged`/`pending` 状态；MCP 的 `success=true` 只表示原始文件已经写入 RustFS
+并进入解析队列，不表示 MolOP 已完成。通过批次查询接口读取最终的 `ingestion_status`、
+`parse_revision_id`、帧数量和 TS 推断结果。
+
 普通认证请求只读会话；`last_seen_at` 最多每 5 分钟条件更新一次。过期会话和撤销超过 30 天
 的会话由调度器定期执行 `make auth-session-cleanup`（或
 `uv run tricycle-auth-session-cleanup --revoked-retention-days 30`）清理。该命令输出 JSON
@@ -235,20 +257,20 @@ Cloudflare，必须另建 Cache Rule，使 URI path 以 `/api/` 开头的请求 
 | 其他 REST、GraphQL、MCP、depiction 接口 | `401` | 需要有效身份 |
 
 公开文件请求携带无效 `Authorization` header 时仍返回 `401`，不会降级为匿名。
-统一文件上传已开放，新建 Artifact 固定为 `project`；可见性修改尚未开放。上传接口先
-校验项目权限，在 PostgreSQL 建立 `pending` Artifact 关系，再保存 RustFS object，校验
-通过后更新为 `available`。写入、校验或状态提交失败时，生命周期补偿 Hook 立即定点删除
-未变成 `available` 的本次对象和 pending 预约行，不保留 `missing` 垃圾记录。Artifact
-DELETE 保留 `retired` tombstone，RustFS 临时故障时可重复请求继续清理。
+统一文件上传已开放，新建 Artifact 固定为 `project`；可见性修改尚未开放。所有本地、远程、
+单文件和批量入口都先校验权限，在 PostgreSQL 建立 `pending` Artifact 与 UploadBatch item，
+再把原始对象写入 RustFS；对象校验通过后 item 变为 `staged`，由独立 upload-worker 自动
+领取。worker 从 RustFS 读取并校验对象，使用所有上传会话共享的 MolOP 进程池解析，再由
+有界数据库消费者持久化。HTTP/MCP 请求不执行 MolOP，也不等待解析完成。写入、校验或状态
+提交失败时，生命周期补偿 Hook 立即定点删除未变成 `available` 的本次对象和 pending 预约行，
+不保留 `missing` 垃圾记录。Artifact DELETE 保留 `retired` tombstone，RustFS 临时故障时
+可重复请求继续清理。
 退役来源不会继续参与详情、下载和派生事实可见性；同一项目以相同 Artifact 类型重新上传
-相同 bytes 会恢复原 tombstone 和既有解析历史。计算输出
-统一拆分并录入所有 MolOP 帧；检测到
-TS 帧时额外创建或复用同一反应，并保存 TS CalculationFrame 到反应的推断溯源。
+相同 bytes 会恢复原 tombstone 和既有解析历史。计算输出由 worker 统一拆分并录入所有 MolOP
+帧；检测到 TS 帧时额外创建或复用同一反应，并保存 TS CalculationFrame 到反应的推断溯源。
 格式由 MolOP probe 从内容识别；文件名、扩展名、目录结构、manifest 和上传顺序都不参与
-化学身份。批量请求按文件在 RustFS、MolOP 和数据库之间流水推进：RustFS 写入完成即把文件
-提交到可复用的共享 MolOP 进程池，解析结果由单一有界数据库消费者顺序持久化；最终请求仍在
-同一个数据库事务中提交。每个文件使用独立 savepoint，一个文件失败不会回滚其他文件，整批
-结果最后只提交一次。
+化学身份。批量大小只影响 RustFS 暂存和领取窗口，不会为每个会话创建解析进程；所有 worker
+任务在进程内共享同一个有界 MolOP 进程池，并按文件隔离失败。
 生产 OIDC 用户首次登录后才进入本地用户目录；首次 system administrator 需要部署侧将该
 用户加入 system organization 并授予 owner/admin，API 不允许普通项目 manager 提升全局
 账号权限。
@@ -541,7 +563,14 @@ make seed-da-bench
 
 ### 直接批量导入存量文件
 
-大量存量文件不需要经过浏览器或 HTTP API。`tricycle-import-artifacts` 在服务端进程内递归读取文件，直接调用 Artifact 入库服务，写入 PostgreSQL/RustFS，并按现有 MolOP 解析流程处理计算输出。指纹计算也采用有界的顺序释放流水线，不会先扫描并哈希完整目录后才开始解析。导入默认一次向解析流水线提供 64 个候选文件，实际并发槽位由 `TRICYCLE_MOLOP_BATCH_N_JOBS` 独立控制；任一文件结束后，候选池中的下一文件会立即补位。完成结果每 16 个进入一次持久化微批，文件解析、RustFS 写入和数据库持久化可以流水线重叠。准备阶段还会把 Artifact/ingestion 身份预约拆成有界事务，避免大批量身份锁耗尽 PostgreSQL 共享内存。本地磁盘流模式不把 HTTP 请求的 `max_batch_files` 或 `max_batch_bytes` 当作处理屏障，但仍执行单文件大小限制；远程上传仍受这些请求级限制保护。每个微批提交后立即追加并 `fsync` 逐文件检查点，内容 SHA-256 由 Artifact 唯一约束负责幂等去重。
+大量存量文件不需要经过浏览器或 HTTP API。`tricycle-import-artifacts` 在服务端进程内递归发现并
+指纹化文件，创建 UploadBatch 后把原始文件暂存到 RustFS；它不会在 CLI 进程中调用 MolOP。
+独立 upload-worker 自动领取这些 staged item，并用与远程上传相同的共享解析池和持久化路径
+完成入库。指纹计算采用有界流水线，不会先扫描并哈希完整目录后才开始暂存；导入默认一次向
+队列提供 64 个候选文件，批次窗口只控制暂存背压。需要运行 CLI 的同时保持
+`tricycle-upload-worker`（`make dev`/`make dev-stack` 会自动启动），否则文件会安全保留在
+RustFS 的 staged 队列中等待 worker。每个文件仍按内容 SHA-256 幂等，单个暂存失败不会回滚
+同批其他文件。
 
 #### 文件流与进程池模型
 
@@ -555,15 +584,12 @@ sequenceDiagram
     participant Q as Candidate queue
     participant U as ArtifactUploadService
     participant R as RustFS
-    participant G as File-slot gate
-    participant P as File-local parser
-    participant W as Persistence consumer
+    participant W as upload-worker
     participant D as PostgreSQL
     participant C as JSONL checkpoint
 
     Note over F: ThreadPoolExecutor，内部上限 32
-    Note over G,P: n_jobs 个文件槽位；所有文件共享一个 spawn ProcessPoolExecutor
-    Note over P: 子进程内 OMP/OPENBLAS/MKL 通常都设为 1
+    Note over W: 所有上传会话共享一个 spawn MolOP ProcessPoolExecutor
 
     I->>F: 递归发现文件，计算 SHA-256
     F->>Q: 放入候选队列
@@ -572,26 +598,14 @@ sequenceDiagram
         Note right of Q: IMPORT_PIPELINE_WINDOW_FILES
         loop 窗口内的每个文件（并发）
             U->>R: 写入并校验原始对象
-            R-->>U: object ready
-            U->>G: 等待并获取文件槽位
-            G->>P: 提交到可复用 MolOP 进程池
-            P->>P: MolOP 解析 + frame 后处理
-            alt 正常完成
-                P-->>G: 返回 frames/diagnostics
-                G-->>U: 释放文件槽位
-                P-->>W: 放入有界结果队列
-            else 超时或解析失败
-                P-->>G: 安全清理后抛出 timeout/error
-                G-->>U: 释放文件槽位
-                P-->>W: 放入该文件失败结果
-            end
+            R-->>U: object ready；item=staged
+            U->>D: 提交 batch/item 检查点
         end
-        W->>W: 累积完成结果
-        opt 达到 IMPORT_COMMIT_BATCH_FILES
-            W->>D: 写入完成结果微批
-            D-->>W: commit
-            W->>C: 追加状态并 fsync
-        end
+        W->>D: 领取 staged item
+        W->>R: 读取并校验已暂存对象
+        W->>W: 提交共享 MolOP 池并持久化解析结果
+        W->>D: 更新 ingestion/item 状态
+        U->>C: 追加暂存检查点并 fsync
         U-->>Q: 槽位释放，继续取下一候选
     end
 ```
@@ -599,12 +613,23 @@ sequenceDiagram
 图中的边界需要这样理解：
 
 - 指纹线程池只负责发现文件和读取 SHA-256，内部上限为 `32`；它不是 MolOP 解析池。`IMPORT_STREAM_QUEUE_SIZE` 只限制指纹结果到候选窗口之间的缓冲。
-- `TRICYCLE_MOLOP_BATCH_N_JOBS` 实际上是文件级 admission semaphore：最多允许多少个文件同时进入解析阶段。文件在等待槽位时不消耗单文件 parse timeout。
-- 文件获得槽位后，生产解析路径把 parser/frame 任务提交到一个可复用的 `spawn` 进程池。因此 `n_jobs=16` 表示最多 16 个文件任务进入共享池，不会为每个文件重复创建进程池；文件完成或失败后，候选队列继续补位。取消或超时只结束该文件的请求任务，已提交的共享池任务由池自行排空。
+- `TRICYCLE_MOLOP_BATCH_N_JOBS` 是 worker 内共享 MolOP 进程池的文件级准入上限。API、MCP、
+  本地 CLI 和远程批量入口都只负责把文件推进 RustFS/staged 队列，不会在各自会话中创建解析池。
+- worker 领取后把 parser/frame 任务提交到同一个可复用的 `spawn` 进程池。因此 `n_jobs=16`
+  表示该服务进程最多同时执行 16 个文件任务，不会为每个 artifact 或上传会话重复创建进程池；
+  文件完成或失败后，队列继续补位。取消或超时只结束该文件的任务，已提交的共享池工作由池自行排空。
 - 子进程内部的 OpenMP/BLAS native thread 由 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS` 和 `MKL_NUM_THREADS` 控制；推荐都设为 `1`。候选窗口和 native thread 数都不会替代文件级槽位。
-- 每个导入批次只有一个有界持久化消费者，结果队列和 `IMPORT_COMMIT_BATCH_FILES` 共同形成数据库写入背压。提交微批后才追加并 `fsync` checkpoint；单文件失败不会回滚已经提交的其他文件。
+- RustFS 暂存批次只负责上传背压；解析 worker 以领取窗口和有界持久化批次形成数据库写入背压。
+  暂存检查点记录 batch/item ID，最终解析状态以 UploadBatch 查询结果为准；单文件失败不会回滚
+  已暂存或已完成的其他文件。
 
-浏览器或远程 API 路径不经过 Import CLI 的指纹线程池和本地候选队列：API 先把字节写入 RustFS 并将条目标记为 `staged`，独立 `upload-worker` 每轮领取 `TRICYCLE_MAX_BATCH_FILES`（当前为 64）个文件，按项目/用户交给 `ArtifactUploadService.reparse_batch`。该方法只读取并校验已有对象，然后委托现有 `upload_batch`、共享 MolOP 进程池和单一持久化消费者；不会再次上传，也不会建立第二套解析路径。`TRICYCLE_UPLOAD_MAX_CONCURRENCY` 限制 RustFS 读取槽位，`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 只用于 pending-ingestion 恢复，`TRICYCLE_MOLOP_BATCH_N_JOBS` 限制共享解析池准入，三者不能简单相乘。
+浏览器、MCP 或远程 API 路径不经过 Import CLI 的指纹线程池和本地候选队列：入口先把字节写入
+RustFS 并将 item 标记为 `staged`，独立 `upload-worker` 每轮领取 `TRICYCLE_MAX_BATCH_FILES`
+（当前为 64）个文件，按项目/用户交给 `ArtifactUploadService.reparse_batch`。该方法只读取
+并校验已有对象，然后委托共享 MolOP 进程池和单一持久化消费者；不会再次上传，也不会建立
+第二套解析路径。`TRICYCLE_UPLOAD_MAX_CONCURRENCY` 限制 RustFS 读取槽位，
+`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 只用于旧 pending-ingestion 恢复，
+`TRICYCLE_MOLOP_BATCH_N_JOBS` 限制共享解析池准入，三者不能简单相乘。
 
 远程 reparse 的批次边界必须与解析并发分开理解：worker 每轮最多领取 64 个 staged
 文件，`reparse_batch` 将本次 project/user 分组的实际文件数传给 `upload_batch` 作为一次
@@ -648,10 +673,10 @@ make import-artifacts
 
 调参时按以下顺序处理：
 
-- 首先调 `TRICYCLE_MOLOP_BATCH_N_JOBS`，建议按 `2 → 4 → 8 → 16` 递增，每次使用同一批真实文件重新测量。近似的 CPU 压力是“文件 worker 数 × 每个 worker 的 native thread 数”；三个 OpenMP/BLAS 变量应保持为 `1`，不要通过把它们设大来代替文件级并发。生产环境必须使用正整数，不能使用 `-1`。
-- `IMPORT_PIPELINE_WINDOW_FILES` 是候选池，不是 worker 数；先取约 `4 × TRICYCLE_MOLOP_BATCH_N_JOBS`，并至少大于 worker 数。`IMPORT_STREAM_QUEUE_SIZE` 是发现/指纹阶段的缓冲，通常与候选池取相同值。增大这两个值只会增加预取和内存占用，不会增加解析并发；大文件或内存紧张时应优先减小它们。
+- 首先调 `TRICYCLE_MOLOP_BATCH_N_JOBS`，建议按 `2 → 4 → 8 → 16` 递增，每次使用同一批真实文件重新测量。它是 worker 共享解析进程池的文件级准入上限；三个 OpenMP/BLAS 变量应保持为 `1`，不要通过把它们设大来代替文件级并发。生产环境必须使用正整数，不能使用 `-1`。
+- `IMPORT_PIPELINE_WINDOW_FILES` 是 RustFS 暂存候选池，不是 parser worker 数；它只影响预取、背压和内存占用。`IMPORT_STREAM_QUEUE_SIZE` 是发现/指纹阶段的缓冲，通常与候选池取相同值。增大这两个值不会增加解析并发；大文件或内存紧张时应优先减小它们。
 - 指纹阶段使用独立线程池，当前内部上限为 `32` 个 worker，没有对应的环境变量或 CLI 参数。若统计中的瓶颈在 fingerprint 阶段，应先检查磁盘和 SHA-256 读取开销，不要盲目增大 MolOP 解析并发。
-- `IMPORT_COMMIT_BATCH_FILES` 只控制一次持久化事务和检查点频率，不控制解析并发。`16` 是稳定起点；遇到锁竞争、statement timeout 或数据库内存压力时降到 `8`，只有数据库有余量且提交频率成为瓶颈时才尝试 `32`。
+- `IMPORT_COMMIT_BATCH_FILES` 目前仅为旧 CLI 参数保留；worker 的领取窗口和持久化批次由服务端控制，不由本地 CLI 会话创建解析进程。若调整 worker 的提交边界，应同步观察锁竞争、statement timeout 和数据库内存压力。
 - `IMPORT_MAX_TRANSIENT_RETRIES=3` 建议保持不变。它只用于死锁、序列化冲突、连接瞬断等瞬态错误；提高它不能修复持续性错误，只会延长失败恢复时间。
 - `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS=60` 是 10 MiB 文件的基准预算，并随源文件大小放大；它是异常文件隔离参数，不是提速参数。慢磁盘或大文件较多时提高，想更快跳过异常文件时降低，但应先确认失败率。
 - `TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE=false` 是上一版高吞吐导入的默认值，适合大规模普通导入；需要 frame role/source locator、source span 和 block hash 等审计证据时显式设为 `true`，并接受额外开销。`TRICYCLE_MOLOP_PARALLEL_FRAME_PERSISTENCE=true` 应保持开启。
@@ -698,8 +723,8 @@ MCP 的 `get_import_status`、`list_import_failures`、`retry_import_items`、
 
 - 可以传入多个文件或目录；目录会递归扫描，符号链接不会展开。
 - 对 `calculation_output`，已知的 JSON/CSV/TSV/YAML/TOML、结构文件和 Markdown 旁车文件会自动跳过；未知扩展名仍会保留，以兼容不同量化软件。可用 `--include-suffix`（重复传入）建立本地扩展名白名单，或用 `--exclude-suffix` 增加排除项。
-- `--pipeline-window-files` 控制一次交给解析流水线的候选文件数，默认 `64`；也可通过 `IMPORT_PIPELINE_WINDOW_FILES` 传给 `make import-artifacts`。该窗口应明显大于解析槽位数，以便槽位释放后立即补位。
-- `--commit-batch-files` 控制已完成结果的持久化微批大小，默认 `16`；也可通过 `IMPORT_COMMIT_BATCH_FILES` 传给 `make import-artifacts`。它不限制候选池或解析并发。
+- `--pipeline-window-files` 控制一次交给 RustFS 暂存的候选文件数，默认 `64`；也可通过 `IMPORT_PIPELINE_WINDOW_FILES` 传给 `make import-artifacts`。它只形成暂存背压，不创建或限制 worker 的解析进程。
+- `--commit-batch-files` 是旧 CLI 参数，为兼容既有调用保留；解析持久化微批由 durable upload-worker 控制，不由本地导入会话直接提交。
 - `--stream-queue-size` 只控制文件发现/指纹阶段到流水线窗口之间的有界缓冲，默认 `64`；也可通过 `IMPORT_STREAM_QUEUE_SIZE` 传给 `make import-artifacts`。
 - 数据库死锁、序列化冲突、连接瞬断、statement timeout 和 `max_locks_per_transaction` 等瞬态资源错误会自动退避并把失败批次二分；默认每个文件最多重试 `3` 次。耗尽后只记录该文件失败，其他文件继续导入，下一次使用同一 `--state-file` 会再次尝试。
 - 默认导入 `calculation_output`，可用 `--artifact-kind input|workflow_manifest|auxiliary` 覆盖。

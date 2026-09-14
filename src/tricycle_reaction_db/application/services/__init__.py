@@ -131,8 +131,10 @@ from tricycle_reaction_db.application.services.operational_queries import (
     WorkflowManifestQueryService,
 )
 from tricycle_reaction_db.application.services.organization_management import (
+    OrganizationManagementAccessDeniedError,
     OrganizationManagementConflictError,
     OrganizationManagementError,
+    OrganizationManagementNotFoundError,
     OrganizationManagementService,
 )
 from tricycle_reaction_db.application.services.project_management import (
@@ -298,6 +300,8 @@ __all__ = [
     "ProjectManagementService",
     "OrganizationManagementConflictError",
     "OrganizationManagementError",
+    "OrganizationManagementAccessDeniedError",
+    "OrganizationManagementNotFoundError",
     "OrganizationManagementService",
     "CalculationQueryService",
     "CalculationResultQueryService",

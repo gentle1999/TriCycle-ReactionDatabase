@@ -7,6 +7,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from pathlib import Path
 from uuid import UUID, uuid4
 
 from sqlalchemy import and_, func, or_
@@ -69,6 +70,18 @@ class UploadBatchLimitError(UploadBatchError):
 
 
 UPLOAD_PROGRESS_METADATA_KEY = "__tricycle_upload_progress"
+_stage_slots: tuple[asyncio.AbstractEventLoop, int, asyncio.Semaphore] | None = None
+
+
+def _shared_stage_slots() -> asyncio.Semaphore:
+    """Bound RustFS staging across all upload sessions in this event loop."""
+
+    global _stage_slots
+    loop = asyncio.get_running_loop()
+    workers = max(1, get_settings().upload_max_concurrency)
+    if _stage_slots is None or _stage_slots[0] is not loop or _stage_slots[1] != workers:
+        _stage_slots = (loop, workers, asyncio.Semaphore(workers))
+    return _stage_slots[2]
 
 
 def _with_upload_progress(
@@ -118,6 +131,14 @@ class PendingIngestionJob:
     artifact_file_id: UUID
     user_id: UUID
     lease_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class StagedUploadSubmission:
+    """The durable queue records created by a transport upload request."""
+
+    batch: UploadBatchView
+    items: tuple[UploadBatchItemView, ...]
 
 
 def _required_uuid(value: UUID | None, label: str) -> UUID:
@@ -178,6 +199,7 @@ def _item_view(
 ) -> UploadBatchItemView:
     return UploadBatchItemView(
         id=_required_uuid(item.id, "UploadBatchItem"),
+        batch_id=item.batch_id,
         created_at=_required_datetime(item.created_at, "UploadBatchItem.created_at"),
         updated_at=_required_datetime(item.updated_at, "UploadBatchItem.updated_at"),
         client_file_id=item.client_file_id,
@@ -197,6 +219,7 @@ def _item_view(
         materialization_status=ImportMaterializationStatus(item.materialization_status),
         parse_revision_id=item.parse_revision_id,
         artifact_file_id=item.artifact_file_id,
+        ingestion_id=ingestion.id if ingestion is not None else None,
         ingestion_status=ingestion.status if ingestion is not None else ingestion_status,
         ingestion_error_message=(
             ingestion.error_message if ingestion is not None else ingestion_error_message
@@ -480,6 +503,188 @@ class UploadBatchService:
             await session.refresh(batch)
             return _batch_view(batch)
 
+    @classmethod
+    async def create_and_stage(
+        cls,
+        *,
+        files: list[ArtifactUploadPayload],
+        artifact_kind: ArtifactKind,
+        project_id: UUID,
+        user_id: UUID,
+        shared_metadata: dict[str, object] | None = None,
+    ) -> StagedUploadSubmission:
+        """Create an implicit durable batch for a transport upload.
+
+        The legacy artifact upload endpoints do not expose client-side batch
+        manifests, but they must still use exactly the same staging and worker
+        hand-off as the explicit upload queue.  This adapter gives those
+        endpoints a stable batch/item identity without duplicating the queue
+        state machine.
+        """
+
+        if not files:
+            raise UploadBatchConflictError("upload request contains no files")
+
+        client_file_ids = [uuid4() for _ in files]
+        descriptors: list[UploadBatchFileCreate] = []
+        payloads: list[tuple[UUID, ArtifactUploadPayload]] = []
+        seen_paths: set[str] = set()
+        for index, upload in enumerate(files):
+            size_bytes = cls._payload_size(upload)
+            if size_bytes < 0:
+                raise UploadBatchConflictError("uploaded artifact has no payload")
+            filename = Path(upload.filename).name
+            if not filename:
+                raise UploadBatchConflictError("uploaded artifact requires a filename")
+            relative_path = upload.relative_path or filename
+            if relative_path in seen_paths:
+                relative_path = f"{relative_path}.__direct_{index}"
+            seen_paths.add(relative_path)
+            descriptors.append(
+                UploadBatchFileCreate(
+                    client_file_id=client_file_ids[index],
+                    original_filename=filename,
+                    relative_path=relative_path,
+                    size_bytes=size_bytes,
+                    media_type=upload.media_type,
+                )
+            )
+            payloads.append(
+                (
+                    client_file_ids[index],
+                    ArtifactUploadPayload(
+                        filename=filename,
+                        media_type=upload.media_type,
+                        payload=upload.payload,
+                        spool_path=upload.spool_path,
+                        error_code=upload.error_code,
+                        error_message=upload.error_message,
+                        relative_path=relative_path,
+                        expected_sha256=upload.expected_sha256,
+                        expected_size_bytes=upload.expected_size_bytes,
+                    ),
+                )
+            )
+
+        batch = await cls.create(
+            UploadBatchCreate(
+                project_id=project_id,
+                artifact_kind=artifact_kind,
+                shared_metadata=shared_metadata or {},
+                files=descriptors,
+            ),
+            user_id=user_id,
+        )
+        items = await cls.upload_items(batch.id, files=payloads, user_id=user_id)
+        refreshed = await cls.get(batch.id, user_id=user_id, project_id=project_id)
+        return StagedUploadSubmission(batch=refreshed, items=tuple(items))
+
+    @classmethod
+    async def enqueue_reparse(
+        cls,
+        artifact_id: UUID,
+        *,
+        user_id: UUID,
+    ) -> StagedUploadSubmission:
+        """Put an existing calculation artifact on the shared parse queue."""
+
+        async with session_factory() as session:
+            artifact = await session.get(ArtifactFile, artifact_id)
+            if artifact is None:
+                raise UploadBatchNotFoundError("artifact not found")
+            await AuthorizationService.require_project_permission(
+                user_id,
+                artifact.project_id,
+                ProjectPermission.ARTIFACT_UPLOAD,
+            )
+            if artifact.artifact_kind is not ArtifactKind.CALCULATION_OUTPUT:
+                raise UploadBatchConflictError("only calculation output artifacts can be reparsed")
+            if artifact.storage_status is not StorageStatus.AVAILABLE:
+                raise UploadBatchConflictError("artifact bytes are not available for reparse")
+
+            existing = (
+                await session.exec(
+                    select(UploadBatchItem, UploadBatch)
+                    .join(UploadBatch, col(UploadBatch.id) == col(UploadBatchItem.batch_id))
+                    .where(
+                        col(UploadBatch.created_by_user_id) == user_id,
+                        col(UploadBatch.status) == UploadBatchStatus.ACTIVE,
+                        col(UploadBatchItem.artifact_file_id) == artifact_id,
+                        col(UploadBatchItem.status).in_(
+                            (
+                                UploadBatchItemStatus.STAGED,
+                                UploadBatchItemStatus.PROCESSING,
+                            )
+                        ),
+                    )
+                    .order_by(col(UploadBatchItem.created_at), col(UploadBatchItem.id))
+                )
+            ).first()
+            if existing is not None:
+                item, batch = existing
+                ingestion = (
+                    await session.exec(
+                        select(ArtifactIngestion).where(
+                            col(ArtifactIngestion.artifact_file_id) == artifact_id
+                        )
+                    )
+                ).first()
+                return StagedUploadSubmission(
+                    batch=_batch_view(batch),
+                    items=(_item_view(item, ingestion),),
+                )
+
+            now = datetime.now(UTC)
+            batch = UploadBatch(
+                project_id=artifact.project_id,
+                created_by_user_id=user_id,
+                artifact_kind=artifact.artifact_kind,
+                status=UploadBatchStatus.ACTIVE,
+                total_count=1,
+                total_bytes=artifact.size_bytes,
+                staged_count=1,
+                updated_at=now,
+            )
+            session.add(batch)
+            await session.flush()
+            batch_id = _required_uuid(batch.id, "UploadBatch")
+            item = UploadBatchItem(
+                batch_id=batch_id,
+                client_file_id=uuid4(),
+                position=0,
+                original_filename=artifact.original_filename,
+                relative_path=artifact.source_relative_path or artifact.original_filename,
+                size_bytes=artifact.size_bytes,
+                media_type=artifact.media_type,
+                content_sha256=artifact.content_sha256,
+                status=UploadBatchItemStatus.STAGED,
+                parse_status=ImportParseStatus.PENDING.value,
+                materialization_status=ImportMaterializationStatus.SUCCEEDED.value,
+                artifact_file_id=artifact_id,
+                metadata_json=_with_upload_progress(
+                    {"reparse": True},
+                    phase="staged",
+                    completed=0,
+                    total=1,
+                ),
+                updated_at=now,
+            )
+            session.add(item)
+            await session.commit()
+            await session.refresh(batch)
+            await session.refresh(item)
+            ingestion = (
+                await session.exec(
+                    select(ArtifactIngestion).where(
+                        col(ArtifactIngestion.artifact_file_id) == artifact_id
+                    )
+                )
+            ).first()
+            return StagedUploadSubmission(
+                batch=_batch_view(batch),
+                items=(_item_view(item, ingestion),),
+            )
+
     @staticmethod
     async def list_batches(
         *,
@@ -611,14 +816,6 @@ class UploadBatchService:
         if upload.spool_path is not None:
             return upload.spool_path.stat().st_size
         return -1
-
-    @staticmethod
-    def _payload_bytes(upload: ArtifactUploadPayload) -> bytes:
-        if upload.payload is not None:
-            return upload.payload
-        if upload.spool_path is not None:
-            return upload.spool_path.read_bytes()
-        raise UploadBatchConflictError("uploaded artifact has no payload")
 
     @staticmethod
     def _payload_sha256(upload: ArtifactUploadPayload) -> str:
@@ -868,15 +1065,27 @@ class UploadBatchService:
         if len(set(client_file_ids)) != len(client_file_ids):
             raise UploadBatchConflictError("client_file_id must be unique within an upload request")
         total_bytes = sum(max(0, cls._payload_size(upload)) for _, upload in files)
-        if total_bytes > settings.max_batch_bytes:
+        if len(files) > 1 and total_bytes > settings.max_batch_bytes:
             raise UploadBatchLimitError(
                 f"upload batch exceeds the {settings.max_batch_bytes}-byte limit"
             )
 
         now = datetime.now(UTC)
-        content_sha256_by_client_id = {
-            client_file_id: cls._payload_sha256(upload) for client_file_id, upload in files
-        }
+
+        async def calculate_digest(
+            client_file_id: UUID,
+            upload: ArtifactUploadPayload,
+        ) -> tuple[UUID, str]:
+            # Local imports may point at multi-gigabyte files. Hashing them in
+            # the event-loop thread would pause every upload session, even
+            # though staging itself is independently bounded below.
+            return client_file_id, await asyncio.to_thread(cls._payload_sha256, upload)
+
+        content_sha256_by_client_id = dict(
+            await asyncio.gather(
+                *(calculate_digest(client_file_id, upload) for client_file_id, upload in files)
+            )
+        )
         pending: list[tuple[UUID, ArtifactUploadPayload, str, str, str | None, int]] = []
         views_by_client_id: dict[UUID, UploadBatchItemView] = {}
         async with session_factory() as session:
@@ -1013,26 +1222,37 @@ class UploadBatchService:
 
         # Each stage operation is independent.  A failed object store request
         # becomes one failed queue item, while all other files remain usable.
-        for (
-            client_file_id,
-            upload,
-            resolved_media_type,
-            relative_path,
-            expected_sha256,
-            expected_size_bytes,
-        ) in pending:
+        # The shared admission semaphore keeps concurrent upload sessions from
+        # creating an unbounded number of RustFS client threads.
+        stage_slots = _shared_stage_slots()
+
+        async def stage_one(
+            staged_file: tuple[UUID, ArtifactUploadPayload, str, str, str | None, int],
+        ) -> tuple[UUID, UploadBatchItemView]:
+            (
+                client_file_id,
+                upload,
+                resolved_media_type,
+                relative_path,
+                expected_sha256,
+                expected_size_bytes,
+            ) = staged_file
             try:
-                staged = await ArtifactUploadService.stage(
-                    payload=cls._payload_bytes(upload),
-                    filename=upload.filename,
-                    media_type=resolved_media_type,
-                    artifact_kind=artifact_kind,
-                    project_id=project_id,
-                    user_id=user_id,
-                    relative_path=relative_path,
-                    expected_sha256=expected_sha256,
-                    expected_size_bytes=expected_size_bytes,
-                )
+                async with stage_slots:
+                    source = upload.payload if upload.payload is not None else upload.spool_path
+                    if source is None:
+                        raise UploadBatchConflictError("uploaded artifact has no payload")
+                    staged = await ArtifactUploadService.stage_source(
+                        source=source,
+                        filename=upload.filename,
+                        media_type=resolved_media_type,
+                        artifact_kind=artifact_kind,
+                        project_id=project_id,
+                        user_id=user_id,
+                        relative_path=relative_path,
+                        expected_sha256=expected_sha256,
+                        expected_size_bytes=expected_size_bytes,
+                    )
             except asyncio.CancelledError:
                 await cls._finish_staged_item(
                     batch_id,
@@ -1048,15 +1268,17 @@ class UploadBatchService:
                     user_id=user_id,
                     error=error,
                 )
-                views_by_client_id[client_file_id] = finished
+                return client_file_id, finished
             else:
-                views_by_client_id[client_file_id] = await cls._finish_staged_item(
+                return client_file_id, await cls._finish_staged_item(
                     batch_id,
                     client_file_id,
                     user_id=user_id,
                     result=staged,
                 )
 
+        staged_results = await asyncio.gather(*(stage_one(file) for file in pending))
+        views_by_client_id.update(dict(staged_results))
         return [views_by_client_id[client_file_id] for client_file_id in client_file_ids]
 
     @classmethod
@@ -1720,6 +1942,7 @@ class UploadBatchService:
 
 __all__ = [
     "PendingIngestionJob",
+    "StagedUploadSubmission",
     "UploadBatchConflictError",
     "UploadBatchError",
     "UploadBatchLimitError",

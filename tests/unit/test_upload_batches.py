@@ -59,6 +59,7 @@ def _item_view(
 ) -> UploadBatchItemView:
     return UploadBatchItemView(
         id=ITEM_ID,
+        batch_id=BATCH_ID,
         created_at=NOW,
         updated_at=NOW,
         client_file_id=client_file_id,

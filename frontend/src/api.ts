@@ -1,6 +1,6 @@
 import type {
   ArtifactPreview,
-  ArtifactBatchUploadResult,
+  ArtifactBatchUploadAccepted,
   ArtifactSummary,
   CalculationFrameDetail,
   CalculationFrameSummary,
@@ -19,6 +19,7 @@ import type {
   MolecularTopologyDetail,
   Page,
   ArtifactUploadResult,
+  ArtifactUploadAccepted,
   AuditEventView,
   ReactionEnergyProfile,
   MappedReactionThermodynamics,
@@ -227,7 +228,7 @@ async function uploadArtifact(
   projectId: string,
   artifactKind: ArtifactUploadResult["artifact_kind"],
   signal?: AbortSignal,
-): Promise<ArtifactUploadResult> {
+): Promise<ArtifactUploadAccepted> {
   const form = new FormData();
   form.set("project_id", projectId);
   form.set("file", file);
@@ -249,7 +250,7 @@ async function uploadArtifact(
     }
     throw new ApiError(response.status, detail);
   }
-  return (await response.json()) as ArtifactUploadResult;
+  return (await response.json()) as ArtifactUploadAccepted;
 }
 
 async function uploadArtifacts(
@@ -257,7 +258,7 @@ async function uploadArtifacts(
   projectId: string,
   artifactKind: ArtifactUploadResult["artifact_kind"],
   signal?: AbortSignal,
-): Promise<ArtifactBatchUploadResult> {
+): Promise<ArtifactBatchUploadAccepted> {
   const form = new FormData();
   form.set("project_id", projectId);
   for (const file of files) form.append("files", file);
@@ -270,7 +271,7 @@ async function uploadArtifacts(
     signal,
   });
   if (!response.ok) throw new ApiError(response.status, response.statusText);
-  return (await response.json()) as ArtifactBatchUploadResult;
+  return (await response.json()) as ArtifactBatchUploadAccepted;
 }
 
 function uploadBatchFile(
@@ -782,12 +783,12 @@ export const api = {
       signal,
     ),
   reparseArtifact: (id: string, signal?: AbortSignal) =>
-    requestMutation<ArtifactUploadResult>(
+    requestMutation<ArtifactUploadAccepted>(
       `/api/artifacts/${encodeURIComponent(id)}/reparse`,
       "POST",
       undefined,
       signal,
-    ) as Promise<ArtifactUploadResult>,
+    ) as Promise<ArtifactUploadAccepted>,
   deleteArtifact,
   uploadArtifact,
   uploadArtifacts,

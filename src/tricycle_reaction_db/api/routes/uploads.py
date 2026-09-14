@@ -9,10 +9,10 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, s
 
 from tricycle_reaction_db.api.authentication import get_authenticated_principal
 from tricycle_reaction_db.application.dtos import (
-    ArtifactBatchUploadResult,
+    ArtifactBatchUploadAccepted,
     ArtifactMetadataUpdate,
     ArtifactSummary,
-    ArtifactUploadResult,
+    ArtifactUploadAccepted,
     ArtifactValidationResult,
 )
 from tricycle_reaction_db.application.services.artifact_management import (
@@ -31,6 +31,12 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
 )
 from tricycle_reaction_db.application.services.authentication import AuthenticatedPrincipal
 from tricycle_reaction_db.application.services.authorization import ProjectAccessDeniedError
+from tricycle_reaction_db.application.services.upload_batches import (
+    UploadBatchConflictError,
+    UploadBatchLimitError,
+    UploadBatchNotFoundError,
+    UploadBatchService,
+)
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.domain.enums import ArtifactKind
 
@@ -56,14 +62,14 @@ async def _spool_upload(file: UploadFile, path: Path, *, maximum: int) -> int:
     return size
 
 
-@router.post("", response_model=ArtifactUploadResult)
+@router.post("", response_model=ArtifactUploadAccepted, status_code=status.HTTP_202_ACCEPTED)
 async def upload_artifact(
     principal: Principal,
     project_id: Annotated[UUID, Form()],
     file: Annotated[UploadFile, File()],
     artifact_kind: Annotated[ArtifactKind, Form()] = ArtifactKind.CALCULATION_OUTPUT,
-) -> ArtifactUploadResult:
-    """Store any artifact; calculation outputs are parsed frame-by-frame with MolOP."""
+) -> ArtifactUploadAccepted:
+    """Stage one artifact; a durable worker performs calculation parsing later."""
 
     filename = file.filename
     if filename is None or not filename.strip():
@@ -81,16 +87,29 @@ async def upload_artifact(
             headers=UPLOAD_PREFLIGHT_HEADERS,
         )
     try:
-        return await ArtifactUploadService.upload(
-            payload=payload,
-            filename=filename,
-            media_type=file.content_type or "application/octet-stream",
+        submission = await UploadBatchService.create_and_stage(
+            files=[
+                ArtifactUploadPayload(
+                    filename=filename,
+                    media_type=file.content_type or "application/octet-stream",
+                    payload=payload,
+                )
+            ],
             artifact_kind=artifact_kind,
             project_id=project_id,
             user_id=principal.user_id,
         )
+        return ArtifactUploadAccepted(batch=submission.batch, item=submission.items[0])
     except ProjectAccessDeniedError as error:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(error)) from error
+    except UploadBatchLimitError as error:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=str(error),
+            headers=UPLOAD_PREFLIGHT_HEADERS,
+        ) from error
+    except UploadBatchConflictError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
     except ArtifactUploadLimitError as error:
         raise HTTPException(
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
@@ -105,14 +124,18 @@ async def upload_artifact(
         ) from error
 
 
-@router.post("/batch", response_model=ArtifactBatchUploadResult)
+@router.post(
+    "/batch",
+    response_model=ArtifactBatchUploadAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 async def upload_artifact_batch(
     principal: Principal,
     project_id: Annotated[UUID, Form()],
     files: Annotated[list[UploadFile], File()],
     artifact_kind: Annotated[ArtifactKind, Form()] = ArtifactKind.CALCULATION_OUTPUT,
-) -> ArtifactBatchUploadResult:
-    """Upload raw files independently; MolOP probes every calculation file."""
+) -> ArtifactBatchUploadAccepted:
+    """Stage raw files independently; a durable worker performs parsing later."""
 
     settings = get_settings()
     maximum = settings.max_upload_bytes
@@ -134,7 +157,7 @@ async def upload_artifact_batch(
                     ArtifactUploadPayload(
                         filename="<unnamed>",
                         media_type=media_type,
-                        payload=None,
+                        payload=b"",
                         error_code="missing_filename",
                         error_message="uploaded artifact requires a filename",
                     )
@@ -164,14 +187,26 @@ async def upload_artifact_batch(
                 )
             )
         try:
-            return await ArtifactUploadService.upload_batch(
+            submission = await UploadBatchService.create_and_stage(
                 files=payloads,
                 artifact_kind=artifact_kind,
                 project_id=project_id,
                 user_id=principal.user_id,
             )
+            return ArtifactBatchUploadAccepted(
+                batch=submission.batch,
+                items=list(submission.items),
+            )
         except ProjectAccessDeniedError as error:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(error)) from error
+        except UploadBatchLimitError as error:
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail=str(error),
+                headers=UPLOAD_PREFLIGHT_HEADERS,
+            ) from error
+        except UploadBatchConflictError as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
         except ArtifactUploadLimitError as error:
             raise HTTPException(
                 status_code=status.HTTP_413_CONTENT_TOO_LARGE,
@@ -229,18 +264,27 @@ async def validate_artifact(
         ) from error
 
 
-@router.post("/{artifact_id}/reparse", response_model=ArtifactUploadResult)
+@router.post(
+    "/{artifact_id}/reparse",
+    response_model=ArtifactUploadAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 async def reparse_artifact(
     artifact_id: UUID,
     principal: Annotated[AuthenticatedPrincipal, Depends(get_authenticated_principal)],
-) -> ArtifactUploadResult:
-    """Reparse an available calculation artifact with the current parser identity."""
+) -> ArtifactUploadAccepted:
+    """Queue an available calculation artifact for reparsing by the worker."""
 
     try:
-        return await ArtifactUploadService.reparse(
-            artifact_id=artifact_id,
+        submission = await UploadBatchService.enqueue_reparse(
+            artifact_id,
             user_id=principal.user_id,
         )
+        return ArtifactUploadAccepted(batch=submission.batch, item=submission.items[0])
+    except UploadBatchNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except UploadBatchConflictError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
     except ProjectAccessDeniedError as error:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(error)) from error
     except ArtifactUploadError as error:

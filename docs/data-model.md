@@ -150,14 +150,13 @@ abstraction policy、匹配 schema、原子对应和被抽象的 feature，便�
 ## 导入与解析状态
 
 浏览器上传、批量上传、显式 reparse 和本地 `tricycle-import-artifacts` CLI 共用同一个
-application upload service；CLI 只把本地路径作为字节来源。浏览器批次采用服务端持久化队列：
-先写入 manifest，再逐文件把字节写入并核验 RustFS/S3，最后把 `UploadBatchItem` 推进到
-`staged`；独立的 `tricycle-upload-worker` 每轮领取最多 64 个 staged 项，调用
-`ArtifactUploadService.reparse_batch`。该批量外壳只读取/校验已有 RustFS 对象，再委托既有
-`upload_batch`、共享 MolOP 进程池和单一持久化消费者，最后提交 `succeeded`/`failed`；不会再次
-上传对象或新增远程解析器。MolOP 不在 HTTP 请求或浏览器生命周期内运行，因此刷新页面、
-切换路由、API 重启或 worker 重启都不会丢失已经 staged 的文件。对象、内容哈希、解析 revision
-和科学事实都不可原地覆盖。
+application upload service；CLI 只把本地路径作为字节来源。所有入口都先建立 durable
+batch/item，并把核验后的原始对象暂存到 RustFS；计算 ingestion 保持 `pending`，条目进入
+`staged`。独立的 `tricycle-upload-worker` 每轮领取最多 64 个 staged 项，读取/校验已有对象，
+再调用共享 MolOP 进程池和统一持久化路径。它不会再次上传对象，也不会为每个请求/会话新增
+解析器。MolOP 不在 HTTP 请求或浏览器生命周期内运行，因此刷新页面、切换路由、API 重启或
+worker 重启都不会丢失已经 staged 的文件。对象、内容哈希、解析 revision 和科学事实都不可
+原地覆盖。
 
 上传批次条目状态的唯一流转为：
 
@@ -187,15 +186,12 @@ worker 的 `recover_stale` 会按项目、文件大小、artifact kind 和该哈
 `CalculationFrame.running_time_seconds` 保存逐帧用时。两者语义不同，文件级用时不能用逐帧用时
 求和替代。
 
-本地导入是流式候选队列：`IMPORT_PIPELINE_WINDOW_FILES` 决定预取候选池，
-`TRICYCLE_MOLOP_BATCH_N_JOBS` 决定同时运行的文件 worker，
-`IMPORT_COMMIT_BATCH_FILES` 只决定已完成结果的持久化/checkpoint 微批。候选池应大于 worker
-数，以便任一文件完成或超时后立即接替下一个文件。单文件解析预算以
-`TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS` 为 10 MiB 基准并随文件大小线性放大；超时只
-终止该文件任务并释放槽位。限制 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS` 和
-`MKL_NUM_THREADS`，而不是把文件并发误当作 native thread 限制。计算输出导入会在 MolOP
-之前排除明确的 JSON/CSV/结构等旁车文件；准备身份预约和持久化都使用有界事务，瞬态数据库
-资源错误会自动退避、拆批并在状态文件中保持可重试。
+本地导入是 RustFS 暂存候选队列：`IMPORT_PIPELINE_WINDOW_FILES` 决定暂存预取窗口；CLI
+不运行 MolOP。worker 内的 `TRICYCLE_MOLOP_BATCH_N_JOBS` 决定共享进程池的文件准入，
+`IMPORT_COMMIT_BATCH_FILES` 仅作为旧 CLI 参数保留，最终解析提交由 worker 管理。保持
+`OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS` 和 `MKL_NUM_THREADS` 有界，避免共享池中的
+native thread 过量。计算输出导入会在暂存前排除明确的 JSON/CSV/结构等旁车文件；身份预约
+和暂存都使用有界事务，单个文件的 RustFS 错误不会影响其他文件。
 
 具体的低资源与吞吐优先起始值见[文件导入超参数推荐](development.md#推荐的导入超参数)。
 

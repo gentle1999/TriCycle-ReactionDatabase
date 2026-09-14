@@ -187,17 +187,16 @@ state, item state, error codes, artifact/revision references, and audit events a
 
 Browser uploads, batch uploads, explicit reparse, and the local
 `tricycle-import-artifacts` CLI use the same application upload service. The
-CLI differs only by using local paths as its byte source. Browser batches are a
-server-owned durable queue: the manifest is written first, each file is written
-and verified in RustFS/S3, and its `UploadBatchItem` becomes `staged`. An
-independent `tricycle-upload-worker` claims at most 64 staged items per window
-and calls `ArtifactUploadService.reparse_batch`. That batch wrapper only
-reads/verifies existing RustFS objects, then delegates to the existing
-`upload_batch`, shared MolOP pool, and single persistence consumer; it does not
-upload objects again or add a remote parser. MolOP is not owned by the HTTP
-request or browser lifecycle, so a page reload, route change, API restart, or
-worker restart cannot discard a staged file. Object identity, content hash,
-parse revisions, and scientific facts are never overwritten in place.
+CLI differs only by using local paths as its byte source. Every ingress path
+first creates the durable batch/item and stages a verified object in RustFS;
+calculation ingestion remains `pending` while the item is `staged`. An
+independent `tricycle-upload-worker` claims at most 64 staged items per window,
+reads/verifies the existing objects, and calls the shared MolOP process pool
+and persistence path. It does not upload objects again or add a parser per
+request/session. MolOP is not owned by the HTTP request or browser lifecycle,
+so a page reload, route change, API restart, or worker restart cannot discard a
+staged file. Object identity, content hash, parse revisions, and scientific
+facts are never overwritten in place.
 
 The only upload-batch item state flow is:
 
@@ -234,18 +233,14 @@ reported by MolOP. `CalculationFrame.running_time_seconds` stores per-frame
 runtime; the file-level value has different semantics and must not be replaced
 by a sum of frame runtimes.
 
-Local import is a streaming candidate queue. `IMPORT_PIPELINE_WINDOW_FILES`
-sets the prefetched candidate pool, `TRICYCLE_MOLOP_BATCH_N_JOBS` sets concurrent
-file workers, and `IMPORT_COMMIT_BATCH_FILES` only sets the completed-result
-persistence/checkpoint microbatch. The candidate pool should exceed the worker
-count so a completed or timed-out task is replaced immediately. The per-file
-budget uses `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS` for 10 MiB and scales
-linearly with source size. A timeout stops only that file and frees its slot.
-Bound `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, and `MKL_NUM_THREADS`; file
-worker concurrency is not a native-thread limit.
-Calculation-output imports reject unambiguous JSON/CSV/structure sidecars before
-MolOP. Identity preparation and persistence use bounded transactions, and
-transient database resource failures back off, split the batch, and remain
+Local import is a streaming RustFS staging queue. `IMPORT_PIPELINE_WINDOW_FILES`
+sets the prefetched staging window; the CLI does not run MolOP. The worker's
+`TRICYCLE_MOLOP_BATCH_N_JOBS` sets shared parser-pool admission, while
+`IMPORT_COMMIT_BATCH_FILES` is retained only for CLI compatibility. Bound
+`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, and `MKL_NUM_THREADS` inside the
+shared parser workers. Calculation-output imports reject unambiguous
+JSON/CSV/structure sidecars before staging. Identity preparation and staging
+use bounded transactions, and transient database/resource failures remain
 retryable in the state file.
 
 See [recommended import settings](development.md#recommended-import-settings) for

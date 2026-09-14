@@ -27,6 +27,8 @@ DEV_RUNTIME_ENV = \
 	TRICYCLE_AUTH_MODE=development \
 	TRICYCLE_API_HOST=0.0.0.0 \
 	TRICYCLE_API_PORT=8000
+DEV_WORKER_RUNTIME_ENV = $(DEV_RUNTIME_ENV) \
+	TRICYCLE_QUERY_STATEMENT_TIMEOUT_MS=120000
 
 # Artifact imports default to the caller's configured runtime. Use the local
 # development stack explicitly with IMPORT_MODE=development.
@@ -62,20 +64,25 @@ serve-frontend:
 	npm --prefix frontend run dev
 
 # Start the host-based development stack. Uvicorn reloads Python changes and
-# Vite provides frontend HMR; Ctrl-C stops only the two foreground processes.
+# Vite provides frontend HMR; the durable upload worker consumes staged files.
 dev:
 	@set -u; \
 	$(DEV_RUNTIME_ENV) TRICYCLE_DEBUG=true uv run tricycle-api & api_pid=$$!; \
+	$(DEV_WORKER_RUNTIME_ENV) uv run tricycle-upload-worker & worker_pid=$$!; \
 	npm --prefix frontend run dev & frontend_pid=$$!; \
 	cleanup() { \
-		kill "$$api_pid" "$$frontend_pid" 2>/dev/null || true; \
+		kill "$$api_pid" "$$worker_pid" "$$frontend_pid" 2>/dev/null || true; \
 		wait "$$api_pid" 2>/dev/null || true; \
+		wait "$$worker_pid" 2>/dev/null || true; \
 		wait "$$frontend_pid" 2>/dev/null || true; \
 	}; \
 	trap 'cleanup; exit 0' INT TERM; \
 	while :; do \
 		if ! kill -0 "$$api_pid" 2>/dev/null; then \
 			wait "$$api_pid"; status=$$?; cleanup; exit "$$status"; \
+		fi; \
+		if ! kill -0 "$$worker_pid" 2>/dev/null; then \
+			wait "$$worker_pid"; status=$$?; cleanup; exit "$$status"; \
 		fi; \
 		if ! kill -0 "$$frontend_pid" 2>/dev/null; then \
 			wait "$$frontend_pid"; status=$$?; cleanup; exit "$$status"; \
@@ -90,16 +97,21 @@ dev-host: dev
 dev-stack: dev-infra-up dev-migrate dev-bootstrap
 	@set -u; \
 	$(DEV_RUNTIME_ENV) TRICYCLE_DEBUG=true uv run tricycle-api & api_pid=$$!; \
+	$(DEV_WORKER_RUNTIME_ENV) uv run tricycle-upload-worker & worker_pid=$$!; \
 	npm --prefix frontend run dev & frontend_pid=$$!; \
 	cleanup() { \
-		kill "$$api_pid" "$$frontend_pid" 2>/dev/null || true; \
+		kill "$$api_pid" "$$worker_pid" "$$frontend_pid" 2>/dev/null || true; \
 		wait "$$api_pid" 2>/dev/null || true; \
+		wait "$$worker_pid" 2>/dev/null || true; \
 		wait "$$frontend_pid" 2>/dev/null || true; \
 	}; \
 	trap 'cleanup; exit 0' INT TERM; \
 	while :; do \
 		if ! kill -0 "$$api_pid" 2>/dev/null; then \
 			wait "$$api_pid"; status=$$?; cleanup; exit "$$status"; \
+		fi; \
+		if ! kill -0 "$$worker_pid" 2>/dev/null; then \
+			wait "$$worker_pid"; status=$$?; cleanup; exit "$$status"; \
 		fi; \
 		if ! kill -0 "$$frontend_pid" 2>/dev/null; then \
 			wait "$$frontend_pid"; status=$$?; cleanup; exit "$$status"; \
@@ -190,7 +202,7 @@ stack-down:
 	docker compose down
 
 stack-logs:
-	docker compose logs --follow api frontend caddy
+	docker compose logs --follow api upload-worker frontend caddy
 
 migrate:
 	uv run alembic upgrade head

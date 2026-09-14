@@ -7,6 +7,7 @@ from sqlmodel import col, select
 
 from tricycle_reaction_db.application.dtos import (
     OrganizationCreate,
+    OrganizationMemberUpsert,
     ProjectCreate,
     ProjectInvitationCreate,
     ProjectMemberRoleUpdate,
@@ -32,7 +33,7 @@ from tricycle_reaction_db.db.models import (
     UserAccount,
 )
 from tricycle_reaction_db.db.session import session_factory
-from tricycle_reaction_db.domain.enums import ProjectRole, ProjectStatus
+from tricycle_reaction_db.domain.enums import OrganizationRole, ProjectRole, ProjectStatus
 from tricycle_reaction_db.domain.identity import (
     DEVELOPMENT_IDENTITY_ISSUER,
     DEVELOPMENT_IDENTITY_SUBJECT,
@@ -125,6 +126,71 @@ async def test_authenticated_user_can_create_an_organization_and_first_project()
                 await session.exec(
                     delete(Organization).where(col(Organization.id) == created_organization_id)
                 )
+            await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_organization_member_management_preserves_owner_boundary() -> None:
+    suffix = uuid4().hex
+    member_user_id = uuid4()
+    organization_id = None
+    owner = _principal()
+
+    try:
+        organization = await OrganizationManagementService.create_organization(
+            OrganizationCreate(slug=f"members-{suffix}", name="Members Organization"),
+            owner,
+        )
+        organization_id = organization.id
+        async with session_factory() as session:
+            session.add(
+                UserAccount(
+                    id=member_user_id,
+                    display_name="Organization Member",
+                    primary_email=f"member-{suffix}@example.test",
+                )
+            )
+            await session.commit()
+
+        added = await OrganizationManagementService.upsert_member(
+            organization.id,
+            OrganizationMemberUpsert(user_id=member_user_id),
+            owner,
+        )
+        assert added.role is OrganizationRole.MEMBER
+        assert [
+            member.user_id
+            for member in await OrganizationManagementService.list_members(
+                organization.id,
+                owner,
+            )
+        ] == [owner.user_id, member_user_id]
+
+        with pytest.raises(
+            OrganizationManagementConflictError,
+            match="last organization owner",
+        ):
+            await OrganizationManagementService.remove_member(organization.id, owner.user_id, owner)
+
+        promoted = await OrganizationManagementService.upsert_member(
+            organization.id,
+            OrganizationMemberUpsert(user_id=member_user_id, role=OrganizationRole.OWNER),
+            owner,
+        )
+        assert promoted.role is OrganizationRole.OWNER
+        await OrganizationManagementService.remove_member(organization.id, owner.user_id, owner)
+    finally:
+        async with session_factory() as session:
+            if organization_id is not None:
+                await session.exec(
+                    delete(OrganizationMembership).where(
+                        col(OrganizationMembership.organization_id) == organization_id
+                    )
+                )
+                await session.exec(
+                    delete(Organization).where(col(Organization.id) == organization_id)
+                )
+            await session.exec(delete(UserAccount).where(col(UserAccount.id) == member_user_id))
             await session.commit()
 
 

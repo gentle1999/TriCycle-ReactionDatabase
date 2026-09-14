@@ -80,6 +80,31 @@ The local frontend proxies `/api`, `/health`, `/docs`, `/graphql`, and
 `/nexusx/*` to the host API. API schemas expose stable business data, not RustFS
 credentials, raw binary Mols, internal JSON, or `ScientificArray.data`.
 
+### MCP organization, project, and calculation-log operations
+
+An MCP token is a user-level credential. It has no fixed organization, project,
+or static scope. Each call resolves the current organization and project
+memberships for the token's user, so membership changes take effect without
+issuing a new token. The service layer still enforces authorization for every
+operation.
+
+| Scope | MCP tools | Permission boundary |
+| --- | --- | --- |
+| Organization | `list_organizations`, `create_organization` | Lists visible organizations; the creator becomes owner |
+| Organization members | `list_organization_members`, `upsert_organization_member`, `remove_organization_member` | Members can list; owners/admins can manage; the last owner cannot be removed or demoted |
+| Project | `create_project`, `list_projects`, `get_project`, `update_project` | Creation requires organization owner/admin; updates require project manager or organization admin |
+| Project members | `list_project_members`, `upsert_project_member`, `remove_project_member` | Project manager or organization admin; the last project manager is preserved |
+| Project invitations | `list_project_invitations`, `create_project_invitation`, `revoke_project_invitation`, `resend_project_invitation`, `accept_project_invitation` | Project manager or organization admin; acceptance still checks the authenticated email |
+| Audit | `list_project_audit` | Project manager or organization admin |
+| Calculation logs | `upload_calculation_log` | Requires project `artifact:upload`; the request only performs size, authorization, and RustFS staging; MolOP/persistence run asynchronously in the worker |
+
+`upload_calculation_log` accepts standard Base64 in `content_base64` (without a
+Data URL prefix). The per-file limit is `TRICYCLE_MAX_UPLOAD_BYTES` (64 MiB by
+default). The response contains the durable `UploadBatch` and item in `staged`/
+`pending` state. `success=true` means that the raw object reached RustFS and the
+parse queue, not that MolOP has completed; read the batch/item later for
+`ingestion_status`, `parse_revision_id`, frame counts, and TS inference results.
+
 ## Query and Parsing Budgets
 
 The default limits are documented in `.env.example`. In particular:
@@ -142,8 +167,10 @@ TRICYCLE_RUN_DATABASE_TESTS=1 uv run pytest -q \
 
 `tricycle-import-artifacts` is the registered project CLI for existing local
 files. It uses the same upload service as the browser and remote batch API;
-only its byte source differs. It recursively reads files, writes verified raw
-objects, and parses calculation outputs with the ordinary MolOP path.
+only its byte source differs. It recursively discovers and fingerprints files,
+creates an `UploadBatch`, and stages verified raw objects in RustFS. The CLI
+does not run MolOP; the independent `upload-worker` claims the staged items and
+uses the same shared parser and persistence path as remote uploads.
 
 ### File flow and process-pool model
 
@@ -159,15 +186,12 @@ sequenceDiagram
     participant Q as Candidate queue
     participant U as ArtifactUploadService
     participant R as RustFS
-    participant G as File-slot gate
-    participant P as Reusable MolOP pool
-    participant W as Persistence consumer
+    participant W as upload-worker
     participant D as PostgreSQL
     participant C as JSONL checkpoint
 
     Note over F: ThreadPoolExecutor, internal cap 32
-    Note over G,P: n_jobs file slots; one reusable spawn ProcessPoolExecutor
-    Note over P: OMP/OPENBLAS/MKL are normally set to 1 in the child
+    Note over W: one reusable spawn MolOP ProcessPoolExecutor shared by uploads
 
     I->>F: Discover paths and compute SHA-256
     F->>Q: Enqueue candidate
@@ -176,26 +200,14 @@ sequenceDiagram
         Note right of Q: IMPORT_PIPELINE_WINDOW_FILES
         loop Each file in the window (concurrent)
             U->>R: Write and verify raw object
-            R-->>U: Object ready
-            U->>G: Wait for and acquire file slot
-            G->>P: Submit parser/frame work
-            P->>P: MolOP parse + frame post-processing
-            alt Normal completion
-                P-->>G: Return frames/diagnostics
-                G-->>U: Release file slot
-                P-->>W: Put bounded result
-            else Timeout or parse failure
-                P-->>G: Raise timeout/error after safe cleanup
-                G-->>U: Release file slot
-                P-->>W: Put file failure result
-            end
+            R-->>U: Object ready; item=staged
+            U->>D: Commit batch/item hand-off
         end
-        W->>W: Accumulate completed results
-        opt IMPORT_COMMIT_BATCH_FILES reached
-            W->>D: Persist completed-result microbatch
-            D-->>W: Commit
-            W->>C: Append status and fsync
-        end
+        W->>D: Claim staged items
+        W->>R: Read and verify existing objects
+        W->>W: Submit to shared MolOP pool and persist results
+        W->>D: Update ingestion/item state
+        U->>C: Append staging checkpoint and fsync
         U-->>Q: Refill with the next candidate
     end
 ```
@@ -205,33 +217,36 @@ Read the boundaries in the diagram as follows:
 - The fingerprint pool only discovers files and reads SHA-256. Its internal
   cap is `32`; it is not the MolOP parser pool. `IMPORT_STREAM_QUEUE_SIZE`
   bounds the buffer from fingerprinting into the candidate window.
-- `TRICYCLE_MOLOP_BATCH_N_JOBS` is a file-level admission semaphore: it limits
-  how many files may enter parsing at once. Waiting for a slot does not consume
-  the per-file parse timeout.
-- After a file acquires a slot, the production path submits parser and frame
-  work to one reusable, `spawn`-based `ProcessPoolExecutor`. Thus `n_jobs=16`
-  means at most 16 file tasks enter the shared pool; a new pool is not created
-  for every artifact. Completed or failed work lets the candidate queue refill.
-  A cancelled or timed-out request releases its admission slot while already
-  submitted shared-pool work is drained by the pool.
+- `TRICYCLE_MOLOP_BATCH_N_JOBS` is the file-level admission limit for the
+  worker's shared MolOP process pool. API, MCP, local CLI, and remote batch
+  entry points only stage files in RustFS and the durable queue; they do not
+  create parser pools in individual upload sessions.
+- After a worker claims an item, parser and frame work is submitted to one
+  reusable, `spawn`-based `ProcessPoolExecutor`. Thus `n_jobs=16` means at most
+  16 file tasks execute in that service process; a new pool is not created for
+  every artifact or upload session. Completed or failed work lets the queue
+  refill. A cancelled or timed-out task releases its admission slot while
+  already submitted shared-pool work is drained by the pool.
 - `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, and `MKL_NUM_THREADS` bound native
   threads inside the child and should normally all be `1`. The candidate
   window and native-thread counts do not replace file-level slots.
-- Each import batch has one bounded persistence consumer. Its result queue and
-  `IMPORT_COMMIT_BATCH_FILES` provide database backpressure. A checkpoint is
-  appended and `fsync`ed after the microbatch commit, so one file failure does
-  not roll back already committed files.
+- The staging window provides RustFS backpressure; the worker's claim window
+  and bounded persistence batches provide database backpressure. The staging
+  checkpoint records batch/item IDs, while final parse status comes from the
+  UploadBatch API. One file failure does not roll back other staged or completed
+  files.
 
-Browser and remote API uploads skip the CLI fingerprint pool and local
-candidate queue: the API stores bytes in RustFS and marks the item `staged`,
-then the independent `upload-worker` claims a `TRICYCLE_MAX_BATCH_FILES` (64)
-window and groups it by project/user for `ArtifactUploadService.reparse_batch`.
-That wrapper only reads/verifies existing objects and delegates to the existing
-`upload_batch`, shared MolOP pool, and single persistence consumer. It does not
-upload objects again or introduce a second parser. `TRICYCLE_UPLOAD_MAX_CONCURRENCY`
-limits RustFS reads, `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` is retained for
-pending-ingestion recovery, and `TRICYCLE_MOLOP_BATCH_N_JOBS` limits shared-pool
-admission; these controls must not simply be multiplied.
+Browser, MCP, and remote API uploads skip the CLI fingerprint pool and local
+candidate queue: the entry point stores bytes in RustFS and marks the item
+`staged`, then the independent `upload-worker` claims a
+`TRICYCLE_MAX_BATCH_FILES` (64) window and groups it by project/user for
+`ArtifactUploadService.reparse_batch`. That wrapper only reads/verifies
+existing objects and delegates to the shared MolOP pool and single persistence
+consumer; it does not upload objects again or introduce a second parser.
+`TRICYCLE_UPLOAD_MAX_CONCURRENCY` limits RustFS reads,
+`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` is retained for legacy pending-ingestion
+recovery, and `TRICYCLE_MOLOP_BATCH_N_JOBS` limits shared-pool admission; these
+controls must not simply be multiplied.
 
 Keep the remote reparse boundaries separate from parser concurrency: the worker
 claims at most 64 staged files, and `reparse_batch` passes the actual number in
@@ -322,9 +337,10 @@ shared parser pool, subject to CPU, memory, and database write-latency checks.
 
 The word “persistence” here means the worker claim's commit boundary; it does not
 serialize 64 files or change the internal 32-result hand-off. Local CLI
-`IMPORT_COMMIT_BATCH_FILES=16` still controls only local transaction/checkpoint
-frequency. These three numbers belong to parser admission, result hand-off, and
-commit boundaries respectively and must not substitute for one another.
+`IMPORT_COMMIT_BATCH_FILES` is retained for compatibility and does not control
+worker parsing or persistence. These controls belong to staging backpressure,
+parser admission, and worker commit boundaries respectively and must not
+substitute for one another.
 
 `TRICYCLE_MAX_UPLOAD_BYTES=64 MiB` is the per-file cap and also applies to local
 imports. `TRICYCLE_MAX_BATCH_FILES=64` and
@@ -379,10 +395,10 @@ Markdown sidecars are skipped before MolOP. Unknown suffixes remain admissible
 for vendor-specific quantum-chemistry formats. Use repeated `--include-suffix`
 options for a local allowlist or `--exclude-suffix` for additional exclusions.
 
-`--pipeline-window-files` is the candidate pool (default `64`),
-`--commit-batch-files` is only the completed-result persistence microbatch
-(default `16`), and `--stream-queue-size` bounds discovery/fingerprinting
-buffering (default `64`). Preparation transactions are bounded separately so a
+`--pipeline-window-files` is the RustFS staging window (default `64`),
+`--commit-batch-files` is a retained compatibility option (default `16`), and
+`--stream-queue-size` bounds discovery/fingerprinting buffering (default `64`).
+Worker preparation and persistence transactions are bounded separately so a
 large request cannot exhaust PostgreSQL advisory-lock shared memory. Deadlocks,
 serialization conflicts, connection interruptions, statement timeouts, and
 `max_locks_per_transaction` failures are retried with exponential backoff and

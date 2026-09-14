@@ -156,7 +156,9 @@ automated tests reproducible.
 
 The browser upload queue and the local importer use the same application upload
 service. The CLI differs only in its source: it reads existing paths directly
-instead of receiving browser-spooled files.
+instead of receiving browser-spooled files. Both paths only stage verified
+objects in RustFS; `tricycle-upload-worker` later claims the durable items and
+parses them through the shared MolOP process pool.
 
 ```bash
 IMPORT_MODE=development \
@@ -188,36 +190,38 @@ validated below the configured staging root; links, special files, changed
 bytes, and files outside the manifest are rejected. Re-registering the same
 manifest is idempotent and returns the existing durable import job.
 
-The checkpoint is append-only and makes the import resumable using source path,
-size, mtime, and SHA-256. Files that contain no recoverable calculation frames
-are retained as filtered artifacts; a failure in one file does not discard
-successfully parsed frames or unrelated files.
+The checkpoint is append-only and makes staging resumable using source path,
+size, mtime, and SHA-256. Start `tricycle-upload-worker` alongside the CLI (the
+`make dev` and `make dev-stack` targets do this automatically) to consume the
+staged files. Final parse status is available from the UploadBatch API; a
+failure in one file does not discard unrelated files.
 
 The importer deliberately separates four controls:
 
 | Control | Default | Purpose |
 | --- | --- | --- |
-| `TRICYCLE_MOLOP_BATCH_N_JOBS` | `2` | Number of concurrent file-level MolOP workers |
+| `TRICYCLE_MOLOP_BATCH_N_JOBS` | `2` | Shared worker-process-pool admission limit |
 | `IMPORT_PIPELINE_WINDOW_FILES` | `64` | Candidate files available to the parser queue |
-| `IMPORT_COMMIT_BATCH_FILES` | `16` | Completed files per persistence/checkpoint microbatch |
+| `IMPORT_COMMIT_BATCH_FILES` | `16` | Legacy compatibility setting; staging checkpoints are per queue window |
 | `IMPORT_STREAM_QUEUE_SIZE` | `64` | Bounded discovery/fingerprinting buffer |
 
-Set the pipeline window appreciably above the worker count so a finished worker
-can immediately take the next queued file. Do not use the persistence microbatch
-size to limit parser concurrency. Keep `OMP_NUM_THREADS`,
+Set the pipeline window to bound RustFS staging and keep memory predictable. The
+worker owns parser concurrency and persistence; do not use the staging window to
+create parser processes. Keep `OMP_NUM_THREADS`,
 `OPENBLAS_NUM_THREADS`, and `MKL_NUM_THREADS` bounded (the supplied development
 configuration uses `1`) to avoid nested native-thread oversubscription.
 
 For a dedicated compute host, use `TRICYCLE_MOLOP_BATCH_N_JOBS=16`, native
-thread limits of `1 / 1 / 1`, a `64 / 64` pipeline/stream window, and a
-`16`-file persistence microbatch as the throughput-oriented starting point.
+thread limits of `1 / 1 / 1`, and a `64 / 64` staging/fingerprint window as the
+throughput-oriented starting point. The worker owns parse and persistence
+batching.
 Keep the conservative `2` worker setting on a low-resource development host;
 the full tuning table and the separate browser/upload-worker settings are in
 [Development: recommended import settings](docs/en/development.md#recommended-import-settings).
 
-The baseline file timeout is `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS` for a
-10 MiB source. Larger files receive a proportional allowance; a timed-out file
-fails independently and releases its worker slot.
+The worker's baseline file timeout is `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS`
+for a 10 MiB source. Larger files receive a proportional allowance; a timed-out
+file fails independently and releases its shared-pool admission slot.
 
 For all importer flags, reparse behavior, and production import configuration,
 see [Development: direct artifact import](docs/development.md#直接批量导入存量文件).

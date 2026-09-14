@@ -683,6 +683,16 @@ export interface ArtifactBatchUploadResult {
   items: ArtifactBatchUploadItem[];
 }
 
+export interface ArtifactUploadAccepted {
+  batch: UploadBatch;
+  item: UploadBatchItem;
+}
+
+export interface ArtifactBatchUploadAccepted {
+  batch: UploadBatch;
+  items: UploadBatchItem[];
+}
+
 export type UploadBatchStatus = "active" | "paused" | "completed" | "cancelled";
 export type UploadBatchItemStatus =
   | "queued"
@@ -736,6 +746,7 @@ export interface UploadBatchPage {
 
 export interface UploadBatchItem {
   id: string;
+  batch_id: string;
   created_at: string;
   updated_at: string;
   client_file_id: string;
@@ -748,7 +759,13 @@ export interface UploadBatchItem {
   attempt_count: number;
   processing_attempt_count: number;
   content_sha256: string | null;
+  expected_file_sha256?: string | null;
+  is_gaussian_log?: boolean;
+  parse_status?: string;
+  materialization_status?: string;
+  parse_revision_id?: string | null;
   artifact_file_id: string | null;
+  ingestion_id?: string | null;
   ingestion_status: ArtifactSummary["ingestion_status"];
   ingestion_error_message: string | null;
   error_code: string | null;
