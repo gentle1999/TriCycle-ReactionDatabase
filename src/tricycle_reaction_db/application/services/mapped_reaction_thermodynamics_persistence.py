@@ -14,6 +14,7 @@ from sqlmodel import Session, col, select
 
 from tricycle_reaction_db.application.dtos import MappedReactionThermodynamics
 from tricycle_reaction_db.application.services._persistence import (
+    _attach_or_reuse_entity,
     _attach_pending_entities,
     _require_id,
 )
@@ -762,6 +763,7 @@ def refresh_mapped_reaction_thermodynamics(
     aggregates already stored on MappedReactionThermodynamicProfile.
     """
 
+    mapped_reaction = _attach_or_reuse_entity(session, mapped_reaction)
     _attach_pending_entities(session)
     mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
     if _input is not None and source_frame_ids_by_geometry is not None:
@@ -955,8 +957,9 @@ def refresh_mapped_reactions_thermodynamics(
         return ()
     mapped_reactions_by_id: dict[UUID, MappedReaction] = {}
     for mapped_reaction in mapped_reactions:
-        mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
-        mapped_reactions_by_id.setdefault(mapped_reaction_id, mapped_reaction)
+        canonical = _attach_or_reuse_entity(session, mapped_reaction)
+        mapped_reaction_id = _require_id(canonical, label="MappedReaction")
+        mapped_reactions_by_id.setdefault(mapped_reaction_id, canonical)
     mapped_reaction_ids = tuple(mapped_reactions_by_id)
     _attach_pending_entities(session)
 

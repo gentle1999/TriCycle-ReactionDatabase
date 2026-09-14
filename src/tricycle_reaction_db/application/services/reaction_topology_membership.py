@@ -17,6 +17,7 @@ from sqlmodel import Session, col, select
 
 from tricycle_reaction_db.application.services._persistence import (
     _acquire_identity_locks,
+    _attach_or_reuse_entity,
     _flush_new_entity,
     _new_entity,
     _require_id,
@@ -214,7 +215,8 @@ def persist_logical_participant_concrete_topology(
         if membership not in session.new and membership not in session.info.get(
             "_fast_pending_entities", ()
         ):
-            session.add(membership)
+            membership = _attach_or_reuse_entity(session, membership)
+            _cache_membership(session, membership)
             session.flush()
         return membership
 

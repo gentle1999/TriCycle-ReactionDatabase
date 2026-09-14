@@ -49,14 +49,18 @@ function isExpressionCondition(
 }
 
 function clearConditionValidation(id: number): void {
-  const timer = validationTimers.get(id);
-  if (timer !== undefined) window.clearTimeout(timer);
-  validationTimers.delete(id);
+  cancelValidationTimer(id);
   validationControllers.get(id)?.abort();
   validationControllers.delete(id);
   const next = { ...validationStates.value };
   delete next[id];
   validationStates.value = next;
+}
+
+function cancelValidationTimer(id: number): void {
+  const timer = validationTimers.get(id);
+  if (timer !== undefined) window.clearTimeout(timer);
+  validationTimers.delete(id);
 }
 
 function validationInput(condition: GeometryQueryCondition): { kind: ChemistryValidationKind; value: string } | null {
@@ -102,8 +106,7 @@ async function validateCondition(condition: GeometryQueryCondition): Promise<boo
 
 function scheduleConditionValidation(condition: GeometryQueryCondition): void {
   const input = validationInput(condition);
-  const timer = validationTimers.get(condition.id);
-  if (timer !== undefined) window.clearTimeout(timer);
+  cancelValidationTimer(condition.id);
   validationControllers.get(condition.id)?.abort();
   validationControllers.delete(condition.id);
   if (!input || !input.value) {
@@ -233,6 +236,9 @@ function buildFilters(): GeometryQueryFilters | null {
 }
 
 async function apply(): Promise<void> {
+  // Do not let a debounce callback start a second validation and abort the
+  // immediate validation that gates query submission.
+  for (const condition of conditions.value) cancelValidationTimer(condition.id);
   const validationResults = await Promise.all(conditions.value.map((condition) => validateCondition(condition)));
   if (!validationResults.every(Boolean)) {
     validationError.value = conditions.value

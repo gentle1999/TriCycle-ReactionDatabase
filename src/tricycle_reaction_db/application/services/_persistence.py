@@ -128,6 +128,32 @@ def _fast_insert_enabled(session: Session) -> bool:
     return bool(session.info.get("tricycle_fast_insert", False))
 
 
+def _attach_or_reuse_entity[EntityT](session: Session, entity: EntityT) -> EntityT:
+    """Attach an entity without creating a second instance for one identity.
+
+    The fast insertion path deliberately turns inserted rows into detached
+    identity holders.  A later query in the same Session can therefore load a
+    canonical instance for the same primary key before a write workflow needs
+    to update the holder.  ``Session.add(detached_holder)`` raises an
+    ``InvalidRequestError`` in that situation.  Reuse the identity-map
+    instance and copy only loaded scalar columns; relationship graphs must not
+    be cascaded across the two object graphs.
+    """
+
+    state = sa_inspect(entity)
+    if state.key is not None:
+        current = session.identity_map.get(state.key)
+        if current is not None and current is not entity:
+            entity_dict = cast(Any, entity).__dict__
+            for column_property in state.mapper.column_attrs:
+                column_name = column_property.key
+                if column_name in entity_dict:
+                    setattr(current, column_name, entity_dict[column_name])
+            return cast(EntityT, current)
+    session.add(entity)
+    return entity
+
+
 def _project_owner_predicate(column: Any, project_id: UUID | None) -> Any:
     """Match one project owner, treating NULL as the quarantined namespace."""
 
@@ -524,6 +550,7 @@ def _flush_shared_entity(
 __all__ = [
     "_acquire_identity_locks",
     "_attach_pending_entities",
+    "_attach_or_reuse_entity",
     "_bulk_insert_pending_entities",
     "_assert_record_matches",
     "_fast_insert_enabled",

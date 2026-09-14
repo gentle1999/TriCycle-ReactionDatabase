@@ -1,5 +1,16 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 
+function isAdvancedFilterResponse(response: import("@playwright/test").Response): boolean {
+  try {
+    const payload = response.request().postDataJSON() as { filter_expression?: unknown };
+    if (typeof payload.filter_expression !== "string" || !payload.filter_expression) return false;
+    const expression = JSON.parse(payload.filter_expression) as { operator?: unknown };
+    return expression !== null && typeof expression === "object" && typeof expression.operator === "string";
+  } catch {
+    return false;
+  }
+}
+
 async function waitForMolecules(page: import("@playwright/test").Page): Promise<void> {
   await page.waitForFunction(() => {
     const canvases = [...document.querySelectorAll<HTMLCanvasElement>(".molecule-canvas canvas")];
@@ -960,7 +971,7 @@ test("reaction advanced query builds a structured AND/OR/NOT expression", async 
   const responsePromise = page.waitForResponse((response) =>
     response.url().includes("/api/logical_reaction_query_service/list_logical_reactions")
     && response.request().method() === "POST"
-    && response.request().postData()?.includes("filter_expression") === true,
+    && isAdvancedFilterResponse(response),
   );
   await dialog.getByRole("button", { name: "应用高级查询" }).click();
   const response = await responsePromise;
@@ -1358,7 +1369,7 @@ test("geometry advanced query builds AND, OR, and NOT expressions", async ({ pag
   const responsePromise = page.waitForResponse((response) =>
     response.url().includes("/api/geometry_query_service/list_geometries")
     && response.request().method() === "POST"
-    && response.request().postData()?.includes("filter_expression") === true,
+    && isAdvancedFilterResponse(response),
   );
   await dialog.getByRole("button", { name: "应用高级查询" }).click();
   const response = await responsePromise;
@@ -1504,8 +1515,9 @@ test("geometry advanced query provides the ChemDoodle editor and SMARTS filter",
 
   await sketcher.locator('.topology-smiles-input input').fill("C=C");
   const responsePromise = page.waitForResponse((response) =>
-    response.url().includes("/api/geometry_query_service/list_geometries") &&
-    response.request().method() === "POST",
+    response.url().includes("/api/geometry_query_service/list_geometries")
+    && response.request().method() === "POST"
+    && isAdvancedFilterResponse(response),
   );
   await dialog.getByRole("button", { name: "应用高级查询" }).click();
 
@@ -1527,9 +1539,9 @@ test("geometry advanced query provides the ChemDoodle editor and SMARTS filter",
   const smartsDialog = page.getByRole("dialog", { name: "高级查询" });
   await smartsDialog.locator('select[id^="advanced-query-field-"]').selectOption("topology_smarts");
   const smartsResponsePromise = page.waitForResponse((candidate) =>
-    candidate.url().includes("/api/geometry_query_service/list_geometries") &&
-    candidate.request().method() === "POST" &&
-    candidate.request().postData()?.includes("filter_expression") === true,
+    candidate.url().includes("/api/geometry_query_service/list_geometries")
+    && candidate.request().method() === "POST"
+    && isAdvancedFilterResponse(candidate),
   );
   await smartsDialog.getByRole("textbox", { name: "SMARTS条件值" }).fill("[s]");
   await smartsDialog.getByRole("button", { name: "应用高级查询" }).click();
@@ -1570,7 +1582,7 @@ test("reaction advanced query accepts a multicomponent MOL Block", async ({ page
   const responsePromise = page.waitForResponse((response) =>
     response.url().includes("/api/logical_reaction_query_service/list_logical_reactions")
     && response.request().method() === "POST"
-    && response.request().postData()?.includes("filter_expression") === true,
+    && isAdvancedFilterResponse(response),
   );
   await dialog.getByRole("button", { name: "应用高级查询" }).click();
   const response = await responsePromise;

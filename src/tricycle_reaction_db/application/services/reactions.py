@@ -28,6 +28,7 @@ from tricycle_reaction_db.application.services._persistence import (
     LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
     _acquire_identity_locks,
     _assert_record_matches,
+    _attach_or_reuse_entity,
     _attach_pending_entities,
     _flush_new_entity,
     _new_entity,
@@ -2054,7 +2055,7 @@ def _promote_mapped_reaction_node_geometry(
         session.flush()
     if not binding.is_primary:
         binding.is_primary = True
-        session.add(binding)
+        binding = _attach_or_reuse_entity(session, binding)
         _attach_pending_entities(session)
         session.flush()
 

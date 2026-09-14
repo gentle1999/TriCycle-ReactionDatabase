@@ -1,11 +1,15 @@
-"""Store uploaded artifacts, ingest calculation outputs, and infer TS reactions."""
+"""Public facade for artifact storage, ingestion, and TS reaction inference.
+
+The transport-facing API remains here for compatibility.  Shared upload types,
+bounded source validation, and MolOP/MolGR endpoint inference live in focused
+modules so the orchestration code does not own every concern.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import copy
 import gzip
-import io
 import json
 import logging
 import multiprocessing
@@ -17,7 +21,6 @@ from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, MutableMapping, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from hashlib import sha256
@@ -51,6 +54,7 @@ from tricycle_reaction_db.application.dtos import (
 from tricycle_reaction_db.application.services._persistence import (
     LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
     _acquire_identity_locks,
+    _attach_or_reuse_entity,
     _attach_pending_entities,
     _bulk_insert_pending_entities,
     _fast_insert_enabled,
@@ -61,6 +65,59 @@ from tricycle_reaction_db.application.services._persistence import (
 )
 from tricycle_reaction_db.application.services.artifact_content import (
     detect_artifact_media_type,
+)
+from tricycle_reaction_db.application.services.artifact_molop_inference import (
+    infer_endpoint_stereochemistry_from_3d as _infer_endpoint_stereochemistry_from_3d_impl,
+)
+from tricycle_reaction_db.application.services.artifact_molop_inference import (
+    infer_ts_frame as _infer_ts_frame_impl,
+)
+from tricycle_reaction_db.application.services.artifact_molop_inference import (
+    mapped_reaction_smiles as _mapped_reaction_smiles_impl,
+)
+from tricycle_reaction_db.application.services.artifact_molop_inference import (
+    signed_ts_endpoints as _signed_ts_endpoints_impl,
+)
+from tricycle_reaction_db.application.services.artifact_upload_types import (
+    ArtifactUploadConflictError,
+    ArtifactUploadError,
+    ArtifactUploadLimitError,
+    ArtifactUploadPayload,
+    MolOPFileParseTimeoutError,
+    NoCalculationFramesError,
+    _DeferredArtifactInferences,
+    _FailedInference,
+    _Inference,
+    _InferencePersistenceTask,
+    _IngestionCompletion,
+    _InspectedUploadSource,
+    _ParsedArtifact,
+    _ParsedChemFile,
+    _PreparedCalculationUpload,
+    _ProcessedFrame,
+    _RetiredArtifactReservation,
+    _SuccessfulInference,
+)
+from tricycle_reaction_db.application.services.artifact_upload_validation import (
+    inspect_upload_source as _inspect_upload_source_impl,
+)
+from tricycle_reaction_db.application.services.artifact_upload_validation import (
+    parser_payload as _parser_payload_impl,
+)
+from tricycle_reaction_db.application.services.artifact_upload_validation import (
+    require_batch_upload_budget as _require_batch_upload_budget_impl,
+)
+from tricycle_reaction_db.application.services.artifact_upload_validation import (
+    require_decompressed_upload_size as _require_decompressed_upload_size_impl,
+)
+from tricycle_reaction_db.application.services.artifact_upload_validation import (
+    require_upload_size as _require_upload_size_impl,
+)
+from tricycle_reaction_db.application.services.artifact_upload_validation import (
+    safe_parser_suffix as _safe_parser_suffix,
+)
+from tricycle_reaction_db.application.services.artifact_upload_validation import (
+    upload_payload_bytes as _upload_payload_bytes,
 )
 from tricycle_reaction_db.application.services.authorization import (
     AuthorizationService,
@@ -92,7 +149,7 @@ from tricycle_reaction_db.application.services.reaction_geometry_reconciliation 
     ensure_transition_state_path,
 )
 from tricycle_reaction_db.core.config import get_settings
-from tricycle_reaction_db.core.units import ANGSTROM, CM_INVERSE, magnitude_in
+from tricycle_reaction_db.core.units import CM_INVERSE, magnitude_in
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
     ArtifactIngestion,
@@ -120,7 +177,6 @@ from tricycle_reaction_db.ingestion import (
     configure_molecular_graph_reconstruction,
     ensure_serializable_double_bond_stereochemistry,
     frame_records_from_molop,
-    infer_molgr_stereochemistry_from_3d,
     normalize_topology,
     normalize_topology_with_mapping,
 )
@@ -150,31 +206,6 @@ INFERENCE_PERSIST_BATCH_SIZE = 16
 MOLOP_PARSE_TIMEOUT_REFERENCE_BYTES = 10 * 1024 * 1024
 
 
-class ArtifactUploadError(RuntimeError):
-    pass
-
-
-class MolOPFileParseTimeoutError(ArtifactUploadError):
-    """One file exceeded the bounded MolOP plus post-processing budget."""
-
-    error_code = "molop_parse_timeout"
-
-    def __init__(self, message: str) -> None:
-        super().__init__(f"[{self.error_code}] {message}")
-
-
-class ArtifactUploadLimitError(ArtifactUploadError):
-    """Upload bytes or file count exceed a configured hard resource budget."""
-
-
-class ArtifactUploadConflictError(ArtifactUploadError):
-    pass
-
-
-class NoCalculationFramesError(ArtifactUploadError):
-    """The source is not a QM calculation output accepted by the catalogue."""
-
-
 def _is_no_calculation_frames_message(message: str | None) -> bool:
     """Recognize MolOP's parser-level no-frame outcome as a filter result."""
 
@@ -195,226 +226,10 @@ def _parser_error_from_worker(message: str | None) -> ArtifactUploadError:
     return ArtifactUploadError(normalized_message)
 
 
-@dataclass(frozen=True, slots=True)
-class _SuccessfulInference:
-    file_frame_index: int
-    imaginary_mode_index: int
-    imaginary_frequency_cm1: float
-    reaction_smiles: str
-    negative_endpoint: Chem.Mol
-    positive_endpoint: Chem.Mol
-    negative_displacement_ratio: float
-    positive_displacement_ratio: float
-    charge: int
-    multiplicity: int
-
-
-@dataclass(frozen=True, slots=True)
-class _FailedInference:
-    file_frame_index: int
-    imaginary_mode_index: int
-    imaginary_frequency_cm1: float
-    error_code: str
-    error_message: str
-    error_metadata: dict[str, Any] | None = None
-
-
-_Inference = _SuccessfulInference | _FailedInference
-
-
-@dataclass(frozen=True, slots=True)
-class _ParsedArtifact:
-    # Production parsing keeps the owning-process ChemFile so topology
-    # reconstruction can be deferred until persistence.  The slim wrapper is
-    # retained for the legacy process-pool parser, where the frame tree cannot
-    # be sent back over IPC without a large copy.
-    chem_file: Any
-    frame_records: tuple[MolOPFrameRecords, ...]
-    source_frame_count: int
-    source_format: str | None
-    source_compression: str | None
-    inferences: tuple[_Inference, ...]
-    record_sha256: str | None = None
-    artifact_sha256: str | None = None
-    parse_diagnostics: tuple[dict[str, Any], ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class _ProcessedFrame:
-    """One frame after MolGR reconstruction and ingestion-level validation."""
-
-    file_frame_index: int
-    record: MolOPFrameRecords | None
-    inference: _Inference | None
-    topology_reconstruction_status: str | None
-    error_code: str | None = None
-    error_message: str | None = None
-    error_type: str | None = None
-    error_metadata: dict[str, Any] | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _ParsedChemFile:
-    """File-level MolOP metadata retained after worker conversion.
-
-    The original ChemFile contains every parsed frame.  Returning it together
-    with ``frame_records`` duplicates the complete frame tree across the
-    process boundary, so only the metadata and source segments cross IPC.
-    """
-
-    payload: dict[str, Any]
-    source_segments: tuple[Any, ...]
-    source_frame_count: int
-
-    def __len__(self) -> int:
-        """Expose the original ChemFile cardinality after IPC slimming."""
-
-        return self.source_frame_count
-
-    @property
-    def schema_version(self) -> str:
-        return str(self.payload["schema_version"])
-
-    @property
-    def artifact_sha256(self) -> str | None:
-        value = self.payload.get("artifact_sha256")
-        return value if isinstance(value, str) else None
-
-    @property
-    def artifact_size_bytes(self) -> int | None:
-        value = self.payload.get("artifact_size_bytes")
-        return value if isinstance(value, int) else None
-
-    @property
-    def source_diagnostics(self) -> list[Any]:
-        value = self.payload.get("source_diagnostics", [])
-        return value if isinstance(value, list) else []
-
-    def model_dump(self, *, mode: str = "python", **_kwargs: Any) -> dict[str, Any]:
-        return dict(self.payload)
-
-
-@dataclass(frozen=True, slots=True)
-class _IngestionCompletion:
-    parse_revision_id: UUID
-    parse_revision_created: bool
-    source_frame_count: int
-    transition_state_frame_count: int
-    source_format: str | None
-    completed_at: datetime
-    parse_completeness: ParseCompleteness = ParseCompleteness.COMPLETE
-    parse_diagnostics: tuple[dict[str, Any], ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class _DeferredArtifactInferences:
-    ingestion: ArtifactIngestion
-    parse_revision: ParseRevision
-    parsed: _ParsedArtifact
-    frames_by_file_index: dict[int, CalculationFrame]
-    revision_created: bool
-    defer_revision_local_flush: bool
-
-
-@dataclass(frozen=True, slots=True)
-class _InferencePersistenceTask:
-    deferred: _DeferredArtifactInferences
-    inferred: _SuccessfulInference
-    calculation_frame: CalculationFrame
-
-
-@dataclass(frozen=True, slots=True)
-class ArtifactUploadPayload:
-    filename: str
-    media_type: str
-    payload: bytes | None
-    spool_path: Path | None = None
-    error_code: str | None = None
-    error_message: str | None = None
-    # Optional manifest identity. These values are checked against the bytes
-    # after the source has been inspected, immediately before persistence.
-    relative_path: str | None = None
-    expected_sha256: str | None = None
-    expected_size_bytes: int | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _RetiredArtifactReservation:
-    bucket: str
-    object_key: str
-    version_id: str | None
-    etag: str | None
-    storage_verified_at: datetime | None
-
-
-@dataclass(frozen=True, slots=True)
-class _PreparedCalculationUpload:
-    settings: RustFSSettings
-    artifact_id: UUID
-    object_key: str
-    ingestion_id: UUID | None
-    started_at: datetime
-    source: bytes | Path
-    size_bytes: int
-    media_type: str
-    content_sha256: str
-    retired_reservation: _RetiredArtifactReservation | None = None
-    needs_storage: bool = True
-    check_existing_object: bool = True
-    skip_parse: bool = False
-    force_new_revision: bool = False
-    ingestion_status: ArtifactIngestionStatus | None = None
-    duplicate_of: int | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _InspectedUploadSource:
-    source: bytes | Path
-    size_bytes: int
-    content_sha256: str
-    media_probe: bytes
-
-
-class _InspectingReader:
-    """Record raw source identity while a gzip reader consumes a stream."""
-
-    def __init__(self, stream: io.BufferedReader, *, probe_size: int) -> None:
-        self._stream = stream
-        self._digest = sha256()
-        self._probe = bytearray()
-        self._probe_size = probe_size
-        self.size_bytes = 0
-
-    def read(self, size: int = -1) -> bytes:
-        chunk = self._stream.read(size)
-        if chunk:
-            self._digest.update(chunk)
-            self.size_bytes += len(chunk)
-            if len(self._probe) < self._probe_size:
-                self._probe.extend(chunk[: self._probe_size - len(self._probe)])
-        return chunk
-
-    @property
-    def content_sha256(self) -> str:
-        return self._digest.hexdigest()
-
-    @property
-    def media_probe(self) -> bytes:
-        return bytes(self._probe)
-
-
 def _require_prepared_ingestion_id(reservation: _PreparedCalculationUpload) -> UUID:
     if reservation.ingestion_id is None:
         raise RuntimeError("calculation upload is missing its ingestion reservation")
     return reservation.ingestion_id
-
-
-def _safe_parser_suffix(filename: str) -> str:
-    name = Path(filename).name.lower()
-    if name.endswith(".gz"):
-        name = name[:-3]
-    suffix = Path(name).suffix
-    return suffix if suffix in {".log", ".out", ".xyz"} else ".log"
 
 
 _molop_process_pool: ProcessPoolExecutor | None = None
@@ -1229,9 +1044,7 @@ _ORIGINAL_RUN_MOLOP_SOURCE_PARSER = _run_molop_source_parser
 
 
 def _require_upload_size(payload: bytes) -> None:
-    maximum = get_settings().max_upload_bytes
-    if len(payload) > maximum:
-        raise ArtifactUploadError(f"uploaded artifact exceeds the {maximum}-byte limit")
+    _require_upload_size_impl(payload, maximum_size=get_settings().max_upload_bytes)
 
 
 def _inspect_upload_source(
@@ -1239,58 +1052,7 @@ def _inspect_upload_source(
     *,
     maximum_size: int,
 ) -> _InspectedUploadSource:
-    """Inspect one source without materializing a spooled file in memory."""
-
-    if file.payload is not None:
-        payload = file.payload
-        if len(payload) > maximum_size:
-            raise ArtifactUploadLimitError(
-                f"uploaded artifact exceeds the {maximum_size}-byte limit"
-            )
-        _require_decompressed_upload_size(payload, file.filename)
-        return _InspectedUploadSource(
-            source=payload,
-            size_bytes=len(payload),
-            content_sha256=sha256(payload).hexdigest(),
-            media_probe=payload[: 64 * 1024],
-        )
-
-    if file.spool_path is None:
-        raise ArtifactUploadError("uploaded artifact has no payload")
-    expected_size = file.spool_path.stat().st_size
-    if expected_size > maximum_size:
-        raise ArtifactUploadLimitError(f"uploaded artifact exceeds the {maximum_size}-byte limit")
-
-    with file.spool_path.open("rb") as stream:
-        source = _InspectingReader(stream, probe_size=64 * 1024)
-        is_gzip = file.filename.lower().endswith(".gz") or stream.peek(2)[:2] == b"\x1f\x8b"
-        if is_gzip:
-            try:
-                with gzip.GzipFile(fileobj=cast(Any, source), mode="rb") as decompressed:
-                    decompressed_size = 0
-                    while chunk := decompressed.read(min(1024 * 1024, maximum_size + 1)):
-                        decompressed_size += len(chunk)
-                        if decompressed_size > maximum_size:
-                            raise ArtifactUploadLimitError(
-                                f"decompressed artifact exceeds the {maximum_size}-byte limit"
-                            )
-            except ArtifactUploadLimitError:
-                raise
-            except (EOFError, OSError, zlib.error):
-                # Invalid gzip remains an isolated MolOP parse failure, matching
-                # the bytes-upload path's validation behavior.
-                pass
-        while source.read(1024 * 1024):
-            pass
-
-    if source.size_bytes != expected_size:
-        raise ArtifactUploadError("uploaded spool file changed while being inspected")
-    return _InspectedUploadSource(
-        source=file.spool_path,
-        size_bytes=source.size_bytes,
-        content_sha256=source.content_sha256,
-        media_probe=source.media_probe,
-    )
+    return _inspect_upload_source_impl(file, maximum_size=maximum_size)
 
 
 def _require_batch_upload_budget(
@@ -1299,35 +1061,15 @@ def _require_batch_upload_budget(
     enforce_batch_files: bool = True,
     enforce_batch_bytes: bool = True,
 ) -> dict[int, _InspectedUploadSource]:
-    """Validate every batch dimension before authorization, storage, or parsing."""
-
     settings = get_settings()
-    if enforce_batch_files and len(files) > settings.max_batch_files:
-        raise ArtifactUploadLimitError(
-            f"upload batch exceeds the {settings.max_batch_files}-file limit"
-        )
-    total_bytes = 0
-    inspected_by_index: dict[int, _InspectedUploadSource] = {}
-    for index, file in enumerate(files):
-        if file.payload is None and file.spool_path is None:
-            continue
-        inspected = _inspect_upload_source(file, maximum_size=settings.max_upload_bytes)
-        if enforce_batch_bytes:
-            total_bytes += inspected.size_bytes
-        if enforce_batch_bytes and total_bytes > settings.max_batch_bytes:
-            raise ArtifactUploadLimitError(
-                f"upload batch exceeds the {settings.max_batch_bytes}-byte limit"
-            )
-        inspected_by_index[index] = inspected
-    return inspected_by_index
-
-
-def _upload_payload_bytes(file: ArtifactUploadPayload) -> bytes:
-    if file.payload is not None:
-        return file.payload
-    if file.spool_path is not None:
-        return file.spool_path.read_bytes()
-    raise ArtifactUploadError("uploaded artifact has no payload")
+    return _require_batch_upload_budget_impl(
+        files,
+        maximum_upload_size=settings.max_upload_bytes,
+        maximum_batch_files=settings.max_batch_files,
+        maximum_batch_bytes=settings.max_batch_bytes,
+        enforce_batch_files=enforce_batch_files,
+        enforce_batch_bytes=enforce_batch_bytes,
+    )
 
 
 def _parser_payload(
@@ -1337,112 +1079,20 @@ def _parser_payload(
     max_decompressed_bytes: int | None = None,
 ) -> tuple[bytes, str | None]:
     maximum = max_decompressed_bytes or get_settings().max_upload_bytes
-    if len(payload) > maximum:
-        raise ArtifactUploadError(f"uploaded artifact exceeds the {maximum}-byte limit")
-    if payload.startswith(b"\x1f\x8b") or filename.lower().endswith(".gz"):
-        try:
-            output = bytearray()
-            with gzip.GzipFile(fileobj=io.BytesIO(payload), mode="rb") as stream:
-                while True:
-                    chunk = stream.read(min(1024 * 1024, maximum + 1 - len(output)))
-                    if not chunk:
-                        break
-                    output.extend(chunk)
-                    if len(output) > maximum:
-                        raise ArtifactUploadError(
-                            f"decompressed artifact exceeds the {maximum}-byte limit"
-                        )
-            return bytes(output), "gzip"
-        except (EOFError, OSError, zlib.error) as error:
-            raise ArtifactUploadError("uploaded gzip artifact is invalid") from error
-    if len(payload) > maximum:
-        raise ArtifactUploadError(f"decompressed artifact exceeds the {maximum}-byte limit")
-    return payload, None
+    return _parser_payload_impl(payload, filename, max_decompressed_bytes=maximum)
 
 
 def _require_decompressed_upload_size(payload: bytes, filename: str) -> None:
     """Reject compressed resource bombs while preserving invalid-file isolation."""
-
-    if not (payload.startswith(b"\x1f\x8b") or filename.lower().endswith(".gz")):
-        return
-    try:
-        _parser_payload(payload, filename)
-    except ArtifactUploadError as error:
-        if "exceeds the" in str(error):
-            raise ArtifactUploadLimitError(str(error)) from error
+    _require_decompressed_upload_size_impl(
+        payload,
+        filename,
+        maximum_size=get_settings().max_upload_bytes,
+    )
 
 
 def _mapped_reaction_smiles(reactant: Chem.Mol, product: Chem.Mol) -> str:
-    reactant_atoms = [
-        atom.GetAtomicNum()
-        for atom in reactant.GetAtoms()  # type: ignore[no-untyped-call]
-    ]
-    product_atoms = [
-        atom.GetAtomicNum()
-        for atom in product.GetAtoms()  # type: ignore[no-untyped-call]
-    ]
-    if reactant_atoms != product_atoms:
-        raise ValueError("MolOP TS endpoints do not preserve source atom order")
-
-    sides: list[str] = []
-    for endpoint in (reactant, product):
-        mapped = Chem.Mol(endpoint)
-        # The endpoint has already been assigned from its 3D conformer by
-        # ``_infer_endpoint_stereochemistry_from_3d``. This function is only a
-        # one-way projection of that frozen graph; it must never infer stereo
-        # again or let a SMILES traversal become a new source of truth.
-        for prop_name in ("_smilesAtomOutputOrder", "_smilesBondOutputOrder"):
-            if mapped.HasProp(prop_name):
-                mapped.ClearProp(prop_name)
-        for atom_index, atom in enumerate(mapped.GetAtoms()):  # type: ignore[no-untyped-call]
-            atom.SetAtomMapNum(atom_index + 1)
-        # MolGR owns the endpoint graph.  Sanitizing fragments here can erase
-        # radical/electronic annotations before topology persistence. Keep the
-        # endpoint's one trusted conformer through fragment extraction: RDKit
-        # may retain BondStereo/BondDir values whose local atom order is no
-        # longer sufficient to reconstruct the physical E/Z state after a
-        # disconnected fragment is isolated.
-        fragments = Chem.GetMolFrags(mapped, asMols=True, sanitizeFrags=False)
-        serialized_fragments: list[Chem.Mol] = []
-        for fragment in fragments:
-            # Split while the endpoint conformer is still available, then
-            # discard it only after the projection has completed. A failure is
-            # propagated as an explicit inference failure; emitting a
-            # non-isomeric reaction would silently lose trusted 3D stereo.
-            repaired = ensure_serializable_double_bond_stereochemistry(
-                fragment,
-                preserve_atom_maps=True,
-            )
-            # A terminal alkene can carry direction-only flags from MolOP's
-            # source traversal even though RDKit correctly reports no E/Z
-            # assignment. Those flags are not stereochemical evidence and
-            # would make the SMILES writer emit arbitrary slash markers.
-            if not any(
-                bond.GetStereo() in {Chem.BondStereo.STEREOE, Chem.BondStereo.STEREOZ}
-                for bond in repaired.GetBonds()  # type: ignore[no-untyped-call]
-            ):
-                for bond in repaired.GetBonds():  # type: ignore[no-untyped-call]
-                    bond.SetBondDir(Chem.BondDir.NONE)
-            repaired.RemoveAllConformers()
-            serialized_fragments.append(repaired)
-        sides.append(
-            ".".join(
-                sorted(
-                    Chem.MolToSmiles(
-                        fragment,
-                        canonical=True,
-                        isomericSmiles=True,
-                        allHsExplicit=True,
-                    )
-                    for fragment in serialized_fragments
-                )
-            )
-        )
-    # Fragment order is not stable across MolOP endpoint reconstruction. Each
-    # fragment is canonicalized and sorted above, so the mapped reaction is
-    # stable without round-tripping a metal-rich graph through RDKit reaction
-    # templates before persistence validates it.
-    return f"{sides[0]}>>{sides[1]}"
+    return _mapped_reaction_smiles_impl(reactant, product)
 
 
 def _infer_endpoint_stereochemistry_from_3d(endpoint: Chem.Mol) -> Chem.Mol:
@@ -1454,146 +1104,27 @@ def _infer_endpoint_stereochemistry_from_3d(endpoint: Chem.Mol) -> Chem.Mol:
     is deliberately performed by a separate serialization-only helper.
     """
 
-    return infer_molgr_stereochemistry_from_3d(endpoint)
+    return _infer_endpoint_stereochemistry_from_3d_impl(endpoint)
 
 
 def _signed_ts_endpoints(
     frame: BaseCalcFrame[Any],
     vibration_position: int,
 ) -> tuple[Chem.Mol, Chem.Mol, float, float]:
-    """Return MolOP's inferred pre/post-TS endpoints with signed displacements.
-
-    Endpoint selection and sampling policy are delegated to MolOP's
-    ``possible_pre_post_ts`` defaults. The project only measures the selected
-    endpoints' actual displacement along the imaginary mode to restore the
-    signed direction/ratio used by the persisted endpoint rows.
-    """
-
-    reactant, product = frame.possible_pre_post_ts(show_3D=True)
-    if frame.vibrations is None:
-        raise ValueError("TS frame has no vibration mode")
-    center = np.asarray(magnitude_in(frame.coords, ANGSTROM), dtype=np.float64)
-    mode = np.asarray(
-        magnitude_in(
-            frame.vibrations[vibration_position].vibration_mode,
-            ANGSTROM,
-        ),
-        dtype=np.float64,
+    return _signed_ts_endpoints_impl(
+        frame,
+        vibration_position,
+        infer_endpoint_stereochemistry=_infer_endpoint_stereochemistry_from_3d,
     )
-    mode_norm = float(np.sum(np.square(mode)))
-    if mode.shape != center.shape or mode_norm <= 0:
-        raise ValueError("TS imaginary mode does not match the source coordinates")
-
-    def _signed_ratio(endpoint: Chem.Mol) -> float:
-        if endpoint.GetNumConformers() != 1 or not endpoint.GetConformer().Is3D():
-            raise ValueError("MolOP TS endpoint lost its 3D conformer")
-        coordinates = np.asarray(
-            endpoint.GetConformer().GetPositions(),
-            dtype=np.float64,
-        )
-        if coordinates.shape != center.shape or not np.isfinite(coordinates).all():
-            raise ValueError("MolOP TS endpoint coordinates are invalid")
-        return float(np.sum((center - coordinates) * mode) / mode_norm)
-
-    negative_ratio = _signed_ratio(reactant)
-    positive_ratio = _signed_ratio(product)
-    if negative_ratio > positive_ratio:
-        negative_ratio, positive_ratio = positive_ratio, negative_ratio
-        reactant, product = product, reactant
-    if negative_ratio >= 0 or positive_ratio <= 0:
-        raise ValueError(
-            "MolOP pre/post-TS endpoints do not bracket the TS center on the imaginary mode"
-        )
-    reactant = _infer_endpoint_stereochemistry_from_3d(reactant)
-    product = _infer_endpoint_stereochemistry_from_3d(product)
-    return reactant, product, abs(negative_ratio), positive_ratio
 
 
 def _infer_ts_frame(frame: BaseCalcFrame[Any], fallback_index: int) -> _Inference | None:
-    """Validate and infer one TS frame after its topology was reconstructed.
-
-    A suspicious status on the TS frame describes the reconstruction of the
-    frame graph itself.  It must not prevent MolOP from generating the signed
-    displaced endpoints: endpoint trust is evaluated independently below.
-    """
-
-    if frame.is_TS is not True:
-        return None
-    file_frame_index = frame.file_frame_index
-    if file_frame_index is None:
-        file_frame_index = fallback_index
-    vibrations = frame.vibrations
-    if vibrations is None or len(vibrations.imaginary_idxs) != 1:
-        return None
-    imaginary_position = vibrations.imaginary_idxs[0]
-    imaginary_mode_index = (
-        vibrations.mode_indices[imaginary_position]
-        if vibrations.mode_indices
-        else imaginary_position
+    return _infer_ts_frame_impl(
+        frame,
+        fallback_index,
+        signed_endpoints=_signed_ts_endpoints,
+        mapped_smiles=_mapped_reaction_smiles,
     )
-    frequency = vibrations[imaginary_position].frequency
-    if frequency is None:
-        return None
-    frequency_cm1 = float(magnitude_in(frequency, CM_INVERSE))
-    try:
-        (
-            negative_endpoint,
-            positive_endpoint,
-            negative_displacement_ratio,
-            positive_displacement_ratio,
-        ) = _signed_ts_endpoints(frame, imaginary_position)
-        if any(
-            endpoint.HasProp("_MolGRReconstructionStatus")
-            and endpoint.GetProp("_MolGRReconstructionStatus") == "suspicious_fallback"
-            for endpoint in (negative_endpoint, positive_endpoint)
-        ):
-            return _FailedInference(
-                file_frame_index=file_frame_index,
-                imaginary_mode_index=imaginary_mode_index,
-                imaginary_frequency_cm1=frequency_cm1,
-                error_code="ts_topology_untrusted",
-                error_message=("MolGR returned a suspicious fallback topology for a TS endpoint"),
-            )
-        reactant, product = sorted(
-            (negative_endpoint, positive_endpoint),
-            key=lambda endpoint: len(Chem.GetMolFrags(endpoint)),
-            reverse=True,
-        )
-        for endpoint in (negative_endpoint, positive_endpoint, reactant, product):
-            endpoint_atoms = [
-                atom.GetAtomicNum()
-                for atom in endpoint.GetAtoms()  # type: ignore[no-untyped-call]
-            ]
-            if endpoint_atoms != frame.atoms:
-                raise ValueError("MolOP TS endpoint atom order differs from the TS source frame")
-        return _SuccessfulInference(
-            file_frame_index=file_frame_index,
-            imaginary_mode_index=imaginary_mode_index,
-            imaginary_frequency_cm1=frequency_cm1,
-            reaction_smiles=_mapped_reaction_smiles(reactant, product),
-            negative_endpoint=negative_endpoint,
-            positive_endpoint=positive_endpoint,
-            negative_displacement_ratio=negative_displacement_ratio,
-            positive_displacement_ratio=positive_displacement_ratio,
-            charge=int(frame.charge),
-            multiplicity=int(frame.multiplicity),
-        )
-    except Exception as error:
-        error_code = getattr(error, "error_code", "ts_endpoint_inference_failed")
-        error_metadata = None
-        evidence = getattr(error, "evidence", None)
-        if callable(evidence):
-            candidate = evidence()
-            if isinstance(candidate, dict):
-                error_metadata = candidate
-        return _FailedInference(
-            file_frame_index=file_frame_index,
-            imaginary_mode_index=imaginary_mode_index,
-            imaginary_frequency_cm1=frequency_cm1,
-            error_code=error_code,
-            error_message=str(error) or type(error).__name__,
-            error_metadata=error_metadata,
-        )
 
 
 def _detach_frame_for_process(frame: BaseCalcFrame[Any]) -> BaseCalcFrame[Any]:
@@ -4221,7 +3752,8 @@ def _run_flush_attached(session: SQLAlchemySession) -> dict[str, object]:
         typed_session.info["tricycle_fast_insert"] = previous_fast_insert
     # The bulk path leaves client-ID rows detached. Reattaching them uses the
     # manufactured identity key and does not emit INSERT/SELECT statements.
-    typed_session.add_all(pending)
+    for entity in pending:
+        _attach_or_reuse_entity(typed_session, entity)
     try:
         typed_session.flush()
     finally:
@@ -5858,15 +5390,11 @@ class ArtifactUploadService:
             parsed: _ParsedArtifact | Exception
             molop_started_at = perf_counter()
             try:
-                # Match the previous high-throughput importer exactly: queue
-                # every parser future into the reusable MolOP pool first.  A
-                # per-file admission semaphore makes frame conversion consume
-                # the same pool before later parser futures are submitted and
-                # leaves the pool intermittently idle on large files.
-                parsed = await _run_molop_source_parser(
+                parsed = await _run_molop_file_pipeline(
                     reservation.source,
                     files[index].filename,
                     artifact_sha256=reservation.content_sha256,
+                    submission_slots=frame_submission_slots,
                 )
             except Exception as error:
                 parsed = error
@@ -5883,25 +5411,18 @@ class ArtifactUploadService:
                 )
                 molop_file_parse_elapsed_ms += (molop_finished_at - molop_started_at) * 1000
             if isinstance(parsed, _ParsedArtifact):
-                molgr_started_at = perf_counter()
-                try:
-                    parsed = await _process_parsed_artifact_frames(
-                        parsed,
-                        submission_slots=frame_submission_slots,
-                    )
-                except Exception as error:
-                    parsed = error
-                molgr_finished_at = perf_counter()
+                # The helper above includes deferred MolGR frame conversion.
+                # Keep the aggregate timing compatible with existing metrics.
                 async with storage_completion_lock:
                     molgr_reconstruction_phase_started_at = min(
-                        molgr_reconstruction_phase_started_at or molgr_started_at,
-                        molgr_started_at,
+                        molgr_reconstruction_phase_started_at or molop_started_at,
+                        molop_started_at,
                     )
                     molgr_reconstruction_phase_finished_at = max(
-                        molgr_reconstruction_phase_finished_at or molgr_finished_at,
-                        molgr_finished_at,
+                        molgr_reconstruction_phase_finished_at or molop_finished_at,
+                        molop_finished_at,
                     )
-                    molgr_reconstruction_elapsed_ms += (molgr_finished_at - molgr_started_at) * 1000
+                    molgr_reconstruction_elapsed_ms += (molop_finished_at - molop_started_at) * 1000
             nonlocal_parse_finished_at = perf_counter()
             # The consumer records the first/last parser completion to expose
             # MolOP wall time separately from database persistence time.
@@ -6691,6 +6212,7 @@ _ORIGINAL_STORE_PAYLOAD = cast(
 __all__ = [
     "ArtifactUploadConflictError",
     "ArtifactUploadError",
+    "ArtifactUploadLimitError",
     "ArtifactUploadPayload",
     "ArtifactUploadService",
     "MolOPFileParseTimeoutError",
