@@ -13,13 +13,13 @@ from sqlalchemy.orm import undefer
 from sqlmodel import Session, col, select
 
 from tricycle_reaction_db.application.dtos import ArtifactFileRecord, CreateReactionCommand
+from tricycle_reaction_db.application.services.artifact_upload_types import _FailedInference
 from tricycle_reaction_db.application.services.artifact_uploads import (
     _create_pending_ingestion,
-    _FailedInference,
     _parse_calculation_output,
     _persist_parsed_artifact,
-    _persist_uploaded_artifact,
 )
+from tricycle_reaction_db.application.services.catalog import persist_artifact_file
 from tricycle_reaction_db.application.services.molecular_geometry import GeometryPersistenceContext
 from tricycle_reaction_db.application.services.reaction_commands import _create_reaction
 from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
@@ -83,7 +83,7 @@ def test_gzip_upload_tracks_artifact_and_decoded_source_identities_separately() 
     transaction = connection.begin()
     try:
         with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
-            artifact = _persist_uploaded_artifact(
+            artifact = persist_artifact_file(
                 session,
                 record=ArtifactFileRecord(
                     project_id=SYSTEM_PROJECT_ID,
@@ -139,7 +139,7 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
     transaction = connection.begin()
     try:
         with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
-            artifact = _persist_uploaded_artifact(
+            artifact = persist_artifact_file(
                 session,
                 record=ArtifactFileRecord(
                     project_id=SYSTEM_PROJECT_ID,
@@ -553,7 +553,7 @@ def test_nonconverged_ts_binds_geometry_and_converged_reparse_adds_evidence() ->
     transaction = connection.begin()
     try:
         with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
-            artifact = _persist_uploaded_artifact(
+            artifact = persist_artifact_file(
                 session,
                 record=ArtifactFileRecord(
                     project_id=SYSTEM_PROJECT_ID,
@@ -675,7 +675,7 @@ def test_successful_parse_with_failed_ts_inference_is_partial() -> None:
     transaction = connection.begin()
     try:
         with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
-            artifact = _persist_uploaded_artifact(
+            artifact = persist_artifact_file(
                 session,
                 record=ArtifactFileRecord(
                     project_id=SYSTEM_PROJECT_ID,

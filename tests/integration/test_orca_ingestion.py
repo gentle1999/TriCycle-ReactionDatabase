@@ -7,10 +7,8 @@ from sqlalchemy import create_engine
 from sqlmodel import Session, select
 
 from tricycle_reaction_db.application.dtos import ArtifactFileRecord
-from tricycle_reaction_db.application.services.artifact_uploads import (
-    _parse_calculation_output,
-    _persist_uploaded_artifact,
-)
+from tricycle_reaction_db.application.services.artifact_uploads import _parse_calculation_output
+from tricycle_reaction_db.application.services.catalog import persist_artifact_file
 from tricycle_reaction_db.application.services.molop_artifact_ingestion import (
     persist_molop_calculation_artifact,
 )
@@ -77,7 +75,7 @@ def test_minimal_orca_single_point_persists_protocol_geometry_and_frame() -> Non
     transaction = connection.begin()
     try:
         with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
-            artifact = _persist_uploaded_artifact(
+            artifact = persist_artifact_file(
                 session,
                 record=ArtifactFileRecord.model_validate(record),
             )

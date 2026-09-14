@@ -140,7 +140,7 @@ def _attach_or_reuse_entity[EntityT](session: Session, entity: EntityT) -> Entit
     be cascaded across the two object graphs.
     """
 
-    state = sa_inspect(entity)
+    state = cast(Any, sa_inspect(entity))
     if state.key is not None:
         current = session.identity_map.get(state.key)
         if current is not None and current is not entity:
@@ -307,7 +307,13 @@ def _attach_pending_entities(session: Session) -> None:
             session.info["_fast_pending_entities"] = pending
             _bulk_insert_pending_entities(session)
         else:
-            session.add_all(pending)
+            # A persistence window may contain detached identity holders and a
+            # canonical instance loaded by a later reconciliation query.  An
+            # unconditional ``add_all`` attempts to attach both objects and
+            # raises when their identity keys are equal.  Reuse the identity
+            # map entry while copying the holder's scalar values instead.
+            for entity in pending:
+                _attach_or_reuse_entity(session, entity)
 
 
 async def _copy_rows_to_postgresql(

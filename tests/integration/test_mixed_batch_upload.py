@@ -300,7 +300,7 @@ async def test_mixed_raw_batch_persists_independently_and_failed_reparse_preserv
                 async def fail_parse(*_: object, **__: object) -> uploads._ParsedArtifact:
                     raise RuntimeError("forced reparse failure")
 
-                monkeypatch.setattr(uploads, "_run_molop_file_parser", fail_parse)
+                monkeypatch.setattr(uploads, "_run_molop_source_parser", fail_parse)
                 with pytest.raises(ArtifactUploadError, match="forced reparse failure"):
                     await ArtifactUploadService.reparse(
                         artifact_id=artifact_id,
@@ -319,7 +319,7 @@ async def test_mixed_raw_batch_persists_independently_and_failed_reparse_preserv
 
                 monkeypatch.setattr(
                     uploads,
-                    "_run_molop_file_parser",
+                    "_run_molop_source_parser",
                     lambda *_args, **_kwargs: asyncio.sleep(
                         0,
                         result=materialized_gaussian,

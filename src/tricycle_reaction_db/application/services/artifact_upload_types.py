@@ -84,9 +84,7 @@ _Inference = _SuccessfulInference | _FailedInference
 @dataclass(frozen=True, slots=True)
 class _ParsedArtifact:
     # Production parsing keeps the owning-process ChemFile so topology
-    # reconstruction can be deferred until persistence.  The slim wrapper is
-    # retained for the legacy process-pool parser, where the frame tree cannot
-    # be sent back over IPC without a large copy.
+    # reconstruction can be deferred until persistence.
     chem_file: Any
     frame_records: tuple[MolOPFrameRecords, ...]
     source_frame_count: int
@@ -110,47 +108,6 @@ class _ProcessedFrame:
     error_message: str | None = None
     error_type: str | None = None
     error_metadata: dict[str, Any] | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _ParsedChemFile:
-    """File-level MolOP metadata retained after worker conversion.
-
-    The original ChemFile contains every parsed frame.  Returning it together
-    with ``frame_records`` duplicates the complete frame tree across the
-    process boundary, so only the metadata and source segments cross IPC.
-    """
-
-    payload: dict[str, Any]
-    source_segments: tuple[Any, ...]
-    source_frame_count: int
-
-    def __len__(self) -> int:
-        """Expose the original ChemFile cardinality after IPC slimming."""
-
-        return self.source_frame_count
-
-    @property
-    def schema_version(self) -> str:
-        return str(self.payload["schema_version"])
-
-    @property
-    def artifact_sha256(self) -> str | None:
-        value = self.payload.get("artifact_sha256")
-        return value if isinstance(value, str) else None
-
-    @property
-    def artifact_size_bytes(self) -> int | None:
-        value = self.payload.get("artifact_size_bytes")
-        return value if isinstance(value, int) else None
-
-    @property
-    def source_diagnostics(self) -> list[Any]:
-        value = self.payload.get("source_diagnostics", [])
-        return value if isinstance(value, list) else []
-
-    def model_dump(self, *, mode: str = "python", **_kwargs: Any) -> dict[str, Any]:
-        return dict(self.payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,7 +205,6 @@ __all__ = [
     "_IngestionCompletion",
     "_InspectedUploadSource",
     "_ParsedArtifact",
-    "_ParsedChemFile",
     "_PreparedCalculationUpload",
     "_ProcessedFrame",
     "_RetiredArtifactReservation",

@@ -1,6 +1,5 @@
 import asyncio
 import gzip
-import threading
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,8 +12,11 @@ from molop.io.base_models import Molecule as molop_molecule_module
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdChemReactions, rdDepictor
 
-from tricycle_reaction_db.application.dtos import ArtifactUploadResult
 from tricycle_reaction_db.application.services import artifact_uploads as upload_module
+from tricycle_reaction_db.application.services.artifact_upload_types import (
+    _FailedInference,
+    _SuccessfulInference,
+)
 from tricycle_reaction_db.application.services.artifact_uploads import (
     ArtifactUploadError,
     ArtifactUploadLimitError,
@@ -22,7 +24,6 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
     ArtifactUploadService,
     MolOPFileParseTimeoutError,
     _await_cancellation_safe,
-    _FailedInference,
     _fast_molop_ingestion_enabled,
     _materialize_parsed_artifacts,
     _molop_file_parse_timeout_seconds,
@@ -33,11 +34,8 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
     _prepare_calculation_parser_path,
     _require_batch_upload_budget,
     _restore_inference_context,
-    _run_molop_file_parser,
     _run_molop_file_pipeline,
-    _run_molop_parser_with_progress,
     _snapshot_inference_context,
-    _SuccessfulInference,
 )
 from tricycle_reaction_db.application.services.authorization import AuthorizationService
 from tricycle_reaction_db.application.services.molecular_geometry import GeometryPersistenceContext
@@ -47,9 +45,7 @@ from tricycle_reaction_db.application.services.reaction_geometry_reconciliation 
 from tricycle_reaction_db.core.config import Settings
 from tricycle_reaction_db.db.models import MappedReactionNodeGeometry
 from tricycle_reaction_db.domain.enums import (
-    ArtifactIngestionStatus,
     ArtifactKind,
-    StorageStatus,
 )
 from tricycle_reaction_db.domain.identity import DEVELOPMENT_USER_ID, SYSTEM_PROJECT_ID
 from tricycle_reaction_db.storage.rustfs import RustFSSettings
@@ -262,16 +258,6 @@ def test_source_evidence_disables_fast_ingestion(
     assert not _fast_molop_ingestion_enabled()
 
 
-def test_slim_chem_file_retains_source_frame_count() -> None:
-    slim = upload_module._ParsedChemFile(
-        payload={},
-        source_segments=(),
-        source_frame_count=7,
-    )
-
-    assert len(slim) == 7
-
-
 def test_storage_pool_does_not_recycle_workers(monkeypatch: pytest.MonkeyPatch) -> None:
     """Avoid Python 3.12's max_tasks_per_child rollover deadlock for uploads."""
 
@@ -304,7 +290,7 @@ async def test_file_pipeline_timeout_isolated_to_one_file(monkeypatch: pytest.Mo
         await asyncio.sleep(1)
         return None
 
-    monkeypatch.setattr(upload_module, "_run_molop_file_parser", slow_file)
+    monkeypatch.setattr(upload_module, "_run_molop_source_parser", slow_file)
     with pytest.raises(MolOPFileParseTimeoutError, match="exceeded 0.01s"):
         await _run_molop_file_pipeline(b"source", "slow.log")
 
@@ -357,7 +343,7 @@ async def test_file_pipeline_timeout_releases_slot_for_next_file(
     async def passthrough_frames(parsed: object, **__: object) -> object:
         return parsed
 
-    monkeypatch.setattr(upload_module, "_run_molop_file_parser", fake_file)
+    monkeypatch.setattr(upload_module, "_run_molop_source_parser", fake_file)
     monkeypatch.setattr(upload_module, "_process_parsed_artifact_frames", passthrough_frames)
     file_slots = asyncio.Semaphore(1)
     slow_task = asyncio.create_task(
@@ -387,7 +373,7 @@ async def test_file_timeout_does_not_shutdown_shared_molop_pool(
         await asyncio.sleep(1)
         return None
 
-    monkeypatch.setattr(upload_module, "_run_molop_file_parser", slow_file)
+    monkeypatch.setattr(upload_module, "_run_molop_source_parser", slow_file)
     monkeypatch.setattr(
         upload_module,
         "_shutdown_molop_process_pool_sync",
@@ -510,20 +496,11 @@ async def test_cancellation_safe_wait_drains_external_operation() -> None:
     assert finished.is_set()
 
 
-@pytest.mark.asyncio
-async def test_file_pipeline_runs_parse_and_conversion_in_file_worker() -> None:
-    parsed = await upload_module._run_isolated_molop_file(
-        TS_FIXTURE.read_bytes(),
-        TS_FIXTURE.name,
-    )
-    assert parsed.source_frame_count == 23
-    assert len(parsed.frame_records) == 23
-    assert len(parsed.inferences) == 1
-
-
 def test_fast_molop_parse_defers_topology_reconstruction_until_materialization() -> None:
     molopconfig.show_progress_bar = False
-    parsed = asyncio.run(_run_molop_file_parser(TS_FIXTURE.read_bytes(), TS_FIXTURE.name))
+    parsed = asyncio.run(
+        upload_module._run_molop_source_parser(TS_FIXTURE.read_bytes(), TS_FIXTURE.name)
+    )
 
     assert parsed.source_frame_count == 23
     assert parsed.frame_records == ()
@@ -1091,47 +1068,6 @@ def test_validate_probes_calculation_without_persistence(monkeypatch) -> None:  
     assert result.inferences[0].reaction_smiles is not None
 
 
-def test_batch_upload_isolates_each_file_failure(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    async def allow_upload(*_: object) -> None:
-        return None
-
-    async def upload(**values: object) -> ArtifactUploadResult:
-        filename = str(values["filename"])
-        if filename == "invalid.log":
-            raise RuntimeError("isolated parse failure")
-        return ArtifactUploadResult(
-            artifact_id=SYSTEM_PROJECT_ID,
-            artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
-            storage_status=StorageStatus.AVAILABLE,
-            ingestion_status=ArtifactIngestionStatus.SUCCEEDED,
-            source_frame_count=1,
-            transition_state_frame_count=0,
-            inferred_reaction_count=0,
-            inferences=[],
-        )
-
-    monkeypatch.setattr(AuthorizationService, "require_project_permission", allow_upload)
-    monkeypatch.setattr(ArtifactUploadService, "_prepare_upload", upload)
-    result = asyncio.run(
-        ArtifactUploadService.upload_batch(
-            files=[
-                ArtifactUploadPayload("gaussian.log", "text/plain", b"gaussian"),
-                ArtifactUploadPayload("invalid.log", "text/plain", b"invalid"),
-                ArtifactUploadPayload("orca.orcaout", "text/plain", b"orca"),
-            ],
-            artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
-            project_id=SYSTEM_PROJECT_ID,
-            user_id=DEVELOPMENT_USER_ID,
-        )
-    )
-
-    assert (result.total_count, result.succeeded_count, result.failed_count) == (3, 2, 1)
-    assert [item.succeeded for item in result.items] == [True, False, True]
-    assert result.items[1].error_code == "artifact_upload_failed"
-    assert result.items[1].error_message == "isolated parse failure"
-    assert result.source_frame_count == 2
-
-
 def test_new_object_upload_skips_rustfs_existence_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1262,17 +1198,12 @@ def test_batch_service_rejects_resource_limits_before_authorization_or_storage(
     async def unexpected_authorization(*_: object) -> None:
         raise AssertionError("resource-rejected batch reached authorization")
 
-    async def unexpected_storage(**_: object) -> ArtifactUploadResult:
-        raise AssertionError("resource-rejected batch reached storage")
-
     monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
     monkeypatch.setattr(
         AuthorizationService,
         "require_project_permission",
         unexpected_authorization,
     )
-    monkeypatch.setattr(ArtifactUploadService, "_prepare_upload", unexpected_storage)
-
     with pytest.raises(ArtifactUploadLimitError, match=message):
         asyncio.run(
             ArtifactUploadService.upload_batch(
@@ -1303,29 +1234,3 @@ def test_local_streaming_pipeline_can_exceed_http_file_count_limit(
     )
 
     assert set(inspected) == {0, 1}
-
-
-def test_molop_progress_callback_runs_before_parser_batch_finishes() -> None:
-    callback_completed = threading.Event()
-    events: list[str] = []
-
-    def parser(*, progress_queue: object) -> dict[int, str]:
-        progress_queue.put((0, "parsed"))  # type: ignore[attr-defined]
-        assert callback_completed.wait(timeout=1)
-        events.append("parser_finished")
-        return {0: "parsed"}
-
-    async def progress_callback(index: int, result: object) -> None:
-        assert (index, result) == (0, "parsed")
-        events.append("persisted")
-        callback_completed.set()
-
-    result = asyncio.run(
-        _run_molop_parser_with_progress(
-            parser,
-            progress_callback=progress_callback,
-        )
-    )
-
-    assert result == {0: "parsed"}
-    assert events == ["persisted", "parser_finished"]

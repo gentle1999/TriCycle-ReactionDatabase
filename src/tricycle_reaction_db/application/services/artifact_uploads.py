@@ -26,7 +26,7 @@ from functools import partial
 from hashlib import sha256
 from importlib.metadata import version
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Queue
 from time import perf_counter
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -54,9 +54,7 @@ from tricycle_reaction_db.application.dtos import (
 from tricycle_reaction_db.application.services._persistence import (
     LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
     _acquire_identity_locks,
-    _attach_or_reuse_entity,
     _attach_pending_entities,
-    _bulk_insert_pending_entities,
     _fast_insert_enabled,
     _flush_new_entity,
     _new_entity,
@@ -92,7 +90,6 @@ from tricycle_reaction_db.application.services.artifact_upload_types import (
     _IngestionCompletion,
     _InspectedUploadSource,
     _ParsedArtifact,
-    _ParsedChemFile,
     _PreparedCalculationUpload,
     _ProcessedFrame,
     _RetiredArtifactReservation,
@@ -116,15 +113,9 @@ from tricycle_reaction_db.application.services.artifact_upload_validation import
 from tricycle_reaction_db.application.services.artifact_upload_validation import (
     safe_parser_suffix as _safe_parser_suffix,
 )
-from tricycle_reaction_db.application.services.artifact_upload_validation import (
-    upload_payload_bytes as _upload_payload_bytes,
-)
 from tricycle_reaction_db.application.services.authorization import (
     AuthorizationService,
     ProjectPermission,
-)
-from tricycle_reaction_db.application.services.catalog import (
-    persist_artifact_file,
 )
 from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics_persistence import (
     refresh_mapped_reactions_thermodynamics,
@@ -246,13 +237,6 @@ _storage_process_pool_pid: int | None = None
 _storage_process_pool_lock = threading.Lock()
 _file_worker_slots: tuple[asyncio.AbstractEventLoop, int, asyncio.Semaphore] | None = None
 
-# Isolated file executors are intentionally short-lived: a timed-out MolOP
-# call cannot be cancelled inside a synchronous worker, so only that file's
-# child must be terminated. Keep the active set visible to ASGI/CLI shutdown
-# so an in-flight upload cannot leave a child process behind.
-_isolated_file_executors: set[ProcessPoolExecutor] = set()
-_isolated_file_executors_lock = threading.Lock()
-
 # A storage-pool child handles many files over its lifetime. Recreating a
 # boto3 client and performing a bucket HEAD for every file adds a large fixed
 # latency to small and medium calculation outputs. Keep one client per child
@@ -261,30 +245,12 @@ _storage_worker_store: RustFSObjectStore | None = None
 _storage_worker_store_key: tuple[Any, ...] | None = None
 _storage_worker_bucket_ready = False
 
-# A parsed ChemFile is already resident in the MolOP worker. On Linux we can
-# fork short-lived conversion workers from that process and share parsed frames
-# copy-on-write, avoiding another large IPC transfer for every frame.
-_frame_conversion_chem_file: Any = None
-_frame_conversion_schema_version: str | None = None
-
 
 def _initialize_frame_process_worker() -> None:
     """Configure MolGR once when a frame-pool child starts."""
 
     configure_molecular_graph_reconstruction()
     molopconfig.prewarm_topologies = False
-
-
-def _frame_record_from_shared_chem_file(index: int) -> MolOPFrameRecords:
-    chem_file = _frame_conversion_chem_file
-    schema_version = _frame_conversion_schema_version
-    if chem_file is None or schema_version is None:
-        raise RuntimeError("frame conversion worker was not initialized")
-    return frame_records_from_molop(
-        chem_file[index],
-        export_schema_version=schema_version,
-        fallback_index=index,
-    )
 
 
 def _frame_file_index(frame: Any, fallback_index: int) -> int:
@@ -362,130 +328,33 @@ def _parse_failure_metadata(
     return metadata
 
 
-def _frame_records_from_chem_file(
-    chem_file: Any,
-    *,
-    parallel: bool,
-) -> tuple[MolOPFrameRecords, ...]:
-    """Convert parsed frames without re-entering MolGR from worker children."""
-
-    global _frame_conversion_chem_file, _frame_conversion_schema_version
-    frame_count = len(chem_file)
-    if not parallel or os.name != "posix" or frame_count < 32:
-        records: list[MolOPFrameRecords] = []
-        for index, frame in enumerate(chem_file):
-            try:
-                records.append(
-                    frame_records_from_molop(
-                        frame,
-                        export_schema_version=chem_file.schema_version,
-                        fallback_index=index,
-                    )
-                )
-            except Exception:
-                # This compatibility helper historically returned only records.
-                # Callers that need diagnostics use ``_frame_records_with_diagnostics``.
-                raise
-        return tuple(records)
-
-    # ``fork`` shares the already-materialized RDKit/MolOP frame graph read-only.
-    # The worker only serializes DTOs; it must never invoke MolGR itself.
-    _frame_conversion_chem_file = chem_file
-    _frame_conversion_schema_version = str(chem_file.schema_version)
-    workers = min(_resolve_molop_process_workers(get_settings().molop_batch_n_jobs), frame_count)
-    try:
-        with ProcessPoolExecutor(
-            max_workers=workers,
-            mp_context=multiprocessing.get_context("fork"),
-        ) as pool:
-            return tuple(
-                pool.map(
-                    _frame_record_from_shared_chem_file,
-                    range(frame_count),
-                    chunksize=1,
-                )
-            )
-    finally:
-        _frame_conversion_chem_file = None
-        _frame_conversion_schema_version = None
-
-
 def _frame_records_with_diagnostics(
     chem_file: Any,
-    *,
-    parallel: bool,
 ) -> tuple[tuple[MolOPFrameRecords, ...], tuple[dict[str, Any], ...]]:
     """Convert every frame while retaining failures as file diagnostics."""
 
-    frame_count = len(chem_file)
     diagnostics: list[dict[str, Any]] = []
     records: list[MolOPFrameRecords] = []
-    if not parallel or os.name != "posix" or frame_count < 32:
-        for index, frame in enumerate(chem_file):
-            file_frame_index = _frame_file_index(frame, index)
-            try:
-                records.append(
-                    frame_records_from_molop(
-                        frame,
-                        export_schema_version=chem_file.schema_version,
-                        fallback_index=index,
-                    )
+    for index, frame in enumerate(chem_file):
+        file_frame_index = _frame_file_index(frame, index)
+        try:
+            records.append(
+                frame_records_from_molop(
+                    frame,
+                    export_schema_version=chem_file.schema_version,
+                    fallback_index=index,
                 )
-            except Exception as error:
-                diagnostics.append(
-                    _frame_failure_diagnostic(
-                        file_frame_index=file_frame_index,
-                        error=error,
-                        stage="conversion",
-                        segment_index=int(getattr(frame, "segment_index", 0) or 0),
-                    )
+            )
+        except Exception as error:
+            diagnostics.append(
+                _frame_failure_diagnostic(
+                    file_frame_index=file_frame_index,
+                    error=error,
+                    stage="conversion",
+                    segment_index=int(getattr(frame, "segment_index", 0) or 0),
                 )
-        return tuple(records), tuple(diagnostics)
-
-    global _frame_conversion_chem_file, _frame_conversion_schema_version
-    _frame_conversion_chem_file = chem_file
-    _frame_conversion_schema_version = str(chem_file.schema_version)
-    workers = min(_resolve_molop_process_workers(get_settings().molop_batch_n_jobs), frame_count)
-    try:
-        with ProcessPoolExecutor(
-            max_workers=workers,
-            mp_context=multiprocessing.get_context("fork"),
-        ) as pool:
-            futures = {
-                pool.submit(_frame_record_from_shared_chem_file, index): index
-                for index in range(frame_count)
-            }
-            for future in as_completed(futures):
-                index = futures[future]
-                frame = chem_file[index]
-                try:
-                    records.append(future.result())
-                except Exception as error:
-                    diagnostics.append(
-                        _frame_failure_diagnostic(
-                            file_frame_index=_frame_file_index(frame, index),
-                            error=error,
-                            stage="conversion",
-                            segment_index=int(getattr(frame, "segment_index", 0) or 0),
-                        )
-                    )
-    finally:
-        _frame_conversion_chem_file = None
-        _frame_conversion_schema_version = None
-    records.sort(key=lambda record: record.frame.file_frame_index)
-    diagnostics.sort(key=lambda item: int(item["file_frame_index"]))
+            )
     return tuple(records), tuple(diagnostics)
-
-
-async def _run_molop_parser(function: Any, *args: Any, **kwargs: Any) -> Any:
-    """Run a synchronous parser dispatcher without a request-level gate.
-
-    Concurrency is owned by the explicit stage process pools. Keeping an
-    asyncio semaphore here made the effective parallelism opaque and forced
-    unrelated upload batches to queue behind one another.
-    """
-
-    return await asyncio.to_thread(function, *args, **kwargs)
 
 
 async def _await_cancellation_safe(operation: Awaitable[Any]) -> Any:
@@ -501,36 +370,6 @@ async def _await_cancellation_safe(operation: Awaitable[Any]) -> Any:
         with suppress(BaseException):
             await operation_task
         raise
-
-
-async def _run_molop_parser_with_progress(
-    function: Any,
-    *args: Any,
-    progress_callback: Callable[[int, Any], Awaitable[None]],
-    **kwargs: Any,
-) -> Any:
-    """Run a parser while forwarding completed-file events to the event loop."""
-
-    progress_queue: Queue[tuple[int, Any]] = Queue()
-    kwargs["progress_queue"] = progress_queue
-    parser_task = asyncio.create_task(_run_molop_parser(function, *args, **kwargs))
-    callback_error: Exception | None = None
-    while not parser_task.done() or not progress_queue.empty():
-        try:
-            input_index, result = await asyncio.to_thread(progress_queue.get, True, 0.1)
-        except Empty:
-            continue
-        if callback_error is None:
-            try:
-                await progress_callback(input_index, result)
-            except Exception as error:
-                # The parser owns temporary paths used by its worker processes.
-                # Let it finish before unwinding the upload transaction.
-                callback_error = error
-    parsed = await parser_task
-    if callback_error is not None:
-        raise callback_error
-    return parsed
 
 
 def _resolve_molop_process_workers(n_jobs: int) -> int:
@@ -633,19 +472,8 @@ def _get_storage_process_pool(n_jobs: int) -> ProcessPoolExecutor:
 async def close_molop_process_pool() -> None:
     """Release parser workers during ASGI shutdown."""
 
-    await asyncio.to_thread(_shutdown_isolated_file_executors_sync)
     await asyncio.to_thread(_shutdown_molop_process_pool_sync)
     await asyncio.to_thread(_shutdown_upload_stage_pools_sync)
-
-
-def _shutdown_isolated_file_executors_sync() -> None:
-    """Terminate active file-local workers without touching other upload stages."""
-
-    with _isolated_file_executors_lock:
-        executors = tuple(_isolated_file_executors)
-        _isolated_file_executors.clear()
-    for executor in executors:
-        _terminate_executor_sync(executor)
 
 
 def _shutdown_molop_process_pool_sync() -> None:
@@ -721,83 +549,6 @@ async def _run_molop_source_parser(
             raise ArtifactUploadError(str(error) or type(error).__name__) from error
 
 
-def _terminate_executor_sync(pool: ProcessPoolExecutor) -> None:
-    """Terminate only the workers belonging to one file executor."""
-
-    processes = tuple(getattr(pool, "_processes", {}).values())
-    # Stop accepting work before killing the child. This prevents a future
-    # submitted just as the timeout fires from being stranded in the executor.
-    with suppress(Exception):
-        pool.shutdown(wait=False, cancel_futures=True)
-    for process in processes:
-        with suppress(Exception):
-            process.terminate()
-    for process in processes:
-        with suppress(Exception):
-            process.join(timeout=1)
-    # A parser may be stuck in native code and ignore SIGTERM. Do not allow
-    # that one file to become an orphan; escalation is scoped to this executor.
-    for process in processes:
-        still_alive = False
-        with suppress(Exception):
-            still_alive = process.is_alive()
-        if still_alive:
-            with suppress(Exception):
-                process.kill()
-            with suppress(Exception):
-                process.join(timeout=1)
-
-
-async def _run_isolated_molop_file(
-    source: bytes | Path,
-    filename: str,
-    *,
-    artifact_sha256: str | None = None,
-) -> _ParsedArtifact:
-    """Run parse and frame post-processing in a killable, file-local worker."""
-
-    with tempfile.TemporaryDirectory(prefix="tricycle-molop-file-") as directory:
-        parser_path, source_compression = await asyncio.to_thread(
-            _prepare_calculation_parser_path,
-            source,
-            filename,
-            temporary_dir=Path(directory),
-            input_index=0,
-        )
-        pool = ProcessPoolExecutor(
-            max_workers=1,
-            mp_context=multiprocessing.get_context("spawn"),
-            initializer=_initialize_frame_process_worker,
-        )
-        with _isolated_file_executors_lock:
-            _isolated_file_executors.add(pool)
-        terminated = False
-        try:
-            loop = asyncio.get_running_loop()
-            parsed, error_message = await loop.run_in_executor(
-                pool,
-                _parse_calculation_path_isolated_worker,
-                parser_path,
-                source_compression,
-                artifact_sha256,
-            )
-            if parsed is None:
-                raise _parser_error_from_worker(error_message)
-            return parsed
-        except asyncio.CancelledError:
-            # asyncio.timeout cancels this coroutine. A running synchronous
-            # parser cannot observe that cancellation, so terminate only this
-            # file's private worker before propagating it to the caller.
-            terminated = True
-            await asyncio.to_thread(_terminate_executor_sync, pool)
-            raise
-        finally:
-            with _isolated_file_executors_lock:
-                _isolated_file_executors.discard(pool)
-            if not terminated:
-                await asyncio.to_thread(pool.shutdown, wait=True, cancel_futures=False)
-
-
 async def _run_molop_file_pipeline(
     source: bytes | Path,
     filename: str,
@@ -809,8 +560,7 @@ async def _run_molop_file_pipeline(
     """Parse and reconstruct one file through the shared MolOP pipeline.
 
     The file slot bounds submissions while the reusable process pool keeps its
-    workers hot across the whole queue. Hooked parser/frame functions retain
-    the legacy path for tests and integrations.
+    workers hot across the whole queue.
     """
 
     timeout_seconds = _molop_file_parse_timeout_seconds(source)
@@ -822,22 +572,6 @@ async def _run_molop_file_pipeline(
         await effective_file_slots.acquire()
         acquired_file_slot = True
         async with asyncio.timeout(timeout_seconds):
-            # Keep test/extension hooks and the legacy public parser wrapper
-            # intact. Production calls use the reusable MolOP pool, matching
-            # the batch importer: the file semaphore bounds submissions while
-            # the process pool keeps its workers hot across the whole queue.
-            if (
-                _run_molop_file_parser is not _ORIGINAL_RUN_MOLOP_FILE_PARSER
-                or _run_molop_source_parser is not _ORIGINAL_RUN_MOLOP_SOURCE_PARSER
-                or _process_parsed_artifact_frames is not _ORIGINAL_PROCESS_PARSED_ARTIFACT_FRAMES
-            ):
-                parsed = await _run_molop_file_parser(source, filename)
-                return await _process_parsed_artifact_frames(
-                    parsed,
-                    submission_slots=(
-                        submission_slots or asyncio.Semaphore(_frame_submission_limit())
-                    ),
-                )
             parsed = await _run_molop_source_parser(
                 source,
                 filename,
@@ -1029,18 +763,6 @@ async def _pipeline_task_lifecycle(
         raise
     finally:
         await cancel_unfinished_tasks()
-
-
-async def _run_molop_file_parser(payload: bytes | Path, filename: str) -> _ParsedArtifact:
-    """Backward-compatible bytes-only wrapper used by reparse callers."""
-
-    return await _run_molop_source_parser(payload, filename)
-
-
-# These sentinels let tests and integrations replace the legacy parser/frame
-# hooks without forcing them through the file-isolated production worker.
-_ORIGINAL_RUN_MOLOP_FILE_PARSER = _run_molop_file_parser
-_ORIGINAL_RUN_MOLOP_SOURCE_PARSER = _run_molop_source_parser
 
 
 def _require_upload_size(payload: bytes) -> None:
@@ -1265,17 +987,10 @@ def _parsed_artifact_from_chem_file(
     *,
     source_compression: str | None,
     artifact_sha256: str | None = None,
-    slim_chem_file: bool = False,
-    parallel_frame_conversion: bool = False,
     materialize_topologies: bool = True,
 ) -> _ParsedArtifact:
     frame_records, conversion_diagnostics = (
-        _frame_records_with_diagnostics(
-            chem_file,
-            parallel=parallel_frame_conversion,
-        )
-        if materialize_topologies
-        else ((), ())
+        _frame_records_with_diagnostics(chem_file) if materialize_topologies else ((), ())
     )
     # ``frame.rdmol`` is lazy in MolOP. Materialize frame records first so
     # MolGR's reconstruction status is known before TS endpoint inference is
@@ -1298,25 +1013,15 @@ def _parsed_artifact_from_chem_file(
                     inference = None
                 if inference is not None:
                     inferred.append(inference)
-    parsed_chem_file: Any = chem_file
-    if slim_chem_file:
-        file_payload = chem_file.model_dump(mode="python")
-        source_segments = tuple(chem_file.source_segments)
-        file_payload["source_segments"] = list(source_segments)
-        parsed_chem_file = _ParsedChemFile(
-            payload=file_payload,
-            source_segments=source_segments,
-            source_frame_count=len(chem_file),
-        )
     return _ParsedArtifact(
-        chem_file=parsed_chem_file,
+        chem_file=chem_file,
         frame_records=frame_records,
         source_frame_count=len(chem_file),
         source_format=chem_file.source_format,
         source_compression=source_compression,
         inferences=tuple(inferred),
         record_sha256=(
-            _revision_record_hash(artifact_sha256, parsed_chem_file, list(frame_records))
+            _revision_record_hash(artifact_sha256, chem_file, list(frame_records))
             if artifact_sha256 is not None and materialize_topologies
             else None
         ),
@@ -1337,10 +1042,6 @@ def _materialize_parsed_artifacts(
             materialized[id(parsed)] = parsed
             continue
         chem_file = parsed.chem_file
-        if isinstance(chem_file, _ParsedChemFile):
-            raise RuntimeError(
-                "deferred MolOP topology reconstruction requires the owning-process ChemFile"
-            )
         jobs = [
             (
                 fallback_index,
@@ -1439,10 +1140,6 @@ async def _process_parsed_artifact_frames(
     if parsed.frame_records:
         return parsed
     chem_file = parsed.chem_file
-    if isinstance(chem_file, _ParsedChemFile):
-        raise RuntimeError(
-            "deferred MolOP topology reconstruction requires the owning-process ChemFile"
-        )
     pool = _get_frame_process_pool(get_settings().molop_batch_n_jobs)
     loop = asyncio.get_running_loop()
 
@@ -1547,45 +1244,6 @@ async def _process_parsed_artifact_frames(
     )
 
 
-_ORIGINAL_PROCESS_PARSED_ARTIFACT_FRAMES = _process_parsed_artifact_frames
-
-
-def _parse_calculation_path_isolated_worker(
-    path: str,
-    source_compression: str | None,
-    artifact_sha256: str | None = None,
-) -> tuple[_ParsedArtifact | None, str | None]:
-    """Parse and fully convert one file inside its file-local worker."""
-
-    previous_prewarm = molopconfig.prewarm_topologies
-    try:
-        configure_molecular_graph_reconstruction()
-        molopconfig.prewarm_topologies = False
-        chem_file = AutoFileParser(
-            path,
-            parser_detection="auto",
-            capture_source_evidence=get_settings().molop_capture_source_evidence,
-            release_file_content=True,
-        )
-        return (
-            _parsed_artifact_from_chem_file(
-                chem_file,
-                source_compression=source_compression,
-                artifact_sha256=artifact_sha256,
-                # Return only file metadata across IPC after all frame work is
-                # complete. This removes the parent-side post-processing stage.
-                slim_chem_file=True,
-                materialize_topologies=True,
-            ),
-            None,
-        )
-    except Exception as error:
-        return None, str(error) or type(error).__name__
-    finally:
-        molopconfig.prewarm_topologies = previous_prewarm
-        configure_molecular_graph_reconstruction()
-
-
 def _parse_calculation_path_worker(
     path: str,
     source_compression: str | None,
@@ -1608,50 +1266,12 @@ def _parse_calculation_path_worker(
                 chem_file,
                 source_compression=source_compression,
                 artifact_sha256=artifact_sha256,
-                slim_chem_file=False,
                 materialize_topologies=False,
             ),
             None,
         )
     except Exception as error:
         return None, str(error) or type(error).__name__
-    finally:
-        molopconfig.prewarm_topologies = previous_prewarm
-        configure_molecular_graph_reconstruction()
-
-
-def _parse_calculation_path_parent(
-    path: str,
-    source_compression: str | None,
-    artifact_sha256: str | None = None,
-) -> _ParsedArtifact:
-    """Parse one file in the API process, optionally deferring topology work."""
-
-    previous_prewarm = molopconfig.prewarm_topologies
-    fast_ingestion = _fast_molop_ingestion_enabled()
-    try:
-        # Defer graph reconstruction while retaining MolOP's frame roles and
-        # source evidence. ``frame.rdmol`` is materialized later by the
-        # persistence microbatch.
-        configure_molecular_graph_reconstruction()
-        molopconfig.prewarm_topologies = False
-        chem_file = AutoFileParser(
-            path,
-            parser_detection="auto",
-            capture_source_evidence=get_settings().molop_capture_source_evidence,
-            release_file_content=True,
-        )
-        return _parsed_artifact_from_chem_file(
-            chem_file,
-            source_compression=source_compression,
-            artifact_sha256=artifact_sha256,
-            # The owning process keeps the complete ChemFile for deferred
-            # reconstruction.  Audit/validation callers still materialize
-            # records immediately when the fast path is disabled.
-            slim_chem_file=False,
-            parallel_frame_conversion=False,
-            materialize_topologies=not fast_ingestion,
-        )
     finally:
         molopconfig.prewarm_topologies = previous_prewarm
         configure_molecular_graph_reconstruction()
@@ -1892,19 +1512,6 @@ def _parse_calculation_outputs_batch(
             timings_ms["molop_parse_ms"] = (perf_counter() - parse_started_at) * 1000
             timings_ms["total_ms"] = (perf_counter() - started_at) * 1000
         return parsed_by_index
-
-
-def _persist_uploaded_artifact(
-    session: Session,
-    *,
-    record: ArtifactFileRecord,
-) -> ArtifactFile:
-    artifact = persist_artifact_file(session, record)
-    if artifact.artifact_kind is not record.artifact_kind:
-        raise ArtifactUploadConflictError(
-            "an identical artifact is already registered with a different artifact kind"
-        )
-    return artifact
 
 
 def _prepare_pending_upload(
@@ -3213,11 +2820,7 @@ def _persist_parsed_artifact(
     # work can be shared across the persistence batch.  Single-file uploads
     # reach this path directly, while batch uploads materialize their files in
     # ``persist_parsed_files`` before calling us.
-    if (
-        not parsed.frame_records
-        and parsed.source_frame_count
-        and not isinstance(parsed.chem_file, _ParsedChemFile)
-    ):
+    if not parsed.frame_records and parsed.source_frame_count:
         parsed = _materialize_parsed_artifacts([parsed])[0]
     artifact = ingestion.artifact_file
     if existing_revision_ids is None:
@@ -3728,73 +3331,8 @@ def _run_flush(session: SQLAlchemySession) -> dict[str, object]:
         typed_session.info["tricycle_fast_insert"] = previous_fast_insert
 
 
-def _run_flush_attached(session: SQLAlchemySession) -> dict[str, object]:
-    """Bulk-flush a persistence window and reattach its identity holders.
-
-    The microbatch context remains live after this barrier, so rows inserted by
-    the Core fast path are attached again immediately.  ``make_transient_to_detached``
-    gives those rows persistent identity state without a lookup, preserving the
-    context's object graph while avoiding the ORM unit-of-work walk over every
-    frame/result row.
-    """
-
-    typed_session = cast(Session, session)
-    pending = typed_session.info.pop("_fast_pending_entities", None)
-    if not pending:
-        typed_session.flush()
-        return {}
-    previous_fast_insert = typed_session.info.get("tricycle_fast_insert", False)
-    typed_session.info["tricycle_fast_insert"] = True
-    try:
-        typed_session.info["_fast_pending_entities"] = pending
-        _bulk_insert_pending_entities(typed_session)
-    finally:
-        typed_session.info["tricycle_fast_insert"] = previous_fast_insert
-    # The bulk path leaves client-ID rows detached. Reattaching them uses the
-    # manufactured identity key and does not emit INSERT/SELECT statements.
-    for entity in pending:
-        _attach_or_reuse_entity(typed_session, entity)
-    try:
-        typed_session.flush()
-    finally:
-        typed_session.info["tricycle_fast_insert"] = previous_fast_insert
-    diagnostics = typed_session.info.get("_fast_bulk_insert_diagnostics")
-    return dict(diagnostics) if isinstance(diagnostics, dict) else {}
-
-
 def _run_disable_autoflush(session: SQLAlchemySession) -> None:
     cast(Session, session).autoflush = False
-
-
-def _run_persist_parsed_artifact(
-    session: SQLAlchemySession,
-    *,
-    ingestion_id: UUID,
-    parsed: _ParsedArtifact,
-    started_at: datetime,
-    completed_at: datetime,
-    geometry_context: GeometryPersistenceContext | None = None,
-    preload_geometry_context: bool = True,
-    ingestion: ArtifactIngestion | None = None,
-    existing_revision_ids: set[UUID] | None = None,
-    defer_ingestion_completion: bool = False,
-    defer_reconciliation: bool = False,
-    deferred_inferences: list[_DeferredArtifactInferences] | None = None,
-) -> tuple[UUID, bool]:
-    return _persist_parsed_artifact(
-        cast(Session, session),
-        ingestion_id=ingestion_id,
-        parsed=parsed,
-        started_at=started_at,
-        completed_at=completed_at,
-        geometry_context=geometry_context,
-        preload_geometry_context=preload_geometry_context,
-        ingestion=ingestion,
-        existing_revision_ids=existing_revision_ids,
-        defer_ingestion_completion=defer_ingestion_completion,
-        defer_reconciliation=defer_reconciliation,
-        deferred_inferences=deferred_inferences,
-    )
 
 
 def _run_persist_parsed_artifact_savepoint(
@@ -4166,16 +3704,6 @@ def _stored_result(artifact: ArtifactFile) -> ArtifactUploadResult:
         inferred_reaction_count=0,
         inferences=[],
     )
-
-
-async def _ingestion_failure_details(ingestion_id: UUID | None) -> tuple[str | None, str | None]:
-    if ingestion_id is None:
-        return None, None
-    async with session_factory() as session:
-        ingestion = await session.get(ArtifactIngestion, ingestion_id)
-        if ingestion is None:
-            return None, None
-        return ingestion.error_code, ingestion.error_message
 
 
 class ArtifactUploadService:
@@ -5241,16 +4769,6 @@ class ArtifactUploadService:
             enforce_batch_bytes=not streaming,
         )
         timings["validate_budget_ms"] = (perf_counter() - started) * 1000
-        prepare_function = getattr(cls._prepare_upload, "__func__", cls._prepare_upload)
-        if prepare_function is not _ORIGINAL_PREPARE_UPLOAD:
-            return await cls._upload_batch_with_prepare_hook(
-                files=files,
-                artifact_kind=artifact_kind,
-                project_id=project_id,
-                user_id=user_id,
-                on_file_parsed=on_file_parsed,
-                on_file_committed=on_file_committed,
-            )
         phase_started = perf_counter()
         await AuthorizationService.require_project_permission(
             user_id,
@@ -6078,81 +5596,6 @@ class ArtifactUploadService:
             items=complete_items,
         )
 
-    @classmethod
-    async def _upload_batch_with_prepare_hook(
-        cls,
-        *,
-        files: list[ArtifactUploadPayload],
-        artifact_kind: ArtifactKind,
-        project_id: UUID,
-        user_id: UUID,
-        on_file_parsed: Callable[[int, bool], Awaitable[None]] | None,
-        on_file_committed: Callable[[int, ArtifactBatchUploadItem], Awaitable[None]] | None,
-    ) -> ArtifactBatchUploadResult:
-        """Preserve dependency-injected single-upload test doubles.
-
-        Production never enters this adapter: it only applies when an embedding
-        or test replaces the class's private preparation hook.
-        """
-
-        await AuthorizationService.require_project_permission(
-            user_id,
-            project_id,
-            ProjectPermission.ARTIFACT_UPLOAD,
-        )
-        items: list[ArtifactBatchUploadItem] = []
-        for index, file in enumerate(files):
-            try:
-                payload = _upload_payload_bytes(file)
-                prepared = await cls._prepare_upload(
-                    payload=payload,
-                    filename=file.filename,
-                    media_type=file.media_type,
-                    artifact_kind=artifact_kind,
-                    project_id=project_id,
-                    user_id=user_id,
-                )
-                if not isinstance(prepared, ArtifactUploadResult):
-                    raise RuntimeError("prepare-hook adapters must return ArtifactUploadResult")
-                succeeded = prepared.ingestion_status not in {
-                    ArtifactIngestionStatus.FAILED,
-                    ArtifactIngestionStatus.FILTERED,
-                }
-                items.append(
-                    ArtifactBatchUploadItem(
-                        filename=file.filename,
-                        succeeded=succeeded,
-                        result=prepared,
-                        error_code=None if succeeded else "ingestion_failed",
-                    )
-                )
-            except Exception as error:
-                items.append(
-                    ArtifactBatchUploadItem(
-                        filename=file.filename,
-                        succeeded=False,
-                        error_code="artifact_upload_failed",
-                        error_message=str(error) or type(error).__name__,
-                    )
-                )
-            if on_file_parsed is not None:
-                await on_file_parsed(index, items[-1].succeeded)
-            if on_file_committed is not None:
-                await on_file_committed(index, items[-1])
-        succeeded_count = sum(item.succeeded for item in items)
-        results = [item.result for item in items if item.result is not None]
-        return ArtifactBatchUploadResult(
-            total_count=len(items),
-            succeeded_count=succeeded_count,
-            failed_count=len(items) - succeeded_count,
-            source_frame_count=sum(result.source_frame_count or 0 for result in results),
-            transition_state_frame_count=sum(
-                result.transition_state_frame_count or 0 for result in results
-            ),
-            inferred_reaction_count=sum(result.inferred_reaction_count for result in results),
-            items=items,
-        )
-
     @staticmethod
     def _store_payload(
         settings: RustFSSettings,
@@ -6199,10 +5642,6 @@ class ArtifactUploadService:
             return store.head(object_key)
 
 
-_ORIGINAL_PREPARE_UPLOAD = cast(
-    Any,
-    ArtifactUploadService.__dict__["_prepare_upload"],
-).__func__
 _ORIGINAL_STORE_PAYLOAD = cast(
     Any,
     ArtifactUploadService.__dict__["_store_payload"],

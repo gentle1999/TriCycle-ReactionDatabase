@@ -11,12 +11,14 @@ from uuid import UUID
 from sqlalchemy import delete, text
 from sqlmodel import col, select
 
-from tricycle_reaction_db.application.services.artifact_uploads import (
+from tricycle_reaction_db.application.services.artifact_upload_types import (
     _FailedInference,
+    _SuccessfulInference,
+)
+from tricycle_reaction_db.application.services.artifact_uploads import (
     _parse_calculation_output,
     _persist_transition_state_endpoints,
     _resolve_and_bind_transition_state_reaction,
-    _SuccessfulInference,
     infer_transition_states_from_calculation_output,
 )
 from tricycle_reaction_db.db.models import (
