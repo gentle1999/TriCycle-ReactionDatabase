@@ -177,8 +177,9 @@ workflow manifest
 3. `published`：记录可组成可信路径并对查询接口可见。
 4. `quarantined`：解析或 QC 证据不足，保留原始事实但不进入正式路径。
 
-重新解析创建新 revision，不覆盖历史结果。重复的 artifact + parser/config hash
-必须幂等。
+重新解析先删除旧 revision 及其 segment/frame/inference 物化结果，再从 RustFS 重新建立
+唯一的 revision；失败时保留原始对象但不恢复旧解析结果。重复的 artifact + parser/config
+hash 必须幂等。
 
 ## 4. 初始技术基线
 

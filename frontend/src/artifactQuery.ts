@@ -71,7 +71,8 @@ export const ingestionStatusOptions = [
   { value: "succeeded", label: "成功" },
   { value: "partial", label: "部分成功" },
   { value: "filtered", label: "已过滤（无计算帧）" },
-  { value: "pending", label: "正在解析" },
+  { value: "processing", label: "正在解析" },
+  { value: "pending", label: "等待解析" },
   { value: "failed", label: "失败" },
 ] as const;
 

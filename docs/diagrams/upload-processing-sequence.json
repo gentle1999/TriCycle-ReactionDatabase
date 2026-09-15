@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "文件上传与统一解析持久化时序",
+    "locale": "zh-CN",
+    "output": "docs/diagrams/upload-processing-sequence.html",
+    "viewBox": [1060, 1280],
+    "animation": "none",
+    "quality_profile": "showcase",
+    "column_fit": "spread"
+  },
+  "participants": [
+    { "id": "remote", "type": "external", "label": "远程客户端", "sublabel": "单 / 批量" },
+    { "id": "local", "type": "external", "label": "本地导入 CLI", "sublabel": "本地文件" },
+    { "id": "ingress", "type": "backend", "label": "上传暂存服务", "sublabel": "暂存入口" },
+    { "id": "rustfs", "type": "cloud", "label": "RustFS", "sublabel": "对象暂存" },
+    { "id": "postgres", "type": "database", "label": "PostgreSQL", "sublabel": "队列与领域" },
+    { "id": "worker", "type": "backend", "label": "upload-worker", "sublabel": "单实例" },
+    { "id": "molop", "type": "backend", "label": "MolOP 进程池", "sublabel": "共享解析" },
+    { "id": "committer", "type": "backend", "label": "持久化消费者", "sublabel": "微批提交" }
+  ],
+  "segments": [
+    { "from": 150, "to": 540, "label": "统一暂存" },
+    { "from": 548, "to": 710, "label": "领取任务" },
+    { "from": 716, "to": 800, "label": "统一解析" },
+    { "from": 802, "to": 1000, "label": "微批持久化" },
+    { "from": 1010, "to": 1230, "label": "状态查询" }
+  ],
+  "messages": [
+    { "from": "remote", "to": "ingress", "y": 180, "label": "POST /api/artifacts 或 /batch", "variant": "emphasis" },
+    { "from": "local", "to": "ingress", "y": 222, "label": "tricycle-import-artifacts", "variant": "emphasis" },
+    { "from": "ingress", "to": "postgres", "y": 264, "label": "创建 pending Artifact + UploadBatch Item", "variant": "emphasis" },
+    { "from": "postgres", "to": "ingress", "y": 306, "label": "返回可恢复的批次 / 文件标识", "variant": "return" },
+    { "from": "ingress", "to": "rustfs", "y": 348, "label": "写入原始字节 + 校验摘要", "variant": "emphasis" },
+    { "from": "rustfs", "to": "ingress", "y": 390, "label": "对象可用", "variant": "return" },
+    { "from": "ingress", "to": "postgres", "y": 432, "label": "校验通过：Item = STAGED", "variant": "emphasis" },
+    { "from": "ingress", "to": "remote", "y": 474, "label": "202 + batch/item 标识", "variant": "return" },
+    { "from": "ingress", "to": "local", "y": 516, "label": "返回暂存结果", "variant": "return" },
+    { "from": "worker", "to": "postgres", "y": 558, "label": "领取 STAGED 项并加处理租约", "variant": "emphasis" },
+    { "from": "postgres", "to": "worker", "y": 600, "label": "PROCESSING 任务窗口（最多 64）", "variant": "return" },
+    { "from": "worker", "to": "rustfs", "y": 642, "label": "读取已暂存原始文件", "variant": "default" },
+    { "from": "rustfs", "to": "worker", "y": 684, "label": "返回文件字节", "variant": "return" },
+    { "from": "worker", "to": "molop", "y": 726, "label": "提交解析任务", "variant": "emphasis" },
+    { "from": "molop", "to": "worker", "y": 768, "label": "返回帧 / 拓扑 / 反应证据", "variant": "return" },
+    { "from": "worker", "to": "committer", "y": 810, "label": "结果进入有界持久化队列", "variant": "emphasis" },
+    { "from": "committer", "to": "postgres", "y": 852, "label": "队列为空：仅写入预加载结果，不提交", "variant": "default" },
+    { "from": "committer", "to": "postgres", "y": 894, "label": "累计 32 个结果：提交一次微批事务", "variant": "emphasis" },
+    { "from": "committer", "to": "postgres", "y": 936, "label": "当前领取窗口结束：提交剩余结果", "variant": "emphasis" },
+    { "from": "committer", "to": "worker", "y": 978, "label": "项目 / 用户组完成，串行处理下一组", "variant": "return" },
+    { "from": "worker", "to": "postgres", "y": 1020, "label": "逐项完成 UploadBatchItem 状态", "variant": "default" },
+    { "from": "remote", "to": "ingress", "y": 1062, "label": "GET 状态 / 结果", "variant": "default" },
+    { "from": "ingress", "to": "postgres", "y": 1104, "label": "读取批次与解析状态", "variant": "default" },
+    { "from": "postgres", "to": "ingress", "y": 1146, "label": "SUCCEEDED / PARTIAL / FAILED", "variant": "return" },
+    { "from": "ingress", "to": "remote", "y": 1188, "label": "返回最终状态与结果标识", "variant": "return" }
+  ],
+  "activations": [
+    { "participant": "ingress", "from": 258, "to": 532, "type": "backend" },
+    { "participant": "rustfs", "from": 342, "to": 690, "type": "cloud" },
+    { "participant": "postgres", "from": 258, "to": 1156, "type": "database" },
+    { "participant": "worker", "from": 552, "to": 1036, "type": "backend" },
+    { "participant": "molop", "from": 720, "to": 774, "type": "backend" },
+    { "participant": "committer", "from": 804, "to": 992, "type": "backend" },
+    { "participant": "ingress", "from": 1056, "to": 1204, "type": "backend" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "入口一致",
+      "items": [
+        "单文件、批量文件、远程上传和本地导入都先写入 RustFS",
+        "上传请求只负责暂存并创建 STAGED 任务",
+        "解析不占用原始上传连接"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "单 worker 共享资源",
+      "items": [
+        "所有新任务由同一个 upload-worker 领取",
+        "worker 进程内所有任务共享 MolOP 进程池",
+        "不同项目 / 用户组串行处理，不并发打开持久化组"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "微批提交语义",
+      "items": [
+        "有界队列满 32 个结果时提交一次",
+        "队列为空只刷新预加载结果，不触发提交",
+        "领取窗口结束时提交剩余结果"
+      ]
+    }
+  ]
+}

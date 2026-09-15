@@ -106,7 +106,8 @@ const messages = {
     statuses: {
       available: "可用",
       unavailable: "不可用",
-      pending: "等待中",
+      pending: "等待解析",
+      processing: "正在解析",
       queued: "等待",
       uploading: "上传中",
       parsing: "正在解析",
@@ -223,7 +224,8 @@ const messages = {
     statuses: {
       available: "Available",
       unavailable: "Unavailable",
-      pending: "Pending",
+      pending: "Waiting to parse",
+      processing: "Parsing",
       queued: "Queued",
       uploading: "Uploading",
       parsing: "Parsing",

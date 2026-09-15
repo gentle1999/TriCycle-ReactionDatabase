@@ -10,7 +10,9 @@ from tricycle_reaction_db.application.dtos.artifacts import (
 )
 from tricycle_reaction_db.application.services._persistence import (
     _acquire_identity_locks,
+    _fast_insert_enabled,
     _flush_shared_entity,
+    _new_entity,
 )
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
@@ -63,6 +65,14 @@ def persist_calculation_protocol(
     *,
     project_id: UUID,
 ) -> CalculationProtocol:
+    protocol_cache = None
+    cache_key = (project_id, record.protocol_hash)
+    if _fast_insert_enabled(session):
+        protocol_cache = session.info.setdefault("_fast_calculation_protocol_cache", {})
+        cached_protocol = protocol_cache.get(cache_key)
+        if isinstance(cached_protocol, CalculationProtocol):
+            return cached_protocol
+
     _acquire_identity_locks(
         session,
         ("calculation_protocol", project_id, record.protocol_hash),
@@ -74,8 +84,20 @@ def persist_calculation_protocol(
         )
     ).first()
     if protocol is None:
-        protocol = CalculationProtocol(project_id=project_id, **record.model_dump())
-        _flush_shared_entity(session, protocol, label="CalculationProtocol")
+        protocol = _new_entity(
+            session,
+            CalculationProtocol,
+            project_id=project_id,
+            **record.model_dump(),
+        )
+        _flush_shared_entity(
+            session,
+            protocol,
+            label="CalculationProtocol",
+            defer_if_fast=True,
+        )
+    if protocol_cache is not None:
+        protocol_cache[cache_key] = protocol
     return protocol
 
 

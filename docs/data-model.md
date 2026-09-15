@@ -155,8 +155,14 @@ batch/item，并把核验后的原始对象暂存到 RustFS；计算 ingestion �
 `staged`。独立的 `tricycle-upload-worker` 每轮领取最多 64 个 staged 项，读取/校验已有对象，
 再调用共享 MolOP 进程池和统一持久化路径。它不会再次上传对象，也不会为每个请求/会话新增
 解析器。MolOP 不在 HTTP 请求或浏览器生命周期内运行，因此刷新页面、切换路由、API 重启或
-worker 重启都不会丢失已经 staged 的文件。对象、内容哈希、解析 revision 和科学事实都不可
-原地覆盖。
+worker 重启都不会丢失已经 staged 的文件。对象和内容哈希不可原地覆盖。成功 reparse 会在
+解析前删除该 Artifact 的全部旧 ParseRevision、segment、frame、推断及相关派生绑定，再从
+空白状态建立新的物化结果；失败时保留 RustFS 原始对象并将 ingestion 标记为 `failed`，不
+恢复旧解析结果。
+
+文件级 ingestion 在 RustFS 暂存完成后保持 `pending`，表示等待 worker；worker 从 staged
+条目领取对象并开始 MolOP/帧处理时切换为 `processing`。处理租约由 worker 心跳续期；租约
+过期会回收为 `pending`，因此前端不会把等待队列误报为正在解析。
 
 上传批次条目状态的唯一流转为：
 
@@ -179,8 +185,10 @@ worker 的 `recover_stale` 会按项目、文件大小、artifact kind 和该哈
 一次解析创建一个 `ParseRevision`，尽可能保留所有可恢复 segment 和 frame。单个帧的
 归一化/持久化错误不会丢弃同一文件中已成功的帧；文件没有可恢复计算帧时，Artifact 仍保存，
 但 ingestion 标记为 `filtered`，而不是 `succeeded`。`ArtifactIngestion` 的可见状态为
-`pending`、`succeeded`、`partial`、`filtered` 或 `failed`，前端据此区分正在解析、部分成功、
-无计算帧与真正失败。显式 reparse 创建新的 revision，不覆盖已有成功结果。
+`pending`、`processing`、`succeeded`、`partial`、`filtered` 或 `failed`，前端据此区分等待解析、正在解析、部分成功、
+无计算帧与真正失败。显式 reparse 先删除该 Artifact 的全部旧 revision、segment、frame 和
+推断结果，再创建新的 revision；因此同一帧不会同时有两种口径。解析或持久化失败时，旧结果
+不会被恢复，文件保持 `failed`，等待下一次从 RustFS 重新领取。
 
 `ParseRevision.running_time_seconds` 保存 MolOP 报告的文件级计算用时；
 `CalculationFrame.running_time_seconds` 保存逐帧用时。两者语义不同，文件级用时不能用逐帧用时

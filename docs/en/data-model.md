@@ -195,8 +195,11 @@ reads/verifies the existing objects, and calls the shared MolOP process pool
 and persistence path. It does not upload objects again or add a parser per
 request/session. MolOP is not owned by the HTTP request or browser lifecycle,
 so a page reload, route change, API restart, or worker restart cannot discard a
-staged file. Object identity, content hash, parse revisions, and scientific
-facts are never overwritten in place.
+staged file. Object identity and content hashes are never overwritten in
+place. A successful reparse first deletes every old `ParseRevision`, its
+segments, frames, inferences, and related revision-owned bindings, then builds
+the new materialization from the RustFS source. A failed reparse keeps the raw
+object but marks ingestion `failed`; it does not restore deleted parse state.
 
 The only upload-batch item state flow is:
 
@@ -223,10 +226,16 @@ states between polls cannot remain displayed in an obsolete state.
 One parse creates one `ParseRevision` and persists every recoverable segment
 and frame. A frame-level normalization or persistence error does not discard
 other successful frames in the same file. A file with no recoverable calculation
-frame remains an artifact, but is `filtered`, not `succeeded`. Visible
-`ArtifactIngestion` states are `pending`, `succeeded`, `partial`, `filtered`,
-and `failed`. Explicit reparse appends a new revision and preserves a previous
-successful result.
+frame remains an artifact, but is `filtered`, not `succeeded`. An
+`ArtifactIngestion` remains `pending` while RustFS data waits for a worker; the
+worker changes it to `processing` when it claims the staged object and starts
+MolOP/frame work. Heartbeats renew the processing lease and an expired lease
+returns the ingestion to `pending` for recovery. Visible states are
+`pending`, `processing`, `succeeded`, `partial`, `filtered`,
+and `failed`. Explicit reparse deletes all old revision-owned rows before
+creating the new revision, so one artifact cannot expose two parse
+interpretations at once. A parsing or persistence failure leaves no old parse
+materialization to fall back to.
 
 `ParseRevision.running_time_seconds` stores the file-level calculation runtime
 reported by MolOP. `CalculationFrame.running_time_seconds` stores per-frame

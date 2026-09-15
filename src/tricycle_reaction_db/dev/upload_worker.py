@@ -28,7 +28,7 @@ class UploadBatchWorker:
 
     async def _renew_until_done(
         self,
-        job: UploadProcessingJob,
+        jobs: list[UploadProcessingJob],
         finished: asyncio.Event,
     ) -> None:
         settings = get_settings()
@@ -40,11 +40,12 @@ class UploadBatchWorker:
             except TimeoutError:
                 pass
             try:
-                if not await UploadBatchService.renew_processing_lease(job):
+                renewed = await UploadBatchService.renew_processing_leases(jobs)
+                if renewed == 0 and not finished.is_set():
                     logger.warning(
-                        "processing lease was lost batch=%s item=%s",
-                        job.batch_id,
-                        job.item_id,
+                        "processing lease group was lost project=%s jobs=%d",
+                        jobs[0].project_id,
+                        len(jobs),
                     )
                     return
             except Exception:
@@ -52,107 +53,81 @@ class UploadBatchWorker:
                 # heartbeat failure is retried on the next interval; if the
                 # lease really expires, finalization is protected by lease_id.
                 logger.exception(
-                    "failed to renew processing lease batch=%s item=%s",
-                    job.batch_id,
-                    job.item_id,
+                    "failed to renew processing lease group project=%s jobs=%d",
+                    jobs[0].project_id,
+                    len(jobs),
                 )
-
-    async def _process(self, job: UploadProcessingJob) -> None:
-        finished = asyncio.Event()
-        heartbeat = asyncio.create_task(self._renew_until_done(job, finished))
-        try:
-            result = await ArtifactUploadService.reparse(
-                artifact_id=job.artifact_file_id,
-                user_id=job.user_id,
-            )
-        except asyncio.CancelledError:
-            # Leave the lease for recovery.  A cancellation can happen while
-            # MolOP is being shut down and must not manufacture a parse failure.
-            raise
-        except Exception as error:
-            try:
-                await UploadBatchService.finish_processing(job, error=error)
-            except Exception:
-                logger.exception(
-                    "failed to record upload worker error batch=%s item=%s",
-                    job.batch_id,
-                    job.item_id,
-                )
-        else:
-            try:
-                await UploadBatchService.finish_processing(job, result=result)
-            except Exception:
-                logger.exception(
-                    "failed to record upload worker result batch=%s item=%s",
-                    job.batch_id,
-                    job.item_id,
-                )
-        finally:
-            finished.set()
-            heartbeat.cancel()
-            await asyncio.gather(heartbeat, return_exceptions=True)
 
     async def _process_jobs(self, jobs: list[UploadProcessingJob]) -> None:
-        """Reparse one claim window with one shared batch persistence pipeline."""
+        """Reparse one claim window through sequential persistence microbatches.
+
+        Queue batches describe the client-facing upload session, not the
+        persistence unit.  A claim window can therefore contain many
+        one-file batches.  Combine those files by project and author before
+        calling ``reparse_batch`` so the parser queue and the single database
+        persistence consumer see a real microbatch.  Different projects (or
+        users, whose authorization context must remain isolated) are processed
+        one after another because each call owns a project-scoped transaction.
+        """
 
         if not jobs:
             return
-        # A claim can contain more than one active batch. Keep those batches
-        # separate because ``upload_batch`` has one project-scoped persistence
-        # context. Run the groups concurrently so every session feeds the same
-        # parser pool instead of making one batch wait behind another batch's
-        # database flush.
+        # UploadBatch is a client-facing queue boundary, not a persistence
+        # boundary. Grouping by project and user lets independent one-file
+        # queues enter the same parser/persistence microbatch while keeping
+        # the authorization and project-scoped reconciliation context safe.
         groups: dict[tuple[UUID, UUID], list[UploadProcessingJob]] = {}
         for job in jobs:
-            groups.setdefault((job.batch_id, job.user_id), []).append(job)
+            groups.setdefault((job.project_id, job.user_id), []).append(job)
 
-        finished_by_item = {job.item_id: asyncio.Event() for job in jobs}
-        heartbeats = [
-            asyncio.create_task(self._renew_until_done(job, finished_by_item[job.item_id]))
-            for job in jobs
-        ]
-        async def process_group(group: list[UploadProcessingJob]) -> None:
+        async def process_microbatch(group: list[UploadProcessingJob]) -> None:
             group_results: dict[UUID, ArtifactUploadResult | Exception]
+            finished = asyncio.Event()
+            heartbeat = asyncio.create_task(self._renew_until_done(group, finished))
             try:
-                group_results = await ArtifactUploadService.reparse_batch(
-                    artifact_ids=[job.artifact_file_id for job in group],
-                    user_id=group[0].user_id,
-                    force_reparse=True,
-                )
-            except Exception as error:
-                group_results = {job.artifact_file_id: error for job in group}
-
-            for job in group:
-                result = group_results.get(job.artifact_file_id)
                 try:
-                    if isinstance(result, Exception):
-                        await UploadBatchService.finish_processing(job, error=result)
-                    elif result is None:
-                        await UploadBatchService.finish_processing(
-                            job,
-                            error=RuntimeError("artifact reparse returned no result"),
-                        )
-                    else:
-                        await UploadBatchService.finish_processing(job, result=result)
-                except Exception:
-                    logger.exception(
-                        "failed to record upload worker batch result batch=%s item=%s",
-                        job.batch_id,
-                        job.item_id,
+                    group_results = await ArtifactUploadService.reparse_batch(
+                        artifact_ids=[job.artifact_file_id for job in group],
+                        user_id=group[0].user_id,
+                        force_reparse=True,
                     )
-                finally:
-                    finished_by_item[job.item_id].set()
+                except Exception as error:
+                    group_results = {job.artifact_file_id: error for job in group}
 
-        try:
-            await asyncio.gather(*(process_group(group) for group in groups.values()))
-        finally:
-            for heartbeat in heartbeats:
+                for job in group:
+                    result = group_results.get(job.artifact_file_id)
+                    try:
+                        if isinstance(result, Exception):
+                            await UploadBatchService.finish_processing(job, error=result)
+                        elif result is None:
+                            await UploadBatchService.finish_processing(
+                                job,
+                                error=RuntimeError("artifact reparse returned no result"),
+                            )
+                        else:
+                            await UploadBatchService.finish_processing(job, result=result)
+                    except Exception:
+                        logger.exception(
+                            "failed to record upload worker batch result batch=%s item=%s",
+                            job.batch_id,
+                            job.item_id,
+                        )
+            finally:
+                finished.set()
                 heartbeat.cancel()
-            await asyncio.gather(*heartbeats, return_exceptions=True)
+                await asyncio.gather(heartbeat, return_exceptions=True)
+
+        # Do not submit persistence groups concurrently.  Each
+        # ``reparse_batch`` owns a project-scoped transaction and identity
+        # locks; concurrent groups only turn independent one-file queue
+        # items into a database lock convoy.  Parsing inside each call is
+        # still concurrent through the shared MolOP process pool.
+        for group in groups.values():
+            await process_microbatch(group)
 
     async def _renew_pending_until_done(
         self,
-        job: PendingIngestionJob,
+        jobs: list[PendingIngestionJob],
         finished: asyncio.Event,
     ) -> None:
         settings = get_settings()
@@ -164,55 +139,103 @@ class UploadBatchWorker:
             except TimeoutError:
                 pass
             try:
-                if not await UploadBatchService.renew_pending_ingestion_lease(job):
+                renewed = await UploadBatchService.renew_pending_ingestion_leases(jobs)
+                if renewed == 0 and not finished.is_set():
                     logger.warning(
-                        "pending ingestion lease was lost ingestion=%s artifact=%s",
-                        job.ingestion_id,
-                        job.artifact_file_id,
+                        "pending ingestion lease group was lost project=%s jobs=%d",
+                        jobs[0].project_id,
+                        len(jobs),
                     )
                     return
             except Exception:
                 logger.exception(
-                    "failed to renew pending ingestion lease ingestion=%s artifact=%s",
-                    job.ingestion_id,
-                    job.artifact_file_id,
+                    "failed to renew pending ingestion lease group project=%s jobs=%d",
+                    jobs[0].project_id,
+                    len(jobs),
                 )
 
-    async def _process_pending(self, job: PendingIngestionJob) -> None:
-        """Resume an orphaned reservation and let the service finalize it."""
+    async def _process_pending_jobs(self, jobs: list[PendingIngestionJob]) -> None:
+        """Feed compatibility reservations into the shared batch pipeline.
 
-        finished = asyncio.Event()
-        heartbeat = asyncio.create_task(self._renew_pending_until_done(job, finished))
-        try:
-            await ArtifactUploadService.reparse(
-                artifact_id=job.artifact_file_id,
-                user_id=job.user_id,
-                ingestion_id=job.ingestion_id,
-                ingestion_lease_id=job.lease_id,
-            )
-        except asyncio.CancelledError:
-            # The lease deliberately remains claimable after expiry.
-            raise
-        except Exception as error:
-            # ``reparse`` records parse/storage failures itself. This fallback
-            # also covers authorization or precondition errors raised before
-            # its normal failure boundary.
+        These rows predate ``UploadBatch`` but must have the same execution
+        semantics as durable web uploads.  In particular, do not reparse each
+        reservation in its own coroutine: that creates a completion barrier
+        around the claim window and makes every one-file legacy upload own a
+        separate persistence transaction.  Grouping by project and user lets
+        ``reparse_batch`` keep one parser/persistence pipeline and one
+        project-scoped transaction for the whole group.
+        """
+
+        if not jobs:
+            return
+
+        groups: dict[tuple[UUID, UUID], list[PendingIngestionJob]] = {}
+        for job in jobs:
+            groups.setdefault((job.project_id, job.user_id), []).append(job)
+
+        async def process_microbatch(group: list[PendingIngestionJob]) -> None:
+            group_results: dict[UUID, ArtifactUploadResult | Exception]
+            finished = asyncio.Event()
+            heartbeat = asyncio.create_task(self._renew_pending_until_done(group, finished))
             try:
-                await ArtifactUploadService.fail_pending_ingestion(
-                    ingestion_id=job.ingestion_id,
-                    lease_id=job.lease_id,
-                    error=error,
-                )
-            except Exception:
-                logger.exception(
-                    "failed to record orphaned ingestion error ingestion=%s artifact=%s",
-                    job.ingestion_id,
-                    job.artifact_file_id,
-                )
-        finally:
-            finished.set()
-            heartbeat.cancel()
-            await asyncio.gather(heartbeat, return_exceptions=True)
+                try:
+                    group_results = await ArtifactUploadService.reparse_batch(
+                        artifact_ids=[job.artifact_file_id for job in group],
+                        user_id=group[0].user_id,
+                        force_reparse=True,
+                    )
+                except asyncio.CancelledError:
+                    # Leave the reservations leased so normal stale-lease
+                    # recovery can return them to pending after shutdown.
+                    raise
+                except Exception as error:
+                    group_results = {job.artifact_file_id: error for job in group}
+
+                for job in group:
+                    result = group_results.get(job.artifact_file_id)
+                    if isinstance(result, Exception):
+                        try:
+                            await ArtifactUploadService.fail_pending_ingestion(
+                                ingestion_id=job.ingestion_id,
+                                lease_id=job.lease_id,
+                                error=result,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "failed to record orphaned ingestion error "
+                                "ingestion=%s artifact=%s",
+                                job.ingestion_id,
+                                job.artifact_file_id,
+                            )
+                    elif result is None:
+                        missing_result_error = RuntimeError("artifact reparse returned no result")
+                        try:
+                            await ArtifactUploadService.fail_pending_ingestion(
+                                ingestion_id=job.ingestion_id,
+                                lease_id=job.lease_id,
+                                error=missing_result_error,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "failed to record missing orphaned ingestion result ingestion=%s "
+                                "artifact=%s",
+                                job.ingestion_id,
+                                job.artifact_file_id,
+                            )
+                    # A successful or partial ArtifactUploadResult already owns
+                    # final ingestion state through upload_batch.  Do not write
+                    # a second terminal state after that transaction.
+            finally:
+                finished.set()
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
+
+        # Keep project/user groups serial.  Parsing within each call is still
+        # concurrent through the single shared MolOP process pool, while
+        # concurrent project transactions would create DB lock convoys and
+        # defeat the shared persistence consumer.
+        for group in groups.values():
+            await process_microbatch(group)
 
     async def run(self, stop_event: asyncio.Event | None = None) -> None:
         settings = get_settings()
@@ -230,10 +253,15 @@ class UploadBatchWorker:
                     await self._process_jobs(jobs)
                     continue
                 pending_jobs = await UploadBatchService.claim_pending_ingestions(
-                    limit=settings.upload_worker_concurrency,
+                    # Compatibility reservations use the same bounded claim
+                    # window as durable upload batches.  The old value here
+                    # (the worker concurrency, normally 16) caused a
+                    # sixteen-file completion barrier and starved the shared
+                    # parser pool between claims.
+                    limit=settings.max_batch_files,
                 )
                 if pending_jobs:
-                    await asyncio.gather(*(self._process_pending(job) for job in pending_jobs))
+                    await self._process_pending_jobs(pending_jobs)
                     continue
             except asyncio.CancelledError:
                 raise

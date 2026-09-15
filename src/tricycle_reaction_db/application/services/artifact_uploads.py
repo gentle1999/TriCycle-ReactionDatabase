@@ -77,6 +77,10 @@ from tricycle_reaction_db.application.services.artifact_molop_inference import (
 from tricycle_reaction_db.application.services.artifact_molop_inference import (
     signed_ts_endpoints as _signed_ts_endpoints_impl,
 )
+from tricycle_reaction_db.application.services.artifact_parse_replacement import (
+    ParseCleanupSummary,
+    clear_previous_parse_results_batch,
+)
 from tricycle_reaction_db.application.services.artifact_upload_types import (
     ArtifactUploadConflictError,
     ArtifactUploadError,
@@ -104,9 +108,6 @@ from tricycle_reaction_db.application.services.artifact_upload_validation import
 )
 from tricycle_reaction_db.application.services.artifact_upload_validation import (
     require_batch_upload_budget as _require_batch_upload_budget_impl,
-)
-from tricycle_reaction_db.application.services.artifact_upload_validation import (
-    require_decompressed_upload_size as _require_decompressed_upload_size_impl,
 )
 from tricycle_reaction_db.application.services.artifact_upload_validation import (
     require_upload_size as _require_upload_size_impl,
@@ -409,10 +410,16 @@ def _rustfs_download_submission_slots() -> asyncio.Semaphore:
 
 
 def _fast_molop_ingestion_enabled() -> bool:
-    """Return whether deferred MolGR work and batched frame writes are enabled."""
+    """Return whether deferred MolGR work and batched frame writes are enabled.
+
+    Source-evidence capture changes the fields emitted by MolOP, not the
+    identity or dependency guarantees of the revision-local rows.  It must
+    therefore not disable the set-based persistence path; doing so silently
+    turns an evidence-rich upload into one ORM flush per row.
+    """
 
     settings = get_settings()
-    return not settings.molop_capture_source_evidence and settings.molop_parallel_frame_persistence
+    return settings.molop_parallel_frame_persistence
 
 
 def _get_molop_process_pool(n_jobs: int) -> ProcessPoolExecutor:
@@ -678,7 +685,10 @@ def _recover_aborted_batch_sync(
                 session.add(artifact)
         ingestion_id = reservation.ingestion_id
         ingestion = ingestions.get(ingestion_id) if ingestion_id is not None else None
-        if ingestion is not None and ingestion.status is ArtifactIngestionStatus.PENDING:
+        if ingestion is not None and ingestion.status in {
+            ArtifactIngestionStatus.PENDING,
+            ArtifactIngestionStatus.PROCESSING,
+        }:
             resolved_ingestion_id = _require_id(ingestion, label="ArtifactIngestion")
             _mark_ingestion_failed(
                 session,
@@ -797,15 +807,6 @@ def _parser_payload(
 ) -> tuple[bytes, str | None]:
     maximum = max_decompressed_bytes or get_settings().max_upload_bytes
     return _parser_payload_impl(payload, filename, max_decompressed_bytes=maximum)
-
-
-def _require_decompressed_upload_size(payload: bytes, filename: str) -> None:
-    """Reject compressed resource bombs while preserving invalid-file isolation."""
-    _require_decompressed_upload_size_impl(
-        payload,
-        filename,
-        maximum_size=get_settings().max_upload_bytes,
-    )
 
 
 def _mapped_reaction_smiles(reactant: Chem.Mol, product: Chem.Mol) -> str:
@@ -1801,35 +1802,6 @@ def _delete_reserved_object(
         store.delete(object_key, version_id=metadata.version_id)
 
 
-async def _filter_artifact_without_calculation_frames(
-    *,
-    ingestion_id: UUID,
-    expected_worker_lease_id: UUID | None = None,
-) -> ArtifactUploadResult:
-    async with session_factory() as session:
-        ingestion = await session.get(ArtifactIngestion, ingestion_id)
-        if ingestion is None:
-            raise ArtifactUploadError("artifact ingestion not found")
-        error = NoCalculationFramesError(
-            "source contains no QM calculation frames; artifact was filtered"
-        )
-        await session.run_sync(
-            partial(
-                _run_mark_ingestion_filtered,
-                ingestion_id=ingestion_id,
-                error=error,
-                error_code="no_calculation_frames",
-                completed_at=datetime.now(UTC),
-                source_frame_count=0,
-                transition_state_frame_count=0,
-                expected_worker_lease_id=expected_worker_lease_id,
-            )
-        )
-        await session.commit()
-    async with session_factory() as session:
-        return await session.run_sync(partial(_run_result, ingestion_id=ingestion_id))
-
-
 def _finish_upload_compensation(
     session: Session,
     *,
@@ -1928,7 +1900,9 @@ def _create_pending_ingestion(
         has_revision = session.exec(
             select(ParseRevision.id).where(ParseRevision.artifact_file_id == artifact_id)
         ).first()
-        if ingestion.status is ArtifactIngestionStatus.PENDING or has_revision is None:
+        if ingestion.status is ArtifactIngestionStatus.PENDING or (
+            ingestion.status is not ArtifactIngestionStatus.PROCESSING and has_revision is None
+        ):
             ingestion.status = ArtifactIngestionStatus.PENDING
             ingestion.source_frame_count = None
             ingestion.transition_state_frame_count = None
@@ -1992,9 +1966,9 @@ def _create_pending_ingestions(
                 seconds=get_settings().upload_worker_lease_seconds
             )
             _prepare_new_entity(session, ingestion)
-        elif (
-            ingestion.status is ArtifactIngestionStatus.PENDING
-            or artifact_id not in artifacts_with_revisions
+        elif ingestion.status is ArtifactIngestionStatus.PENDING or (
+            ingestion.status is not ArtifactIngestionStatus.PROCESSING
+            and artifact_id not in artifacts_with_revisions
         ):
             ingestion.status = ArtifactIngestionStatus.PENDING
             ingestion.source_frame_count = None
@@ -2672,6 +2646,24 @@ def _refresh_inference_reaction_profiles(
     cache.affected_reactions_by_id.clear()
 
 
+def _refresh_cleared_reaction_profiles(
+    session: Session,
+    *,
+    cleanup: ParseCleanupSummary,
+) -> None:
+    """Rebuild profiles after stale revision-owned bindings are removed."""
+
+    if not cleanup.affected_mapped_reaction_ids:
+        return
+    session.expire_all()
+    reactions = session.exec(
+        select(MappedReaction).where(
+            col(MappedReaction.id).in_(cleanup.affected_mapped_reaction_ids)
+        )
+    ).all()
+    refresh_mapped_reactions_thermodynamics(session, reactions)
+
+
 def _persist_artifact_inferences(
     session: Session,
     deferred: _DeferredArtifactInferences,
@@ -2826,13 +2818,23 @@ def _persist_parsed_artifact(
             ).all()
             if isinstance(revision_id, UUID)
         }
+    if force_new_revision and existing_revision_ids:
+        # The persistence primitive is also used directly by import/recovery
+        # code. Keep the replacement invariant here as a final guard: a
+        # forced revision can never append to an obsolete materialization.
+        cleanup = clear_previous_parse_results_batch(
+            session,
+            artifact_file_ids=(_require_id(artifact, label="ArtifactFile"),),
+        )
+        _refresh_cleared_reaction_profiles(session, cleanup=cleanup)
+        existing_revision_ids.clear()
     # Single-file uploads and reparses do not arrive through the batch
     # persistence coordinator, so they have no caller-owned geometry context.
     # Reuse one project-bound context for both Formula/Topology/Geometry
     # persistence and the deferred TS reaction inference.  Without this,
     # reparsing a historical file rebuilt its frames but called
     # ``create_reaction_in_session`` with ``project_id=None``; the new
-    # inference then reused the quarantined global reaction root instead of
+    # inference then reused an unowned fallback reaction instead of
     # materializing a project-owned reaction.
     active_geometry_context = geometry_context or GeometryPersistenceContext(
         project_id=artifact.project_id
@@ -2986,6 +2988,35 @@ def _mark_ingestion_failed(
         ingestion.transition_state_frame_count = transition_state_frame_count
     session.add(ingestion)
     return True
+
+
+def _reset_ingestion_for_clean_reparse(
+    ingestion: ArtifactIngestion,
+    *,
+    started_at: datetime,
+    status: ArtifactIngestionStatus = ArtifactIngestionStatus.PENDING,
+    worker_lease_id: UUID | None = None,
+    worker_lease_expires_at: datetime | None = None,
+    cleanup: ParseCleanupSummary | None = None,
+) -> None:
+    """Make an ingestion represent an empty, retryable parse reservation."""
+
+    ingestion.status = status
+    ingestion.source_frame_count = None
+    ingestion.transition_state_frame_count = None
+    ingestion.started_at = started_at
+    ingestion.completed_at = None
+    ingestion.worker_lease_id = worker_lease_id
+    ingestion.worker_lease_expires_at = worker_lease_expires_at
+    ingestion.error_code = None
+    ingestion.error_message = None
+    ingestion.parser_metadata = {
+        "reparse_reset": True,
+        "deleted_parse_revision_count": cleanup.deleted_revision_count if cleanup else 0,
+        "deleted_frame_count": cleanup.deleted_frame_count if cleanup else 0,
+        "deleted_segment_count": cleanup.deleted_segment_count if cleanup else 0,
+        "deleted_inference_count": cleanup.deleted_inference_count if cleanup else 0,
+    }
 
 
 def _mark_ingestion_filtered(
@@ -3217,8 +3248,11 @@ def _preload_batch_persistence_state(
         artifact_id: set() for artifact_id in artifact_ids
     }
     for artifact_id, revision_id in session.exec(
-        select(ParseRevision.artifact_file_id, ParseRevision.id).where(
-            col(ParseRevision.artifact_file_id).in_(artifact_ids)
+        select(ParseRevision.artifact_file_id, ParseRevision.id)
+        .where(col(ParseRevision.artifact_file_id).in_(artifact_ids))
+        .order_by(
+            col(ParseRevision.artifact_file_id),
+            col(ParseRevision.revision_number).desc(),
         )
     ).all():
         if not isinstance(artifact_id, UUID) or not isinstance(revision_id, UUID):
@@ -3406,6 +3440,55 @@ def _run_reconcile_molop_geometry_context(
     context: GeometryPersistenceContext,
 ) -> None:
     reconcile_molop_geometry_context(cast(Session, session), context)
+
+
+def _run_clear_and_reset_parse_state(
+    session: SQLAlchemySession,
+    *,
+    artifact_file_ids: Sequence[UUID],
+    started_at: datetime,
+    worker_lease_by_artifact_id: Mapping[UUID, tuple[UUID | None, datetime | None]] | None = None,
+) -> ParseCleanupSummary:
+    """Delete old materialization and reset ingestion rows in one transaction."""
+
+    typed_session = cast(Session, session)
+    ordered_ids = tuple(dict.fromkeys(artifact_file_ids))
+    if not ordered_ids:
+        return ParseCleanupSummary()
+    _acquire_identity_locks(
+        typed_session,
+        *(("artifact_ingestion", artifact_id) for artifact_id in ordered_ids),
+    )
+    cleanup = clear_previous_parse_results_batch(
+        typed_session,
+        artifact_file_ids=ordered_ids,
+    )
+    _refresh_cleared_reaction_profiles(typed_session, cleanup=cleanup)
+    ingestions = typed_session.exec(
+        select(ArtifactIngestion)
+        .where(col(ArtifactIngestion.artifact_file_id).in_(ordered_ids))
+        .with_for_update()
+    ).all()
+    for ingestion in ingestions:
+        lease = (
+            worker_lease_by_artifact_id.get(ingestion.artifact_file_id)
+            if worker_lease_by_artifact_id is not None
+            else None
+        )
+        _reset_ingestion_for_clean_reparse(
+            ingestion,
+            started_at=started_at,
+            status=(
+                ArtifactIngestionStatus.PROCESSING
+                if lease is not None and lease[0] is not None
+                else ArtifactIngestionStatus.PENDING
+            ),
+            worker_lease_id=lease[0] if lease is not None else None,
+            worker_lease_expires_at=lease[1] if lease is not None else None,
+            cleanup=cleanup,
+        )
+        typed_session.add(ingestion)
+    return cleanup
 
 
 def _run_preload_molecular_geometry_context(
@@ -3648,21 +3731,6 @@ def _inference_reaction_cache_key(
     ).hexdigest()
 
 
-def _run_result(
-    session: SQLAlchemySession,
-    *,
-    ingestion_id: UUID,
-    parse_revision_id: UUID | None = None,
-    parse_revision_created: bool | None = None,
-) -> ArtifactUploadResult:
-    return _result(
-        cast(Session, session),
-        ingestion_id,
-        parse_revision_id=parse_revision_id,
-        parse_revision_created=parse_revision_created,
-    )
-
-
 def _run_batch_results(
     session: SQLAlchemySession,
     *,
@@ -3719,7 +3787,7 @@ class ArtifactUploadService:
         expected_size_bytes: int | None = None,
         inspected: _InspectedUploadSource | None = None,
     ) -> _PreparedCalculationUpload | ArtifactUploadResult:
-        """Reserve and store an upload, leaving calculation parsing for the caller."""
+        """Reserve and store an upload, leaving calculation parsing to the worker."""
 
         settings = RustFSSettings()
         started_at = datetime.now(UTC)
@@ -3853,41 +3921,6 @@ class ArtifactUploadService:
         )
 
     @classmethod
-    async def stage(
-        cls,
-        *,
-        payload: bytes,
-        filename: str,
-        media_type: str,
-        artifact_kind: ArtifactKind,
-        project_id: UUID,
-        user_id: UUID,
-        relative_path: str | None = None,
-        expected_sha256: str | None = None,
-        expected_size_bytes: int | None = None,
-    ) -> ArtifactUploadResult:
-        """Persist bytes and an ingestion reservation without running MolOP.
-
-        Web queue requests must have a durable hand-off point.  Once this
-        method returns, the raw bytes are verified in RustFS, the immutable
-        ``ArtifactFile`` exists, and calculation outputs have a pending
-        ``ArtifactIngestion`` row.  Parsing is deliberately performed later by
-        the upload worker through :meth:`reparse`.
-        """
-
-        return await cls.stage_source(
-            source=payload,
-            filename=filename,
-            media_type=media_type,
-            artifact_kind=artifact_kind,
-            project_id=project_id,
-            user_id=user_id,
-            relative_path=relative_path,
-            expected_sha256=expected_sha256,
-            expected_size_bytes=expected_size_bytes,
-        )
-
-    @classmethod
     async def stage_source(
         cls,
         *,
@@ -3949,310 +3982,101 @@ class ArtifactUploadService:
             )
 
     @classmethod
-    async def upload(
+    async def clear_previous_parse_results(
         cls,
         *,
-        payload: bytes,
-        filename: str,
-        media_type: str,
-        artifact_kind: ArtifactKind,
-        project_id: UUID,
+        artifact_ids: Sequence[UUID],
         user_id: UUID,
-        relative_path: str | None = None,
-        expected_sha256: str | None = None,
-        expected_size_bytes: int | None = None,
-    ) -> ArtifactUploadResult:
-        if not payload:
-            raise ArtifactUploadError("uploaded artifact is empty")
-        _require_upload_size(payload)
-        _require_decompressed_upload_size(payload, filename)
-        await AuthorizationService.require_project_permission(
-            user_id,
-            project_id,
-            ProjectPermission.ARTIFACT_UPLOAD,
-        )
-        prepared = await cls._prepare_upload(
-            payload=payload,
-            filename=filename,
-            media_type=media_type,
-            artifact_kind=artifact_kind,
-            project_id=project_id,
-            user_id=user_id,
-            relative_path=relative_path,
-            expected_sha256=expected_sha256,
-            expected_size_bytes=expected_size_bytes,
-        )
-        if isinstance(prepared, ArtifactUploadResult):
-            return prepared
-        ingestion_id = _require_prepared_ingestion_id(prepared)
-        started_at = prepared.started_at
+        worker_lease_by_artifact_id: Mapping[UUID, tuple[UUID | None, datetime | None]]
+        | None = None,
+    ) -> ParseCleanupSummary:
+        """Delete all materialized parse state before a clean reparse.
 
-        try:
-            parsed = await _run_molop_file_pipeline(payload, filename)
-        except Exception as error:
-            parse_error = error
-            async with session_factory() as session:
-                await session.run_sync(
-                    lambda sync_session: _mark_ingestion_failed(
-                        cast(Session, sync_session),
-                        ingestion_id=ingestion_id,
-                        error=parse_error,
-                        error_code=getattr(parse_error, "error_code", "molop_parse_failed"),
-                        completed_at=datetime.now(UTC),
-                        error_metadata=_parse_failure_metadata(parse_error),
-                    )
-                )
-                await session.commit()
-                return await session.run_sync(
-                    lambda sync_session: _result(cast(Session, sync_session), ingestion_id)
-                )
-
-        if parsed.source_frame_count == 0:
-            return await _filter_artifact_without_calculation_frames(
-                ingestion_id=ingestion_id,
-            )
-
-        try:
-            async with session_factory() as session:
-                parse_revision_id, parse_revision_created = await session.run_sync(
-                    lambda sync_session: _persist_parsed_artifact(
-                        cast(Session, sync_session),
-                        ingestion_id=ingestion_id,
-                        parsed=parsed,
-                        started_at=started_at,
-                        completed_at=datetime.now(UTC),
-                    )
-                )
-                await session.commit()
-                return await session.run_sync(
-                    lambda sync_session: _result(
-                        cast(Session, sync_session),
-                        ingestion_id,
-                        parse_revision_id=parse_revision_id,
-                        parse_revision_created=parse_revision_created,
-                    )
-                )
-        except Exception as error:
-            persistence_error = error
-            async with session_factory() as session:
-                await session.run_sync(
-                    lambda sync_session: _mark_ingestion_failed(
-                        cast(Session, sync_session),
-                        ingestion_id=ingestion_id,
-                        error=persistence_error,
-                        error_code=getattr(
-                            persistence_error,
-                            "error_code",
-                            "calculation_persistence_failed",
-                        ),
-                        completed_at=datetime.now(UTC),
-                        source_frame_count=parsed.source_frame_count,
-                        transition_state_frame_count=len(parsed.inferences),
-                        error_metadata=_parse_failure_metadata(
-                            persistence_error,
-                            parsed=parsed,
-                        ),
-                    )
-                )
-                await session.commit()
-                return await session.run_sync(
-                    lambda sync_session: _result(cast(Session, sync_session), ingestion_id)
-                )
-
-    @classmethod
-    async def reparse(
-        cls,
-        *,
-        artifact_id: UUID,
-        user_id: UUID,
-        ingestion_id: UUID | None = None,
-        ingestion_lease_id: UUID | None = None,
-    ) -> ArtifactUploadResult:
-        """Parse a stored calculation artifact with the current parser identity.
-
-        ``ingestion_id`` and ``ingestion_lease_id`` are used only by the
-        compatibility recovery worker.  They prevent a late result from an
-        abandoned parser from overwriting a newer retry.
+        The source artifact and its RustFS object remain intact. Every old
+        ``ParseRevision`` and all revision-owned rows are removed in the same
+        transaction, so a subsequent parse starts at revision number one.
         """
 
-        if (ingestion_id is None) != (ingestion_lease_id is None):
-            raise ArtifactUploadError("ingestion recovery requires both id and lease")
-
+        ordered_ids = tuple(dict.fromkeys(artifact_ids))
+        if not ordered_ids:
+            return ParseCleanupSummary()
         started_at = datetime.now(UTC)
         async with session_factory() as session:
-            artifact = await session.get(ArtifactFile, artifact_id)
-            if artifact is None:
-                raise ArtifactUploadError("artifact not found")
-            await AuthorizationService.require_project_permission(
-                user_id,
-                artifact.project_id,
-                ProjectPermission.ARTIFACT_UPLOAD,
-            )
-            if artifact.artifact_kind is not ArtifactKind.CALCULATION_OUTPUT:
-                raise ArtifactUploadError("only calculation output artifacts can be reparsed")
-            if ingestion_id is not None and ingestion_lease_id is not None:
-                ingestion = (
-                    await session.exec(
-                        select(ArtifactIngestion)
-                        .where(
-                            col(ArtifactIngestion.id) == ingestion_id,
-                            col(ArtifactIngestion.artifact_file_id) == artifact_id,
-                            col(ArtifactIngestion.status) == ArtifactIngestionStatus.PENDING,
-                            col(ArtifactIngestion.worker_lease_id) == ingestion_lease_id,
-                            col(ArtifactIngestion.worker_lease_expires_at) > started_at,
-                        )
-                        .with_for_update()
-                    )
-                ).one_or_none()
-                if ingestion is None:
-                    raise ArtifactUploadError("pending ingestion recovery lease is no longer valid")
-            else:
-                ingestion, _ = await session.run_sync(
-                    lambda sync_session: _create_pending_ingestion(
-                        cast(Session, sync_session),
-                        artifact=artifact,
-                        started_at=started_at,
-                    )
-                )
-            if ingestion is None:
-                raise ArtifactUploadError("artifact ingestion was not created")
-            resolved_ingestion_id = _require_id(ingestion, label="ArtifactIngestion")
-            processing_lease_id = ingestion.worker_lease_id
-            had_parse_revision = (
+            artifacts = (
                 await session.exec(
-                    select(ParseRevision.id).where(
-                        col(ParseRevision.artifact_file_id) == artifact_id
-                    )
+                    select(ArtifactFile).where(col(ArtifactFile.id).in_(ordered_ids))
                 )
-            ).first() is not None
-            filename = artifact.original_filename
-            expected_sha256 = artifact.content_sha256
-            expected_size = artifact.size_bytes
-            settings = RustFSSettings().model_copy(update={"bucket": artifact.bucket})
-            object_key = artifact.object_key
-            storage_status = artifact.storage_status
-            await session.commit()
-
-        try:
-            if storage_status is StorageStatus.PENDING:
-                stored = await asyncio.to_thread(cls._head_payload, settings, object_key)
-                if stored.size != expected_size or (
-                    stored.sha256 is not None and stored.sha256 != expected_sha256
-                ):
-                    raise ArtifactUploadError(
-                        "stored artifact metadata does not match database identity"
-                    )
-                async with session_factory() as session:
-                    await session.run_sync(
-                        lambda sync_session: _mark_upload_available(
-                            cast(Session, sync_session),
-                            artifact_id=artifact_id,
-                            object_key=object_key,
-                            stored=stored,
-                        )
-                    )
-                    await session.commit()
-            # Keep storage reads and identity validation inside the same
-            # failure boundary as MolOP parsing.  A worker crash or RustFS
-            # read failure must not leave the newly-created ingestion pending
-            # forever while the upload-batch item is already terminally failed.
-            payload = await asyncio.to_thread(cls._load_payload, settings, object_key)
-            if len(payload) != expected_size or sha256(payload).hexdigest() != expected_sha256:
-                raise ArtifactUploadError("stored artifact bytes do not match database identity")
-            _require_upload_size(payload)
-            parsed = await _run_molop_file_pipeline(payload, filename)
-        except Exception as error:
-            parse_error = error
-            if processing_lease_id is not None or not had_parse_revision:
-                async with session_factory() as session:
-                    await session.run_sync(
-                        lambda sync_session: _mark_ingestion_failed(
-                            cast(Session, sync_session),
-                            ingestion_id=resolved_ingestion_id,
-                            error=parse_error,
-                            error_code=getattr(
-                                parse_error,
-                                "error_code",
-                                "molop_reparse_failed",
-                            ),
-                            completed_at=datetime.now(UTC),
-                            error_metadata=_parse_failure_metadata(parse_error),
-                            expected_worker_lease_id=processing_lease_id,
-                        )
-                    )
-                    await session.commit()
-            raise ArtifactUploadError(str(error) or type(error).__name__) from error
-
-        if parsed.source_frame_count == 0 and not had_parse_revision:
-            return await _filter_artifact_without_calculation_frames(
-                ingestion_id=resolved_ingestion_id,
-                expected_worker_lease_id=processing_lease_id,
+            ).all()
+            artifacts_by_id = {
+                artifact_id: artifact
+                for artifact in artifacts
+                if (artifact_id := artifact.id) is not None
+            }
+            missing = [
+                artifact_id for artifact_id in ordered_ids if artifact_id not in artifacts_by_id
+            ]
+            if missing:
+                raise ArtifactUploadError(f"artifact not found: {missing[0]}")
+            project_ids: set[UUID] = set()
+            for artifact in artifacts_by_id.values():
+                if artifact.artifact_kind is not ArtifactKind.CALCULATION_OUTPUT:
+                    raise ArtifactUploadError("only calculation output artifacts can be reparsed")
+                if artifact.storage_status is not StorageStatus.AVAILABLE:
+                    raise ArtifactUploadError("artifact bytes are not available for parse cleanup")
+                project_ids.add(artifact.project_id)
+            for project_id in project_ids:
+                await AuthorizationService.require_project_permission(
+                    user_id,
+                    project_id,
+                    ProjectPermission.ARTIFACT_UPLOAD,
+                )
+            cleanup = await session.run_sync(
+                partial(
+                    _run_clear_and_reset_parse_state,
+                    artifact_file_ids=ordered_ids,
+                    started_at=started_at,
+                    worker_lease_by_artifact_id=worker_lease_by_artifact_id,
+                )
             )
+            await session.commit()
+        return cleanup
 
-        try:
-            async with session_factory() as session:
-                if processing_lease_id is not None:
-                    current_ingestion = (
-                        await session.exec(
-                            select(ArtifactIngestion)
-                            .where(
-                                col(ArtifactIngestion.id) == resolved_ingestion_id,
-                                col(ArtifactIngestion.status) == ArtifactIngestionStatus.PENDING,
-                                col(ArtifactIngestion.worker_lease_id) == processing_lease_id,
-                                col(ArtifactIngestion.worker_lease_expires_at) > datetime.now(UTC),
-                            )
-                            .with_for_update()
+    @classmethod
+    async def _mark_cleared_reparse_failures(
+        cls,
+        failures: Mapping[UUID, Exception],
+    ) -> None:
+        """Mark artifacts failed after their old materialization was cleared."""
+
+        if not failures:
+            return
+        async with session_factory() as session:
+            ingestion_ids: dict[UUID, UUID] = {}
+            for artifact_id in failures:
+                ingestion_id = (
+                    await session.exec(
+                        select(ArtifactIngestion.id).where(
+                            col(ArtifactIngestion.artifact_file_id) == artifact_id
                         )
-                    ).one_or_none()
-                    if current_ingestion is None:
-                        raise ArtifactUploadError(
-                            "pending ingestion recovery lease is no longer valid"
-                        )
-                parse_revision_id, parse_revision_created = await session.run_sync(
-                    lambda sync_session: _persist_parsed_artifact(
-                        cast(Session, sync_session),
-                        ingestion_id=resolved_ingestion_id,
-                        parsed=parsed,
-                        started_at=started_at,
+                    )
+                ).first()
+                if isinstance(ingestion_id, UUID):
+                    ingestion_ids[artifact_id] = ingestion_id
+            for artifact_id, error in failures.items():
+                ingestion_id = ingestion_ids.get(artifact_id)
+                if ingestion_id is None:
+                    continue
+                await session.run_sync(
+                    partial(
+                        _run_mark_ingestion_failed,
+                        ingestion_id=ingestion_id,
+                        error=error,
+                        error_code=getattr(error, "error_code", "artifact_storage_failed"),
                         completed_at=datetime.now(UTC),
-                        force_new_revision=True,
+                        error_metadata=_parse_failure_metadata(error),
                     )
                 )
-                await session.commit()
-                return await session.run_sync(
-                    lambda sync_session: _result(
-                        cast(Session, sync_session),
-                        resolved_ingestion_id,
-                        parse_revision_id=parse_revision_id,
-                        parse_revision_created=parse_revision_created,
-                    )
-                )
-        except Exception as error:
-            persistence_error = error
-            if processing_lease_id is not None or not had_parse_revision:
-                async with session_factory() as session:
-                    await session.run_sync(
-                        lambda sync_session: _mark_ingestion_failed(
-                            cast(Session, sync_session),
-                            ingestion_id=resolved_ingestion_id,
-                            error=persistence_error,
-                            error_code=getattr(
-                                persistence_error,
-                                "error_code",
-                                "calculation_reparse_persistence_failed",
-                            ),
-                            completed_at=datetime.now(UTC),
-                            source_frame_count=parsed.source_frame_count,
-                            transition_state_frame_count=len(parsed.inferences),
-                            error_metadata=_parse_failure_metadata(
-                                persistence_error,
-                                parsed=parsed,
-                            ),
-                            expected_worker_lease_id=processing_lease_id,
-                        )
-                    )
-                    await session.commit()
-            raise ArtifactUploadError(str(error) or type(error).__name__) from error
+            await session.commit()
 
     @classmethod
     async def reparse_batch(
@@ -4261,17 +4085,18 @@ class ArtifactUploadService:
         artifact_ids: Sequence[UUID],
         user_id: UUID,
         force_reparse: bool = False,
+        previous_results_cleared: bool = False,
     ) -> dict[UUID, ArtifactUploadResult | Exception]:
         """Reparse staged objects through the existing bounded batch pipeline.
 
         The durable worker has already completed the RustFS hand-off. This
         method only downloads and verifies those objects, then delegates all
         MolOP, MolGR, and database work to ``upload_batch``. The parser claim
-        window remains 64 files, and a worker claim is kept as one persistence
-        window to preserve the previous high-throughput importer cadence. In
-        particular, it does not create a second parser or a second persistence
-        consumer; the shared process pool and batched writer are the same path
-        used by the local importer.
+        window remains 64 files, while database commits stay bounded to the
+        shared 32-result persistence microbatch. In particular, it does not
+        create a second parser or a second persistence consumer; the shared
+        process pool and batched writer are the same path used by the local
+        importer.
         """
 
         ordered_ids = tuple(dict.fromkeys(artifact_ids))
@@ -4289,6 +4114,7 @@ class ArtifactUploadService:
             for artifact in artifacts
             if (artifact_id := artifact.id) is not None
         }
+        processing_lease_by_artifact_id: dict[UUID, tuple[UUID, datetime]] = {}
         results: dict[UUID, ArtifactUploadResult | Exception] = {}
         valid_artifacts: list[ArtifactFile] = []
         project_id: UUID | None = None
@@ -4342,9 +4168,49 @@ class ArtifactUploadService:
         if current_chunk:
             artifact_chunks.append(current_chunk)
 
-        # Several claimed project/user groups may be reparsed concurrently by
-        # the worker. Use one loop-wide gate so their RustFS reads do not each
-        # allocate a full upload_max_concurrency window.
+        if force_reparse and not previous_results_cleared:
+            # Complete the destructive phase for every file before starting
+            # any RustFS read or parser work. This gives a batch a real
+            # clean-start boundary even when a later object is unavailable.
+            active_lease_cutoff = datetime.now(UTC)
+            async with session_factory() as session:
+                ingestions = (
+                    await session.exec(
+                        select(ArtifactIngestion).where(
+                            col(ArtifactIngestion.artifact_file_id).in_(ordered_ids)
+                        )
+                    )
+                ).all()
+            for ingestion in ingestions:
+                if (
+                    ingestion.status is ArtifactIngestionStatus.PROCESSING
+                    and ingestion.worker_lease_id is not None
+                    and ingestion.worker_lease_expires_at is not None
+                    and ingestion.worker_lease_expires_at > active_lease_cutoff
+                ):
+                    processing_lease_by_artifact_id[ingestion.artifact_file_id] = (
+                        ingestion.worker_lease_id,
+                        ingestion.worker_lease_expires_at,
+                    )
+            for artifact_chunk in artifact_chunks:
+                try:
+                    await cls.clear_previous_parse_results(
+                        artifact_ids=[
+                            _require_id(artifact, label="ArtifactFile")
+                            for artifact in artifact_chunk
+                        ],
+                        user_id=user_id,
+                        worker_lease_by_artifact_id=processing_lease_by_artifact_id,
+                    )
+                except Exception as error:
+                    for artifact in artifact_chunk:
+                        results[_require_id(artifact, label="ArtifactFile")] = error
+                    return results
+            previous_results_cleared = True
+
+        # The worker serializes project/user microbatches, but keep one
+        # loop-wide gate here so RustFS reads remain bounded if this service is
+        # also called by another durable consumer or an explicit batch retry.
         download_slots = _rustfs_download_submission_slots()
 
         async def load_payload(artifact: ArtifactFile) -> ArtifactUploadPayload | Exception:
@@ -4379,6 +4245,13 @@ class ArtifactUploadService:
 
         for artifact_chunk in artifact_chunks:
             loaded = await asyncio.gather(*(load_payload(artifact) for artifact in artifact_chunk))
+            failed_loads = {
+                _require_id(artifact, label="ArtifactFile"): payload_or_error
+                for artifact, payload_or_error in zip(artifact_chunk, loaded, strict=True)
+                if isinstance(payload_or_error, Exception)
+            }
+            if previous_results_cleared and failed_loads:
+                await cls._mark_cleared_reparse_failures(failed_loads)
             upload_files: list[tuple[UUID, ArtifactUploadPayload]] = []
             upload_artifacts: list[ArtifactFile] = []
             for artifact, payload_or_error in zip(artifact_chunk, loaded, strict=True):
@@ -4394,13 +4267,15 @@ class ArtifactUploadService:
                     artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
                     project_id=project_id,
                     user_id=user_id,
-                    # Keep one persistence consumer/window for the durable
-                    # worker claim, just as the previous local importer did
-                    # for a completed claim. The process pool remains shared
-                    # and capped independently by molop_batch_n_jobs.
-                    persistence_batch_files=len(upload_files),
+                    # The worker's project/user group can contain up to the
+                    # 64-file claim window, but commits must happen at the
+                    # bounded persistence microbatch boundary. This keeps
+                    # the single consumer and shared parser pool while
+                    # releasing project-scoped identity locks regularly.
+                    persistence_batch_files=PERSISTENCE_PRELOAD_BATCH_SIZE,
                     reparse_failed_ingestions=True,
                     force_reparse=force_reparse,
+                    previous_results_cleared=previous_results_cleared,
                 )
             except Exception as error:
                 for artifact in upload_artifacts:
@@ -4535,6 +4410,7 @@ class ArtifactUploadService:
         source_inspections: Mapping[int, _InspectedUploadSource] | None = None,
         reparse_failed_ingestions: bool = False,
         force_reparse: bool = False,
+        previous_results_cleared: bool = False,
     ) -> tuple[
         dict[int, _PreparedCalculationUpload],
         dict[int, ArtifactBatchUploadItem],
@@ -4662,6 +4538,21 @@ class ArtifactUploadService:
                             reservations_by_digest.items()
                         )
                     }
+                    clean_reparse = artifact_kind is ArtifactKind.CALCULATION_OUTPUT and (
+                        reparse_failed_ingestions or force_reparse
+                    )
+                    cleanup: ParseCleanupSummary | None = None
+                    if clean_reparse and not previous_results_cleared:
+                        cleanup = await session.run_sync(
+                            partial(
+                                _run_clear_and_reset_parse_state,
+                                artifact_file_ids=[
+                                    _require_id(artifact, label="ArtifactFile")
+                                    for artifact in artifacts_by_digest.values()
+                                ],
+                                started_at=datetime.now(UTC),
+                            )
+                        )
                     ingestions_by_artifact_id: dict[UUID, tuple[ArtifactIngestion, bool]] = {}
                     if artifact_kind is ArtifactKind.CALCULATION_OUTPUT:
                         started_by_artifact_id = {
@@ -4694,6 +4585,7 @@ class ArtifactUploadService:
                             retry_failed = (
                                 (reparse_failed_ingestions or force_reparse)
                                 and not created
+                                and ingestion.status is not ArtifactIngestionStatus.PROCESSING
                                 and (
                                     force_reparse
                                     or ingestion.status
@@ -4704,9 +4596,6 @@ class ArtifactUploadService:
                                 )
                             )
                             if retry_failed:
-                                # Reopen the durable ingestion reservation. Existing
-                                # revisions, if any, are retained as provenance and
-                                # the parser result is written as a new revision.
                                 ingestion.status = ArtifactIngestionStatus.PENDING
                                 ingestion.started_at = started_at
                                 ingestion.completed_at = None
@@ -4721,10 +4610,30 @@ class ArtifactUploadService:
                                 session.add(ingestion)
                                 ingestion_status = ArtifactIngestionStatus.PENDING
                                 force_new_revision = True
+                            if clean_reparse and not previous_results_cleared:
+                                _reset_ingestion_for_clean_reparse(
+                                    ingestion,
+                                    started_at=started_at,
+                                    status=(
+                                        ArtifactIngestionStatus.PROCESSING
+                                        if ingestion.status is ArtifactIngestionStatus.PROCESSING
+                                        else ArtifactIngestionStatus.PENDING
+                                    ),
+                                    worker_lease_id=ingestion.worker_lease_id,
+                                    worker_lease_expires_at=ingestion.worker_lease_expires_at,
+                                    cleanup=cleanup,
+                                )
+                                session.add(ingestion)
+                                ingestion_status = ingestion.status
+                                force_new_revision = True
                             skip_parse = (
                                 not created
                                 and not retry_failed
-                                and ingestion.status is not ArtifactIngestionStatus.PENDING
+                                and ingestion.status
+                                not in {
+                                    ArtifactIngestionStatus.PENDING,
+                                    ArtifactIngestionStatus.PROCESSING,
+                                }
                             )
                         reservations[index] = _PreparedCalculationUpload(
                             settings=settings,
@@ -4805,6 +4714,7 @@ class ArtifactUploadService:
         enforce_batch_file_limit: bool = True,
         reparse_failed_ingestions: bool = False,
         force_reparse: bool = False,
+        previous_results_cleared: bool = False,
     ) -> ArtifactBatchUploadResult:
         """Prepare once, then advance files through an asynchronous pipeline.
 
@@ -4853,6 +4763,7 @@ class ArtifactUploadService:
             source_inspections=source_inspections,
             reparse_failed_ingestions=reparse_failed_ingestions,
             force_reparse=force_reparse,
+            previous_results_cleared=previous_results_cleared,
         )
         timings["prepare_db_ms"] = (perf_counter() - phase_started) * 1000
 
@@ -5052,10 +4963,10 @@ class ArtifactUploadService:
 
         # Keep the old importer execution shape: one claim window owns one
         # shared parser queue and one SQLAlchemy persistence consumer. The
-        # database transaction is bounded below so project-scoped advisory
-        # locks are released regularly; each committed window gets a fresh
-        # GeometryPersistenceContext as well, so ORM objects and reconciliation
-        # caches never cross a transaction boundary.
+        # database transaction is bounded by ``persistence_batch_files`` so
+        # project-scoped advisory locks are released regularly; each committed
+        # window gets a fresh GeometryPersistenceContext as well, so ORM
+        # objects and reconciliation caches never cross a transaction boundary.
         persistence_pipeline_started = perf_counter()
         parse_errors_by_index: dict[int, Exception] = {}
         parse_failure_metadata_by_index: dict[int, dict[str, Any]] = {}
@@ -5295,14 +5206,14 @@ class ArtifactUploadService:
             async def commit_persistence_window(
                 completed_indices: list[int],
             ) -> None:
-                """Flush one bounded window and release its identity locks.
+                """Flush one persistence microbatch and release its locks.
 
                 The parser queue and process pool remain shared for the
-                whole claim window.  Only the database transaction is
+                whole claim window. Only the database transaction is
                 bounded: project-scoped identity locks are PostgreSQL
                 transaction locks, so retaining one transaction for all
-                64 files eventually exhausts ``max_locks_per_transaction``.
-                A fresh Geometry context per committed window keeps the
+                claimed files can exhaust ``max_locks_per_transaction``.
+                A fresh Geometry context per committed microbatch keeps the
                 reconciliation graph and transaction-local candidate index
                 bounded after the commit.
                 """
@@ -5324,12 +5235,7 @@ class ArtifactUploadService:
                     ingestion = persistence_ingestions_by_id[ingestion_id]
                     await session.run_sync(
                         partial(
-                            cast(
-                                Any,
-                                _run_mark_ingestion_filtered
-                                if original_index in no_frame_indices
-                                else _run_mark_ingestion_failed,
-                            ),
+                            _run_mark_ingestion_failed,
                             ingestion_id=ingestion_id,
                             error=parse_error,
                             error_code=(
@@ -5435,14 +5341,15 @@ class ArtifactUploadService:
                 parse_revision_by_ingestion_id: dict[UUID, UUID | None] = {}
                 parse_revision_created_by_ingestion_id: dict[UUID, bool | None] = {}
                 for original_index in window_parse_indices:
+                    reservation = prepared[original_index]
                     ingestion_id = _require_prepared_ingestion_id(prepared[original_index])
                     persisted_revision = persisted_revisions_by_index.get(original_index)
-                    parse_revision_by_ingestion_id[ingestion_id] = (
-                        persisted_revision[0] if persisted_revision is not None else None
-                    )
-                    parse_revision_created_by_ingestion_id[ingestion_id] = (
-                        persisted_revision[1] if persisted_revision is not None else None
-                    )
+                    if persisted_revision is not None:
+                        parse_revision_by_ingestion_id[ingestion_id] = persisted_revision[0]
+                        parse_revision_created_by_ingestion_id[ingestion_id] = persisted_revision[1]
+                    else:
+                        parse_revision_by_ingestion_id[ingestion_id] = None
+                        parse_revision_created_by_ingestion_id[ingestion_id] = False
 
                 if parse_revision_by_ingestion_id:
                     result_started = perf_counter()
@@ -5537,10 +5444,9 @@ class ArtifactUploadService:
                 if storage_error is None and local_index is not None:
                     await persist_completed_file(local_index, parsed)
                     # Keep parsing and database work overlapped inside the
-                    # same claim transaction.  The previous importer fed
-                    # the shared persistence consumer every preload-sized
-                    # group instead of waiting for the whole claim to
-                    # finish; only the commit boundary remains claim-sized.
+                    # same claim window. The shared persistence consumer is
+                    # fed every preload-sized group, while commit boundaries
+                    # remain independently bounded by ``persistence_batch_files``.
                     if pending_preload and (
                         len(pending_preload) >= PERSISTENCE_PRELOAD_BATCH_SIZE
                         or pipeline_result_queue.empty()

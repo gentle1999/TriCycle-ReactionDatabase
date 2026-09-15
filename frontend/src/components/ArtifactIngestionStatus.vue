@@ -14,12 +14,12 @@ defineProps<{
   <span
     v-if="status"
     class="status-dot artifact-ingestion-status"
-    :class="[statusTone(status), { 'is-processing': status === 'pending' }]"
+    :class="[statusTone(status), { 'is-processing': status === 'processing' }]"
     :title="errorMessage ?? undefined"
     role="status"
   >
-    <LoaderCircle v-if="status === 'pending'" :size="12" aria-hidden="true" />
-    {{ status === "pending" ? labelFor("parsing") : labelFor(status) }}
+    <LoaderCircle v-if="status === 'processing'" :size="12" aria-hidden="true" />
+    {{ labelFor(status) }}
   </span>
   <span v-else>—</span>
 </template>

@@ -137,11 +137,13 @@
   - Gaussian、ORCA 和混合批次黄金样本端到端通过。
 - **验收记录（2026-08-12）：** 单文件/批量上传、只读 validate、MolOP 内容 probe、
   文件级独立事务、全帧持久化、TS 推断和普通重复上传幂等均已实现。显式 reparse 从
-  RustFS 读取并校验原始 bytes，创建递增 `revision_number/reparse_of_id`；
+  RustFS 读取并校验原始 bytes，清理旧 ParseRevision 后从 `revision_number=1` 重建；
   TransitionStateInference 按 ParseRevision + frame 唯一。Gaussian 29 帧、ORCA 1 帧和
   无效文件的真实 PostgreSQL/RustFS 混合批次测试通过；失败文件未回滚其他文件，解析与
-  持久化两类失败 reparse 均不覆盖既有成功状态。普通重复上传不创建新 revision，显式
-  reparse 不用随机 nonce 伪造科学 identity hash。
+  持久化两类失败 reparse 都将空 ingestion 标记为失败，不恢复旧结果；重解析前删除旧
+  revision 的全部 segment/frame/inference 物化记录和相关派生绑定，避免同一帧同时暴露两种
+  口径。普通重复上传不创建新 revision，显式 reparse 不用随机 nonce 伪造科学 identity
+  hash。历史重处理脚本先清空所有多 revision Artifact，再统一重解析。
 
 ### I2 Reaction-Geometry-Frame 关联 QC
 

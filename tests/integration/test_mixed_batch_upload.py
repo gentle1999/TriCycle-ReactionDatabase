@@ -12,7 +12,6 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from tricycle_reaction_db.application.services import artifact_uploads as uploads
 from tricycle_reaction_db.application.services.artifact_uploads import (
-    ArtifactUploadError,
     ArtifactUploadPayload,
     ArtifactUploadService,
 )
@@ -89,7 +88,7 @@ async def _ingestion_snapshot(
 
 
 @pytest.mark.asyncio
-async def test_mixed_raw_batch_persists_independently_and_failed_reparse_preserves_success(
+async def test_mixed_raw_batch_persists_independently_and_failed_reparse_starts_clean(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     run_marker = str(uuid4()).encode()
@@ -283,8 +282,11 @@ async def test_mixed_raw_batch_persists_independently_and_failed_reparse_preserv
                 assert all(batch.timings_ms[phase] >= 0 for phase in expected_timing_phases)
                 assert not individual_ingestion_reads
                 assert not individual_revision_id_reads
-                assert len(parse_revision_selects) == 2
-                assert all(
+                # The retry now has an explicit clean-up phase, so it adds
+                # revision reads for deletion in addition to the set-based
+                # preload reads.
+                assert len(parse_revision_selects) >= 2
+                assert any(
                     "artifact_file_id IN" in statement for statement in parse_revision_selects
                 )
 
@@ -301,19 +303,26 @@ async def test_mixed_raw_batch_persists_independently_and_failed_reparse_preserv
                     raise RuntimeError("forced reparse failure")
 
                 monkeypatch.setattr(uploads, "_run_molop_source_parser", fail_parse)
-                with pytest.raises(ArtifactUploadError, match="forced reparse failure"):
-                    await ArtifactUploadService.reparse(
-                        artifact_id=artifact_id,
+                parse_failure = (
+                    await ArtifactUploadService.reparse_batch(
+                        artifact_ids=[artifact_id],
                         user_id=DEVELOPMENT_USER_ID,
+                        force_reparse=True,
                     )
-                assert (
-                    await _ingestion_snapshot(
-                        isolated_factory,
-                        ingestion_id=ingestion_id,
-                        artifact_id=artifact_id,
-                    )
-                    == before
+                )[artifact_id]
+                assert not isinstance(parse_failure, Exception)
+                assert parse_failure.ingestion_status is ArtifactIngestionStatus.FAILED
+                after_parse_failure = await _ingestion_snapshot(
+                    isolated_factory,
+                    ingestion_id=ingestion_id,
+                    artifact_id=artifact_id,
                 )
+                assert before[-1]
+                assert after_parse_failure[0] is ArtifactIngestionStatus.FAILED
+                assert after_parse_failure[1:3] == (None, None)
+                assert after_parse_failure[4] == "molop_parse_failed"
+                assert "forced reparse failure" in str(after_parse_failure[5])
+                assert after_parse_failure[-1] == ()
 
                 materialized_gaussian = parsed_gaussian[-1]
 
@@ -330,22 +339,23 @@ async def test_mixed_raw_batch_persists_independently_and_failed_reparse_preserv
                     raise RuntimeError("forced reparse persistence failure")
 
                 monkeypatch.setattr(uploads, "_persist_parsed_artifact", fail_persistence)
-                with pytest.raises(
-                    ArtifactUploadError,
-                    match="forced reparse persistence failure",
-                ):
-                    await ArtifactUploadService.reparse(
-                        artifact_id=artifact_id,
+                persistence_failure = (
+                    await ArtifactUploadService.reparse_batch(
+                        artifact_ids=[artifact_id],
                         user_id=DEVELOPMENT_USER_ID,
+                        force_reparse=True,
                     )
-                assert (
-                    await _ingestion_snapshot(
-                        isolated_factory,
-                        ingestion_id=ingestion_id,
-                        artifact_id=artifact_id,
-                    )
-                    == before
+                )[artifact_id]
+                assert not isinstance(persistence_failure, Exception)
+                assert persistence_failure.ingestion_status is ArtifactIngestionStatus.FAILED
+                after_persistence_failure = await _ingestion_snapshot(
+                    isolated_factory,
+                    ingestion_id=ingestion_id,
+                    artifact_id=artifact_id,
                 )
+                assert after_persistence_failure[0] is ArtifactIngestionStatus.FAILED
+                assert after_persistence_failure[1:3] == (23, 1)
+                assert after_persistence_failure[-1] == ()
             finally:
                 await transaction.rollback()
     finally:

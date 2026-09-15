@@ -104,12 +104,14 @@ Geometry、LogicalReaction、MappedReaction 的领域分层，保持源坐标、
 3. 退役、权限撤销和可见性变更在后续请求中立即生效。缓存键与授权/来源水位关联，缓存命中
    也不能跳过授权。历史快照不授予已经撤销的访问权。
 4. 成功 reparse、选源策略变化和缓存刷新是不同操作。默认不自动采用 failed、filtered、pending
-   revision；partial revision 仅经显式 QC 选择，不覆盖上一有效成功版本。
+   revision；reparse 会先删除旧 revision 及其 segment/frame/inference 物化结果，再从 RustFS
+   建立唯一的当前 revision。解析或持久化失败时不恢复已删除的旧结果。
 5. 科学方法评分只能作为显式分析策略，不能把未知方法或同分的不同协议视为等价；
    方法、基组、电子态、溶剂、温压和适用标准态须能追溯。
 6. Geometry 的精确身份和近似匹配分开。原始 Frame 坐标、匹配证据和版本保留；不放松
    stereochemistry、电子态或原子对应来提高命中率。
-7. 不以清库、重新导入全部文件或删除旧 revision 作为默认迁移方案。阶段完成需有代码、
+7. 不以清库、重新导入全部文件或删除旧 revision 作为默认迁移方案；历史多 revision 文件的
+   显式 clean-first 修复由两阶段脚本执行。阶段完成需有代码、
    迁移/接口、测试和文档证据；跳过或环境不可用不等于通过。
 8. 跨用户/项目共享边界固定为不可变的 `ArtifactFile`。`ParseRevision`、`CalculationFrame`
    以及 Formula、Topology、Geometry、Reaction 和所有派生关系必须沿同一个 ArtifactFile
@@ -137,28 +139,32 @@ manifest/API staging
 
 固定边界如下：
 
-- `UploadBatchWorker._process_jobs` 只能把租约窗口交给 `reparse_batch`；
-  `_process_pending` 保留单文件恢复兼容性。不得为 RustFS 对象新增 remote
+- `UploadBatchWorker._process_jobs` 和 `_process_pending_jobs` 都只能把租约窗口交给
+  `reparse_batch`；兼容 pending-ingestion 恢复也必须按项目/用户合并，不得退回单文件
+  `reparse`。不得为 RustFS 对象新增 remote
   parser、第二套 MolOP 调用、第二套 frame materialization 或第二套入库事务。
   已 staged 的对象不能再次上传到 RustFS。
-- `reparse` 是唯一的文件级解析/重解析服务，`reparse_batch` 只是批量调度外壳；
-  后者负责读取/校验已有对象后，委托既有 `upload_batch` 完成 MolOP、MolGR 和
-  数据库工作。worker 只负责认领/续租、调用服务和提交队列的 terminal 状态。
+- `reparse_batch` 是唯一的 durable worker 文件解析/重解析服务；它负责读取/校验已有
+  对象后，委托既有 `upload_batch` 完成 MolOP、MolGR 和数据库工作。旧的同步
+  `ArtifactUploadService.upload()`、`reparse()`、`stage()` 入口已经移除，worker 只负责
+  认领/续租、调用服务和提交队列的 terminal 状态。
 - 本地 CLI 的批量流水线、显式单文件 reparse 和 durable worker 可以有不同的来源读取
   与结果队列，但必须复用同一个 `_run_molop_file_pipeline` 和 `upload_batch` 解析边界；
   来源是本地路径还是 RustFS object 不能改变科学解析语义。
 - 本地 CLI 的 `IMPORT_PIPELINE_WINDOW_FILES=64` 是候选窗口；远程 worker 每轮按
-  `TRICYCLE_MAX_BATCH_FILES=64` 领取 staged 任务，并按项目/用户分组交给
-  `reparse_batch`。`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 只保留给 pending-ingestion
-  恢复，不得再作为 staged 解析窗口。
+  `TRICYCLE_MAX_BATCH_FILES=64` 领取 staged 任务，并按项目/用户聚合后交给
+  `reparse_batch`。客户端的 `UploadBatch` 只是队列和进度边界，不是持久化边界；
+  同一项目/用户下的多个单文件批次必须进入同一个持久化微批。不同项目/用户的微批
+  必须顺序处理，不能并发争抢项目范围的身份锁。`TRICYCLE_UPLOAD_WORKER_CONCURRENCY`
+  只保留给 pending-ingestion 恢复，不得再作为 staged 解析窗口。
 - `TRICYCLE_MOLOP_BATCH_N_JOBS=16` 是已有 `_file_worker_submission_slots` 和共享
   `spawn` MolOP 进程池的文件级准入上限，16 个文件任务共享同一组热进程；不能为每个
   文件创建新的池。`OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS` 和 `MKL_NUM_THREADS`
   通常固定为 `1`。
 - worker 不在 `reparse_batch` 外增加数据库调度器、第二个消费者或另一套持久化实现。
-  `reparse_batch` 只做 RustFS 读取/校验和批次切分，`upload_batch` 负责共享解析池、
-  失败 ingestion 收尾和科学事实事务；worker 只负责领取、续租、调用服务和提交
-  terminal 状态。
+  worker 只把领取窗口聚合成项目/用户微批，并顺序调用 `reparse_batch`；后者只做
+  RustFS 读取/校验和批次切分，`upload_batch` 负责共享解析池、失败 ingestion 收尾
+  和科学事实事务；worker 最后分别提交各原始队列项的 terminal 状态。
 
 ### 2.2 批量导入吞吐不变量（回归保护）
 
@@ -171,7 +177,7 @@ manifest/API staging
 | 解析准入 | `TRICYCLE_MOLOP_BATCH_N_JOBS`，专用主机通常为 `16` | 同一个共享池、同一个 `16` 文件准入上限 | 不是 `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 或 RustFS 读取并发 |
 | 候选/领取窗口 | `IMPORT_PIPELINE_WINDOW_FILES=64` | `TRICYCLE_MAX_BATCH_FILES` 最多 `64` | 只是保持队列有活，不是解析进程数 |
 | 持久化交接 | 内部 `PERSISTENCE_PRELOAD_BATCH_SIZE=32` | 同样是 `32` 个结果，或结果队列暂时为空 | 不能等待整个领取窗口结束才写数据库 |
-| 提交/检查点 | `IMPORT_COMMIT_BATCH_FILES`，默认 `16` | 每个实际 worker claim 作为一个 `upload_batch` 持久化窗口（通常 `64`） | 提交边界不控制解析并发 |
+| 提交/检查点 | `IMPORT_COMMIT_BATCH_FILES`，默认 `16` | 每个项目/用户微批进入一个 `upload_batch` 调用；调用内每 `32` 个结果提交一次，一个 claim 可按项目/用户拆成多个顺序调用 | 提交边界不控制解析并发 |
 
 实现约束如下：
 
@@ -182,9 +188,11 @@ manifest/API staging
   结果（或队列暂时为空）就执行 `persist_parsed_files`，解析和数据库写入必须保持流水线
   重叠；只有提交窗口结束才 `commit`。把持久化推迟到整个 64 文件 claim 完成，会重新
   引入已修复的吞吐回归。
-- `reparse_batch` 对每个 project/user 分组只读取并校验已有 RustFS 对象，然后调用
-  `upload_batch(..., persistence_batch_files=<本次分组文件数>)`。因此远程路径的 64
-  是领取/提交窗口，不是第二个解析队列，也不是把 64 个文件串行解析。
+- worker 必须先把领取窗口中的任务按 project/user 聚合；原始 `UploadBatch` 的单文件
+  边界不能阻止微批合并。每个 project/user 微批只读取并校验已有 RustFS 对象，然后
+  调用 `reparse_batch`；其中 `upload_batch` 仍使用 `32` 个结果的持久化提交边界，
+  多个项目/用户微批顺序执行。因此远程路径的 64 是领取窗口，不是第二个解析队列，
+  也不是把 64 个文件串行解析或并发打开 64 个持久化事务。
 - worker 的 `TRICYCLE_UPLOAD_MAX_CONCURRENCY` 只控制 RustFS 读取；
   `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 只服务于 pending-ingestion 恢复；两者都不能
   替代或叠加 MolOP 文件级并发。
@@ -199,10 +207,11 @@ manifest/API staging
   失败隔离不回退，并同步增加架构回归测试。
 
 因此，导入链路的固定关系是：`16` 个共享解析槽位持续取任务，结果按 `32` 个持续交给
-同一个持久化消费者，本地按配置提交微批，RustFS worker 通常按 `64` 个 claim 一次提交。
+同一个持久化消费者，本地按配置提交微批，RustFS worker 通常按 `64` 个 claim 后按
+项目/用户组成微批并顺序提交。客户端单文件批次不能绕过服务端微批。
 修改任一数字或把其中一层用于控制另一层，都必须先更新本节、开发/部署文档和对应测试。
 
-任何改变导入路径的提交都必须回答：是否仍然经过 `reparse`、是否仍然经过
+任何改变导入路径的提交都必须回答：是否仍然经过 `reparse_batch`、是否仍然经过
 `_run_molop_file_pipeline`、是否只增加了调度/租约/资源控制；若答案是否定的，必须先
 更新本节设计和对应的架构测试，不能直接引入平行实现。
 

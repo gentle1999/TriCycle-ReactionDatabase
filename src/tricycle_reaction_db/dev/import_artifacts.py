@@ -1030,9 +1030,7 @@ async def import_files(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=(
-            "Stage files in the configured RustFS queue for durable worker processing."
-        ),
+        description=("Stage files in the configured RustFS queue for durable worker processing."),
     )
     parser.add_argument(
         "roots",
@@ -1095,10 +1093,7 @@ def _parser() -> argparse.ArgumentParser:
         "--commit-batch-files",
         type=int,
         default=IMPORT_COMMIT_BATCH_FILES,
-        help=(
-            "legacy queue-window compatibility value "
-            f"(default: {IMPORT_COMMIT_BATCH_FILES})"
-        ),
+        help=(f"legacy queue-window compatibility value (default: {IMPORT_COMMIT_BATCH_FILES})"),
     )
     parser.add_argument(
         "--pipeline-window-files",

@@ -241,7 +241,7 @@ Cloudflare，必须另建 Cache Rule，使 URI path 以 `/api/` 开头的请求 
 | `POST /api/artifacts` | `401` | 需要目标项目 `artifact:upload` 权限 |
 | `POST /api/artifacts/batch` | `401` | 同一项目内独立处理多个文件 |
 | `POST /api/artifacts/validate` | `401` | 只 probe/解析，不写存储或数据库 |
-| `POST /api/artifacts/{id}/reparse` | `401` | 校验已存 bytes 后创建下一 parse revision |
+| `POST /api/artifacts/{id}/reparse` | `401` | 校验已存 bytes，删除旧 parse materialization 后从 revision 1 重建 |
 | `PATCH /api/artifacts/{id}` | `401` | 项目 manager 修改显示文件名或可见性 |
 | `DELETE /api/artifacts/{id}` | `401` | 需要项目 `artifact:delete`，退役记录并清理对象 |
 | `GET/POST /api/projects` | `401` | 可含归档项目；创建要求组织 owner/admin |
@@ -300,9 +300,41 @@ curl -sS -X POST \
 
 响应给出 artifact/ingestion ID、源帧数、TS 帧数，以及每个 TS 帧复用的
 logical/mapped reaction ID，以及本次 `parse_revision_id/parse_revision_created`。同一文件
-普通重复上传返回相同 revision；显式 reparse 创建 artifact 内递增 revision 并连接前驱。
-已有成功 revision 时解析或持久化失败不会覆盖当前成功 ingestion 汇总。非计算 artifact
-只返回存储结果，不创建 ParseRevision 或 CalculationFrame。
+普通重复上传返回相同 revision；显式 reparse 会先删除 Artifact 的全部旧 ParseRevision 和
+revision-owned 结果，再从 revision 1 建立新的结果。解析或持久化失败时 ingestion 标记为
+`failed`，不会恢复已经删除的旧结果。
+非计算 artifact 只返回存储结果，不创建 ParseRevision 或 CalculationFrame。
+
+历史上若同一 Artifact 存在多个 ParseRevision，可先检查候选集，再使用统一
+RustFS/MolOP/持久化路径修复：
+
+```bash
+uv run python scripts/reparse_overlapping_artifacts.py --dry-run
+uv run python scripts/reparse_overlapping_artifacts.py \
+  --batch-size 32 \
+  --state-file .tmp/reparse-overlapping-artifacts-clean-first.jsonl
+```
+
+该脚本选择存在多个 ParseRevision 的计算 Artifact（包括历史 `quarantined` revision），先
+完成全部清空阶段，再开始解析阶段；因此不会把旧 revision 留在数据库中。JSONL 检查点记录
+manifest、`clear` 和 `reparse` 三个阶段，支持中断后继续，失败和 partial 文件不会被标记为
+已完成。不要复用旧的仅记录解析结果的检查点。
+
+如果只需要清理明确的一组文件，使用统一的按 ID 清理命令。它在一个授权数据库事务中以
+集合操作删除全部旧 ParseRevision 及其 revision-owned 结果，保留 ArtifactFile/RustFS 原始文件，
+并把对应 ingestion 重置为 `pending`，之后由 upload-worker 自动重新解析：
+
+```bash
+uv run python scripts/clear_artifact_parse_results.py \
+  --artifact-id '<artifact-uuid-1>' \
+  --artifact-id '<artifact-uuid-2>'
+
+uv run python scripts/clear_artifact_parse_results.py \
+  --artifact-id-file .tmp/artifact-ids.txt
+```
+
+ID 文件支持空格、逗号和换行分隔，也支持 `#` 注释；同一 ID 会自动去重。该命令只清理解析
+物化结果，不删除 RustFS 对象或 Artifact 目录记录。
 
 ### 上传补偿与可选 RustFS 垃圾回收
 
@@ -572,42 +604,63 @@ make seed-da-bench
 RustFS 的 staged 队列中等待 worker。每个文件仍按内容 SHA-256 幂等，单个暂存失败不会回滚
 同批其他文件。
 
-#### 文件流与进程池模型
+#### 文件上传统一时序与数据流
 
-下面的时序图描述本地 `tricycle-import-artifacts` 的主路径。一个 pipeline window 内的文件任务会并发推进；图中用循环表示同一批中的每个文件，不表示这些文件串行执行。
+下面的时序图统一描述远程单文件、远程批量、本地 `tricycle-import-artifacts` 和 MCP
+计算日志上传。时间和数据流均自上而下；不同入口只在“原始字节来自哪里”这一点上不同。
+系统会先在 PostgreSQL 建立 `pending` 预约和批次项，再写入并校验 RustFS；只有对象可用
+且 item 变为 `staged` 后，文件才进入待解析队列。worker 领取 staged 对象并真正开始
+MolOP/帧处理时，文件级 ingestion 才切换为 `processing`；租约过期会回到 `pending`。
+也可以打开[独立可缩放图示](diagrams/upload-processing-sequence.html)。
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant I as Import CLI
-    participant F as Fingerprint pool
-    participant Q as Candidate queue
-    participant U as ArtifactUploadService
-    participant R as RustFS
-    participant W as upload-worker
+    participant R as 远程客户端
+    participant L as 本地导入 CLI
+    participant S as 上传暂存服务
+    participant O as RustFS
     participant D as PostgreSQL
-    participant C as JSONL checkpoint
+    participant W as upload-worker
+    participant M as MolOP 进程池
+    participant P as 持久化消费者
 
-    Note over F: ThreadPoolExecutor，内部上限 32
-    Note over W: 所有上传会话共享一个 spawn MolOP ProcessPoolExecutor
-
-    I->>F: 递归发现文件，计算 SHA-256
-    F->>Q: 放入候选队列
-    loop 每个 pipeline window
-        Q->>U: 提供候选文件窗口
-        Note right of Q: IMPORT_PIPELINE_WINDOW_FILES
-        loop 窗口内的每个文件（并发）
-            U->>R: 写入并校验原始对象
-            R-->>U: object ready；item=staged
-            U->>D: 提交 batch/item 检查点
-        end
-        W->>D: 领取 staged item
-        W->>R: 读取并校验已暂存对象
-        W->>W: 提交共享 MolOP 池并持久化解析结果
-        W->>D: 更新 ingestion/item 状态
-        U->>C: 追加暂存检查点并 fsync
-        U-->>Q: 槽位释放，继续取下一候选
+    Note over R,P: 时间和数据流自上而下；生产部署保持一个 upload-worker 实例
+    alt 远程单文件或批量上传
+        R->>S: POST /api/artifacts、/batch 或 MCP 计算日志
+    else 本地存量导入
+        L->>S: tricycle-import-artifacts
     end
+    S->>D: 创建 pending Artifact + UploadBatch Item
+    D-->>S: 返回可恢复的批次 / 文件标识
+    S->>O: 写入原始字节并校验 SHA-256
+    O-->>S: 对象可用
+    S->>D: 标记 Item = staged，进入待解析队列
+    S-->>R: 202 + batch/item 标识
+    S-->>L: 返回暂存结果
+
+    W->>D: 领取 staged 项并加处理租约
+    D-->>W: PROCESSING 领取窗口（最多 64 个文件）
+    loop 每个 project/user 持久化组（组间串行）
+        loop 组内文件
+            W->>O: 读取并校验已暂存原始文件
+            O-->>W: 返回文件字节
+            W->>M: 提交 MolOP 解析任务
+            M-->>W: 返回帧、拓扑和反应证据
+            W->>P: 结果进入有界持久化队列
+            alt 结果队列暂时为空
+                P->>D: 仅持久化预加载结果，不提交事务
+            else 累计 32 个完成结果
+                P->>D: 提交 32 个结果的微批事务
+            end
+        end
+    end
+    P->>D: 当前领取窗口结束，提交剩余结果
+    W->>D: 逐项完成 UploadBatchItem 状态
+    R->>S: GET 批次状态 / 解析结果
+    S->>D: 读取批次、入库和帧状态
+    D-->>S: SUCCEEDED / PARTIAL / FAILED
+    S-->>R: 返回最终状态与结果标识
 ```
 
 图中的边界需要这样理解：
@@ -615,6 +668,9 @@ sequenceDiagram
 - 指纹线程池只负责发现文件和读取 SHA-256，内部上限为 `32`；它不是 MolOP 解析池。`IMPORT_STREAM_QUEUE_SIZE` 只限制指纹结果到候选窗口之间的缓冲。
 - `TRICYCLE_MOLOP_BATCH_N_JOBS` 是 worker 内共享 MolOP 进程池的文件级准入上限。API、MCP、
   本地 CLI 和远程批量入口都只负责把文件推进 RustFS/staged 队列，不会在各自会话中创建解析池。
+- `pending` 只是写入过程中的可恢复预约和等待队列状态；RustFS 写入和摘要校验成功后才转为
+  `staged`，worker 领取后文件级 ingestion 才显示为 `processing`。上传请求不会在 RustFS
+  之前或之后直接调用 MolOP。
 - worker 领取后把 parser/frame 任务提交到同一个可复用的 `spawn` 进程池。因此 `n_jobs=16`
   表示该服务进程最多同时执行 16 个文件任务，不会为每个 artifact 或上传会话重复创建进程池；
   文件完成或失败后，队列继续补位。取消或超时只结束该文件的任务，已提交的共享池工作由池自行排空。
@@ -622,6 +678,8 @@ sequenceDiagram
 - RustFS 暂存批次只负责上传背压；解析 worker 以领取窗口和有界持久化批次形成数据库写入背压。
   暂存检查点记录 batch/item ID，最终解析状态以 UploadBatch 查询结果为准；单文件失败不会回滚
   已暂存或已完成的其他文件。
+- `upload-worker` 的单实例是共享 MolOP 池和单一活动持久化消费者的部署边界。API 可以横向扩展；
+  不要横向扩展 upload-worker，否则每个进程都会拥有自己的 MolOP 池和持久化消费者。
 
 浏览器、MCP 或远程 API 路径不经过 Import CLI 的指纹线程池和本地候选队列：入口先把字节写入
 RustFS 并将 item 标记为 `staged`，独立 `upload-worker` 每轮领取 `TRICYCLE_MAX_BATCH_FILES`
@@ -632,10 +690,13 @@ RustFS 并将 item 标记为 `staged`，独立 `upload-worker` 每轮领取 `TRI
 `TRICYCLE_MOLOP_BATCH_N_JOBS` 限制共享解析池准入，三者不能简单相乘。
 
 远程 reparse 的批次边界必须与解析并发分开理解：worker 每轮最多领取 64 个 staged
-文件，`reparse_batch` 将本次 project/user 分组的实际文件数传给 `upload_batch` 作为一次
-持久化提交窗口；窗口内部仍由同一个结果队列和单一消费者每 32 个解析结果（或队列暂时
-为空）调用一次 `persist_parsed_files`，不能等到 64 个文件全部解析完成后才写数据库。
-因此 `64` 只表示领取/提交窗口，实际解析并发仍只由共享 MolOP 池的
+文件。客户端 `UploadBatch` 只是队列/进度边界，不是持久化边界；即使原始上传是单文件
+批次，同一项目/用户的任务也必须在 worker 中合并为一个持久化微批。不同项目/用户的
+微批顺序执行，不能并发打开多个项目持久化事务。每个 project/user 微批通过
+`reparse_batch` 交给 `upload_batch`，再使用同一个结果队列和单一消费者；其中每 32
+个解析结果（或队列暂时为空）调用一次 `persist_parsed_files`，并在持久化微批边界
+提交事务，不能等到整个领取窗口全部解析完成后才写数据库。因此 `64` 只表示领取窗口，
+`32` 是固定的持久化提交微批，实际解析并发仍只由共享 MolOP 池的
 `TRICYCLE_MOLOP_BATCH_N_JOBS`（专用主机通常为 `16`）决定。该 durable bulk/reparse
 事务还使用上一版的 legacy bulk 热路径：reaction SMILES topology 缓存和单次 set-based
 Geometry 匹配保持开启，后来增加的逐文件 concrete/logical/reverse reconciliation 不得
@@ -681,11 +742,12 @@ make import-artifacts
 - `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS=60` 是 10 MiB 文件的基准预算，并随源文件大小放大；它是异常文件隔离参数，不是提速参数。慢磁盘或大文件较多时提高，想更快跳过异常文件时降低，但应先确认失败率。
 - `TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE=false` 是上一版高吞吐导入的默认值，适合大规模普通导入；需要 frame role/source locator、source span 和 block hash 等审计证据时显式设为 `true`，并接受额外开销。`TRICYCLE_MOLOP_PARALLEL_FRAME_PERSISTENCE=true` 应保持开启。
 
-浏览器和远程 API 上传使用独立的 durable `upload-worker`，参数不要与本地导入的 `IMPORT_*` 混用。`TRICYCLE_UPLOAD_MAX_CONCURRENCY=8` 限制 RustFS 读取；`TRICYCLE_MAX_BATCH_FILES=64` 是 worker 的领取/持久化窗口；`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 仅用于旧 pending-ingestion 恢复。专用算力主机可以把共享解析池 `TRICYCLE_MOLOP_BATCH_N_JOBS` 调到 `16`，并根据 CPU、内存和数据库写入延迟复测。
+浏览器和远程 API 上传使用独立的 durable `upload-worker`，参数不要与本地导入的 `IMPORT_*` 混用。`TRICYCLE_UPLOAD_MAX_CONCURRENCY=8` 限制 RustFS 读取；`TRICYCLE_MAX_BATCH_FILES=64` 是 worker 的领取窗口，持久化提交微批固定为 32 个结果；`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 仅用于旧 pending-ingestion 恢复。专用算力主机可以把共享解析池 `TRICYCLE_MOLOP_BATCH_N_JOBS` 调到 `16`，并根据 CPU、内存和数据库写入延迟复测。
 
-这里的“持久化窗口”是 worker claim 的提交边界，不代表 64 个文件串行处理，也不改变
-内部 32 个结果的持续交接规则；本地 CLI 的 `IMPORT_COMMIT_BATCH_FILES=16` 仍只控制
-本地事务/检查点频率。三种数字分别属于解析准入、结果交接和提交边界，不能互相替代。
+worker 的 64 个文件是领取窗口，不代表 64 个文件共用一个事务；每个 project/user 微批
+通过同一个结果队列和单一消费者处理，并按 32 个结果提交一次。它不改变解析准入；本地
+CLI 的 `IMPORT_COMMIT_BATCH_FILES=16` 仍只控制本地事务/检查点频率。三种数字分别属于
+解析准入、结果交接和提交边界，不能互相替代。
 
 `TRICYCLE_MAX_UPLOAD_BYTES=64 MiB` 是单文件上限，本地导入也会执行；`TRICYCLE_MAX_BATCH_FILES=64` 和 `TRICYCLE_MAX_BATCH_BYTES=512 MiB` 是 HTTP 批次保护，不是本地导入的吞吐参数。只有在专用内网压测或可信批量客户端中，并且反向代理 body limit、RustFS、PostgreSQL 都已验证有余量时，才临时提高批次上限到例如 `1024` 文件 / `1 GiB`；不要为普通公网 API 修改这些默认值。`TRICYCLE_UPLOAD_WORKER_LEASE_SECONDS=3600`、`TRICYCLE_UPLOAD_CLIENT_LEASE_SECONDS=900` 和轮询间隔 `1` 秒属于故障恢复参数，保持默认值即可。
 

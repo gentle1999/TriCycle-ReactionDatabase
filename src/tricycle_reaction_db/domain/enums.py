@@ -99,6 +99,7 @@ class ParseStatus(StrEnum):
 
 class ArtifactIngestionStatus(StrEnum):
     PENDING = "pending"
+    PROCESSING = "processing"
     SUCCEEDED = "succeeded"
     PARTIAL = "partial"
     FILTERED = "filtered"

@@ -105,6 +105,46 @@ default). The response contains the durable `UploadBatch` and item in `staged`/
 parse queue, not that MolOP has completed; read the batch/item later for
 `ingestion_status`, `parse_revision_id`, frame counts, and TS inference results.
 
+For an explicit artifact reparse, a normal duplicate upload returns the same
+revision, while reparse first deletes every old `ParseRevision`, segment,
+frame, TS inference, and affected derived binding, then rebuilds revision 1
+from the RustFS source. If parsing or persistence fails, ingestion is marked
+`failed`; no obsolete parse result is restored.
+
+To repair historical duplicate materialization, first inspect the candidate
+set and then run the resumable shared RustFS/MolOP/persistence path:
+
+```bash
+uv run python scripts/reparse_overlapping_artifacts.py --dry-run
+uv run python scripts/reparse_overlapping_artifacts.py \
+  --batch-size 32 \
+  --state-file .tmp/reparse-overlapping-artifacts-clean-first.jsonl
+```
+
+The command selects calculation artifacts with more than one `ParseRevision`,
+including historical `quarantined` rows. It completes the `clear` phase for
+all candidates before beginning `reparse`, and its JSONL manifest/checkpoints
+support resume. Failed or partial files remain retryable.
+
+For a known set of files, use the unified ID-based cleanup command. It performs
+set-based deletion of every old `ParseRevision` and its revision-owned results
+in one authorized database transaction, keeps the ArtifactFile/RustFS source,
+and resets the corresponding ingestions to `pending` for automatic pickup by
+the upload worker:
+
+```bash
+uv run python scripts/clear_artifact_parse_results.py \
+  --artifact-id '<artifact-uuid-1>' \
+  --artifact-id '<artifact-uuid-2>'
+
+uv run python scripts/clear_artifact_parse_results.py \
+  --artifact-id-file .tmp/artifact-ids.txt
+```
+
+The ID file accepts whitespace-, comma-, or newline-separated UUIDs and `#`
+comments. Duplicate IDs are removed. The command does not delete RustFS
+objects or Artifact catalogue rows.
+
 ## Query and Parsing Budgets
 
 The default limits are documented in `.env.example`. In particular:
@@ -172,44 +212,67 @@ creates an `UploadBatch`, and stages verified raw objects in RustFS. The CLI
 does not run MolOP; the independent `upload-worker` claims the staged items and
 uses the same shared parser and persistence path as remote uploads.
 
-### File flow and process-pool model
+### Unified file-upload sequence and data flow
 
-The sequence below shows the main path for local `tricycle-import-artifacts`.
-File tasks within one pipeline window advance concurrently; the inner loop
-represents each file in that window and is not a serial execution model.
+The sequence below covers remote single-file uploads, remote batches, the local
+`tricycle-import-artifacts` CLI, and MCP calculation-log uploads. Time and data
+flow move from top to bottom; the only source difference is where the raw bytes
+come from. The service first creates a recoverable `pending` reservation and
+batch item in PostgreSQL, then writes and verifies RustFS. Only an available
+object whose item is marked `staged` enters the parse queue. When the worker
+claims that object and starts MolOP/frame processing, the file-level ingestion
+becomes `processing`; an expired lease returns it to `pending`. A
+[standalone zoomable version](diagrams/upload-processing-sequence.html) is also
+available.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant I as Import CLI
-    participant F as Fingerprint pool
-    participant Q as Candidate queue
-    participant U as ArtifactUploadService
-    participant R as RustFS
-    participant W as upload-worker
+    participant R as Remote client
+    participant L as Local import CLI
+    participant S as Upload staging service
+    participant O as RustFS
     participant D as PostgreSQL
-    participant C as JSONL checkpoint
+    participant W as upload-worker
+    participant M as MolOP process pool
+    participant P as Persistence consumer
 
-    Note over F: ThreadPoolExecutor, internal cap 32
-    Note over W: one reusable spawn MolOP ProcessPoolExecutor shared by uploads
-
-    I->>F: Discover paths and compute SHA-256
-    F->>Q: Enqueue candidate
-    loop Each pipeline window
-        Q->>U: Provide candidate window
-        Note right of Q: IMPORT_PIPELINE_WINDOW_FILES
-        loop Each file in the window (concurrent)
-            U->>R: Write and verify raw object
-            R-->>U: Object ready; item=staged
-            U->>D: Commit batch/item hand-off
-        end
-        W->>D: Claim staged items
-        W->>R: Read and verify existing objects
-        W->>W: Submit to shared MolOP pool and persist results
-        W->>D: Update ingestion/item state
-        U->>C: Append staging checkpoint and fsync
-        U-->>Q: Refill with the next candidate
+    Note over R,P: Time and data flow move downward; production keeps one upload-worker instance
+    alt Remote single-file or batch upload
+        R->>S: POST /api/artifacts, /batch, or MCP calculation log
+    else Local existing-file import
+        L->>S: tricycle-import-artifacts
     end
+    S->>D: Create pending Artifact + UploadBatch Item
+    D-->>S: Return recoverable batch/file identity
+    S->>O: Write raw bytes and verify SHA-256
+    O-->>S: Object available
+    S->>D: Mark Item = staged; enter durable parse queue
+    S-->>R: 202 + batch/item identity
+    S-->>L: Return staging result
+
+    W->>D: Claim staged items and acquire leases
+    D-->>W: PROCESSING claim window (up to 64 files)
+    loop Each project/user persistence group (groups are serial)
+        loop Each file in the group
+            W->>O: Read and verify staged raw object
+            O-->>W: Return file bytes
+            W->>M: Submit MolOP parse task
+            M-->>W: Return frames, topology, and reaction evidence
+            W->>P: Enqueue result in bounded persistence queue
+            alt Result queue is temporarily empty
+                P->>D: Persist preload results only; do not commit
+            else 32 completed results accumulated
+                P->>D: Commit one 32-result persistence microbatch
+            end
+        end
+    end
+    P->>D: Claim window ends; commit remaining results
+    W->>D: Finalize each UploadBatchItem state
+    R->>S: GET batch status / parse result
+    S->>D: Read batch, ingestion, and frame state
+    D-->>S: SUCCEEDED / PARTIAL / FAILED
+    S-->>R: Return final status and result identities
 ```
 
 Read the boundaries in the diagram as follows:
@@ -221,6 +284,11 @@ Read the boundaries in the diagram as follows:
   worker's shared MolOP process pool. API, MCP, local CLI, and remote batch
   entry points only stage files in RustFS and the durable queue; they do not
   create parser pools in individual upload sessions.
+- `pending` is the recoverable reservation and waiting-queue state. An item
+  becomes a parser task only after RustFS write and SHA-256 verification
+  succeed and the item changes to `staged`; after the worker claims it, the
+  file-level ingestion is reported as `processing`. No upload request calls
+  MolOP directly.
 - After a worker claims an item, parser and frame work is submitted to one
   reusable, `spawn`-based `ProcessPoolExecutor`. Thus `n_jobs=16` means at most
   16 file tasks execute in that service process; a new pool is not created for
@@ -235,6 +303,10 @@ Read the boundaries in the diagram as follows:
   checkpoint records batch/item IDs, while final parse status comes from the
   UploadBatch API. One file failure does not roll back other staged or completed
   files.
+- The single `upload-worker` instance is the boundary for the shared MolOP pool
+  and the single active persistence consumer. API nodes may scale horizontally;
+  do not scale upload-worker horizontally unless multiple parser pools and
+  persistence consumers are intentionally desired.
 
 Browser, MCP, and remote API uploads skip the CLI fingerprint pool and local
 candidate queue: the entry point stores bytes in RustFS and marks the item
@@ -249,12 +321,16 @@ recovery, and `TRICYCLE_MOLOP_BATCH_N_JOBS` limits shared-pool admission; these
 controls must not simply be multiplied.
 
 Keep the remote reparse boundaries separate from parser concurrency: the worker
-claims at most 64 staged files, and `reparse_batch` passes the actual number in
-the project/user group to `upload_batch` as one persistence commit window. Within
-that window, the same result queue and single consumer call `persist_parsed_files`
-for every 32 parsed results (or when the queue is temporarily empty); persistence
-must not wait until all 64 files have parsed. Thus `64` is the claim/commit window,
-while actual parser concurrency is controlled only by the shared MolOP pool's
+claims at most 64 staged files, aggregates each project/user microbatch, and
+passes the microbatch through `reparse_batch` to `upload_batch`. The client
+`UploadBatch` is only a queue/progress boundary, not a persistence boundary:
+one-file submissions for the same project/user are merged into one microbatch,
+and different project/user microbatches are committed sequentially. Within a
+microbatch, the same result queue and single consumer call `persist_parsed_files`
+for every 32 parsed results (or when the queue is temporarily empty), and commit
+at that bounded persistence boundary; persistence must not wait until all 64
+claimed files have parsed. Thus `64` is the claim window and `32` is the commit
+microbatch, while actual parser concurrency is controlled only by the shared MolOP pool's
 `TRICYCLE_MOLOP_BATCH_N_JOBS` (normally `16` on a dedicated host). The durable
 bulk/reparse transaction also uses the previous legacy bulk hot path: reaction-SMILES
 topology caching and one set-based Geometry match remain enabled, while later
@@ -330,13 +406,15 @@ Tune in this order:
 Browser and remote API uploads use the independent durable `upload-worker`, so
 do not confuse its controls with the local `IMPORT_*` variables.
 `TRICYCLE_UPLOAD_MAX_CONCURRENCY=8` limits RustFS reads and
-`TRICYCLE_MAX_BATCH_FILES=64` is the worker claim/commit window;
+`TRICYCLE_MAX_BATCH_FILES=64` is the worker claim window; persistence commits
+are bounded to 32 results per microbatch;
 `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` is only for pending-ingestion recovery.
 A dedicated compute host may use `TRICYCLE_MOLOP_BATCH_N_JOBS=16` for the
 shared parser pool, subject to CPU, memory, and database write-latency checks.
 
-The word “persistence” here means the worker claim's commit boundary; it does not
-serialize 64 files or change the internal 32-result hand-off. Local CLI
+The worker claim window does not define a database transaction: it does not
+serialize 64 files or change the internal 32-result hand-off. Persistence commits
+are bounded to that 32-result microbatch. Local CLI
 `IMPORT_COMMIT_BATCH_FILES` is retained for compatibility and does not control
 worker parsing or persistence. These controls belong to staging backpressure,
 parser admission, and worker commit boundaries respectively and must not

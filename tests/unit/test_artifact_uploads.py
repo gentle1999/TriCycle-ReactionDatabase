@@ -249,13 +249,13 @@ def test_frame_failure_diagnostic_keeps_specific_error_code_and_evidence() -> No
     assert diagnostic["metadata"] == {"failure_boundary": "canonical_atom_order_projection"}
 
 
-def test_source_evidence_disables_fast_ingestion(
+def test_source_evidence_keeps_fast_ingestion_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = Settings(_env_file=None, molop_capture_source_evidence=True)
     monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
     assert settings.molop_capture_source_evidence
-    assert not _fast_molop_ingestion_enabled()
+    assert _fast_molop_ingestion_enabled()
 
 
 def test_storage_pool_does_not_recycle_workers(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -496,8 +496,14 @@ async def test_cancellation_safe_wait_drains_external_operation() -> None:
     assert finished.is_set()
 
 
-def test_fast_molop_parse_defers_topology_reconstruction_until_materialization() -> None:
+def test_fast_molop_parse_defers_topology_reconstruction_until_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     molopconfig.show_progress_bar = False
+    # The parser runs in a spawned process, so configure the child through the
+    # environment rather than only replacing the parent module's settings
+    # accessor. This keeps the test independent of the repository .env file.
+    monkeypatch.setenv("TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE", "false")
     parsed = asyncio.run(
         upload_module._run_molop_source_parser(TS_FIXTURE.read_bytes(), TS_FIXTURE.name)
     )

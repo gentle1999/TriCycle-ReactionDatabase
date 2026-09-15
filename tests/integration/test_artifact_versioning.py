@@ -9,7 +9,8 @@ from tricycle_reaction_db.application.services.artifact_content import (
     ArtifactContentService,
     iter_artifact_download,
 )
-from tricycle_reaction_db.application.services.artifact_uploads import ArtifactUploadService
+from tricycle_reaction_db.application.services.artifact_uploads import ArtifactUploadPayload
+from tricycle_reaction_db.application.services.upload_batches import UploadBatchService
 from tricycle_reaction_db.db.models import ArtifactFile
 from tricycle_reaction_db.db.session import session_factory
 from tricycle_reaction_db.domain.enums import ArtifactKind
@@ -52,15 +53,14 @@ async def test_versioned_upload_persists_and_downloads_the_exact_s3_version(
     )
     monkeypatch.setenv("TRICYCLE_RUSTFS_BUCKET", bucket)
     try:
-        result = await ArtifactUploadService.upload(
-            payload=payload,
-            filename="versioned-artifact.txt",
-            media_type="text/plain",
+        submission = await UploadBatchService.create_and_stage(
+            files=[ArtifactUploadPayload("versioned-artifact.txt", "text/plain", payload)],
             artifact_kind=ArtifactKind.AUXILIARY,
             project_id=SYSTEM_PROJECT_ID,
             user_id=DEVELOPMENT_USER_ID,
         )
-        artifact_id = result.artifact_id
+        artifact_id = submission.items[0].artifact_file_id
+        assert artifact_id is not None
         async with session_factory() as session:
             artifact = await session.get(ArtifactFile, artifact_id)
             assert artifact is not None

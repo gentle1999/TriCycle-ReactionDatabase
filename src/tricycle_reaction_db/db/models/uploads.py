@@ -331,7 +331,7 @@ class ArtifactIngestion(SQLModel, table=True):
             name="ck_artifact_ingestion_timestamps_ordered",
         ),
         CheckConstraint(
-            "status = 'pending' OR completed_at IS NOT NULL",
+            "status IN ('pending', 'processing') OR completed_at IS NOT NULL",
             name="ck_artifact_ingestion_terminal_timestamp",
         ),
         CheckConstraint(

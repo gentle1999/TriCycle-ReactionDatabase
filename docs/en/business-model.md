@@ -11,7 +11,7 @@
 | Object | Meaning | Identity or mutability |
 | --- | --- | --- |
 | ArtifactFile | A project's original input, output, or auxiliary file | Content hash and object location are immutable; the artifact can be retired |
-| ParseRevision | One auditable parse of an artifact | Appended; a prior revision is never overwritten |
+| ParseRevision | The artifact's current materialized parse | A reparse deletes the old revision and its materialization, then rebuilds revision 1 |
 | CalculationFrame | One recovered calculation frame | Keeps source coordinates, method, frequency, and array provenance |
 | MolecularTopology | A MolGR reconstructed graph | Explicit H, bonds, charge, radical electrons, and stereochemistry identify it |
 | Geometry | A topology, coordinates, charge, and multiplicity fact | Same coordinates with a different electronic state are distinct |
@@ -30,9 +30,11 @@ frame remains downloadable and auditable as `filtered`. The UI renders `pending`
 as parsing in progress, not as a failure.
 
 A project manager can rename an artifact, adjust visibility, request reparse, or
-retire it. Content, hashes, and established observations are never changed in
-place. Reparse consumes the same source bytes and appends a revision, allowing
-comparison of different MolOP/MolGR versions or parser configurations.
+retire it. Raw content and hashes are never changed in place. Reparse consumes
+the same source bytes, first deletes every old `ParseRevision` and its
+revision-owned materialization, and then rebuilds the current revision. If
+parsing or persistence fails, the ingestion is marked `failed`; deleted parse
+results are not restored.
 
 ## Chemical Facts and Presentation
 

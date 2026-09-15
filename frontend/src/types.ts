@@ -464,7 +464,7 @@ export interface ArtifactSummary {
   storage_status: string;
   storage_verified_at: string | null;
   preview_available: boolean;
-  ingestion_status: "pending" | "succeeded" | "partial" | "filtered" | "failed" | null;
+  ingestion_status: "pending" | "processing" | "succeeded" | "partial" | "filtered" | "failed" | null;
   source_frame_count: number | null;
   transition_state_frame_count: number | null;
   running_time_seconds: number | null;
@@ -657,7 +657,7 @@ export interface ArtifactUploadResult {
   artifact_kind: "calculation_output" | "input" | "workflow_manifest" | "auxiliary";
   storage_status: string;
   ingestion_id: string | null;
-  ingestion_status: "pending" | "succeeded" | "partial" | "filtered" | "failed" | null;
+  ingestion_status: "pending" | "processing" | "succeeded" | "partial" | "filtered" | "failed" | null;
   source_frame_count: number | null;
   transition_state_frame_count: number | null;
   inferred_reaction_count: number;

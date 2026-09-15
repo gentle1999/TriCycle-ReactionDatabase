@@ -2275,8 +2275,8 @@ test("upload queue shows artifact parsing after transport succeeds", async ({ pa
 
   await page.goto(`/uploads?batch=${batchId}`);
   const row = page.locator(".upload-task-row").filter({ hasText: "background-parse.log" });
-  await expect(row).toContainText("已上传，正在解析");
-  await expect(row).toHaveClass(/is-parsing/);
+  await expect(row).toContainText("已上传，等待解析");
+  await expect(row).not.toHaveClass(/is-parsing/);
 });
 
 test("ten-thousand-file queue keeps the rendered list paginated", async ({ page }) => {

@@ -98,7 +98,7 @@ const operationBusy = computed(() => operationArtifactId.value !== null || batch
 function canReparseArtifact(artifact: ArtifactSummary): boolean {
   return artifact.artifact_kind === "calculation_output"
     && artifact.storage_status === "available"
-    && artifact.ingestion_status !== "pending"
+    && !["pending", "processing"].includes(artifact.ingestion_status ?? "")
     && reparseableProjectIds.value.has(artifact.project_id);
 }
 

@@ -105,7 +105,7 @@ Add relations and projections rather than rewriting existing scientific identiti
 
 | Responsibility | Target direction; new names are design candidates | Rule |
 | --- | --- | --- |
-| Original facts | ArtifactFile, ParseRevision, CalculationFrame, raw results | Append facts; do not replace original bytes or parsed results |
+| Original facts | ArtifactFile, ParseRevision, CalculationFrame, raw results | RustFS source bytes remain immutable; a reparse deletes obsolete revision-owned materialization before rebuilding the single current revision |
 | Effective parsing | `ArtifactRevisionSelection` or equivalent explicit record | Separate current selection from history; record policy, reason, and time |
 | Source authorization | Actual Frame/Revision relations such as `ThermodynamicProfileSource` | Shared identity does not grant private calculation access; filtering, ordering, and statistics must also respect sources |
 | Reproducible analysis | `AnalysisSnapshot`, versioned profiles and membership evidence | Pin actual inputs, settings, and algorithms; historical reads still require current authorization |
@@ -147,8 +147,8 @@ Fixed rules:
 RustFS is the staging and integrity boundary for raw files, not a second parsing entry point.
 Once a file has been written to RustFS and PostgreSQL contains its `ArtifactFile`,
 `ArtifactIngestion`, and `staged` queue item, calculation-output processing must use the
-existing reparse logic. The batch worker's `reparse_batch` is only a grouping wrapper around
-the existing `upload_batch` pipeline:
+single `reparse_batch` worker path. It is the grouping wrapper around the existing
+`upload_batch` pipeline:
 
 ```text
 manifest/API staging
@@ -165,30 +165,36 @@ manifest/API staging
 
 The fixed boundaries are:
 
-- `UploadBatchWorker._process_jobs` may only hand a leased window to `reparse_batch`;
-  `_process_pending` remains the single-file recovery compatibility path. Do not add a remote
+- `UploadBatchWorker._process_jobs` and `_process_pending_jobs` may only hand leased windows to
+  `reparse_batch`; pending-ingestion recovery must also be grouped by project/user and must not
+  return to single-file `reparse`. Do not add a remote
   parser, a second MolOP invocation, a second frame-materializing path, or a second persistence
   transaction for RustFS objects. An already-staged object must not be uploaded again.
-- `reparse` is the only file-level parse/reparse service and `reparse_batch` is only its batch
-  scheduling wrapper. The wrapper reads/verifies existing objects and delegates MolOP, MolGR,
-  failed-ingestion finalization, and scientific-fact persistence to `upload_batch`. The worker
-  only claims/renews leases, invokes the service, and commits terminal queue state.
+- `reparse_batch` is the only durable worker file-level parse/reparse service. It reads/verifies
+  existing objects and delegates MolOP, MolGR, failed-ingestion finalization, and scientific-fact
+  persistence to `upload_batch`. The old synchronous `upload()`, `reparse()`, and `stage()` entry
+  points are removed. The worker only claims/renews leases, invokes the service, and commits
+  terminal queue state.
 - The local CLI, explicit single-file reparse, and durable worker may differ in source reads and
   result queues, but they must share `_run_molop_file_pipeline` and the `upload_batch` boundary.
   A local path versus a RustFS object must not change scientific parsing semantics.
 - `IMPORT_PIPELINE_WINDOW_FILES=64` is a local candidate window. The remote worker claims
-  `TRICYCLE_MAX_BATCH_FILES=64` staged jobs and groups them by project/user for `reparse_batch`.
-  `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` is retained for pending-ingestion recovery, not as a
-  second staged-parser queue.
+  `TRICYCLE_MAX_BATCH_FILES=64` staged jobs and aggregates them by project/user before calling
+  `reparse_batch`. A client `UploadBatch` is a queue/progress boundary, not a persistence
+  boundary; multiple one-file batches for the same project/user must enter one persistence
+  microbatch. Different project/user microbatches must run sequentially rather than competing
+  for project-scoped identity locks. `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` is retained for
+  pending-ingestion recovery, not as a second staged-parser queue.
 - `TRICYCLE_MOLOP_BATCH_N_JOBS=16` is the `_file_worker_submission_slots` admission limit for
   one reusable `spawn` MolOP process pool. Sixteen file tasks share hot processes; a new pool is
   not created for each file. Keep `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, and
   `MKL_NUM_THREADS` at `1` unless a measured design change says otherwise.
 - The worker must not add its own database scheduler, second consumer, or alternate persistence
-  implementation around `reparse_batch`. The wrapper only reads/verifies RustFS objects and
+  implementation around `reparse_batch`. It only aggregates a claim window into project/user
+  microbatches and invokes them sequentially. The wrapper only reads/verifies RustFS objects and
   splits the batch; `upload_batch` owns the shared parser pool, failed-ingestion cleanup, and
-  scientific-fact transaction. The worker only claims/renews leases, invokes the service, and
-  records terminal queue state.
+  scientific-fact transaction. The worker records terminal state separately for each original
+  queue item.
 
 ### 2.2 Bulk-import throughput invariants (regression guard)
 
@@ -203,7 +209,7 @@ check before merge.
 | Parser admission | `TRICYCLE_MOLOP_BATCH_N_JOBS`, normally `16` on a dedicated host | The same shared pool and the same `16`-file admission limit | Not `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` or RustFS read concurrency |
 | Candidate/claim window | `IMPORT_PIPELINE_WINDOW_FILES=64` | Up to `TRICYCLE_MAX_BATCH_FILES=64` | Keeps the queue supplied; it is not the parser-process count |
 | Persistence hand-off | Internal `PERSISTENCE_PRELOAD_BATCH_SIZE=32` | The same `32` results, or when the result queue is temporarily empty | Must not wait for the whole claim before writing |
-| Commit/checkpoint | `IMPORT_COMMIT_BATCH_FILES`, default `16` | One `upload_batch` persistence window per actual worker claim (normally `64`) | The commit boundary does not control parser concurrency |
+| Commit/checkpoint | `IMPORT_COMMIT_BATCH_FILES`, default `16` | One `upload_batch` call per project/user microbatch; it commits every `32` results, and one claim may produce several sequential calls | The commit boundary does not control parser concurrency |
 
 The implementation invariants are:
 
@@ -215,9 +221,12 @@ The implementation invariants are:
   results (or when the queue is temporarily empty) are handed to `persist_parsed_files`, so parser
   work and database writes overlap. Only the persistence-window boundary commits. Moving all
   persistence until a 64-file claim completes reintroduces the fixed throughput regression.
-- For each project/user group, `reparse_batch` only reads and verifies existing RustFS objects,
-  then calls `upload_batch(..., persistence_batch_files=<files in this group>)`. Thus `64` on the
-  remote path is a claim/commit window, not a second parser queue and not 64 serial parses.
+- The worker first aggregates the claim window by project/user; the original `UploadBatch`
+  boundary cannot prevent microbatching across one-file submissions. Each project/user
+  microbatch only reads and verifies existing RustFS objects, then calls `reparse_batch`; its
+  `upload_batch` call commits at the fixed `32`-result persistence boundary. Different
+  microbatches run sequentially. Thus `64` on the remote path is a claim window, not a second parser queue,
+  64 serial parses, or 64 concurrent persistence transactions.
 - `TRICYCLE_UPLOAD_MAX_CONCURRENCY` controls only RustFS reads;
   `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` is only for pending-ingestion recovery. Neither may
   replace or be multiplied with MolOP file-level concurrency.
@@ -234,11 +243,12 @@ The implementation invariants are:
 
 The fixed relationship is therefore: 16 shared parser slots continuously take work, results are
 continuously handed to one persistence consumer in groups of 32, local imports commit configured
-microbatches, and the RustFS worker normally commits one 64-file claim. Changing any number or
-using one layer to control another requires updating this section, the development/deployment
-guides, and the corresponding tests first.
+microbatches, and the RustFS worker normally aggregates a 64-file claim into project/user
+microbatches and commits them sequentially. A client one-file batch cannot bypass server-side
+microbatching. Changing any number or using one layer to control another requires updating this
+section, the development/deployment guides, and the corresponding tests first.
 
-Every change to the import path must answer whether it still goes through `reparse` and
+Every change to the import path must answer whether it still goes through `reparse_batch` and
 `_run_molop_file_pipeline`, and whether it only adds scheduling, lease, or resource control.
 If not, update this design and the corresponding architecture tests before introducing a
 parallel implementation.

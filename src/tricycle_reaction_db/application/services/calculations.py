@@ -104,6 +104,7 @@ _PARSE_REVISION_WORKFLOW_FIELDS = {
     "record_sha256",
     "status",
 }
+_FAST_NEW_PARSE_REVISION_IDS_KEY = "_fast_new_parse_revision_ids"
 
 
 def _dto_values(record: Any, *, exclude: set[str] | None = None) -> dict[str, Any]:
@@ -304,6 +305,9 @@ def persist_parse_revision(
             **_dto_values(record),
         )
         _flush_new_entity(session, new_revision, label="ParseRevision")
+        session.info.setdefault(_FAST_NEW_PARSE_REVISION_IDS_KEY, set()).add(
+            _require_id(new_revision, label="ParseRevision")
+        )
         return new_revision
     _acquire_identity_locks(
         session,
@@ -371,14 +375,17 @@ def persist_parse_revision(
         ParseRevision,
         artifact_file=artifact_file,
         revision_number=(latest_revision.revision_number + 1 if latest_revision is not None else 1),
-        reparse_of_id=(
-            _require_id(latest_revision, label="ParseRevision")
-            if force_new_revision and latest_revision is not None
-            else None
-        ),
+        # Reparse is a clean replacement. Obsolete ParseRevision rows are
+        # deleted before this point, so retaining a self-referential audit
+        # chain would only reintroduce stale parse state.
+        reparse_of_id=None,
         **_dto_values(record),
     )
     _flush_new_entity(session, revision, label="ParseRevision")
+    if _fast_insert_enabled(session):
+        session.info.setdefault(_FAST_NEW_PARSE_REVISION_IDS_KEY, set()).add(
+            _require_id(revision, label="ParseRevision")
+        )
     return revision
 
 
@@ -397,21 +404,38 @@ def persist_calculation_segment(
     _validate_segment_source_bounds(parse_revision, record)
     if protocol is not None:
         _validate_segment_software(parse_revision, protocol)
+
+    # A fast ingestion revision is client-ID allocated and has just been
+    # created in this transaction.  Its segment identity cannot already exist
+    # in PostgreSQL, so the idempotent lock/read path would only add a round
+    # trip.  Queue the row with the other revision-local entities instead.
+    fast_new_revision_ids = session.info.get(_FAST_NEW_PARSE_REVISION_IDS_KEY, set())
+    if _fast_insert_enabled(session) and parse_revision_id in fast_new_revision_ids:
+        segment = _new_entity(
+            session,
+            CalculationSegment,
+            parse_revision=parse_revision,
+            protocol=protocol,
+            **_dto_values(record),
+        )
+        _flush_new_entity(session, segment, label="CalculationSegment")
+        return segment
+
     _acquire_identity_locks(
         session,
         ("calculation_segment", parse_revision_id, record.segment_index),
     )
-    segment = session.exec(
+    existing_segment = session.exec(
         select(CalculationSegment).where(
             CalculationSegment.parse_revision_id == parse_revision_id,
             CalculationSegment.segment_index == record.segment_index,
         )
     ).first()
-    if segment is not None:
-        if segment.protocol_id != protocol_id:
+    if existing_segment is not None:
+        if existing_segment.protocol_id != protocol_id:
             raise ValueError("CalculationSegment identity resolved to a different protocol")
-        _assert_record_matches(segment, record, label="CalculationSegment")
-        return segment
+        _assert_record_matches(existing_segment, record, label="CalculationSegment")
+        return existing_segment
 
     segment = _new_entity(
         session,

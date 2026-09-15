@@ -2,6 +2,7 @@ import os
 from datetime import UTC, datetime
 from hashlib import sha256
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -9,13 +10,23 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from tricycle_reaction_db.application.services import artifact_uploads as uploads
 from tricycle_reaction_db.application.services.authorization import AuthorizationService
-from tricycle_reaction_db.db.models import ArtifactFile, ArtifactIngestion
+from tricycle_reaction_db.application.services.upload_batches import UploadBatchService
+from tricycle_reaction_db.db.models import (
+    ArtifactFile,
+    ArtifactIngestion,
+    UploadBatch,
+    UploadBatchItem,
+)
 from tricycle_reaction_db.db.session import engine
 from tricycle_reaction_db.domain.enums import (
     ArtifactIngestionStatus,
     ArtifactKind,
     ArtifactVisibility,
+    ImportMaterializationStatus,
+    ImportParseStatus,
     StorageStatus,
+    UploadBatchItemStatus,
+    UploadBatchStatus,
 )
 from tricycle_reaction_db.domain.identity import DEVELOPMENT_USER_ID, SYSTEM_PROJECT_ID
 from tricycle_reaction_db.storage.rustfs import RustFSSettings
@@ -231,6 +242,109 @@ async def test_upload_batch_persistence_failure_recovers_pending_ingestion(
                 assert recovered_ingestion is not None
                 assert recovered_ingestion.status is ArtifactIngestionStatus.FAILED
                 assert recovered_ingestion.error_code == "molop_parse_failed"
+        finally:
+            await transaction.rollback()
+
+
+@pytest.mark.asyncio
+async def test_claim_processing_publishes_worker_owned_ingestion_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A staged RustFS object becomes processing only after the worker claim."""
+
+    import tricycle_reaction_db.application.services.upload_batches as upload_batches
+
+    content = b"processing status fixture"
+    digest = sha256(content).hexdigest()
+    now = datetime.now(UTC)
+    async with engine.connect() as connection:
+        transaction = await connection.begin()
+        factory = async_sessionmaker(
+            bind=connection,
+            class_=AsyncSession,
+            expire_on_commit=False,
+            join_transaction_mode="create_savepoint",
+        )
+        monkeypatch.setattr(uploads, "session_factory", factory)
+        monkeypatch.setattr(upload_batches, "session_factory", factory)
+        try:
+            async with factory() as session:
+                artifact = ArtifactFile(
+                    project_id=SYSTEM_PROJECT_ID,
+                    created_by_user_id=DEVELOPMENT_USER_ID,
+                    visibility=ArtifactVisibility.PROJECT,
+                    bucket=RustFSSettings().bucket,
+                    object_key=f"uploads/processing-status/{digest}",
+                    content_sha256=digest,
+                    size_bytes=len(content),
+                    original_filename="processing-status.log",
+                    media_type="text/plain",
+                    artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+                    storage_status=StorageStatus.AVAILABLE,
+                )
+                session.add(artifact)
+                await session.flush()
+                assert artifact.id is not None
+                ingestion = ArtifactIngestion(
+                    artifact_file_id=artifact.id,
+                    parser_version=uploads.MOLOP_VERSION,
+                    started_at=now,
+                )
+                session.add(ingestion)
+                batch = UploadBatch(
+                    project_id=SYSTEM_PROJECT_ID,
+                    created_by_user_id=DEVELOPMENT_USER_ID,
+                    artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+                    status=UploadBatchStatus.ACTIVE,
+                    total_count=1,
+                    total_bytes=len(content),
+                    staged_count=1,
+                    updated_at=now,
+                )
+                session.add(batch)
+                await session.flush()
+                assert batch.id is not None
+                item = UploadBatchItem(
+                    batch_id=batch.id,
+                    client_file_id=uuid4(),
+                    position=0,
+                    original_filename="processing-status.log",
+                    relative_path="processing-status.log",
+                    size_bytes=len(content),
+                    media_type="text/plain",
+                    status=UploadBatchItemStatus.STAGED,
+                    parse_status=ImportParseStatus.PENDING.value,
+                    materialization_status=ImportMaterializationStatus.SUCCEEDED.value,
+                    content_sha256=digest,
+                    artifact_file_id=artifact.id,
+                    metadata_json={},
+                    updated_at=now,
+                )
+                session.add(item)
+                await session.commit()
+
+            async with factory() as session:
+                before_claim = await session.get(ArtifactIngestion, ingestion.id)
+                assert before_claim is not None
+                assert before_claim.status is ArtifactIngestionStatus.PENDING
+
+            jobs = await UploadBatchService.claim_processing(limit=1)
+            assert len(jobs) == 1
+            assert jobs[0].artifact_file_id == artifact.id
+
+            async with factory() as session:
+                after_claim = await session.get(ArtifactIngestion, ingestion.id)
+                assert after_claim is not None
+                assert after_claim.status is ArtifactIngestionStatus.PROCESSING
+                assert after_claim.worker_lease_id == jobs[0].lease_id
+                assert after_claim.worker_lease_expires_at is not None
+
+            assert await UploadBatchService.renew_processing_lease(jobs[0])
+            async with factory() as session:
+                after_renew = await session.get(ArtifactIngestion, ingestion.id)
+                assert after_renew is not None
+                assert after_renew.status is ArtifactIngestionStatus.PROCESSING
+                assert after_renew.worker_lease_id == jobs[0].lease_id
         finally:
             await transaction.rollback()
 

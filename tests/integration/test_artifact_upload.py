@@ -33,6 +33,7 @@ from tricycle_reaction_db.application.services.reactions import (
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
     CalculationFrame,
+    CalculationSegment,
     LogicalReaction,
     MappedReaction,
     MappedReactionEdge,
@@ -177,6 +178,7 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
                 .order_by(col(ParseRevision.created_at).desc())
             ).first()
             assert revision is not None
+            first_revision_id = revision.id
             assert revision.running_time_seconds == pytest.approx(
                 float(parsed.chem_file.running_time.to("second").magnitude)
             )
@@ -208,6 +210,10 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
             assert "sampling_steps" not in inference.inference_settings
             assert inference.logical_reaction_id is not None
             assert inference.mapped_reaction_id is not None
+            first_inference_frame_id = inference.calculation_frame_id
+            first_mapped_reaction_id = inference.mapped_reaction_id
+            assert first_inference_frame_id is not None
+            assert first_mapped_reaction_id is not None
             logical_reaction = session.get(LogicalReaction, inference.logical_reaction_id)
             mapped_reaction = session.get(MappedReaction, inference.mapped_reaction_id)
             assert logical_reaction is not None
@@ -504,11 +510,37 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
             )
             session.flush()
             assert third_revision_created is True
-            assert third_revision_id != revision.id
+            assert third_revision_id != first_revision_id
             reparse_revision = session.get(ParseRevision, third_revision_id)
             assert reparse_revision is not None
-            assert reparse_revision.revision_number == revision.revision_number + 1
-            assert reparse_revision.reparse_of_id == revision.id
+            assert reparse_revision.revision_number == 1
+            assert reparse_revision.reparse_of_id is None
+            old_revision = session.get(ParseRevision, first_revision_id)
+            assert old_revision is None
+            assert (
+                session.exec(
+                    select(func.count())
+                    .select_from(CalculationSegment)
+                    .where(CalculationSegment.parse_revision_id == first_revision_id)
+                ).one()
+                == 0
+            )
+            assert (
+                session.exec(
+                    select(func.count())
+                    .select_from(CalculationFrame)
+                    .where(CalculationFrame.parse_revision_id == first_revision_id)
+                ).one()
+                == 0
+            )
+            assert (
+                session.exec(
+                    select(func.count())
+                    .select_from(TransitionStateInference)
+                    .where(TransitionStateInference.parse_revision_id == first_revision_id)
+                ).one()
+                == 0
+            )
             assert (
                 session.exec(
                     select(func.count())
@@ -522,8 +554,8 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
                     TransitionStateInference.parse_revision_id == third_revision_id
                 )
             ).one()
-            assert reparse_inference.calculation_frame_id != inference.calculation_frame_id
-            assert reparse_inference.mapped_reaction_id == inference.mapped_reaction_id
+            assert reparse_inference.calculation_frame_id != first_inference_frame_id
+            assert reparse_inference.mapped_reaction_id == first_mapped_reaction_id
     finally:
         transaction.rollback()
         connection.close()
@@ -588,6 +620,9 @@ def test_nonconverged_ts_binds_geometry_and_converged_reparse_adds_evidence() ->
             ).one()
             assert first_inference.status is TransitionStateInferenceStatus.SUCCEEDED
             assert first_inference.mapped_reaction_id is not None
+            first_mapped_reaction_id = first_inference.mapped_reaction_id
+            first_inference_frame_id = first_inference.calculation_frame_id
+            assert first_inference_frame_id is not None
             first_frame = session.get(CalculationFrame, first_inference.calculation_frame_id)
             assert first_frame is not None
             assert first_frame.optimization_status is OptimizationStatus.NOT_CONVERGED
@@ -631,12 +666,31 @@ def test_nonconverged_ts_binds_geometry_and_converged_reparse_adds_evidence() ->
             )
             session.flush()
             assert created is True
+            old_revision = session.get(ParseRevision, first_revision_id)
+            assert old_revision is None
+            assert (
+                session.exec(
+                    select(func.count())
+                    .select_from(CalculationFrame)
+                    .where(CalculationFrame.parse_revision_id == first_revision_id)
+                ).one()
+                == 0
+            )
+            assert (
+                session.exec(
+                    select(func.count())
+                    .select_from(TransitionStateInference)
+                    .where(TransitionStateInference.parse_revision_id == first_revision_id)
+                ).one()
+                == 0
+            )
             second_inference = session.exec(
                 select(TransitionStateInference).where(
                     TransitionStateInference.parse_revision_id == second_revision_id
                 )
             ).one()
-            assert second_inference.mapped_reaction_id == first_inference.mapped_reaction_id
+            assert second_inference.mapped_reaction_id == first_mapped_reaction_id
+            assert second_inference.calculation_frame_id != first_inference_frame_id
             second_frame = session.get(CalculationFrame, second_inference.calculation_frame_id)
             assert second_frame is not None
             assert second_frame.optimization_status is OptimizationStatus.CONVERGED

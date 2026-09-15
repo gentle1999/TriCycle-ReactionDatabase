@@ -857,7 +857,8 @@ async function retryFailed(): Promise<void> {
 }
 
 function taskStatusLabel(task: QueueTask): string {
-  if (task.ingestionStatus === "pending") return "已上传，正在解析";
+  if (task.ingestionStatus === "pending") return "已上传，等待解析";
+  if (task.ingestionStatus === "processing") return "已领取，正在解析";
   if (task.ingestionStatus === "partial") return "已解析，部分计算帧可用";
   if (task.ingestionStatus === "filtered") return "已保存，无可识别计算帧";
   if (task.ingestionStatus === "failed") return "文件已上传，解析失败";
@@ -1115,7 +1116,7 @@ onBeforeUnmount(() => {
       <div class="upload-task-list" role="list" aria-label="上传文件状态">
         <div v-if="loadingBatch" class="table-loading">正在加载上传批次</div>
         <div v-else-if="!visibleTasks.length" class="compact-empty">队列为空</div>
-        <div v-for="task in visibleTasks" v-else :key="task.clientFileId" class="upload-task-row" :class="[`is-${task.status}`, { 'is-parsing': task.ingestionStatus === 'pending' }]" role="listitem">
+        <div v-for="task in visibleTasks" v-else :key="task.clientFileId" class="upload-task-row" :class="[`is-${task.status}`, { 'is-parsing': task.ingestionStatus === 'processing' }]" role="listitem">
           <span class="upload-task-status" :title="taskStatusLabel(task)"></span>
           <div class="upload-task-name"><strong>{{ task.filename }}</strong><span>{{ task.relativePath }}</span></div>
           <span class="upload-task-size">{{ formatBytes(task.size) }}</span>

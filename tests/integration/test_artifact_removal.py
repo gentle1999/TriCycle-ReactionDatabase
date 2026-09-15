@@ -1,21 +1,25 @@
 import os
 from hashlib import sha256
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
+from sqlmodel import select
 
 from tricycle_reaction_db.application.dtos import ArtifactMetadataUpdate
 from tricycle_reaction_db.application.services import (
     ArtifactManagementService,
     ArtifactNotFoundError,
     ArtifactQueryService,
-    ArtifactUploadService,
 )
 from tricycle_reaction_db.application.services.artifact_content import ArtifactContentService
+from tricycle_reaction_db.application.services.artifact_uploads import ArtifactUploadPayload
+from tricycle_reaction_db.application.services.upload_batches import UploadBatchService
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
     Project,
     ProjectMembership,
+    UploadBatch,
+    UploadBatchItem,
     UserAccount,
 )
 from tricycle_reaction_db.db.session import session_factory
@@ -43,19 +47,36 @@ pytestmark = [
 ]
 
 
+async def _stage_auxiliary(
+    *,
+    payload: bytes,
+    filename: str,
+    project_id: UUID,
+    user_id: UUID,
+) -> tuple[UUID, UUID]:
+    submission = await UploadBatchService.create_and_stage(
+        files=[ArtifactUploadPayload(filename, "text/plain", payload)],
+        artifact_kind=ArtifactKind.AUXILIARY,
+        project_id=project_id,
+        user_id=user_id,
+    )
+    artifact_id = submission.items[0].artifact_file_id
+    assert artifact_id is not None
+    return artifact_id, submission.batch.id
+
+
 @pytest.mark.asyncio
 async def test_artifact_removal_retires_catalogue_and_deletes_object() -> None:
     payload = f"artifact removal {uuid4()}\n".encode()
-    uploaded = await ArtifactUploadService.upload(
+    uploaded_artifact_id, upload_batch_id = await _stage_auxiliary(
         payload=payload,
         filename="remove-me.txt",
-        media_type="text/plain",
-        artifact_kind=ArtifactKind.AUXILIARY,
         project_id=SYSTEM_PROJECT_ID,
         user_id=DEVELOPMENT_USER_ID,
     )
-    artifact_id = uploaded.artifact_id
+    artifact_id = uploaded_artifact_id
     object_key = None
+    restored_batch_id = None
 
     try:
         async with session_factory() as session:
@@ -98,16 +119,13 @@ async def test_artifact_removal_retires_catalogue_and_deletes_object() -> None:
                 max_bytes=4096,
                 project_id=SYSTEM_PROJECT_ID,
             )
-        restored = await ArtifactUploadService.upload(
+        restored_artifact_id, restored_batch_id = await _stage_auxiliary(
             payload=payload,
             filename="remove-me-again.txt",
-            media_type="text/plain",
-            artifact_kind=ArtifactKind.AUXILIARY,
             project_id=SYSTEM_PROJECT_ID,
             user_id=DEVELOPMENT_USER_ID,
         )
-        assert restored.artifact_id == artifact_id
-        assert restored.storage_status is StorageStatus.AVAILABLE
+        assert restored_artifact_id == artifact_id
         restored_summary = await ArtifactQueryService.get_artifact(
             project_id=SYSTEM_PROJECT_ID,
             artifact_id=artifact_id,
@@ -122,6 +140,19 @@ async def test_artifact_removal_retires_catalogue_and_deletes_object() -> None:
             assert store.exists(object_key)
     finally:
         async with session_factory() as session:
+            for batch_id in (upload_batch_id, restored_batch_id):
+                if batch_id is None:
+                    continue
+                item = (
+                    await session.exec(
+                        select(UploadBatchItem).where(UploadBatchItem.batch_id == batch_id)
+                    )
+                ).all()
+                for batch_item in item:
+                    await session.delete(batch_item)
+                batch = await session.get(UploadBatch, batch_id)
+                if batch is not None:
+                    await session.delete(batch)
             artifact = await session.get(ArtifactFile, artifact_id)
             if artifact is not None:
                 await session.delete(artifact)
@@ -139,6 +170,8 @@ async def test_cross_project_uploads_share_object_until_last_reference_is_retire
     membership_id = uuid4()
     first_artifact_id = None
     second_artifact_id = None
+    first_batch_id = None
+    second_batch_id = None
     object_key = None
 
     async with session_factory() as session:
@@ -162,24 +195,18 @@ async def test_cross_project_uploads_share_object_until_last_reference_is_retire
         await session.commit()
 
     try:
-        first = await ArtifactUploadService.upload(
+        first_artifact_id, first_batch_id = await _stage_auxiliary(
             payload=payload,
             filename="project-a.txt",
-            media_type="text/plain",
-            artifact_kind=ArtifactKind.AUXILIARY,
             project_id=SYSTEM_PROJECT_ID,
             user_id=DEVELOPMENT_USER_ID,
         )
-        second = await ArtifactUploadService.upload(
+        second_artifact_id, second_batch_id = await _stage_auxiliary(
             payload=payload,
             filename="project-b.txt",
-            media_type="text/plain",
-            artifact_kind=ArtifactKind.AUXILIARY,
             project_id=project_id,
             user_id=user_id,
         )
-        first_artifact_id = first.artifact_id
-        second_artifact_id = second.artifact_id
         assert first_artifact_id != second_artifact_id
 
         async with session_factory() as session:
@@ -213,6 +240,18 @@ async def test_cross_project_uploads_share_object_until_last_reference_is_retire
             assert not store.exists(object_key)
     finally:
         async with session_factory() as session:
+            for batch_id in (first_batch_id, second_batch_id):
+                if batch_id is not None:
+                    items = (
+                        await session.exec(
+                            select(UploadBatchItem).where(UploadBatchItem.batch_id == batch_id)
+                        )
+                    ).all()
+                    for item in items:
+                        await session.delete(item)
+                    batch = await session.get(UploadBatch, batch_id)
+                    if batch is not None:
+                        await session.delete(batch)
             for artifact_id in (first_artifact_id, second_artifact_id):
                 if artifact_id is not None:
                     artifact = await session.get(ArtifactFile, artifact_id)

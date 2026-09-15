@@ -10,7 +10,7 @@ from hashlib import sha256
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, func, or_
+from sqlalchemy import and_, func, or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -115,6 +115,7 @@ def _with_upload_progress(
 class UploadProcessingJob:
     """A leased, server-owned parse task detached from the browser request."""
 
+    project_id: UUID
     batch_id: UUID
     item_id: UUID
     client_file_id: UUID
@@ -127,6 +128,7 @@ class UploadProcessingJob:
 class PendingIngestionJob:
     """A lease for a calculation ingestion left outside the web queue."""
 
+    project_id: UUID
     ingestion_id: UUID
     artifact_file_id: UUID
     user_id: UUID
@@ -228,6 +230,35 @@ def _item_view(
         error_message=item.error_message,
         metadata=item.metadata_json,
     )
+
+
+def _mark_ingestion_processing(
+    ingestion: ArtifactIngestion,
+    *,
+    started_at: datetime,
+    lease_id: UUID,
+    lease_expires_at: datetime,
+) -> None:
+    """Publish that the worker has taken the RustFS object into MolOP."""
+
+    ingestion.status = ArtifactIngestionStatus.PROCESSING
+    ingestion.started_at = started_at
+    ingestion.completed_at = None
+    ingestion.processing_attempt_count += 1
+    ingestion.worker_lease_id = lease_id
+    ingestion.worker_lease_expires_at = lease_expires_at
+    ingestion.error_code = None
+    ingestion.error_message = None
+
+
+def _reset_ingestion_to_pending(ingestion: ArtifactIngestion) -> None:
+    """Return an expired parser lease to the durable waiting queue."""
+
+    ingestion.status = ArtifactIngestionStatus.PENDING
+    ingestion.started_at = None
+    ingestion.completed_at = None
+    ingestion.worker_lease_id = None
+    ingestion.worker_lease_expires_at = None
 
 
 async def _owned_batch(
@@ -763,9 +794,9 @@ class UploadBatchService:
             if artifact_ids:
                 ingestions = (
                     await session.exec(
-                        select(ArtifactIngestion).where(
-                            col(ArtifactIngestion.artifact_file_id).in_(artifact_ids)
-                        )
+                        select(ArtifactIngestion)
+                        .where(col(ArtifactIngestion.artifact_file_id).in_(artifact_ids))
+                        .with_for_update()
                     )
                 ).all()
                 ingestions_by_artifact_id = {
@@ -1528,6 +1559,38 @@ class UploadBatchService:
                 batches[batch_id].updated_at = now
                 _finish_batch_if_terminal(batches[batch_id])
                 session.add(batches[batch_id])
+
+            # Compatibility ingestions do not have an UploadBatchItem to
+            # drive recovery. Reset only those expired parser leases here;
+            # batch-owned rows are reconciled together with their item above.
+            has_upload_item = (
+                select(1)
+                .where(
+                    col(UploadBatchItem.artifact_file_id) == col(ArtifactIngestion.artifact_file_id)
+                )
+                .exists()
+            )
+            stale_ingestions = (
+                await session.exec(
+                    select(ArtifactIngestion)
+                    .where(
+                        col(ArtifactIngestion.status) == ArtifactIngestionStatus.PROCESSING,
+                        or_(
+                            col(ArtifactIngestion.worker_lease_id).is_(None),
+                            col(ArtifactIngestion.worker_lease_expires_at).is_(None),
+                            col(ArtifactIngestion.worker_lease_expires_at) <= now,
+                        ),
+                        ~has_upload_item,
+                    )
+                    .order_by(col(ArtifactIngestion.started_at).nulls_first())
+                    .limit(limit)
+                    .with_for_update(skip_locked=True)
+                )
+            ).all()
+            for ingestion in stale_ingestions:
+                _reset_ingestion_to_pending(ingestion)
+                session.add(ingestion)
+                recovered += 1
             if recovered:
                 await session.commit()
             return recovered
@@ -1602,15 +1665,17 @@ class UploadBatchService:
                 ingestion_id = _required_uuid(ingestion.id, "ArtifactIngestion")
                 artifact_id = _required_uuid(artifact.id, "ArtifactFile")
                 lease_id = uuid4()
-                ingestion.processing_attempt_count += 1
-                ingestion.worker_lease_id = lease_id
-                ingestion.worker_lease_expires_at = now + timedelta(
-                    seconds=settings.upload_worker_lease_seconds
+                lease_expires_at = now + timedelta(seconds=settings.upload_worker_lease_seconds)
+                _mark_ingestion_processing(
+                    ingestion,
+                    started_at=now,
+                    lease_id=lease_id,
+                    lease_expires_at=lease_expires_at,
                 )
-                ingestion.started_at = now
                 session.add(ingestion)
                 jobs.append(
                     PendingIngestionJob(
+                        project_id=artifact.project_id,
                         ingestion_id=ingestion_id,
                         artifact_file_id=artifact_id,
                         user_id=artifact.created_by_user_id,
@@ -1633,7 +1698,7 @@ class UploadBatchService:
                     .where(
                         col(ArtifactIngestion.id) == job.ingestion_id,
                         col(ArtifactIngestion.artifact_file_id) == job.artifact_file_id,
-                        col(ArtifactIngestion.status) == ArtifactIngestionStatus.PENDING,
+                        col(ArtifactIngestion.status) == ArtifactIngestionStatus.PROCESSING,
                         col(ArtifactIngestion.worker_lease_id) == job.lease_id,
                     )
                     .with_for_update()
@@ -1647,6 +1712,43 @@ class UploadBatchService:
             session.add(ingestion)
             await session.commit()
             return True
+
+    @staticmethod
+    async def renew_pending_ingestion_leases(jobs: list[PendingIngestionJob]) -> int:
+        """Renew a compatibility claim with one set-based database update.
+
+        The worker processes a project/user group as one parser/persistence
+        microbatch.  Renewing every row through its own ``SELECT ... FOR
+        UPDATE`` creates one database session per file and makes those
+        heartbeat transactions wait behind the persistence transaction.  A
+        single conditional update keeps the lease semantics while limiting
+        the heartbeat to one session for the whole group.
+        """
+
+        if not jobs:
+            return 0
+        settings = get_settings()
+        now = datetime.now(UTC)
+        expires_at = now + timedelta(seconds=settings.upload_worker_lease_seconds)
+        predicate = or_(
+            *(
+                and_(
+                    col(ArtifactIngestion.id) == job.ingestion_id,
+                    col(ArtifactIngestion.artifact_file_id) == job.artifact_file_id,
+                    col(ArtifactIngestion.status) == ArtifactIngestionStatus.PROCESSING,
+                    col(ArtifactIngestion.worker_lease_id) == job.lease_id,
+                )
+                for job in jobs
+            )
+        )
+        async with session_factory() as session:
+            result = await session.exec(
+                update(ArtifactIngestion)
+                .where(predicate)
+                .values(worker_lease_expires_at=expires_at)
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0)
 
     @staticmethod
     async def _recover_items_in_session(
@@ -1696,6 +1798,26 @@ class UploadBatchService:
                 phase = "queued"
                 error_code = "upload_interrupted"
                 error_message = "上传请求中断，文件已返回等待队列"
+            if was_processing and item.artifact_file_id is not None:
+                ingestion = (
+                    await session.exec(
+                        select(ArtifactIngestion)
+                        .where(
+                            col(ArtifactIngestion.artifact_file_id) == item.artifact_file_id,
+                            col(ArtifactIngestion.status) == ArtifactIngestionStatus.PROCESSING,
+                            or_(
+                                col(ArtifactIngestion.worker_lease_id) == item.worker_lease_id,
+                                col(ArtifactIngestion.worker_lease_id).is_(None),
+                                col(ArtifactIngestion.worker_lease_expires_at).is_(None),
+                                col(ArtifactIngestion.worker_lease_expires_at) <= now,
+                            ),
+                        )
+                        .with_for_update()
+                    )
+                ).first()
+                if ingestion is not None:
+                    _reset_ingestion_to_pending(ingestion)
+                    session.add(ingestion)
             item.worker_lease_id = None
             item.worker_lease_expires_at = None
             item.error_code = error_code
@@ -1732,6 +1854,19 @@ class UploadBatchService:
         )
         async with session_factory() as session:
             rows = (await session.exec(statement)).all()
+            artifact_ids = {
+                item.artifact_file_id for item, _batch in rows if item.artifact_file_id is not None
+            }
+            ingestions_by_artifact_id = {
+                ingestion.artifact_file_id: ingestion
+                for ingestion in (
+                    await session.exec(
+                        select(ArtifactIngestion)
+                        .where(col(ArtifactIngestion.artifact_file_id).in_(artifact_ids))
+                        .with_for_update()
+                    )
+                ).all()
+            }
             for item, batch in rows:
                 batch_id = _required_uuid(batch.id, "UploadBatch")
                 item_id = _required_uuid(item.id, "UploadBatchItem")
@@ -1755,13 +1890,12 @@ class UploadBatchService:
                     _finish_batch_if_terminal(batch)
                     continue
                 lease_id = uuid4()
+                lease_expires_at = now + timedelta(seconds=settings.upload_worker_lease_seconds)
                 item.status = UploadBatchItemStatus.PROCESSING
                 item.parse_status = ImportParseStatus.PENDING.value
                 item.processing_attempt_count += 1
                 item.worker_lease_id = lease_id
-                item.worker_lease_expires_at = now + timedelta(
-                    seconds=settings.upload_worker_lease_seconds
-                )
+                item.worker_lease_expires_at = lease_expires_at
                 item.error_code = None
                 item.error_message = None
                 item.metadata_json = _with_upload_progress(
@@ -1774,10 +1908,20 @@ class UploadBatchService:
                 batch.staged_count = max(0, batch.staged_count - 1)
                 batch.processing_count += 1
                 batch.updated_at = now
+                ingestion = ingestions_by_artifact_id.get(item.artifact_file_id)
+                if ingestion is not None:
+                    _mark_ingestion_processing(
+                        ingestion,
+                        started_at=now,
+                        lease_id=lease_id,
+                        lease_expires_at=lease_expires_at,
+                    )
+                    session.add(ingestion)
                 session.add(item)
                 session.add(batch)
                 jobs.append(
                     UploadProcessingJob(
+                        project_id=batch.project_id,
                         batch_id=batch_id,
                         item_id=item_id,
                         client_file_id=item.client_file_id,
@@ -1807,13 +1951,81 @@ class UploadBatchService:
             ).one_or_none()
             if item is None:
                 return False
-            item.worker_lease_expires_at = datetime.now(UTC) + timedelta(
-                seconds=settings.upload_worker_lease_seconds
-            )
-            item.updated_at = datetime.now(UTC)
+            now = datetime.now(UTC)
+            expires_at = now + timedelta(seconds=settings.upload_worker_lease_seconds)
+            item.worker_lease_expires_at = expires_at
+            item.updated_at = now
+            if item.artifact_file_id is not None:
+                ingestion = (
+                    await session.exec(
+                        select(ArtifactIngestion)
+                        .where(
+                            col(ArtifactIngestion.artifact_file_id) == item.artifact_file_id,
+                            col(ArtifactIngestion.status) == ArtifactIngestionStatus.PROCESSING,
+                            col(ArtifactIngestion.worker_lease_id) == job.lease_id,
+                        )
+                        .with_for_update()
+                    )
+                ).first()
+                if ingestion is not None:
+                    ingestion.worker_lease_expires_at = expires_at
+                    session.add(ingestion)
             session.add(item)
             await session.commit()
             return True
+
+    @staticmethod
+    async def renew_processing_leases(jobs: list[UploadProcessingJob]) -> int:
+        """Renew one upload-batch claim group using set-based updates.
+
+        ``reparse_batch`` owns the only persistence consumer for a
+        project/user group.  Heartbeats must therefore share that same
+        coarse-grained shape; a per-file locking query otherwise creates a
+        connection and a lock waiter for every claimed item.
+        """
+
+        if not jobs:
+            return 0
+        settings = get_settings()
+        now = datetime.now(UTC)
+        expires_at = now + timedelta(seconds=settings.upload_worker_lease_seconds)
+        item_predicate = or_(
+            *(
+                and_(
+                    col(UploadBatchItem.id) == job.item_id,
+                    col(UploadBatchItem.batch_id) == job.batch_id,
+                    col(UploadBatchItem.status) == UploadBatchItemStatus.PROCESSING,
+                    col(UploadBatchItem.worker_lease_id) == job.lease_id,
+                )
+                for job in jobs
+            )
+        )
+        ingestion_predicate = or_(
+            *(
+                and_(
+                    col(ArtifactIngestion.artifact_file_id) == job.artifact_file_id,
+                    col(ArtifactIngestion.status) == ArtifactIngestionStatus.PROCESSING,
+                    col(ArtifactIngestion.worker_lease_id) == job.lease_id,
+                )
+                for job in jobs
+            )
+        )
+        async with session_factory() as session:
+            item_result = await session.exec(
+                update(UploadBatchItem)
+                .where(item_predicate)
+                .values(
+                    worker_lease_expires_at=expires_at,
+                    updated_at=now,
+                )
+            )
+            await session.exec(
+                update(ArtifactIngestion)
+                .where(ingestion_predicate)
+                .values(worker_lease_expires_at=expires_at)
+            )
+            await session.commit()
+        return int(getattr(item_result, "rowcount", 0) or 0)
 
     @classmethod
     async def finish_processing(
@@ -1873,6 +2085,7 @@ class UploadBatchService:
                 ).first()
             failure_statuses = {
                 ArtifactIngestionStatus.PENDING,
+                ArtifactIngestionStatus.PROCESSING,
                 ArtifactIngestionStatus.FAILED,
                 ArtifactIngestionStatus.FILTERED,
             }
@@ -1885,6 +2098,25 @@ class UploadBatchService:
             batch.processing_count = max(0, batch.processing_count - 1)
             item.worker_lease_id = None
             item.worker_lease_expires_at = None
+            if (
+                failed
+                and ingestion is not None
+                and ingestion.status
+                in {ArtifactIngestionStatus.PENDING, ArtifactIngestionStatus.PROCESSING}
+            ):
+                ingestion.status = ArtifactIngestionStatus.FAILED
+                ingestion.completed_at = now
+                ingestion.worker_lease_id = None
+                ingestion.worker_lease_expires_at = None
+                ingestion.error_code = (
+                    getattr(error, "error_code", None) if error is not None else "ingestion_failed"
+                ) or "ingestion_failed"
+                ingestion.error_message = (
+                    str(error) or type(error).__name__
+                    if error is not None
+                    else "artifact processing failed"
+                )
+                session.add(ingestion)
             if upload_result is not None:
                 item.artifact_file_id = upload_result.artifact_id
                 item.parse_revision_id = upload_result.parse_revision_id

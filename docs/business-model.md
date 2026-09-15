@@ -8,7 +8,7 @@
 | 对象 | 含义 | 不变性/身份 |
 | --- | --- | --- |
 | ArtifactFile | 一个项目拥有的原始输入、输出或辅助文件 | 内容哈希和对象位置不可覆盖；可退役 |
-| ParseRevision | 对 Artifact 的一次可审计解析 | 追加，不覆盖旧 revision |
+| ParseRevision | 对 Artifact 当前物化结果的一次解析 | 重解析前删除旧 revision 及其物化子表，成功后从 revision 1 重新建立 |
 | CalculationFrame | 解析出的一个计算帧 | 保留源坐标、方法、频率和数组溯源 |
 | MolecularTopology | MolGR 重建的分子图 | 显式氢、键、电荷、自由基和立体信息参与身份 |
 | Geometry | topology、坐标、电荷和多重度组成的几何事实 | 同坐标但电子状态不同即不同 Geometry |
@@ -24,9 +24,10 @@
 recoverable frame 的文件仍可下载和审计，状态为 `filtered`。前端必须把 `pending` 显示为
 “正在解析”，不要误报为失败。
 
-项目 manager 可重命名文件、调整可见性、请求 reparse 或退役文件；内容、哈希和已经记录的
-计算事实不在原记录上修改。reparse 读取同一原始 bytes 并产生新 revision，方便比较不同
-MolOP/MolGR 版本或解析配置。
+项目 manager 可重命名文件、调整可见性、请求 reparse 或退役文件；原始内容和哈希不在原记录上
+修改。reparse 读取同一原始 bytes，并在解析前删除该 Artifact 的所有旧 ParseRevision、
+segment、frame、推断和相关派生绑定。成功解析后只保留新的 revision 及其物化结果；若解析或
+持久化失败，ingestion 标记为 `failed`，不会恢复已删除的旧结果。
 
 ## 化学事实和显示
 

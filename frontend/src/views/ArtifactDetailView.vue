@@ -73,7 +73,10 @@ const framesQuery = useQuery({
 watch(
   () => artifact.value?.ingestion_status,
   (status, previousStatus) => {
-    if (previousStatus === "pending" && status !== "pending") void framesQuery.refetch();
+    if (["pending", "processing"].includes(previousStatus ?? "")
+      && !["pending", "processing"].includes(status ?? "")) {
+      void framesQuery.refetch();
+    }
   },
 );
 

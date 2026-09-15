@@ -83,9 +83,7 @@ def _staged_submission(
             ),
             media_type=file.media_type,
             status=(
-                UploadBatchItemStatus.STAGED
-                if is_calculation
-                else UploadBatchItemStatus.SUCCEEDED
+                UploadBatchItemStatus.STAGED if is_calculation else UploadBatchItemStatus.SUCCEEDED
             ),
             attempt_count=1,
             processing_attempt_count=0,
@@ -93,15 +91,11 @@ def _staged_submission(
             expected_file_sha256=None,
             is_gaussian_log=False,
             parse_status=(
-                ImportParseStatus.PENDING
-                if is_calculation
-                else ImportParseStatus.SUCCEEDED
+                ImportParseStatus.PENDING if is_calculation else ImportParseStatus.SUCCEEDED
             ),
             materialization_status=ImportMaterializationStatus.SUCCEEDED,
             artifact_file_id=(
-                artifact_ids[position]
-                if artifact_ids is not None
-                else UUID(int=0x850 + position)
+                artifact_ids[position] if artifact_ids is not None else UUID(int=0x850 + position)
             ),
             ingestion_id=UUID(int=0x950 + position) if is_calculation else None,
             ingestion_status=ArtifactIngestionStatus.PENDING if is_calculation else None,

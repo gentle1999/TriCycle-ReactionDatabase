@@ -27,7 +27,8 @@ export const artifactLabels: Record<string, string> = {
 const statusLabels: Record<string, string> = {
   available: "可用",
   unavailable: "不可用",
-  pending: "等待中",
+  pending: "等待解析",
+  processing: "正在解析",
   queued: "等待",
   uploading: "上传中",
   parsing: "正在解析",
