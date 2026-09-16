@@ -3731,19 +3731,22 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
                 col(ArtifactIngestion.artifact_file_id) == col(ArtifactFile.id),
             ).join(
                 MolecularTopologyDerivation,
-                col(CalculationFrame.topology_derivation_id)
-                == col(MolecularTopologyDerivation.id),
+                col(CalculationFrame.topology_derivation_id) == col(MolecularTopologyDerivation.id),
             )
-            count_statement = count_statement.join(
-                ArtifactIngestion,
-                col(ArtifactIngestion.artifact_file_id) == col(ArtifactFile.id),
-            ).join(
-                Geometry,
-                col(CalculationFrame.geometry_id) == col(Geometry.id),
-            ).join(
-                MolecularTopologyDerivation,
-                col(CalculationFrame.topology_derivation_id)
-                == col(MolecularTopologyDerivation.id),
+            count_statement = (
+                count_statement.join(
+                    ArtifactIngestion,
+                    col(ArtifactIngestion.artifact_file_id) == col(ArtifactFile.id),
+                )
+                .join(
+                    Geometry,
+                    col(CalculationFrame.geometry_id) == col(Geometry.id),
+                )
+                .join(
+                    MolecularTopologyDerivation,
+                    col(CalculationFrame.topology_derivation_id)
+                    == col(MolecularTopologyDerivation.id),
+                )
             )
 
         statement = statement.where(visibility_criterion, frame_visibility_criterion, *predicates)
@@ -3767,11 +3770,10 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
                 # The project catalogue already maintains one frame count per
                 # visible Geometry.  Avoid joining every frame to its artifact
                 # merely to populate the catalogue totals panel.
-                total_statement = (
-                    select(func.coalesce(func.sum(ProjectGeometryCatalog.frame_count), 0))
-                    .where(
-                        col(ProjectGeometryCatalog.project_id) == scope.requested_project_id,
-                    )
+                total_statement = select(
+                    func.coalesce(func.sum(ProjectGeometryCatalog.frame_count), 0)
+                ).where(
+                    col(ProjectGeometryCatalog.project_id) == scope.requested_project_id,
                 )
                 total = int((await session.execute(total_statement)).scalar_one())
             else:

@@ -16,6 +16,7 @@ from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
     CalculationFrame,
     MappedReaction,
+    MappedReactionThermodynamicProfile,
     ParseRevision,
     TransitionStateEndpoint,
 )
@@ -120,6 +121,16 @@ def test_da_bench_seed_is_idempotent_across_postgres_and_rustfs(tmp_path: Path) 
                 assert mapped_reaction is not None
                 assert mapped_reaction.minimum_activation_gibbs_free_energy_kcal_mol is not None
                 assert mapped_reaction.minimum_reaction_gibbs_free_energy_kcal_mol is not None
+                profiles = session.exec(
+                    select(MappedReactionThermodynamicProfile).where(
+                        col(MappedReactionThermodynamicProfile.mapped_reaction_id)
+                        == first.mapped_reaction_id
+                    )
+                ).all()
+                assert profiles
+                assert all(
+                    profile.source_visibility_status.value == "visible" for profile in profiles
+                )
                 endpoints = session.exec(
                     select(TransitionStateEndpoint)
                     .join(

@@ -918,8 +918,10 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
             # the outer page query still checks Geometry.project_id, so only
             # filters that actually reference Geometry/topology need those
             # joins in the count query.
-            count_statement = select(func.count()).select_from(ProjectGeometryCatalog).where(
-                col(ProjectGeometryCatalog.project_id) == scope.requested_project_id
+            count_statement = (
+                select(func.count())
+                .select_from(ProjectGeometryCatalog)
+                .where(col(ProjectGeometryCatalog.project_id) == scope.requested_project_id)
             )
             if requires_geometry_count_join or requires_topology_count_join or topology_predicates:
                 count_statement = count_statement.join(

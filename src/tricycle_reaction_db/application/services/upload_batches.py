@@ -2337,9 +2337,7 @@ class UploadBatchService:
                     continue
 
                 raw_result = results.get(job.artifact_file_id)
-                upload_result = (
-                    raw_result if isinstance(raw_result, ArtifactUploadResult) else None
-                )
+                upload_result = raw_result if isinstance(raw_result, ArtifactUploadResult) else None
                 error = raw_result if isinstance(raw_result, Exception) else None
                 result_ingestion_id = (
                     upload_result.ingestion_id if upload_result is not None else None
