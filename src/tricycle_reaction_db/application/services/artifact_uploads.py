@@ -120,6 +120,9 @@ from tricycle_reaction_db.application.services.authorization import (
     AuthorizationService,
     ProjectPermission,
 )
+from tricycle_reaction_db.application.services.database_statistics import (
+    refresh_project_statistics,
+)
 from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics_persistence import (
     refresh_mapped_reactions_thermodynamics,
 )
@@ -183,10 +186,13 @@ from tricycle_reaction_db.storage.rustfs import (
 
 MOLOP_VERSION = version("molop")
 logger = logging.getLogger(__name__)
-# Keep the persistence window used by the previous high-throughput importer.
-# The worker claim window is 64 files, so 32 gives the shared transaction two
-# bounded preload/write windows without doubling the database boundary count.
-PERSISTENCE_PRELOAD_BATCH_SIZE = 32
+# Keep the parser claim window independent from the database write window. A
+# file can contain many frames and one 32-file transaction was large enough to
+# hold hundreds of identity locks for tens of seconds. Eight files is the
+# normal hand-off/commit stack; the frame ceiling below prevents eight large
+# multi-frame files from recreating the same long transaction.
+PERSISTENCE_PRELOAD_BATCH_SIZE = 8
+PERSISTENCE_BATCH_FRAME_LIMIT = 128
 # MolGR reconstruction is CPU-heavy and each frame crosses a process boundary.
 # Larger chunks amortize pickle/future overhead while retaining enough tasks to
 # keep all configured workers busy across a multi-file batch.
@@ -4056,6 +4062,7 @@ class ArtifactUploadService:
         user_id: UUID,
         worker_lease_by_artifact_id: Mapping[UUID, tuple[UUID | None, datetime | None]]
         | None = None,
+        refresh_statistics: bool = True,
     ) -> ParseCleanupSummary:
         """Delete all materialized parse state before a clean reparse.
 
@@ -4106,6 +4113,11 @@ class ArtifactUploadService:
                 )
             )
             await session.commit()
+        if refresh_statistics:
+            await refresh_project_statistics(
+                project_ids,
+                reason="parse-materialization-clear",
+            )
         return cleanup
 
     @classmethod
@@ -4153,6 +4165,7 @@ class ArtifactUploadService:
         user_id: UUID,
         force_reparse: bool = False,
         previous_results_cleared: bool = False,
+        refresh_statistics: bool = False,
     ) -> dict[UUID, ArtifactUploadResult | Exception]:
         """Reparse staged objects through the existing bounded batch pipeline.
 
@@ -4160,7 +4173,7 @@ class ArtifactUploadService:
         method only downloads and verifies those objects, then delegates all
         MolOP, MolGR, and database work to ``upload_batch``. The parser claim
         window remains 64 files, while database commits stay bounded to the
-        shared 32-result persistence microbatch. In particular, it does not
+        shared eight-file/128-frame persistence microbatch. In particular, it does not
         create a second parser or a second persistence consumer; the shared
         process pool and batched writer are the same path used by the local
         importer.
@@ -4268,6 +4281,7 @@ class ArtifactUploadService:
                         ],
                         user_id=user_id,
                         worker_lease_by_artifact_id=processing_lease_by_artifact_id,
+                        refresh_statistics=False,
                     )
                 except Exception as error:
                     for artifact in artifact_chunk:
@@ -4383,6 +4397,11 @@ class ArtifactUploadService:
                     results[artifact_id] = ArtifactUploadError(
                         item.error_message or item.error_code or "artifact reparse failed"
                     )
+        if refresh_statistics:
+            await refresh_project_statistics(
+                (project_id,),
+                reason="artifact-reparse-complete",
+            )
         return results
 
     @classmethod
@@ -5042,6 +5061,7 @@ class ArtifactUploadService:
         completion_by_ingestion_id: dict[UUID, _IngestionCompletion] = {}
         pending_preload: list[tuple[int, _ParsedArtifact]] = []
         pending_completed_indices: list[int] = []
+        pending_persistence_frame_count = 0
         committed_callback_indices: set[int] = set()
         no_frame_indices: set[int] = set()
         persistence_ingestions_by_id: dict[UUID, ArtifactIngestion] = {}
@@ -5072,6 +5092,7 @@ class ArtifactUploadService:
             return ArtifactUploadError("MolOP returned an invalid parser result")
 
         async def persist_completed_file(local_index: int, parser_result: Any) -> None:
+            nonlocal pending_persistence_frame_count
             parsed = normalize_parser_result(parser_result)
             original_index = parse_indices[local_index]
             if on_file_parsed is not None:
@@ -5092,6 +5113,10 @@ class ArtifactUploadService:
                 parse_errors_by_index[original_index] = no_frame_error
                 return
             pending_preload.append((local_index, parsed))
+            pending_persistence_frame_count += max(
+                1,
+                len(parsed.frame_records) or parsed.source_frame_count,
+            )
 
         parse_pipeline_started = persistence_pipeline_started
         local_index_by_original = {
@@ -5286,6 +5311,7 @@ class ArtifactUploadService:
                 """
 
                 nonlocal geometry_context, deferred_inferences
+                nonlocal pending_persistence_frame_count
                 nonlocal persist_inferred_reaction_cache_hits, persist_write_elapsed_ms
                 if not completed_indices:
                     return
@@ -5511,6 +5537,12 @@ class ArtifactUploadService:
                 # own bounded project context.
                 deferred_inferences = []
                 geometry_context = GeometryPersistenceContext(project_id=project_id)
+                pending_persistence_frame_count = 0
+
+            persistence_preload_limit = min(
+                PERSISTENCE_PRELOAD_BATCH_SIZE,
+                persistence_batch_files,
+            )
 
             for _ in pipeline_tasks:
                 index, storage_error, parsed = await pipeline_result_queue.get()
@@ -5525,17 +5557,21 @@ class ArtifactUploadService:
                 if storage_error is None and local_index is not None:
                     await persist_completed_file(local_index, parsed)
                     # Keep parsing and database work overlapped inside the
-                    # same claim window. The shared persistence consumer is
-                    # fed every preload-sized group, while commit boundaries
-                    # remain independently bounded by ``persistence_batch_files``.
+                    # same claim window. The preload hand-off cannot contain
+                    # more files than the transaction boundary; otherwise a
+                    # nominal eight-file commit could still accumulate the
+                    # old 32-file write set in the same SQLAlchemy Session.
                     if pending_preload and (
-                        len(pending_preload) >= PERSISTENCE_PRELOAD_BATCH_SIZE
+                        len(pending_preload) >= persistence_preload_limit
                         or pipeline_result_queue.empty()
                     ):
                         parsed_batch = pending_preload.copy()
                         pending_preload.clear()
                         await persist_parsed_files(parsed_batch)
-                if len(pending_completed_indices) >= persistence_batch_files:
+                if (
+                    len(pending_completed_indices) >= persistence_batch_files
+                    or pending_persistence_frame_count >= PERSISTENCE_BATCH_FRAME_LIMIT
+                ):
                     completed_batch = pending_completed_indices.copy()
                     pending_completed_indices.clear()
                     parsed_batch = pending_preload.copy()

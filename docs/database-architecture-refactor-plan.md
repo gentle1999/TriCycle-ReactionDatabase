@@ -176,21 +176,21 @@ manifest/API staging
 | --- | --- | --- | --- |
 | 解析准入 | `TRICYCLE_MOLOP_BATCH_N_JOBS`，专用主机通常为 `16` | 同一个共享池、同一个 `16` 文件准入上限 | 不是 `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 或 RustFS 读取并发 |
 | 候选/领取窗口 | `IMPORT_PIPELINE_WINDOW_FILES=64` | `TRICYCLE_MAX_BATCH_FILES` 最多 `64` | 只是保持队列有活，不是解析进程数 |
-| 持久化交接 | 内部 `PERSISTENCE_PRELOAD_BATCH_SIZE=32` | 同样是 `32` 个结果，或结果队列暂时为空 | 不能等待整个领取窗口结束才写数据库 |
-| 提交/检查点 | `IMPORT_COMMIT_BATCH_FILES`，默认 `16` | 每个项目/用户微批进入一个 `upload_batch` 调用；调用内每 `32` 个结果提交一次，一个 claim 可按项目/用户拆成多个顺序调用 | 提交边界不控制解析并发 |
+| 持久化交接 | 内部 `PERSISTENCE_PRELOAD_BATCH_SIZE=8` 个文件，并限制最多 128 帧 | 同样是 8 文件/128 帧边界，或结果队列暂时为空 | 不能等待整个领取窗口结束才写数据库 |
+| 提交/检查点 | `IMPORT_COMMIT_BATCH_FILES`，默认 `16` | 每个项目/用户微批进入一个 `upload_batch` 调用；调用内按 8 文件/128 帧边界提交，一个 claim 可按项目/用户拆成多个顺序调用 | 提交边界不控制解析并发 |
 
 实现约束如下：
 
 - `_run_molop_file_pipeline` 必须把文件任务提交到同一个可复用的 `spawn`
   `ProcessPoolExecutor`；`_file_worker_submission_slots` 才是文件级解析并发的唯一准入点。
   禁止恢复成“每文件创建进程池/执行器”，也禁止把 native OpenMP/BLAS 线程数当成文件并发。
-- `upload_batch` 只有一个有界解析结果队列和一个持久化消费者。消费者每积累 32 个已解析
-  结果（或队列暂时为空）就执行 `persist_parsed_files`，解析和数据库写入必须保持流水线
-  重叠；只有提交窗口结束才 `commit`。把持久化推迟到整个 64 文件 claim 完成，会重新
-  引入已修复的吞吐回归。
+- `upload_batch` 只有一个有界解析结果队列和一个持久化消费者。消费者每积累 8 个已完成
+  文件（或队列暂时为空）就执行 `persist_parsed_files`，并且最多累计 128 帧；解析和数据库
+  写入必须保持流水线重叠。把持久化推迟到整个 64 文件 claim 完成，会重新引入已修复的
+  吞吐回归。
 - worker 必须先把领取窗口中的任务按 project/user 聚合；原始 `UploadBatch` 的单文件
   边界不能阻止微批合并。每个 project/user 微批只读取并校验已有 RustFS 对象，然后
-  调用 `reparse_batch`；其中 `upload_batch` 仍使用 `32` 个结果的持久化提交边界，
+  调用 `reparse_batch`；其中 `upload_batch` 使用 8 个文件或 128 帧的持久化提交边界，
   多个项目/用户微批顺序执行。因此远程路径的 64 是领取窗口，不是第二个解析队列，
   也不是把 64 个文件串行解析或并发打开 64 个持久化事务。
 - worker 的 `TRICYCLE_UPLOAD_MAX_CONCURRENCY` 只控制 RustFS 读取；
@@ -206,8 +206,8 @@ manifest/API staging
   reconciliation。应将其设计成有界批量/可重建刷新，或者先证明同一 fixture 的吞吐和
   失败隔离不回退，并同步增加架构回归测试。
 
-因此，导入链路的固定关系是：`16` 个共享解析槽位持续取任务，结果按 `32` 个持续交给
-同一个持久化消费者，本地按配置提交微批，RustFS worker 通常按 `64` 个 claim 后按
+因此，导入链路的固定关系是：`16` 个共享解析槽位持续取任务，结果按 8 个文件或 128 帧
+持续交给同一个持久化消费者，本地按配置提交微批，RustFS worker 通常按 `64` 个 claim 后按
 项目/用户组成微批并顺序提交。客户端单文件批次不能绕过服务端微批。
 修改任一数字或把其中一层用于控制另一层，都必须先更新本节、开发/部署文档和对应测试。
 

@@ -14,6 +14,7 @@ from tricycle_reaction_db.application.services.upload_batches import (
     UploadProcessingJob,
 )
 from tricycle_reaction_db.core.config import Settings
+from tricycle_reaction_db.dev import upload_worker as worker_module
 from tricycle_reaction_db.dev.upload_worker import UploadBatchWorker
 from tricycle_reaction_db.domain.enums import ArtifactKind, StorageStatus
 
@@ -66,8 +67,10 @@ async def test_worker_merges_compatibility_ingestions_into_one_project_microbatc
         artifact_ids: list[UUID],
         user_id: UUID,
         force_reparse: bool,
+        refresh_statistics: bool,
     ) -> dict[UUID, object]:
         reparse_calls.append((tuple(artifact_ids), user_id, force_reparse))
+        assert refresh_statistics is False
         return {artifact_id: object() for artifact_id in artifact_ids}
 
     async def fail_pending_ingestion(
@@ -107,20 +110,23 @@ async def test_worker_merges_single_file_batches_into_one_project_microbatch(
         artifact_ids: list[UUID],
         user_id: UUID,
         force_reparse: bool,
+        refresh_statistics: bool,
     ) -> dict[UUID, object]:
         reparse_calls.append((tuple(artifact_ids), user_id, force_reparse))
+        assert refresh_statistics is False
         return {artifact_id: object() for artifact_id in artifact_ids}
 
-    async def finish_processing(
-        job: UploadProcessingJob,
-        *,
-        result: object | None = None,
-        error: Exception | None = None,
-    ) -> None:
-        finished.append((job.artifact_file_id, result, error))
+    async def finish_processing_batch(
+        jobs: list[UploadProcessingJob],
+        results: dict[UUID, object],
+    ) -> int:
+        for job in jobs:
+            result = results.get(job.artifact_file_id)
+            finished.append((job.artifact_file_id, result, None))
+        return len(jobs)
 
     monkeypatch.setattr(ArtifactUploadService, "reparse_batch", reparse_batch)
-    monkeypatch.setattr(UploadBatchService, "finish_processing", finish_processing)
+    monkeypatch.setattr(UploadBatchService, "finish_processing_batch", finish_processing_batch)
 
     await UploadBatchWorker()._process_jobs(jobs)
 
@@ -149,10 +155,12 @@ async def test_worker_processes_project_microbatches_sequentially(
         artifact_ids: list[UUID],
         user_id: UUID,
         force_reparse: bool,
+        refresh_statistics: bool,
     ) -> dict[UUID, object]:
         nonlocal active_calls, maximum_active_calls
         assert user_id == USER_ID
         assert force_reparse is True
+        assert refresh_statistics is False
         active_calls += 1
         maximum_active_calls = max(maximum_active_calls, active_calls)
         call_projects.append(PROJECT_A if artifact_ids == [jobs[0].artifact_file_id] else PROJECT_B)
@@ -160,22 +168,44 @@ async def test_worker_processes_project_microbatches_sequentially(
         active_calls -= 1
         return {artifact_ids[0]: object()}
 
-    async def finish_processing(
-        _job: UploadProcessingJob,
-        *,
-        result: object | None = None,
-        error: Exception | None = None,
-    ) -> None:
-        assert result is not None
-        assert error is None
+    async def finish_processing_batch(
+        jobs: list[UploadProcessingJob],
+        results: dict[UUID, object],
+    ) -> int:
+        assert all(results.get(job.artifact_file_id) is not None for job in jobs)
+        return len(jobs)
 
     monkeypatch.setattr(ArtifactUploadService, "reparse_batch", reparse_batch)
-    monkeypatch.setattr(UploadBatchService, "finish_processing", finish_processing)
+    monkeypatch.setattr(UploadBatchService, "finish_processing_batch", finish_processing_batch)
 
     await UploadBatchWorker()._process_jobs(jobs)
 
     assert call_projects == [PROJECT_A, PROJECT_B]
     assert maximum_active_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_flushes_one_statistics_refresh_for_coalesced_projects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[set[UUID], str]] = []
+
+    async def refresh_project_statistics(
+        project_ids: tuple[UUID, ...],
+        *,
+        reason: str,
+    ) -> bool:
+        calls.append((set(project_ids), reason))
+        return True
+
+    monkeypatch.setattr(worker_module, "refresh_project_statistics", refresh_project_statistics)
+    worker = UploadBatchWorker()
+    worker._mark_statistics_dirty((PROJECT_A, PROJECT_B, PROJECT_A))
+
+    await worker._flush_statistics()
+    await worker._flush_statistics()
+
+    assert calls == [({PROJECT_A, PROJECT_B}, "upload-worker-queue-drained")]
 
 
 @pytest.mark.asyncio

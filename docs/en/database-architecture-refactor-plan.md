@@ -208,8 +208,8 @@ check before merge.
 | --- | --- | --- | --- |
 | Parser admission | `TRICYCLE_MOLOP_BATCH_N_JOBS`, normally `16` on a dedicated host | The same shared pool and the same `16`-file admission limit | Not `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` or RustFS read concurrency |
 | Candidate/claim window | `IMPORT_PIPELINE_WINDOW_FILES=64` | Up to `TRICYCLE_MAX_BATCH_FILES=64` | Keeps the queue supplied; it is not the parser-process count |
-| Persistence hand-off | Internal `PERSISTENCE_PRELOAD_BATCH_SIZE=32` | The same `32` results, or when the result queue is temporarily empty | Must not wait for the whole claim before writing |
-| Commit/checkpoint | `IMPORT_COMMIT_BATCH_FILES`, default `16` | One `upload_batch` call per project/user microbatch; it commits every `32` results, and one claim may produce several sequential calls | The commit boundary does not control parser concurrency |
+| Persistence hand-off | Internal `PERSISTENCE_PRELOAD_BATCH_SIZE=8` files, with a 128-frame ceiling | The same eight-file/128-frame boundary, or when the result queue is temporarily empty | Must not wait for the whole claim before writing |
+| Commit/checkpoint | `IMPORT_COMMIT_BATCH_FILES`, default `16` | One `upload_batch` call per project/user microbatch; it commits at the eight-file/128-frame boundary, and one claim may produce several sequential calls | The commit boundary does not control parser concurrency |
 
 The implementation invariants are:
 
@@ -217,14 +217,16 @@ The implementation invariants are:
   `ProcessPoolExecutor`; `_file_worker_submission_slots` is the only file-level parser admission
   point. Do not restore a per-file process pool/executor or use native OpenMP/BLAS thread counts
   as a substitute for file concurrency.
-- `upload_batch` has one bounded parser-result queue and one persistence consumer. Every 32 parsed
-  results (or when the queue is temporarily empty) are handed to `persist_parsed_files`, so parser
+- `upload_batch` has one bounded parser-result queue and one persistence consumer. Every eight
+  completed files (or when the queue is temporarily empty) are handed to `persist_parsed_files`, so parser
   work and database writes overlap. Only the persistence-window boundary commits. Moving all
   persistence until a 64-file claim completes reintroduces the fixed throughput regression.
+  Each commit window is additionally capped at 128 parsed frames so a handful of large files
+  cannot hold identity locks for an entire claim window.
 - The worker first aggregates the claim window by project/user; the original `UploadBatch`
   boundary cannot prevent microbatching across one-file submissions. Each project/user
   microbatch only reads and verifies existing RustFS objects, then calls `reparse_batch`; its
-  `upload_batch` call commits at the fixed `32`-result persistence boundary. Different
+  `upload_batch` call commits at the fixed eight-file/128-frame persistence boundary. Different
   microbatches run sequentially. Thus `64` on the remote path is a claim window, not a second parser queue,
   64 serial parses, or 64 concurrent persistence transactions.
 - `TRICYCLE_UPLOAD_MAX_CONCURRENCY` controls only RustFS reads;
@@ -242,8 +244,8 @@ The implementation invariants are:
   failure isolation do not regress on the same fixture, and add an architecture regression test.
 
 The fixed relationship is therefore: 16 shared parser slots continuously take work, results are
-continuously handed to one persistence consumer in groups of 32, local imports commit configured
-microbatches, and the RustFS worker normally aggregates a 64-file claim into project/user
+continuously handed to one persistence consumer in bounded eight-file/128-frame groups, local
+imports commit configured microbatches, and the RustFS worker normally aggregates a 64-file claim into project/user
 microbatches and commits them sequentially. A client one-file batch cannot bypass server-side
 microbatching. Changing any number or using one layer to control another requires updating this
 section, the development/deployment guides, and the corresponding tests first.

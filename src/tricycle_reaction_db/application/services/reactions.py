@@ -259,18 +259,52 @@ def _reaction_graph_smiles(definition: rdChemReactions.ChemicalReaction) -> str:
 _mapped_reaction_from_smiles = _reaction_from_representation
 
 
-def _logical_map_numbers_for_reaction(mapped_reaction: MappedReaction) -> frozenset[int]:
+def _logical_map_numbers_for_reaction(
+    mapped_reaction: MappedReaction,
+    *,
+    session: Session | None = None,
+) -> frozenset[int]:
     """Read map numbers from persisted participants without reparsing the reaction.
 
     MolGR-derived reactions may contain multicoordinate metals that are valid in
     the trusted source graph but unsafe for RDKit ``ChemicalReaction`` traversal.
     Participant rows are already the authoritative mapping projection, so a
-    second reaction parse here is both unnecessary and crash-prone.
+    second reaction parse here is both unnecessary and crash-prone.  Fast
+    ingestion can defer those rows until a persistence microbatch boundary;
+    include them from the current Session so validation sees the complete
+    in-memory reaction without forcing an early flush.
     """
+
+    if session is not None:
+        mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
+        loaded_participants = mapped_reaction.__dict__.get("participants")
+        participants = (
+            tuple(loaded_participants)
+            if loaded_participants is not None
+            else tuple(
+                session.exec(
+                    select(MappedReactionParticipant).where(
+                        MappedReactionParticipant.mapped_reaction_id == mapped_reaction_id
+                    )
+                ).all()
+            )
+        )
+        pending_participants = tuple(
+            entity
+            for entity in (
+                *tuple(session.new),
+                *tuple(session.info.get("_fast_pending_entities", ())),
+            )
+            if isinstance(entity, MappedReactionParticipant)
+            and entity.mapped_reaction_id == mapped_reaction_id
+        )
+        participants += pending_participants
+    else:
+        participants = tuple(mapped_reaction.participants)
 
     return frozenset(
         atom_map
-        for participant in mapped_reaction.participants
+        for participant in participants
         for atom_map in participant.atom_map_numbers
         if atom_map > 0
     )
@@ -2131,7 +2165,10 @@ def persist_mapped_reaction_node_geometry_mapping(
     )
     if record.mapped_smiles != expected_smiles:
         raise ValueError("mapped_smiles does not match the converted coordinate mapping")
-    logical_map_numbers = _logical_map_numbers_for_reaction(mapped_reaction)
+    logical_map_numbers = _logical_map_numbers_for_reaction(
+        mapped_reaction,
+        session=session,
+    )
     if not set(record.geometry_atom_map_numbers).issubset(logical_map_numbers):
         raise ValueError("coordinate mapping contains atom maps absent from the logical path")
     participant = node_geometry.mapped_reaction_participant

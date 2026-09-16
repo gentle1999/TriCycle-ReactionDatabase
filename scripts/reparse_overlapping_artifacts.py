@@ -33,6 +33,9 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
     ArtifactUploadService,
     close_molop_process_pool,
 )
+from tricycle_reaction_db.application.services.database_statistics import (
+    refresh_project_statistics,
+)
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import ArtifactFile, ParseRevision
 from tricycle_reaction_db.db.session import session_factory
@@ -345,6 +348,7 @@ async def _run(args: argparse.Namespace) -> int:
                     cleanup = await ArtifactUploadService.clear_previous_parse_results(
                         artifact_ids=[candidate.id for candidate in batch],
                         user_id=user_id,
+                        refresh_statistics=False,
                     )
                     for candidate in batch:
                         _append_checkpoint(
@@ -397,6 +401,11 @@ async def _run(args: argparse.Namespace) -> int:
                     )
                 clear_processed += len(batch)
         if clear_error or len(clear_completed) != len(candidates):
+            for project_id in clear_pending_by_project:
+                await refresh_project_statistics(
+                    (project_id,),
+                    reason="overlapping-artifact-clear-complete",
+                )
             totals["failed"] += totals["clear_failed"]
             totals["pending"] = len(candidates) - len(clear_completed)
             print(json.dumps(totals, ensure_ascii=False, sort_keys=True))
@@ -424,6 +433,7 @@ async def _run(args: argparse.Namespace) -> int:
                         user_id=user_id,
                         force_reparse=True,
                         previous_results_cleared=True,
+                        refresh_statistics=False,
                     )
                     for candidate in batch:
                         result = results.get(candidate.id)
@@ -512,6 +522,10 @@ async def _run(args: argparse.Namespace) -> int:
                         flush=True,
                     )
                 processed += len(batch)
+            await refresh_project_statistics(
+                (project_id,),
+                reason="overlapping-artifact-reparse-complete",
+            )
     finally:
         await close_molop_process_pool()
 

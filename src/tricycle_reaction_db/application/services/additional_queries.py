@@ -909,18 +909,23 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
             if maximum_atom_count is not None:
                 topology_predicates.append(col(MolecularTopology.atom_count) <= maximum_atom_count)
         if uses_catalog_summary:
-            count_statement = (
-                select(func.count())
-                .select_from(ProjectGeometryCatalog)
-                .join(
+            # The catalog is the project-owned directory.  The old count
+            # joined every catalog row to Geometry even when the only filter
+            # was a catalog summary flag; on the production project this made
+            # PostgreSQL repeatedly scan the same 21k-row catalog and perform
+            # millions of rejected nested-loop comparisons.  The project
+            # ownership invariant is maintained by the catalog write path and
+            # the outer page query still checks Geometry.project_id, so only
+            # filters that actually reference Geometry/topology need those
+            # joins in the count query.
+            count_statement = select(func.count()).select_from(ProjectGeometryCatalog).where(
+                col(ProjectGeometryCatalog.project_id) == scope.requested_project_id
+            )
+            if requires_geometry_count_join or requires_topology_count_join or topology_predicates:
+                count_statement = count_statement.join(
                     Geometry,
                     col(ProjectGeometryCatalog.geometry_id) == col(Geometry.id),
-                )
-                .where(col(ProjectGeometryCatalog.project_id) == scope.requested_project_id)
-            )
-            count_statement = count_statement.where(
-                col(Geometry.project_id) == scope.requested_project_id
-            )
+                ).where(col(Geometry.project_id) == scope.requested_project_id)
             if requires_topology_count_join or topology_predicates:
                 count_statement = count_statement.join(
                     MolecularTopology,
@@ -1012,13 +1017,8 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                 # for deep pages.
                 thermodynamic_catalog = (
                     select(col(ProjectGeometryCatalog.geometry_id))
-                    .join(
-                        Geometry,
-                        col(Geometry.id) == col(ProjectGeometryCatalog.geometry_id),
-                    )
                     .where(
                         col(ProjectGeometryCatalog.project_id) == scope.requested_project_id,
-                        col(Geometry.project_id) == scope.requested_project_id,
                         col(ProjectGeometryCatalog.has_thermodynamic_property),
                     )
                     .order_by(
@@ -1028,13 +1028,8 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                 )
                 non_thermodynamic_catalog = (
                     select(col(ProjectGeometryCatalog.geometry_id))
-                    .join(
-                        Geometry,
-                        col(Geometry.id) == col(ProjectGeometryCatalog.geometry_id),
-                    )
                     .where(
                         col(ProjectGeometryCatalog.project_id) == scope.requested_project_id,
-                        col(Geometry.project_id) == scope.requested_project_id,
                         ~col(ProjectGeometryCatalog.has_thermodynamic_property),
                     )
                     .order_by(
@@ -1047,14 +1042,9 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                         await session.execute(
                             select(func.count())
                             .select_from(ProjectGeometryCatalog)
-                            .join(
-                                Geometry,
-                                col(Geometry.id) == col(ProjectGeometryCatalog.geometry_id),
-                            )
                             .where(
                                 col(ProjectGeometryCatalog.project_id)
                                 == scope.requested_project_id,
-                                col(Geometry.project_id) == scope.requested_project_id,
                                 col(ProjectGeometryCatalog.has_thermodynamic_property),
                             )
                         )

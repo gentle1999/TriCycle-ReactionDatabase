@@ -16,6 +16,9 @@ from typing import Any
 
 from sqlalchemy import text
 
+from tricycle_reaction_db.application.services.database_statistics import (
+    refresh_database_statistics,
+)
 from tricycle_reaction_db.db.session import session_factory
 
 PRESERVED_TABLES = (
@@ -168,6 +171,7 @@ async def _run(args: argparse.Namespace) -> int:
         if non_empty:
             raise RuntimeError(f"derived rows remain after reset: {non_empty}")
 
+    statistics_refreshed = await refresh_database_statistics(reason="global-derived-reset")
     print(
         json.dumps(
             {
@@ -180,6 +184,7 @@ async def _run(args: argparse.Namespace) -> int:
                 "preserved_counts": preserved_before,
                 "cleared_counts": {name: count for name, count in derived_before.items() if count},
                 "remaining_derived_rows": 0,
+                "statistics_refreshed": statistics_refreshed,
             },
             ensure_ascii=False,
             sort_keys=True,

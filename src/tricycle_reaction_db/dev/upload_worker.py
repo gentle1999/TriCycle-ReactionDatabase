@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Iterable
 from contextlib import suppress
 from uuid import UUID
 
@@ -11,6 +12,9 @@ from tricycle_reaction_db.application.dtos import ArtifactUploadResult
 from tricycle_reaction_db.application.services.artifact_uploads import (
     ArtifactUploadService,
     close_molop_process_pool,
+)
+from tricycle_reaction_db.application.services.database_statistics import (
+    refresh_project_statistics,
 )
 from tricycle_reaction_db.application.services.upload_batches import (
     PendingIngestionJob,
@@ -25,6 +29,36 @@ logger = logging.getLogger(__name__)
 
 class UploadBatchWorker:
     """Lease staged objects, parse them, and publish terminal queue states."""
+
+    def __init__(self) -> None:
+        # A worker poll can contain several project/user groups and several
+        # client-side one-file batches.  Coalesce their affected projects and
+        # analyze once when both queues become empty, instead of analyzing
+        # once per file or per persistence microbatch.
+        self._statistics_dirty_project_ids: set[UUID] = set()
+        self._statistics_refresh_failed = False
+
+    def _mark_statistics_dirty(self, project_ids: Iterable[UUID]) -> None:
+        self._statistics_dirty_project_ids.update(
+            project_id for project_id in project_ids if isinstance(project_id, UUID)
+        )
+        self._statistics_refresh_failed = False
+
+    async def _flush_statistics(self) -> None:
+        if not self._statistics_dirty_project_ids or self._statistics_refresh_failed:
+            return
+        project_ids = tuple(self._statistics_dirty_project_ids)
+        refreshed = await refresh_project_statistics(
+            project_ids,
+            reason="upload-worker-queue-drained",
+        )
+        if refreshed:
+            self._statistics_dirty_project_ids.clear()
+        else:
+            # Do not retry a failed maintenance operation on every idle poll.
+            # A new claimed job resets this flag and creates another natural
+            # retry boundary.
+            self._statistics_refresh_failed = True
 
     async def _renew_until_done(
         self,
@@ -90,28 +124,29 @@ class UploadBatchWorker:
                         artifact_ids=[job.artifact_file_id for job in group],
                         user_id=group[0].user_id,
                         force_reparse=True,
+                        refresh_statistics=False,
                     )
                 except Exception as error:
                     group_results = {job.artifact_file_id: error for job in group}
 
-                for job in group:
-                    result = group_results.get(job.artifact_file_id)
-                    try:
-                        if isinstance(result, Exception):
-                            await UploadBatchService.finish_processing(job, error=result)
-                        elif result is None:
-                            await UploadBatchService.finish_processing(
-                                job,
-                                error=RuntimeError("artifact reparse returned no result"),
-                            )
-                        else:
-                            await UploadBatchService.finish_processing(job, result=result)
-                    except Exception:
-                        logger.exception(
-                            "failed to record upload worker batch result batch=%s item=%s",
-                            job.batch_id,
-                            job.item_id,
+                try:
+                    finalized = await UploadBatchService.finish_processing_batch(
+                        group,
+                        group_results,
+                    )
+                    if finalized != len(group):
+                        logger.warning(
+                            "upload worker finalized only part of a result group "
+                            "expected=%d finalized=%d",
+                            len(group),
+                            finalized,
                         )
+                except Exception:
+                    logger.exception(
+                        "failed to record upload worker result group project=%s files=%d",
+                        group[0].project_id,
+                        len(group),
+                    )
             finally:
                 finished.set()
                 heartbeat.cancel()
@@ -183,6 +218,7 @@ class UploadBatchWorker:
                         artifact_ids=[job.artifact_file_id for job in group],
                         user_id=group[0].user_id,
                         force_reparse=True,
+                        refresh_statistics=False,
                     )
                 except asyncio.CancelledError:
                     # Leave the reservations leased so normal stale-lease
@@ -239,8 +275,26 @@ class UploadBatchWorker:
 
     async def run(self, stop_event: asyncio.Event | None = None) -> None:
         settings = get_settings()
+        startup_recovery_complete = False
         while stop_event is None or not stop_event.is_set():
             try:
+                if not startup_recovery_complete:
+                    recovered_total = 0
+                    while True:
+                        recovered = await UploadBatchService.recover_stale(
+                            limit=settings.max_batch_files,
+                            recover_unexpired_processing=True,
+                        )
+                        recovered_total += recovered
+                        if recovered < settings.max_batch_files:
+                            break
+                    startup_recovery_complete = True
+                    if recovered_total:
+                        logger.warning(
+                            "recovered processing leases left by the previous upload worker "
+                            "files=%d",
+                            recovered_total,
+                        )
                 await UploadBatchService.recover_stale()
                 jobs = await UploadBatchService.claim_processing(
                     # Keep the parser pool fed with a bounded file queue. The
@@ -250,6 +304,7 @@ class UploadBatchWorker:
                     limit=settings.max_batch_files,
                 )
                 if jobs:
+                    self._mark_statistics_dirty(job.project_id for job in jobs)
                     await self._process_jobs(jobs)
                     continue
                 pending_jobs = await UploadBatchService.claim_pending_ingestions(
@@ -261,8 +316,10 @@ class UploadBatchWorker:
                     limit=settings.max_batch_files,
                 )
                 if pending_jobs:
+                    self._mark_statistics_dirty(job.project_id for job in pending_jobs)
                     await self._process_pending_jobs(pending_jobs)
                     continue
+                await self._flush_statistics()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -278,12 +335,22 @@ class UploadBatchWorker:
                         stop_event.wait(),
                         timeout=settings.upload_worker_poll_interval_seconds,
                     )
+        # A graceful stop can arrive immediately after the last result was
+        # finalized.  Flush the coalesced project set before returning so the
+        # final import/reparse boundary gets the same statistics refresh as an
+        # idle poll.
+        await self._flush_statistics()
 
 
 async def _run_worker() -> None:
+    worker = UploadBatchWorker()
     try:
-        await UploadBatchWorker().run()
+        await worker.run()
     finally:
+        # Cancellation can interrupt a parse group before ``run`` reaches its
+        # normal idle boundary. Give the completed database work one final
+        # post-commit statistics refresh before shutting down the shared pool.
+        await worker._flush_statistics()
         await close_molop_process_pool()
         await dispose_engine()
 

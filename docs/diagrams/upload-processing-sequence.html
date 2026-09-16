@@ -5203,11 +5203,11 @@
         </g>
         </g>
 
-        <g data-edge-from="committer" data-edge-to="postgres" data-edge-label="累计 32 个结果：提交一次微批事务" data-edge-key="17">
+        <g data-edge-from="committer" data-edge-to="postgres" data-edge-label="累计 8 个结果或 128 帧：提交一次微批事务" data-edge-key="17">
           <path data-composition-edge-from="committer" data-composition-edge-to="postgres" data-composition-points="966.5,894;609.7857142857142,894" d="M 966.5 894 L 609.7857142857142 894" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
         <g data-detail="context">
           <rect x="698.9428571428571" y="874" width="178.4" height="16" rx="3" class="c-mask"/>
-          <text x="788.1428571428571" y="884" class="t-backend" font-size="9" text-anchor="middle">累计 32 个结果：提交一次微批事务</text>
+          <text x="788.1428571428571" y="884" class="t-backend" font-size="9" text-anchor="middle">累计 8 个结果或 128 帧：提交一次微批事务</text>
         </g>
         </g>
 
@@ -5613,7 +5613,7 @@
           <h3>微批提交语义</h3>
         </div>
         <ul>
-          <li>&bull; 有界队列满 32 个结果时提交一次</li>
+          <li>&bull; 有界队列达到 8 个结果或 128 帧时提交一次</li>
           <li>&bull; 队列为空只刷新预加载结果，不触发提交</li>
           <li>&bull; 领取窗口结束时提交剩余结果</li>
         </ul>

@@ -11,7 +11,11 @@ from tricycle_reaction_db.application.dtos import (
     UploadBatchItemView,
     UploadBatchView,
 )
-from tricycle_reaction_db.application.services.upload_batches import UploadBatchService
+from tricycle_reaction_db.application.services.upload_batches import (
+    UploadBatchService,
+    _queue_ingestion_for_reparse,
+)
+from tricycle_reaction_db.db.models import ArtifactIngestion
 from tricycle_reaction_db.domain.enums import (
     ArtifactIngestionStatus,
     ArtifactKind,
@@ -28,6 +32,37 @@ ARTIFACT_ID = UUID("00000000-0000-7000-8000-000000000704")
 SECOND_CLIENT_FILE_ID = UUID("00000000-0000-7000-8000-000000000705")
 SECOND_ARTIFACT_ID = UUID("00000000-0000-7000-8000-000000000706")
 NOW = datetime(2026, 8, 20, tzinfo=UTC)
+
+
+def test_queue_reparse_publishes_an_empty_pending_ingestion() -> None:
+    ingestion = ArtifactIngestion(
+        artifact_file_id=ARTIFACT_ID,
+        parser_version="0.2.15",
+        status=ArtifactIngestionStatus.PARTIAL,
+        source_frame_count=8,
+        transition_state_frame_count=2,
+        started_at=NOW,
+        completed_at=NOW,
+        error_code="old_error",
+        error_message="old parse result",
+        parser_metadata={"old": True},
+    )
+
+    _queue_ingestion_for_reparse(ingestion, queued_at=NOW)
+
+    assert ingestion.status is ArtifactIngestionStatus.PENDING
+    assert ingestion.source_frame_count is None
+    assert ingestion.transition_state_frame_count is None
+    assert ingestion.started_at is None
+    assert ingestion.completed_at is None
+    assert ingestion.worker_lease_id is None
+    assert ingestion.worker_lease_expires_at is None
+    assert ingestion.error_code is None
+    assert ingestion.error_message is None
+    assert ingestion.parser_metadata == {
+        "reparse_queued": True,
+        "queued_at": NOW.isoformat(),
+    }
 
 
 def _batch_view() -> UploadBatchView:

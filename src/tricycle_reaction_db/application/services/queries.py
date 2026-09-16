@@ -149,6 +149,7 @@ from tricycle_reaction_db.domain.enums import (
     LogicalReactionParticipantSide,
     MappedReactionKind,
     OptimizationStatus,
+    ParseStatus,
     ReactionClass,
     SCFStatus,
     SimilarityMetric,
@@ -3608,7 +3609,7 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
                 ArtifactFile,
                 col(ParseRevision.artifact_file_id) == col(ArtifactFile.id),
             )
-            .where(visibility_criterion, frame_visibility_criterion)
+            .where(visibility_criterion)
         )
         predicates: list[Any] = []
         if artifact_file_id is not None:
@@ -3710,8 +3711,43 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
         # selective artifact/revision/frame join order.  The revision-level
         # visibility expression is equivalent here and would introduce a
         # broad semi-join over all visible frames.
+        if scope.uses_project_owned_fast_path:
+            # The outer statement already has the artifact, revision, and
+            # geometry rows needed for the project-owned visibility contract.
+            # Joining the source tables directly avoids evaluating a
+            # correlated ``EXISTS`` over the complete frame table for every
+            # count/list row.  That correlated form becomes especially bad
+            # when an artifact filter is present: PostgreSQL may scan every
+            # frame before applying the selective artifact equality.
+            frame_visibility_criterion = and_(
+                col(ArtifactIngestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+                col(ParseRevision.status) == ParseStatus.SUCCEEDED,
+                col(Geometry.project_id) == scope.requested_project_id,
+                col(MolecularTopologyDerivation.project_id) == scope.requested_project_id,
+                col(CalculationFrame.geometry_id).is_not(None),
+            )
+            statement = statement.join(
+                ArtifactIngestion,
+                col(ArtifactIngestion.artifact_file_id) == col(ArtifactFile.id),
+            ).join(
+                MolecularTopologyDerivation,
+                col(CalculationFrame.topology_derivation_id)
+                == col(MolecularTopologyDerivation.id),
+            )
+            count_statement = count_statement.join(
+                ArtifactIngestion,
+                col(ArtifactIngestion.artifact_file_id) == col(ArtifactFile.id),
+            ).join(
+                Geometry,
+                col(CalculationFrame.geometry_id) == col(Geometry.id),
+            ).join(
+                MolecularTopologyDerivation,
+                col(CalculationFrame.topology_derivation_id)
+                == col(MolecularTopologyDerivation.id),
+            )
+
         statement = statement.where(visibility_criterion, frame_visibility_criterion, *predicates)
-        count_statement = count_statement.where(*predicates)
+        count_statement = count_statement.where(*predicates, frame_visibility_criterion)
         if artifact_file_id is not None:
             # A file has one stable filename.  Ordering directly by the
             # revision/file index avoids sorting the joined topology rows and
@@ -3733,13 +3769,8 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
                 # merely to populate the catalogue totals panel.
                 total_statement = (
                     select(func.coalesce(func.sum(ProjectGeometryCatalog.frame_count), 0))
-                    .join(
-                        Geometry,
-                        col(Geometry.id) == col(ProjectGeometryCatalog.geometry_id),
-                    )
                     .where(
                         col(ProjectGeometryCatalog.project_id) == scope.requested_project_id,
-                        col(Geometry.project_id) == scope.requested_project_id,
                     )
                 )
                 total = int((await session.execute(total_statement)).scalar_one())

@@ -18,6 +18,7 @@ from tricycle_reaction_db.application.dtos import (
 from tricycle_reaction_db.application.services.reactions import (
     _canonical_mapped_reaction_smiles,
     _canonical_mapped_topology_identity,
+    _logical_map_numbers_for_reaction,
     _mapped_reaction_from_smiles,
     _mapping_assignment_for_topology,
     mapped_reaction_concrete_identity,
@@ -69,6 +70,41 @@ def test_create_reaction_command_requires_only_a_reaction_representation() -> No
             reaction="C1CC1>>C=CC",
             reactants=[{"topology_id": "00000000-0000-0000-0000-000000000000"}],
         )
+
+
+def test_logical_map_numbers_include_fast_pending_participants() -> None:
+    """Fast-path reaction validation must see participants before microbatch flush."""
+
+    mapped_reaction_id = UUID("00000000-0000-0000-0000-000000000101")
+    pending_participant = MappedReactionParticipant(
+        mapped_reaction_id=mapped_reaction_id,
+        logical_reaction_participant_id=UUID("00000000-0000-0000-0000-000000000102"),
+        side=LogicalReactionParticipantSide.REACTANT,
+        template_index=0,
+        atom_map_numbers=[7, 8],
+        mapped_smiles="[CH2:7]=[CH2:8]",
+    )
+    mapped_reaction = cast(
+        MappedReaction,
+        SimpleNamespace(id=mapped_reaction_id, participants=[]),
+    )
+
+    class _Session:
+        info = {"_fast_pending_entities": (pending_participant,)}
+        new: tuple[object, ...] = ()
+
+        def exec(self, _statement: object) -> "_Session":
+            return self
+
+        def all(self) -> list[MappedReactionParticipant]:
+            return []
+
+    atom_maps = _logical_map_numbers_for_reaction(
+        mapped_reaction,
+        session=cast(Session, _Session()),
+    )
+
+    assert atom_maps == frozenset({7, 8})
 
 
 def test_binding_record_requires_complete_selectors_without_software_authority() -> None:

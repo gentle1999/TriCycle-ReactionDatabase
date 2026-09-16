@@ -30,6 +30,9 @@ from tricycle_reaction_db.application.services.authorization import (
     AuthorizationService,
     ProjectPermission,
 )
+from tricycle_reaction_db.application.services.database_statistics import (
+    refresh_project_statistics,
+)
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
     ArtifactIngestion,
@@ -941,6 +944,12 @@ class ProjectDataRemovalService:
                     "project data has an external reference and was not removed"
                 ) from error
 
+        # The delete is committed before refreshing statistics so ANALYZE does
+        # not share the long-running purge transaction or its locks.
+        await refresh_project_statistics(
+            (project_id,),
+            reason="project-data-removal",
+        )
         settings = RustFSSettings()
         active_object_keys: set[tuple[str, str]] = set()
         if references:

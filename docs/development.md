@@ -667,13 +667,15 @@ sequenceDiagram
             W->>P: 结果进入有界持久化队列
             alt 结果队列暂时为空
                 P->>D: 仅持久化预加载结果，不提交事务
-            else 累计 32 个完成结果
-                P->>D: 提交 32 个结果的微批事务
+            else 累计 8 个完成结果或达到 128 帧
+                P->>D: 提交 8 个结果的微批事务
             end
         end
     end
     P->>D: 当前领取窗口结束，提交剩余结果
     W->>D: 逐项完成 UploadBatchItem 状态
+    W->>D: 两个待处理队列均为空后刷新受影响项目统计
+    D-->>W: 完成针对性 ANALYZE
     R->>S: GET 批次状态 / 解析结果
     S->>D: 读取批次、入库和帧状态
     D-->>S: SUCCEEDED / PARTIAL / FAILED
@@ -710,15 +712,31 @@ RustFS 并将 item 标记为 `staged`，独立 `upload-worker` 每轮领取 `TRI
 文件。客户端 `UploadBatch` 只是队列/进度边界，不是持久化边界；即使原始上传是单文件
 批次，同一项目/用户的任务也必须在 worker 中合并为一个持久化微批。不同项目/用户的
 微批顺序执行，不能并发打开多个项目持久化事务。每个 project/user 微批通过
-`reparse_batch` 交给 `upload_batch`，再使用同一个结果队列和单一消费者；其中每 32
-个解析结果（或队列暂时为空）调用一次 `persist_parsed_files`，并在持久化微批边界
-提交事务，不能等到整个领取窗口全部解析完成后才写数据库。因此 `64` 只表示领取窗口，
-`32` 是固定的持久化提交微批，实际解析并发仍只由共享 MolOP 池的
+`reparse_batch` 交给 `upload_batch`，再使用同一个结果队列和单一消费者；其中每 8
+个解析结果、累计达到 128 帧（或队列暂时为空）调用一次 `persist_parsed_files`，并在持久化
+微批边界提交事务，不能等到整个领取窗口全部解析完成后才写数据库。因此 `64` 只表示领取窗口，
+`8` 个文件/`128` 帧是固定的持久化提交微批，实际解析并发仍只由共享 MolOP 池的
 `TRICYCLE_MOLOP_BATCH_N_JOBS`（专用主机通常为 `16`）决定。该 durable bulk/reparse
 事务还使用上一版的 legacy bulk 热路径：reaction SMILES topology 缓存和单次 set-based
 Geometry 匹配保持开启，后来增加的逐文件 concrete/logical/reverse reconciliation 不得
 直接插入；项目范围和所有权约束仍然必须执行。修改这些边界前必须同步更新架构说明并用同一
 批真实文件复测字节吞吐和失败隔离。
+
+#### 项目级批量变更后的统计刷新
+
+PostgreSQL 的自动 ANALYZE 阈值按整张表计算。单个项目即使刚刚完成大批量删除、导入或
+重解析，变更量仍可能小于多项目共享大表的阈值，导致项目列的统计信息继续使用旧估计。
+因此这些操作提交完成后会主动刷新项目查询依赖的统计信息：`ProjectDataRemovalService`
+在删除事务提交后立即执行一次；统一 `upload-worker` 将本轮处理过的 project ID 放入一个
+集合，在 staged 与兼容 pending 队列都为空时一次性执行；优雅停止也会执行最后一次刷新。
+连续的单文件上传只要队列未清空就不会各自触发 ANALYZE。
+
+刷新是一个独立的、提交后的维护事务，只针对 artifact、ingestion、parse、frame、geometry、
+project geometry catalogue 以及反应 profile 读路径所需的列级统计，不会把 ANALYZE 放进长时间
+解析或删除事务。离线的 `reparse_overlapping_artifacts.py`、`reimport_artifact_objects.py`
+和 `clear_artifact_parse_results.py` 也在各自项目阶段结束时调用同一服务。需要注意，PostgreSQL
+的 ANALYZE 本身是表级操作，project ID 用于合并触发边界和日志标识，而不是把采样限制成
+单个项目；刷新失败只记录日志，不回滚已经成功的业务事务。
 
 #### 推荐的导入超参数
 
@@ -759,10 +777,10 @@ make import-artifacts
 - `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS=60` 是 10 MiB 文件的基准预算，并随源文件大小放大；它是异常文件隔离参数，不是提速参数。慢磁盘或大文件较多时提高，想更快跳过异常文件时降低，但应先确认失败率。
 - `TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE=false` 是上一版高吞吐导入的默认值，适合大规模普通导入；需要 frame role/source locator、source span 和 block hash 等审计证据时显式设为 `true`，并接受额外开销。`TRICYCLE_MOLOP_PARALLEL_FRAME_PERSISTENCE=true` 应保持开启。
 
-浏览器和远程 API 上传使用独立的 durable `upload-worker`，参数不要与本地导入的 `IMPORT_*` 混用。`TRICYCLE_UPLOAD_MAX_CONCURRENCY=8` 限制 RustFS 读取；`TRICYCLE_MAX_BATCH_FILES=64` 是 worker 的领取窗口，持久化提交微批固定为 32 个结果；`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 仅用于旧 pending-ingestion 恢复。专用算力主机可以把共享解析池 `TRICYCLE_MOLOP_BATCH_N_JOBS` 调到 `16`，并根据 CPU、内存和数据库写入延迟复测。
+浏览器和远程 API 上传使用独立的 durable `upload-worker`，参数不要与本地导入的 `IMPORT_*` 混用。`TRICYCLE_UPLOAD_MAX_CONCURRENCY=8` 限制 RustFS 读取；`TRICYCLE_MAX_BATCH_FILES=64` 是 worker 的领取窗口，持久化提交微批固定为 8 个文件或 128 帧；`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 仅用于旧 pending-ingestion 恢复。专用算力主机可以把共享解析池 `TRICYCLE_MOLOP_BATCH_N_JOBS` 调到 `16`，并根据 CPU、内存和数据库写入延迟复测。
 
 worker 的 64 个文件是领取窗口，不代表 64 个文件共用一个事务；每个 project/user 微批
-通过同一个结果队列和单一消费者处理，并按 32 个结果提交一次。它不改变解析准入；本地
+通过同一个结果队列和单一消费者处理，并按 8 个文件或 128 帧提交一次。它不改变解析准入；本地
 CLI 的 `IMPORT_COMMIT_BATCH_FILES=16` 仍只控制本地事务/检查点频率。三种数字分别属于
 解析准入、结果交接和提交边界，不能互相替代。
 

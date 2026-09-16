@@ -283,13 +283,15 @@ sequenceDiagram
             W->>P: Enqueue result in bounded persistence queue
             alt Result queue is temporarily empty
                 P->>D: Persist preload results only; do not commit
-            else 32 completed results accumulated
-                P->>D: Commit one 32-result persistence microbatch
+            else 8 files or 128 frames accumulated
+                P->>D: Commit one bounded persistence microbatch
             end
         end
     end
     P->>D: Claim window ends; commit remaining results
     W->>D: Finalize each UploadBatchItem state
+    W->>D: Refresh affected project statistics once both queues are empty
+    D-->>W: Complete targeted ANALYZE
     R->>S: GET batch status / parse result
     S->>D: Read batch, ingestion, and frame state
     D-->>S: SUCCEEDED / PARTIAL / FAILED
@@ -329,6 +331,30 @@ Read the boundaries in the diagram as follows:
   do not scale upload-worker horizontally unless multiple parser pools and
   persistence consumers are intentionally desired.
 
+#### Statistics refresh after project-level bulk changes
+
+PostgreSQL's automatic ANALYZE threshold is calculated for the whole table. A
+project can therefore finish a large delete, import, or reparse while still
+remaining below the threshold of a large table shared by many projects, leaving
+the planner with stale project-column estimates. After a project mutation is
+committed, the application now performs one explicit refresh of the statistics
+used by the project catalogue and derived read paths. `ProjectDataRemovalService`
+refreshes immediately after its delete transaction commits. The unified
+`upload-worker` coalesces affected project IDs in memory and runs one refresh
+when both the staged queue and the compatibility pending-ingestion queue are
+empty; a graceful shutdown flushes the final set as well. Continuous one-file
+uploads therefore do not run ANALYZE once per file while the queue remains busy.
+
+The refresh is a separate post-commit maintenance transaction over the targeted
+columns of the artifact, ingestion, parse, frame, geometry,
+project-geometry-catalogue, and reaction-profile tables. It is never held inside a long parse or delete
+transaction. The offline `reparse_overlapping_artifacts.py`,
+`reimport_artifact_objects.py`, and `clear_artifact_parse_results.py` commands
+use the same service at their project boundary. PostgreSQL ANALYZE is inherently
+table-wide: project IDs coalesce the trigger boundary and identify the log
+entry, but do not limit sampling to one project. A refresh failure is logged as
+best effort and does not roll back an already successful business transaction.
+
 Browser, MCP, and remote API uploads skip the CLI fingerprint pool and local
 candidate queue: the entry point stores bytes in RustFS and marks the item
 `staged`, then the independent `upload-worker` claims a
@@ -348,10 +374,11 @@ passes the microbatch through `reparse_batch` to `upload_batch`. The client
 one-file submissions for the same project/user are merged into one microbatch,
 and different project/user microbatches are committed sequentially. Within a
 microbatch, the same result queue and single consumer call `persist_parsed_files`
-for every 32 parsed results (or when the queue is temporarily empty), and commit
-at that bounded persistence boundary; persistence must not wait until all 64
-claimed files have parsed. Thus `64` is the claim window and `32` is the commit
-microbatch, while actual parser concurrency is controlled only by the shared MolOP pool's
+for every eight completed files (or when the queue is temporarily empty), and commit
+at that bounded persistence boundary. A second ceiling of 128 parsed frames prevents
+multi-frame files from creating an oversized transaction. Persistence must not wait until
+all 64 claimed files have parsed. Thus `64` is the claim window and the
+eight-file/128-frame limit is the commit microbatch, while actual parser concurrency is controlled only by the shared MolOP pool's
 `TRICYCLE_MOLOP_BATCH_N_JOBS` (normally `16` on a dedicated host). The durable
 bulk/reparse transaction also uses the previous legacy bulk hot path: reaction-SMILES
 topology caching and one set-based Geometry match remain enabled, while later
@@ -428,14 +455,14 @@ Browser and remote API uploads use the independent durable `upload-worker`, so
 do not confuse its controls with the local `IMPORT_*` variables.
 `TRICYCLE_UPLOAD_MAX_CONCURRENCY=8` limits RustFS reads and
 `TRICYCLE_MAX_BATCH_FILES=64` is the worker claim window; persistence commits
-are bounded to 32 results per microbatch;
+are bounded to eight completed files or 128 parsed frames per microbatch;
 `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` is only for pending-ingestion recovery.
 A dedicated compute host may use `TRICYCLE_MOLOP_BATCH_N_JOBS=16` for the
 shared parser pool, subject to CPU, memory, and database write-latency checks.
 
 The worker claim window does not define a database transaction: it does not
-serialize 64 files or change the internal 32-result hand-off. Persistence commits
-are bounded to that 32-result microbatch. Local CLI
+serialize 64 files or change the internal eight-file/128-frame hand-off.
+Persistence commits are bounded to that microbatch. Local CLI
 `IMPORT_COMMIT_BATCH_FILES` is retained for compatibility and does not control
 worker parsing or persistence. These controls belong to staging backpressure,
 parser admission, and worker commit boundaries respectively and must not

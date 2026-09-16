@@ -7,8 +7,9 @@ import { api, artifactDownloadUrl } from "@/api";
 import { emptyArtifactFilters, type ArtifactFilterValues, type ArtifactSort, type ArtifactSortBy } from "@/artifactQuery";
 import { formatBytes, formatDurationSeconds, labelFor, shortId, statusTone } from "@/format";
 import { CATALOG_PAGE_SIZE_MAX } from "@/pagination";
+import { queryClient } from "@/queryClient";
 import { withoutAccessState } from "@/routeAccessState";
-import type { ArtifactSummary, CalculationFrameSummary, CurrentUser, PageInfo } from "@/types";
+import type { ArtifactSummary, CalculationFrameSummary, CurrentUser, Page, PageInfo, UploadBatchItem } from "@/types";
 import ArtifactIngestionStatus from "./ArtifactIngestionStatus.vue";
 import CalculationFrameList from "./CalculationFrameList.vue";
 import ArtifactAdvancedQueryModal from "./ArtifactAdvancedQueryModal.vue";
@@ -115,6 +116,34 @@ function canReparseArtifact(artifact: ArtifactSummary): boolean {
 
 function canSelectArtifact(artifact: ArtifactSummary): boolean {
   return canDownloadArtifact(artifact) || canDeleteArtifact(artifact) || canReparseArtifact(artifact);
+}
+
+function applyAcceptedReparse(artifactId: string, item: UploadBatchItem): void {
+  const ingestionStatus: "pending" | "processing" =
+    item.status === "processing" || item.ingestion_status === "processing"
+      ? "processing"
+      : "pending";
+  queryClient.setQueriesData<Page<ArtifactSummary>>(
+    { queryKey: ["catalog", "artifacts"] },
+    (page) => {
+      if (!page) return page;
+      let changed = false;
+      const items = page.items.map((artifact) => {
+        if (artifact.id !== artifactId) return artifact;
+        changed = true;
+        return {
+          ...artifact,
+          ingestion_status: ingestionStatus,
+          source_frame_count: null,
+          transition_state_frame_count: null,
+          running_time_seconds: null,
+          ingestion_error_code: null,
+          ingestion_error_message: null,
+        };
+      });
+      return changed ? { ...page, items } : page;
+    },
+  );
 }
 
 const selectableArtifacts = computed(() => props.artifacts.filter(canSelectArtifact));
@@ -246,7 +275,8 @@ async function reparseArtifact(artifact: ArtifactSummary): Promise<void> {
   operationError.value = "";
   operationResult.value = "";
   try {
-    await api.reparseArtifact(artifact.id);
+    const accepted = await api.reparseArtifact(artifact.id);
+    applyAcceptedReparse(artifact.id, accepted.item);
     selectedArtifactIds.value = new Set(
       [...selectedArtifactIds.value].filter((id) => id !== artifact.id),
     );
@@ -282,7 +312,10 @@ async function executeBatchOperation(
       const artifact = artifacts[index];
       try {
         if (operation === "delete") await api.deleteArtifact(artifact.id);
-        else await api.reparseArtifact(artifact.id);
+        else {
+          const accepted = await api.reparseArtifact(artifact.id);
+          applyAcceptedReparse(artifact.id, accepted.item);
+        }
         succeeded.push(artifact);
       } catch (error) {
         failed.push({ artifact, message: operationErrorMessage(error) });

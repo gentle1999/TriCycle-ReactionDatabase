@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -259,6 +260,28 @@ def _reset_ingestion_to_pending(ingestion: ArtifactIngestion) -> None:
     ingestion.completed_at = None
     ingestion.worker_lease_id = None
     ingestion.worker_lease_expires_at = None
+
+
+def _queue_ingestion_for_reparse(
+    ingestion: ArtifactIngestion,
+    *,
+    queued_at: datetime,
+) -> None:
+    """Publish a clean pending state as soon as a reparse is accepted."""
+
+    ingestion.status = ArtifactIngestionStatus.PENDING
+    ingestion.source_frame_count = None
+    ingestion.transition_state_frame_count = None
+    ingestion.started_at = None
+    ingestion.completed_at = None
+    ingestion.worker_lease_id = None
+    ingestion.worker_lease_expires_at = None
+    ingestion.error_code = None
+    ingestion.error_message = None
+    ingestion.parser_metadata = {
+        "reparse_queued": True,
+        "queued_at": queued_at.isoformat(),
+    }
 
 
 async def _owned_batch(
@@ -633,6 +656,7 @@ class UploadBatchService:
             if artifact.storage_status is not StorageStatus.AVAILABLE:
                 raise UploadBatchConflictError("artifact bytes are not available for reparse")
 
+            now = datetime.now(UTC)
             existing = (
                 await session.exec(
                     select(UploadBatchItem, UploadBatch)
@@ -660,12 +684,39 @@ class UploadBatchService:
                         )
                     )
                 ).first()
+                if (
+                    item.status is UploadBatchItemStatus.STAGED
+                    and ingestion is not None
+                    and ingestion.status is not ArtifactIngestionStatus.PROCESSING
+                ):
+                    _queue_ingestion_for_reparse(ingestion, queued_at=now)
+                    session.add(ingestion)
+                    await session.commit()
                 return StagedUploadSubmission(
                     batch=_batch_view(batch),
-                    items=(_item_view(item, ingestion),),
+                    items=(
+                        _item_view(
+                            item,
+                            ingestion,
+                            ingestion_status=(
+                                ArtifactIngestionStatus.PROCESSING
+                                if item.status is UploadBatchItemStatus.PROCESSING
+                                else ArtifactIngestionStatus.PENDING
+                            ),
+                        ),
+                    ),
                 )
 
-            now = datetime.now(UTC)
+            ingestion = (
+                await session.exec(
+                    select(ArtifactIngestion)
+                    .where(col(ArtifactIngestion.artifact_file_id) == artifact_id)
+                    .with_for_update()
+                )
+            ).first()
+            if ingestion is not None and ingestion.status is not ArtifactIngestionStatus.PROCESSING:
+                _queue_ingestion_for_reparse(ingestion, queued_at=now)
+                session.add(ingestion)
             batch = UploadBatch(
                 project_id=artifact.project_id,
                 created_by_user_id=user_id,
@@ -704,16 +755,19 @@ class UploadBatchService:
             await session.commit()
             await session.refresh(batch)
             await session.refresh(item)
-            ingestion = (
-                await session.exec(
-                    select(ArtifactIngestion).where(
-                        col(ArtifactIngestion.artifact_file_id) == artifact_id
-                    )
-                )
-            ).first()
             return StagedUploadSubmission(
                 batch=_batch_view(batch),
-                items=(_item_view(item, ingestion),),
+                items=(
+                    _item_view(
+                        item,
+                        ingestion,
+                        ingestion_status=(
+                            ingestion.status
+                            if ingestion is not None
+                            else ArtifactIngestionStatus.PENDING
+                        ),
+                    ),
+                ),
             )
 
     @staticmethod
@@ -1506,12 +1560,36 @@ class UploadBatchService:
             return _batch_view(batch)
 
     @classmethod
-    async def recover_stale(cls, *, limit: int = 100) -> int:
-        """Recover leases left by a crashed API or worker process."""
+    async def recover_stale(
+        cls,
+        *,
+        limit: int = 100,
+        recover_unexpired_processing: bool = False,
+    ) -> int:
+        """Recover leases left by a crashed API or worker process.
+
+        Normal polling only reclaims expired leases. A worker restart is a
+        stronger boundary: the process that owned every unexpired processing
+        lease is gone, so startup recovery must return those rows to ``staged``
+        before the new worker starts claiming work. The stronger mode is
+        intentionally explicit and is used only once by the single deployed
+        upload worker.
+        """
 
         settings = get_settings()
         now = datetime.now(UTC)
         upload_cutoff = now - timedelta(seconds=settings.upload_client_lease_seconds)
+        processing_recovery = (
+            col(UploadBatchItem.status) == UploadBatchItemStatus.PROCESSING
+            if recover_unexpired_processing
+            else and_(
+                col(UploadBatchItem.status) == UploadBatchItemStatus.PROCESSING,
+                or_(
+                    col(UploadBatchItem.worker_lease_expires_at).is_(None),
+                    col(UploadBatchItem.worker_lease_expires_at) <= now,
+                ),
+            )
+        )
         statement = (
             select(UploadBatchItem, UploadBatch)
             .join(UploadBatch, col(UploadBatch.id) == col(UploadBatchItem.batch_id))
@@ -1528,13 +1606,7 @@ class UploadBatchService:
                         col(UploadBatchItem.status) == UploadBatchItemStatus.UPLOADING,
                         col(UploadBatchItem.updated_at) <= upload_cutoff,
                     ),
-                    and_(
-                        col(UploadBatchItem.status) == UploadBatchItemStatus.PROCESSING,
-                        or_(
-                            col(UploadBatchItem.worker_lease_expires_at).is_(None),
-                            col(UploadBatchItem.worker_lease_expires_at) <= now,
-                        ),
-                    ),
+                    processing_recovery,
                 ),
             )
             .order_by(col(UploadBatchItem.updated_at), col(UploadBatchItem.id))
@@ -1570,16 +1642,23 @@ class UploadBatchService:
                 )
                 .exists()
             )
+            compatibility_processing_recovery = (
+                col(ArtifactIngestion.status) == ArtifactIngestionStatus.PROCESSING
+                if recover_unexpired_processing
+                else and_(
+                    col(ArtifactIngestion.status) == ArtifactIngestionStatus.PROCESSING,
+                    or_(
+                        col(ArtifactIngestion.worker_lease_id).is_(None),
+                        col(ArtifactIngestion.worker_lease_expires_at).is_(None),
+                        col(ArtifactIngestion.worker_lease_expires_at) <= now,
+                    ),
+                )
+            )
             stale_ingestions = (
                 await session.exec(
                     select(ArtifactIngestion)
                     .where(
-                        col(ArtifactIngestion.status) == ArtifactIngestionStatus.PROCESSING,
-                        or_(
-                            col(ArtifactIngestion.worker_lease_id).is_(None),
-                            col(ArtifactIngestion.worker_lease_expires_at).is_(None),
-                            col(ArtifactIngestion.worker_lease_expires_at) <= now,
-                        ),
+                        compatibility_processing_recovery,
                         ~has_upload_item,
                     )
                     .order_by(col(ArtifactIngestion.started_at).nulls_first())
@@ -2170,6 +2249,191 @@ class UploadBatchService:
             session.add(batch)
             await session.commit()
             return _item_view(item, ingestion)
+
+    @classmethod
+    async def finish_processing_batch(
+        cls,
+        jobs: list[UploadProcessingJob],
+        results: Mapping[UUID, object | None],
+    ) -> int:
+        """Publish one worker group with one set of locks and one commit.
+
+        ``reparse_batch`` already persists a project/user group in one
+        transaction. Finalizing every one-file upload batch through
+        ``finish_processing`` immediately afterwards used to reopen one
+        transaction per file, which made a large reparse look stalled after
+        its actual parse/write work had completed. Lock all involved rows in
+        deterministic order and update them together instead.
+        """
+
+        if not jobs:
+            return 0
+
+        from tricycle_reaction_db.application.dtos import ArtifactUploadResult
+
+        batch_ids = tuple(sorted({job.batch_id for job in jobs}, key=str))
+        item_ids = tuple(sorted({job.item_id for job in jobs}, key=str))
+        artifact_ids = tuple(sorted({job.artifact_file_id for job in jobs}, key=str))
+        result_ingestion_ids = tuple(
+            sorted(
+                {
+                    value.ingestion_id
+                    for value in results.values()
+                    if isinstance(value, ArtifactUploadResult) and value.ingestion_id is not None
+                },
+                key=str,
+            )
+        )
+        async with session_factory() as session:
+            batches = (
+                await session.exec(
+                    select(UploadBatch)
+                    .where(col(UploadBatch.id).in_(batch_ids))
+                    .order_by(col(UploadBatch.id))
+                    .with_for_update()
+                )
+            ).all()
+            items = (
+                await session.exec(
+                    select(UploadBatchItem)
+                    .where(col(UploadBatchItem.id).in_(item_ids))
+                    .order_by(col(UploadBatchItem.id))
+                    .with_for_update()
+                )
+            ).all()
+            ingestions = (
+                await session.exec(
+                    select(ArtifactIngestion).where(
+                        or_(
+                            col(ArtifactIngestion.artifact_file_id).in_(artifact_ids),
+                            col(ArtifactIngestion.id).in_(result_ingestion_ids),
+                        )
+                    )
+                )
+            ).all()
+            batches_by_id = {batch.id: batch for batch in batches}
+            items_by_id = {item.id: item for item in items}
+            ingestions_by_id = {ingestion.id: ingestion for ingestion in ingestions}
+            ingestions_by_artifact_id = {
+                ingestion.artifact_file_id: ingestion for ingestion in ingestions
+            }
+            failure_statuses = {
+                ArtifactIngestionStatus.PENDING,
+                ArtifactIngestionStatus.PROCESSING,
+                ArtifactIngestionStatus.FAILED,
+                ArtifactIngestionStatus.FILTERED,
+            }
+            now = datetime.now(UTC)
+            finalized = 0
+            for job in jobs:
+                batch = batches_by_id.get(job.batch_id)
+                item = items_by_id.get(job.item_id)
+                if (
+                    batch is None
+                    or item is None
+                    or item.status is not UploadBatchItemStatus.PROCESSING
+                    or item.worker_lease_id != job.lease_id
+                ):
+                    continue
+
+                raw_result = results.get(job.artifact_file_id)
+                upload_result = (
+                    raw_result if isinstance(raw_result, ArtifactUploadResult) else None
+                )
+                error = raw_result if isinstance(raw_result, Exception) else None
+                result_ingestion_id = (
+                    upload_result.ingestion_id if upload_result is not None else None
+                )
+                if result_ingestion_id is not None:
+                    ingestion = ingestions_by_id.get(result_ingestion_id)
+                else:
+                    ingestion = ingestions_by_artifact_id.get(job.artifact_file_id)
+                failed = (
+                    error is not None
+                    or upload_result is None
+                    or upload_result.ingestion_status in failure_statuses
+                )
+                batch.processing_count = max(0, batch.processing_count - 1)
+                item.worker_lease_id = None
+                item.worker_lease_expires_at = None
+                if (
+                    failed
+                    and ingestion is not None
+                    and ingestion.status
+                    in {ArtifactIngestionStatus.PENDING, ArtifactIngestionStatus.PROCESSING}
+                ):
+                    ingestion.status = ArtifactIngestionStatus.FAILED
+                    ingestion.completed_at = now
+                    ingestion.worker_lease_id = None
+                    ingestion.worker_lease_expires_at = None
+                    ingestion.error_code = (
+                        getattr(error, "error_code", None)
+                        if error is not None
+                        else "ingestion_failed"
+                    ) or "ingestion_failed"
+                    ingestion.error_message = (
+                        str(error) or type(error).__name__
+                        if error is not None
+                        else "artifact processing failed"
+                    )
+                    session.add(ingestion)
+                if upload_result is not None:
+                    item.artifact_file_id = upload_result.artifact_id
+                    item.parse_revision_id = upload_result.parse_revision_id
+                    item.materialization_status = ImportMaterializationStatus.SUCCEEDED.value
+                if failed:
+                    item.status = UploadBatchItemStatus.FAILED
+                    item.parse_status = (
+                        ImportParseStatus.FILTERED.value
+                        if upload_result is not None
+                        and upload_result.ingestion_status is ArtifactIngestionStatus.FILTERED
+                        else ImportParseStatus.FAILED.value
+                    )
+                    batch.failed_count += 1
+                    item.error_code = (
+                        getattr(error, "error_code", None)
+                        if error is not None
+                        else ingestion.error_code
+                        if ingestion is not None
+                        else "ingestion_failed"
+                    ) or "ingestion_failed"
+                    item.error_message = (
+                        str(error) or type(error).__name__
+                        if error is not None
+                        else ingestion.error_message
+                        if ingestion is not None
+                        else "artifact processing failed"
+                    )
+                    phase = "failed"
+                else:
+                    item.status = UploadBatchItemStatus.SUCCEEDED
+                    item.parse_status = (
+                        ImportParseStatus.PARTIAL.value
+                        if upload_result is not None
+                        and upload_result.ingestion_status is ArtifactIngestionStatus.PARTIAL
+                        else ImportParseStatus.SUCCEEDED.value
+                    )
+                    batch.succeeded_count += 1
+                    item.error_code = None
+                    item.error_message = None
+                    phase = "completed"
+                item.metadata_json = _with_upload_progress(
+                    item.metadata_json,
+                    phase=phase,
+                    completed=1,
+                    total=1,
+                )
+                item.updated_at = now
+                batch.updated_at = now
+                session.add(item)
+                finalized += 1
+
+            if finalized:
+                for batch in batches:
+                    _finish_batch_if_terminal(batch)
+                    session.add(batch)
+                await session.commit()
+            return finalized
 
 
 __all__ = [

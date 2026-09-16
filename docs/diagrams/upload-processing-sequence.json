@@ -45,7 +45,7 @@
     { "from": "molop", "to": "worker", "y": 768, "label": "返回帧 / 拓扑 / 反应证据", "variant": "return" },
     { "from": "worker", "to": "committer", "y": 810, "label": "结果进入有界持久化队列", "variant": "emphasis" },
     { "from": "committer", "to": "postgres", "y": 852, "label": "队列为空：仅写入预加载结果，不提交", "variant": "default" },
-    { "from": "committer", "to": "postgres", "y": 894, "label": "累计 32 个结果：提交一次微批事务", "variant": "emphasis" },
+    { "from": "committer", "to": "postgres", "y": 894, "label": "累计 8 个结果或 128 帧：提交一次微批事务", "variant": "emphasis" },
     { "from": "committer", "to": "postgres", "y": 936, "label": "当前领取窗口结束：提交剩余结果", "variant": "emphasis" },
     { "from": "committer", "to": "worker", "y": 978, "label": "项目 / 用户组完成，串行处理下一组", "variant": "return" },
     { "from": "worker", "to": "postgres", "y": 1020, "label": "逐项完成 UploadBatchItem 状态", "variant": "default" },
@@ -86,7 +86,7 @@
       "dot": "emerald",
       "title": "微批提交语义",
       "items": [
-        "有界队列满 32 个结果时提交一次",
+        "有界队列达到 8 个结果或 128 帧时提交一次",
         "队列为空只刷新预加载结果，不触发提交",
         "领取窗口结束时提交剩余结果"
       ]

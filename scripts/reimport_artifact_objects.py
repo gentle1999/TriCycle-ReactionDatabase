@@ -30,6 +30,9 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
     ArtifactUploadService,
     close_molop_process_pool,
 )
+from tricycle_reaction_db.application.services.database_statistics import (
+    refresh_project_statistics,
+)
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import ArtifactFile, ArtifactIngestion
 from tricycle_reaction_db.db.session import session_factory
@@ -762,6 +765,10 @@ async def _run(args: argparse.Namespace) -> int:
                         flush=True,
                     )
                 processed += len(batch)
+            await refresh_project_statistics(
+                (project_id,),
+                reason="artifact-object-reimport-complete",
+            )
     finally:
         for store in stores.values():
             store.close()

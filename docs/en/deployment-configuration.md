@@ -84,12 +84,15 @@ delegating to the shared MolOP process pool and single persistence consumer. It
 does not upload the object again or add a parser per request. `TRICYCLE_UPLOAD_MAX_CONCURRENCY` limits RustFS reads,
 `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` is retained for pending-ingestion
 recovery, and `TRICYCLE_MOLOP_BATCH_N_JOBS` is the shared parser-pool admission
-limit. Inside `upload_batch`, every 32 parsed results (or a temporarily empty
-result queue) are handed to the single persistence consumer. The client
+limit. Inside `upload_batch`, every eight completed files (or a temporarily
+empty result queue) are handed to the single persistence consumer. The
+persistence transaction is also capped at eight completed files or 128 parsed
+frames, whichever limit is reached first. The client
 `UploadBatch` is only a queue/progress boundary, not a persistence boundary:
 one-file submissions for the same project/user are merged into one persistence
 microbatch, while different project/user microbatches are committed
-sequentially, with each persistence microbatch committed at 32 results.
+sequentially, with each persistence microbatch committed at the bounded
+eight-file/128-frame boundary.
 Neither boundary changes the configured parser-pool admission target, and these
 controls must not be multiplied.
 The bulk path keeps the previous legacy hot-path behavior; per-file
