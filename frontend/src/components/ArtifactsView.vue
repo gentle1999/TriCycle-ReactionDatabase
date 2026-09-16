@@ -6,6 +6,7 @@ import { RouterLink, useRoute } from "vue-router";
 import { api, artifactDownloadUrl } from "@/api";
 import { emptyArtifactFilters, type ArtifactFilterValues, type ArtifactSort, type ArtifactSortBy } from "@/artifactQuery";
 import { formatBytes, formatDurationSeconds, labelFor, shortId, statusTone } from "@/format";
+import { CATALOG_PAGE_SIZE_MAX } from "@/pagination";
 import { withoutAccessState } from "@/routeAccessState";
 import type { ArtifactSummary, CalculationFrameSummary, CurrentUser, PageInfo } from "@/types";
 import ArtifactIngestionStatus from "./ArtifactIngestionStatus.vue";
@@ -29,6 +30,7 @@ const props = defineProps<{
   framesError: string;
   total: number;
   page: PageInfo;
+  pageSize: number;
   sort: ArtifactSort;
 }>();
 
@@ -44,6 +46,7 @@ const emit = defineEmits<{
   previousPage: [];
   nextPage: [];
   jumpPage: [offset: number];
+  pageSizeChange: [pageSize: number];
   applyFilters: [filters: ArtifactFilterValues];
   updateSort: [sort: ArtifactSort];
 }>();
@@ -72,6 +75,7 @@ const selectedArtifactIds = ref<Set<string>>(new Set());
 const operationArtifactId = ref<string | null>(null);
 const operationKind = ref<ArtifactOperation | null>(null);
 const batchOperation = ref<ArtifactOperation | null>(null);
+const batchDownloadBusy = ref(false);
 const batchProgress = ref({ completed: 0, total: 0 });
 const operationError = ref("");
 const operationResult = ref("");
@@ -92,8 +96,15 @@ const reparseableProjectIds = computed(() => new Set(
     .filter((project) => project.permissions.includes("artifact:upload"))
     .map((project) => project.project_id),
 ));
+const downloadableProjectIds = computed(() => new Set(
+  (props.currentUser?.projects ?? [])
+    .filter((project) => project.permissions.includes("artifact:download"))
+    .map((project) => project.project_id),
+));
 
-const operationBusy = computed(() => operationArtifactId.value !== null || batchOperation.value !== null);
+const operationBusy = computed(() =>
+  operationArtifactId.value !== null || batchOperation.value !== null || batchDownloadBusy.value,
+);
 
 function canReparseArtifact(artifact: ArtifactSummary): boolean {
   return artifact.artifact_kind === "calculation_output"
@@ -103,11 +114,12 @@ function canReparseArtifact(artifact: ArtifactSummary): boolean {
 }
 
 function canSelectArtifact(artifact: ArtifactSummary): boolean {
-  return canDeleteArtifact(artifact) || canReparseArtifact(artifact);
+  return canDownloadArtifact(artifact) || canDeleteArtifact(artifact) || canReparseArtifact(artifact);
 }
 
 const selectableArtifacts = computed(() => props.artifacts.filter(canSelectArtifact));
 const selectedArtifacts = computed(() => props.artifacts.filter((artifact) => selectedArtifactIds.value.has(artifact.id)));
+const selectedDownloadableArtifacts = computed(() => selectedArtifacts.value.filter(canDownloadArtifact));
 const selectedDeletableArtifacts = computed(() => selectedArtifacts.value.filter(canDeleteArtifact));
 const selectedReparseableArtifacts = computed(() => selectedArtifacts.value.filter(canReparseArtifact));
 const allSelectableSelected = computed(() =>
@@ -185,6 +197,11 @@ function sortButtonLabel(sortBy: ArtifactSortBy, label: string): string {
 
 function canDeleteArtifact(artifact: ArtifactSummary): boolean {
   return deletableProjectIds.value.has(artifact.project_id);
+}
+
+function canDownloadArtifact(artifact: ArtifactSummary): boolean {
+  return artifact.storage_status === "available"
+    && (artifact.visibility === "public" || downloadableProjectIds.value.has(artifact.project_id));
 }
 
 function operationErrorMessage(error: unknown): string {
@@ -279,6 +296,34 @@ async function executeBatchOperation(
   const workerCount = Math.min(4, artifacts.length);
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
   return { succeeded, failed };
+}
+
+async function downloadSelectedArtifacts(): Promise<void> {
+  if (operationBusy.value) return;
+  const candidates = selectedDownloadableArtifacts.value;
+  if (!candidates.length) return;
+
+  const projectId = props.selectedProjectId ?? candidates[0]?.project_id;
+  if (!projectId) {
+    operationError.value = "当前项目不可用，无法批量下载";
+    return;
+  }
+
+  batchDownloadBusy.value = true;
+  operationError.value = "";
+  operationResult.value = "";
+  try {
+    api.submitArtifactBatchDownload(
+      candidates.map((artifact) => artifact.id),
+      projectId,
+    );
+    clearSelection();
+    operationResult.value = `已开始下载：${candidates.length} 个文件`;
+  } catch (error) {
+    operationError.value = `批量下载失败：${operationErrorMessage(error)}`;
+  } finally {
+    batchDownloadBusy.value = false;
+  }
 }
 
 async function operateSelected(operation: ArtifactOperation): Promise<void> {
@@ -381,7 +426,7 @@ watch(
           <h2 id="artifact-results-title">文件目录</h2>
         </div>
         <div class="catalog-header-actions">
-          <PaginationControls :page="page" label="原始文件分页（顶部）" @previous="emit('previousPage')" @next="emit('nextPage')" @jump="emit('jumpPage', $event)" />
+          <PaginationControls :page="page" :page-size="pageSize" :max-page-size="CATALOG_PAGE_SIZE_MAX" label="原始文件分页（顶部）" @previous="emit('previousPage')" @next="emit('nextPage')" @jump="emit('jumpPage', $event)" @page-size-change="emit('pageSizeChange', $event)" />
         </div>
       </header>
       <div class="catalog-query-status-slot" aria-live="polite">
@@ -391,10 +436,22 @@ watch(
       <div v-if="selectedArtifacts.length" class="artifact-bulk-toolbar" aria-live="polite">
         <div class="artifact-bulk-summary">
           <strong>已选 {{ selectedArtifacts.length }} 个当前页文件</strong>
-          <span v-if="batchOperation">{{ batchOperation === "delete" ? "正在批量删除" : "正在批量重解析" }} {{ batchProgress.completed }} / {{ batchProgress.total }}</span>
-          <span v-else>删除 {{ selectedDeletableArtifacts.length }} 个 · 重解析 {{ selectedReparseableArtifacts.length }} 个</span>
+          <span v-if="batchDownloadBusy">正在打包下载 {{ selectedDownloadableArtifacts.length }} 个</span>
+          <span v-else-if="batchOperation">{{ batchOperation === "delete" ? "正在批量删除" : "正在批量重解析" }} {{ batchProgress.completed }} / {{ batchProgress.total }}</span>
+          <span v-else>下载 {{ selectedDownloadableArtifacts.length }} 个 · 删除 {{ selectedDeletableArtifacts.length }} 个 · 重解析 {{ selectedReparseableArtifacts.length }} 个</span>
         </div>
         <div class="artifact-bulk-actions">
+          <button
+            v-if="selectedDownloadableArtifacts.length"
+            class="command-button"
+            type="button"
+            :disabled="operationBusy"
+            @click="downloadSelectedArtifacts"
+          >
+            <LoaderCircle v-if="batchDownloadBusy" class="is-spinning" :size="15" aria-hidden="true" />
+            <Download v-else :size="15" aria-hidden="true" />
+            批量下载 {{ selectedDownloadableArtifacts.length }} 个
+          </button>
           <button
             v-if="selectedReparseableArtifacts.length"
             class="command-button"
@@ -608,7 +665,7 @@ watch(
         </tbody>
       </table>
     </div>
-    <PaginationControls :page="page" label="原始文件分页（底部）" @previous="emit('previousPage')" @next="emit('nextPage')" @jump="emit('jumpPage', $event)" />
+    <PaginationControls :page="page" :page-size="pageSize" :max-page-size="CATALOG_PAGE_SIZE_MAX" label="原始文件分页（底部）" @previous="emit('previousPage')" @next="emit('nextPage')" @jump="emit('jumpPage', $event)" @page-size-change="emit('pageSizeChange', $event)" />
     <p class="table-summary">{{ total >= 0 ? `显示 ${artifacts.length} / ${total} 个文件` : `本页显示 ${artifacts.length} 个文件` }}</p>
     </section>
     <ArtifactAdvancedQueryModal :open="advancedQueryOpen" :initial-filters="queryFilters" @close="advancedQueryOpen = false" @apply="applyAdvancedFilters" />

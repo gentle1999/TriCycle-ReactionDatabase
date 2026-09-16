@@ -52,6 +52,8 @@ const messages = {
       cursorPage: "第 {page} 页",
       pageInput: "页码",
       jump: "跳转",
+      pageSize: "每页数量",
+      pageSizeMax: "最多 {max}",
     },
     auth: {
       eyebrow: "Authentication",
@@ -170,6 +172,8 @@ const messages = {
       cursorPage: "Page {page}",
       pageInput: "Page",
       jump: "Go",
+      pageSize: "Rows per page",
+      pageSizeMax: "max {max}",
     },
     auth: {
       eyebrow: "Authentication",

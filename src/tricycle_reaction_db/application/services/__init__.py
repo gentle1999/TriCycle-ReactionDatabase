@@ -25,6 +25,7 @@ from tricycle_reaction_db.application.services.artifact_content import (
     artifact_preview_available,
     detect_artifact_media_type,
     iter_artifact_download,
+    write_artifact_archive,
 )
 from tricycle_reaction_db.application.services.artifact_management import (
     ArtifactManagementService,
@@ -136,6 +137,12 @@ from tricycle_reaction_db.application.services.organization_management import (
     OrganizationManagementError,
     OrganizationManagementNotFoundError,
     OrganizationManagementService,
+)
+from tricycle_reaction_db.application.services.project_data_removal import (
+    ProjectDataRemovalConflictError,
+    ProjectDataRemovalError,
+    ProjectDataRemovalNotFoundError,
+    ProjectDataRemovalService,
 )
 from tricycle_reaction_db.application.services.project_management import (
     ProjectManagementConflictError,
@@ -284,6 +291,7 @@ __all__ = [
     "ArtifactObjectIntegrityError",
     "ArtifactPreviewUnsupportedError",
     "ArtifactUnavailableError",
+    "write_artifact_archive",
     "ArtifactManagementService",
     "ArtifactMetadataConflictError",
     "ArtifactRemovalError",
@@ -298,6 +306,10 @@ __all__ = [
     "ProjectManagementNotFoundError",
     "ReactionThermodynamicAnalyticsService",
     "ProjectManagementService",
+    "ProjectDataRemovalConflictError",
+    "ProjectDataRemovalError",
+    "ProjectDataRemovalNotFoundError",
+    "ProjectDataRemovalService",
     "OrganizationManagementConflictError",
     "OrganizationManagementError",
     "OrganizationManagementAccessDeniedError",

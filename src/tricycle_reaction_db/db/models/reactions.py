@@ -7,6 +7,7 @@ from uuid import UUID
 from molalchemy.rdkit.index import RdkitIndex
 from molalchemy.rdkit.types import RdkitBitFingerprint, RdkitReaction
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     Column,
     Computed,
@@ -35,6 +36,7 @@ from tricycle_reaction_db.domain.enums import (
     MappedReactionKind,
     MappedReactionNodeRole,
     ReactionClass,
+    ThermodynamicProfileSourceVisibility,
     WorkflowManifestStatus,
     string_enum,
 )
@@ -461,6 +463,11 @@ class MappedReaction(SQLModel, table=True):
             "logical_reaction_id", "mapped_reaction_key", name="uq_mapped_reaction_key"
         ),
         UniqueConstraint("logical_reaction_id", "mapping_hash", name="uq_mapped_reaction_hash"),
+        Index(
+            "ix_mapped_reaction_project_logical_reaction_id",
+            "project_id",
+            "logical_reaction_id",
+        ),
         CheckConstraint(f"mapping_hash ~ '{_HASH_PATTERN}'", name="ck_mapping_hash_hex"),
         CheckConstraint(
             f"reaction_structural_bfp_schema_version = '{REACTION_STRUCTURAL_BFP_SCHEMA_VERSION}'",
@@ -588,6 +595,11 @@ class MappedReactionThermodynamicProfile(SQLModel, table=True):
             "mapped_reaction_id",
             "activation_gibbs_free_energy_kcal_mol",
         ),
+        Index(
+            "ix_mapped_reaction_thermodynamic_source_visibility",
+            "mapped_reaction_id",
+            "source_visibility_status",
+        ),
         CheckConstraint(
             "reactants IS NOT NULL OR transition_state IS NOT NULL",
             name="ck_mapped_rxn_profile_has_thermodynamic_state",
@@ -615,6 +627,21 @@ class MappedReactionThermodynamicProfile(SQLModel, table=True):
     created_at: datetime | None = created_at_field()
     mapped_reaction_id: UUID = Field(
         foreign_key="mapped_reaction.id", ondelete="CASCADE", index=True, nullable=False
+    )
+    source_visibility_status: ThermodynamicProfileSourceVisibility = Field(
+        default=ThermodynamicProfileSourceVisibility.UNKNOWN,
+        sa_column=Column(
+            string_enum(
+                ThermodynamicProfileSourceVisibility,
+                name="thermodynamic_profile_source_visibility",
+            ),
+            nullable=False,
+            server_default=ThermodynamicProfileSourceVisibility.UNKNOWN.value,
+        ),
+    )
+    source_evidence_complete: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default=text("false")),
     )
     policy_version: str = Field(sa_type=Text, nullable=False)
     source_key_hash: str = Field(max_length=64, nullable=False)
@@ -717,6 +744,41 @@ class MappedReactionThermodynamicProfile(SQLModel, table=True):
         ),
     )
     mapped_reaction: MappedReaction = Relationship(back_populates="thermodynamic_profiles")
+
+
+class MappedReactionThermodynamicProfileSource(SQLModel, table=True):
+    """Normalized source-frame references used to maintain profile visibility."""
+
+    __tablename__ = "mapped_reaction_thermodynamic_profile_source"  # pyright: ignore[reportAssignmentType]
+    __table_args__ = (
+        UniqueConstraint(
+            "profile_id",
+            "calculation_frame_id",
+            name="uq_mapped_reaction_profile_source_frame",
+        ),
+        Index(
+            "ix_mapped_reaction_profile_source_frame_profile",
+            "calculation_frame_id",
+            "profile_id",
+        ),
+    )
+
+    id: UUID | None = uuid_primary_key_field()
+    created_at: datetime | None = created_at_field()
+    profile_id: UUID = Field(
+        foreign_key="mapped_reaction_thermodynamic_profile.id",
+        ondelete="CASCADE",
+        nullable=False,
+    )
+    calculation_frame_id: UUID = Field(
+        foreign_key="calculation_frame.id",
+        ondelete="CASCADE",
+        nullable=False,
+    )
+    allow_partial_ingestion: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default=text("false")),
+    )
 
 
 class MappedReactionParticipant(SQLModel, table=True):

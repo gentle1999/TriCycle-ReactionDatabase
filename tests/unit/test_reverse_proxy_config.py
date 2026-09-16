@@ -112,7 +112,8 @@ def test_caddy_uses_acme_tls_and_explicit_http_redirect() -> None:
     configuration = _caddy_configuration()
 
     assert "auto_https disable_redirects" in configuration
-    assert "http://{$CADDY_SERVER_NAME:localhost}:{$CADDY_HTTP_PORT:80}" in configuration
+    assert "default_bind 0.0.0.0" in configuration
+    assert "http://:{$CADDY_HTTP_PORT:80}" in configuration
     assert "redir https://{host}:{$CADDY_HTTPS_PORT:443}{uri} 308" in configuration
     assert "caddy-data" not in configuration
 

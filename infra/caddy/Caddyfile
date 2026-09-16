@@ -5,14 +5,15 @@
 	http_port {$CADDY_HTTP_PORT:80}
 	https_port {$CADDY_HTTPS_PORT:443}
 	default_sni {$CADDY_SERVER_NAME:localhost}
+	default_bind 0.0.0.0
 	auto_https disable_redirects
 }
 
-http://{$CADDY_SERVER_NAME:localhost}:{$CADDY_HTTP_PORT:80} {
+http://:{$CADDY_HTTP_PORT:80} {
 	redir https://{host}:{$CADDY_HTTPS_PORT:443}{uri} 308
 }
 
-{$CADDY_SERVER_NAME:localhost} {
+{$CADDY_CERT_NAMES:localhost}, :{$CADDY_HTTPS_PORT:443} {
 	# Long uploads and MCP streams are governed by the application. Caddy does
 	# not add a request-body limit and keeps upstream responses unbuffered.
 	header {

@@ -46,6 +46,7 @@ import {
   type ReactionSort,
 } from "./reactionQuery";
 import type { ArtifactSort } from "./artifactQuery";
+import { randomUUID } from "./uuid";
 
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
 const csrfCookieName = import.meta.env.VITE_CSRF_COOKIE_NAME?.trim() || "example_csrf";
@@ -79,6 +80,61 @@ function csrfHeaders(): Record<string, string> {
     .find((item) => item.startsWith(cookiePrefix))
     ?.slice(cookiePrefix.length);
   return token ? { [csrfHeaderName]: decodeURIComponent(token) } : {};
+}
+
+export function submitArtifactBatchDownload(ids: string[], projectId: string): void {
+  const targetName = `artifact-download-${randomUUID()}`;
+  const frame = document.createElement("iframe");
+  frame.name = targetName;
+  frame.title = "";
+  frame.setAttribute("aria-hidden", "true");
+  Object.assign(frame.style, {
+    position: "fixed",
+    width: "1px",
+    height: "1px",
+    border: "0",
+    opacity: "0",
+    pointerEvents: "none",
+  });
+
+  const form = document.createElement("form");
+  form.method = "post";
+  form.action = apiUrl(
+    `/api/artifacts/batch-download/form?project_id=${encodeURIComponent(projectId)}`,
+  );
+  form.target = targetName;
+  form.enctype = "application/x-www-form-urlencoded";
+  form.style.display = "none";
+  for (const id of ids) {
+    const input = document.createElement("input");
+    input.type = "hidden";
+    input.name = "artifact_ids";
+    input.value = id;
+    form.appendChild(input);
+  }
+  for (const [name, value] of Object.entries(csrfHeaders())) {
+    const input = document.createElement("input");
+    input.type = "hidden";
+    input.name = name;
+    input.value = value;
+    form.appendChild(input);
+  }
+
+  let cleanupTimer: number | null = null;
+  const cleanup = (): void => {
+    if (cleanupTimer !== null) window.clearTimeout(cleanupTimer);
+    frame.remove();
+  };
+  cleanupTimer = window.setTimeout(cleanup, 30 * 60 * 1000);
+  document.body.append(frame, form);
+  try {
+    HTMLFormElement.prototype.submit.call(form);
+  } catch (error) {
+    cleanup();
+    throw error;
+  } finally {
+    form.remove();
+  }
 }
 
 export interface ChemistryRepresentation {
@@ -144,11 +200,16 @@ async function requestJson<T>(path: string, body: unknown, signal?: AbortSignal)
   return (await response.json()) as T;
 }
 
-async function requestBlobJson(path: string, body: unknown, signal?: AbortSignal): Promise<Blob> {
+async function requestBlob(
+  path: string,
+  body: unknown,
+  accept: string,
+  signal?: AbortSignal,
+): Promise<Blob> {
   const response = await fetch(apiUrl(path), {
     method: "POST",
     headers: {
-      accept: "text/csv",
+      accept,
       "content-type": "application/json",
       ...csrfHeaders(),
     },
@@ -167,6 +228,10 @@ async function requestBlobJson(path: string, body: unknown, signal?: AbortSignal
     throw new ApiError(response.status, detail);
   }
   return response.blob();
+}
+
+async function requestBlobJson(path: string, body: unknown, signal?: AbortSignal): Promise<Blob> {
+  return requestBlob(path, body, "text/csv", signal);
 }
 
 function reactionAnalyticsPayload(options: ReactionQueryFilters): Record<string, unknown> {
@@ -782,6 +847,7 @@ export const api = {
       })}`,
       signal,
     ),
+  submitArtifactBatchDownload,
   reparseArtifact: (id: string, signal?: AbortSignal) =>
     requestMutation<ArtifactUploadAccepted>(
       `/api/artifacts/${encodeURIComponent(id)}/reparse`,

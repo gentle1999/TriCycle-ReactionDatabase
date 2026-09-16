@@ -50,6 +50,7 @@ from tricycle_reaction_db.db.models import (
     MappedReactionNodeGeometry,
     MappedReactionParticipant,
     MappedReactionThermodynamicProfile,
+    MappedReactionThermodynamicProfileSource,
     MolecularTopology,
     ParseRevision,
     ThermochemistryResult,
@@ -61,6 +62,7 @@ from tricycle_reaction_db.domain.enums import (
     ParseCompleteness,
     ParseStatus,
     StorageStatus,
+    ThermodynamicProfileSourceVisibility,
 )
 
 
@@ -100,6 +102,15 @@ class _MappedReactionThermodynamicsInput:
     transition_state_node_ids: frozenset[UUID]
     composites: dict[UUID, GeometryEnergyComposite]
     runtimes_by_geometry: dict[UUID, dict[UUID, tuple[int, float | None]]]
+    eligible_source_frame_ids: frozenset[UUID]
+
+
+@dataclass(frozen=True, slots=True)
+class _ProfileSourceReference:
+    """One selected calculation frame and its TS-only partial-ingestion rule."""
+
+    calculation_frame_id: UUID
+    allow_partial_ingestion: bool
 
 
 def _runtime_for_geometry_ids(
@@ -431,6 +442,12 @@ def _load_mapped_reaction_thermodynamics_input(
             )
         ).all()
 
+    eligible_source_frame_ids = frozenset(
+        frame.id
+        for frame, _protocol, _thermochemistry in calculation_rows
+        if isinstance(frame.id, UUID)
+    )
+
     runtimes_by_geometry: dict[UUID, dict[UUID, tuple[int, float | None]]] = {}
     if geometry_ids:
         runtime_rows = session.exec(
@@ -481,6 +498,7 @@ def _load_mapped_reaction_thermodynamics_input(
             thermodynamic_only_geometry_ids=transition_state_geometry_ids,
         ),
         runtimes_by_geometry=runtimes_by_geometry,
+        eligible_source_frame_ids=eligible_source_frame_ids,
     )
 
 
@@ -590,13 +608,63 @@ def _build_mapped_reaction_thermodynamics(
     )
 
 
+def _profile_source_references(
+    profile: Any,
+) -> tuple[bool, tuple[_ProfileSourceReference, ...]]:
+    """Extract and validate the frame dependencies of one profile DTO."""
+
+    references: dict[UUID, bool] = {}
+    selection_count = 0
+    complete = True
+    states = (
+        (profile.reactants, False),
+        (profile.transition_state, profile.reactants is None),
+        (profile.products, False),
+    )
+    for state, allow_partial_ingestion in states:
+        if state is None:
+            continue
+        for selection in state.topologies:
+            selection_count += 1
+            electronic_frame_id = selection.electronic_source_frame_id
+            thermochemistry_frame_id = selection.thermochemistry_source_frame_id
+            if not isinstance(selection.geometry_id, UUID):
+                complete = False
+            if not isinstance(electronic_frame_id, UUID):
+                complete = False
+            if not isinstance(thermochemistry_frame_id, UUID):
+                complete = False
+            for frame_id in (electronic_frame_id, thermochemistry_frame_id):
+                if not isinstance(frame_id, UUID):
+                    continue
+                previous_allow_partial = references.get(frame_id)
+                references[frame_id] = (
+                    allow_partial_ingestion
+                    if previous_allow_partial is None
+                    else previous_allow_partial and allow_partial_ingestion
+                )
+    return (
+        selection_count > 0 and complete,
+        tuple(
+            _ProfileSourceReference(frame_id, allow_partial)
+            for frame_id, allow_partial in sorted(references.items(), key=lambda item: str(item[0]))
+        ),
+    )
+
+
 def _materialize_profile_rows(
     result: MappedReactionThermodynamics,
     runtimes_by_geometry: dict[UUID, dict[UUID, tuple[int, float | None]]],
-) -> tuple[MappedReactionThermodynamics, list[MappedReactionThermodynamicProfile]]:
+    eligible_source_frame_ids: frozenset[UUID],
+) -> tuple[
+    MappedReactionThermodynamics,
+    list[MappedReactionThermodynamicProfile],
+    list[tuple[_ProfileSourceReference, ...]],
+]:
     """Convert DTO profiles to persisted rows without database round trips."""
 
     profile_rows: list[MappedReactionThermodynamicProfile] = []
+    source_references_by_profile: list[tuple[_ProfileSourceReference, ...]] = []
     profiles_with_runtime = []
     for profile in result.profiles:
         transition_state = profile.transition_state
@@ -639,6 +707,8 @@ def _materialize_profile_rows(
         }
         profile = profile.model_copy(update=runtime_values)
         profiles_with_runtime.append(profile)
+        source_evidence_complete, source_references = _profile_source_references(profile)
+        source_references_by_profile.append(source_references)
         source_key = {
             "electronic_level": profile.electronic_level,
             "thermochemistry_level": profile.thermochemistry_level,
@@ -662,6 +732,17 @@ def _materialize_profile_rows(
                 thermochemistry_level=list(profile.thermochemistry_level),
                 temperature_kelvin=profile.temperature_kelvin,
                 pressure_atm=profile.pressure_atm,
+                source_visibility_status=(
+                    ThermodynamicProfileSourceVisibility.VISIBLE
+                    if source_evidence_complete
+                    and source_references
+                    and all(
+                        reference.calculation_frame_id in eligible_source_frame_ids
+                        for reference in source_references
+                    )
+                    else ThermodynamicProfileSourceVisibility.HIDDEN
+                ),
+                source_evidence_complete=source_evidence_complete,
                 reactants=(
                     profile.reactants.model_dump(mode="json")
                     if profile.reactants is not None
@@ -711,7 +792,11 @@ def _materialize_profile_rows(
                 **runtime_values,
             )
         )
-    return result.model_copy(update={"profiles": profiles_with_runtime}), profile_rows
+    return (
+        result.model_copy(update={"profiles": profiles_with_runtime}),
+        profile_rows,
+        source_references_by_profile,
+    )
 
 
 def _persist_profile_bounds(
@@ -791,127 +876,30 @@ def refresh_mapped_reaction_thermodynamics(
             col(MappedReactionThermodynamicProfile.mapped_reaction_id) == mapped_reaction_id
         )
     )
-    profile_rows: list[MappedReactionThermodynamicProfile] = []
-    profiles_with_runtime = []
-    for profile in result.profiles:
-        transition_state = profile.transition_state
-        products = profile.products
-        reactant_geometry_ids = (
-            {selection.geometry_id for selection in profile.reactants.topologies}
-            if profile.reactants is not None
-            else set()
-        )
-        transition_state_geometry_ids = (
-            {selection.geometry_id for selection in transition_state.topologies}
-            if transition_state is not None
-            else set()
-        )
-        product_geometry_ids = (
-            {selection.geometry_id for selection in products.topologies}
-            if products is not None
-            else set()
-        )
-        all_geometry_ids = (
-            reactant_geometry_ids | transition_state_geometry_ids | product_geometry_ids
-        )
-        runtime_values = {
-            "reactants_running_time_seconds": _runtime_for_geometry_ids(
-                reactant_geometry_ids,
-                runtimes_by_geometry,
-            ),
-            "transition_state_running_time_seconds": _runtime_for_geometry_ids(
-                transition_state_geometry_ids,
-                runtimes_by_geometry,
-            ),
-            "products_running_time_seconds": _runtime_for_geometry_ids(
-                product_geometry_ids,
-                runtimes_by_geometry,
-            ),
-            "total_running_time_seconds": _runtime_for_geometry_ids(
-                all_geometry_ids,
-                runtimes_by_geometry,
-            ),
-        }
-        profile = profile.model_copy(update=runtime_values)
-        profiles_with_runtime.append(profile)
-        source_key = {
-            "electronic_level": profile.electronic_level,
-            "thermochemistry_level": profile.thermochemistry_level,
-            "temperature_kelvin": profile.temperature_kelvin,
-            "pressure_atm": profile.pressure_atm,
-        }
-        source_key_hash = hashlib.sha256(
-            json.dumps(
-                source_key,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=True,
-            ).encode("utf-8")
-        ).hexdigest()
-        profile_rows.append(
-            cast(Any, MappedReactionThermodynamicProfile)(
-                mapped_reaction_id=mapped_reaction_id,
-                policy_version=profile.policy_version,
-                source_key_hash=source_key_hash,
-                electronic_level=list(profile.electronic_level),
-                thermochemistry_level=list(profile.thermochemistry_level),
-                temperature_kelvin=profile.temperature_kelvin,
-                pressure_atm=profile.pressure_atm,
-                reactants=(
-                    profile.reactants.model_dump(mode="json")
-                    if profile.reactants is not None
-                    else None
-                ),
-                transition_state=(
-                    transition_state.model_dump(mode="json")
-                    if transition_state is not None
-                    else None
-                ),
-                products=products.model_dump(mode="json") if products is not None else None,
-                reactants_enthalpy_hartree=(
-                    float(profile.reactants.enthalpy_hartree)
-                    if profile.reactants is not None
-                    else None
-                ),
-                reactants_gibbs_free_energy_hartree=(
-                    float(profile.reactants.gibbs_free_energy_hartree)
-                    if profile.reactants is not None
-                    else None
-                ),
-                reactants_entropy_cal_mol_k=(
-                    profile.reactants.entropy_cal_mol_k if profile.reactants is not None else None
-                ),
-                transition_state_enthalpy_hartree=(
-                    float(transition_state.enthalpy_hartree)
-                    if transition_state is not None
-                    else None
-                ),
-                transition_state_gibbs_free_energy_hartree=(
-                    float(transition_state.gibbs_free_energy_hartree)
-                    if transition_state is not None
-                    else None
-                ),
-                transition_state_entropy_cal_mol_k=(
-                    transition_state.entropy_cal_mol_k if transition_state is not None else None
-                ),
-                products_enthalpy_hartree=(
-                    float(products.enthalpy_hartree) if products is not None else None
-                ),
-                products_gibbs_free_energy_hartree=(
-                    float(products.gibbs_free_energy_hartree) if products is not None else None
-                ),
-                products_entropy_cal_mol_k=(
-                    products.entropy_cal_mol_k if products is not None else None
-                ),
-                **runtime_values,
-            )
-        )
-    result = result.model_copy(update={"profiles": profiles_with_runtime})
+    result, profile_rows, source_references_by_profile = _materialize_profile_rows(
+        result,
+        runtimes_by_geometry,
+        refresh_input.eligible_source_frame_ids,
+    )
     session.add_all(profile_rows)
     mapped_reaction.thermodynamic_profile_policy_version = (
         MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION
     )
     session.add(mapped_reaction)
+    session.flush()
+    session.add_all(
+        MappedReactionThermodynamicProfileSource(
+            profile_id=_require_id(profile_row, label="MappedReactionThermodynamicProfile"),
+            calculation_frame_id=reference.calculation_frame_id,
+            allow_partial_ingestion=reference.allow_partial_ingestion,
+        )
+        for profile_row, references in zip(
+            profile_rows,
+            source_references_by_profile,
+            strict=True,
+        )
+        for reference in references
+    )
     session.flush()
     bounds = session.exec(
         select(
@@ -1137,6 +1125,11 @@ def refresh_mapped_reactions_thermodynamics(
             if previous is None or candidate[0] > previous[0]:
                 by_file[artifact_id] = candidate
 
+    eligible_source_frame_ids = frozenset(
+        frame.id
+        for frame, _protocol, _thermochemistry in calculation_rows
+        if isinstance(frame.id, UUID)
+    )
     composites = geometry_energy_composites(
         geometry_ids,
         calculation_rows,
@@ -1144,6 +1137,7 @@ def refresh_mapped_reactions_thermodynamics(
     )
     results: list[MappedReactionThermodynamics] = []
     profile_rows: list[MappedReactionThermodynamicProfile] = []
+    source_references_by_profile: list[tuple[_ProfileSourceReference, ...]] = []
     for mapped_reaction_id, _mapped_reaction in mapped_reactions_by_id.items():
         result = _build_mapped_reaction_thermodynamics(
             mapped_reaction_id=mapped_reaction_id,
@@ -1155,12 +1149,14 @@ def refresh_mapped_reactions_thermodynamics(
             ),
             composites=composites,
         )
-        result, reaction_profile_rows = _materialize_profile_rows(
+        result, reaction_profile_rows, reaction_source_references = _materialize_profile_rows(
             result,
             runtimes_by_geometry,
+            eligible_source_frame_ids,
         )
         results.append(result)
         profile_rows.extend(reaction_profile_rows)
+        source_references_by_profile.extend(reaction_source_references)
 
     session.exec(
         delete(MappedReactionThermodynamicProfile).where(
@@ -1174,6 +1170,21 @@ def refresh_mapped_reactions_thermodynamics(
             MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION
         )
     session.add_all(mapped_reaction_values)
+    session.flush()
+    source_rows = [
+        MappedReactionThermodynamicProfileSource(
+            profile_id=_require_id(profile_row, label="MappedReactionThermodynamicProfile"),
+            calculation_frame_id=reference.calculation_frame_id,
+            allow_partial_ingestion=reference.allow_partial_ingestion,
+        )
+        for profile_row, references in zip(
+            profile_rows,
+            source_references_by_profile,
+            strict=True,
+        )
+        for reference in references
+    ]
+    session.add_all(source_rows)
     session.flush()
 
     bounds_by_reaction_id = _persist_profile_bounds(session, mapped_reaction_ids)

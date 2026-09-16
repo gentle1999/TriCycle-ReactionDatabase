@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from uuid import UUID
+from zipfile import ZIP_STORED, ZipFile
 
 from botocore.exceptions import BotoCoreError, ClientError
 from sqlalchemy import select
@@ -130,6 +132,37 @@ def iter_artifact_download(download: ArtifactDownload) -> Iterator[bytes]:
         yield from store.iter_bytes(download.object_key, version_id=download.version_id)
 
 
+def _archive_member_name(download: ArtifactDownload, used_names: set[str]) -> str:
+    candidate = download.original_filename.replace("\\", "/").rsplit("/", 1)[-1]
+    candidate = candidate.replace("\x00", "").strip() or f"artifact-{download.id}"
+    if candidate not in used_names:
+        used_names.add(candidate)
+        return candidate
+
+    path = Path(candidate)
+    stem = path.stem or "artifact"
+    suffix = path.suffix
+    duplicate_index = 2
+    while True:
+        duplicate = f"{stem} ({duplicate_index}){suffix}"
+        if duplicate not in used_names:
+            used_names.add(duplicate)
+            return duplicate
+        duplicate_index += 1
+
+
+def write_artifact_archive(downloads: list[ArtifactDownload], destination: Path) -> None:
+    """Write selected verified artifact objects to a flat ZIP archive."""
+
+    used_names: set[str] = set()
+    with ZipFile(destination, mode="w", compression=ZIP_STORED, allowZip64=True) as archive:
+        for download in downloads:
+            member_name = _archive_member_name(download, used_names)
+            with archive.open(member_name, mode="w", force_zip64=True) as target:
+                for chunk in iter_artifact_download(download):
+                    target.write(chunk)
+
+
 class ArtifactContentService:
     @staticmethod
     async def _reference(
@@ -250,4 +283,5 @@ __all__ = [
     "artifact_preview_available",
     "detect_artifact_media_type",
     "iter_artifact_download",
+    "write_artifact_archive",
 ]

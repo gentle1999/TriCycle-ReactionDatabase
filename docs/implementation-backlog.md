@@ -240,7 +240,7 @@
   分别使用 `query_budget_exceeded`、`query_rate_limit_exceeded` 和 `query_timeout` 稳定错误码；
   慢查询日志只记录 SQL 模板与耗时，不记录绑定值。未索引 descriptor/Murcko scaffold
   扫描按廉价预筛关系执行候选上限；SMARTS 和相似度阈值按 RDKit GiST 谓词后的实际候选
-  计数，纯 Top-K 由 fingerprint GiST KNN 与 `limit <= 200` 限界。Formula 精确元素计数
+计数，纯 Top-K 由 fingerprint GiST KNN 与 `limit <= 500` 限界。Formula 精确元素计数
   使用 `20260812_0033` generated token + GIN，数值范围语义仍以 118 维向量为准。
   传输/schema 专项 `25 passed`，Formula、Topology、Reaction、I3 过滤和查询成本数据库联合
   专项 `30 passed`；代表性计划命中 Formula GIN、Topology/Reaction mol/fingerprint GiST、

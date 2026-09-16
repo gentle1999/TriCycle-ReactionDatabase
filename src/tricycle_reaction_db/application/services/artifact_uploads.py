@@ -61,6 +61,7 @@ from tricycle_reaction_db.application.services._persistence import (
     _new_entity,
     _prepare_new_entity,
     _require_id,
+    _set_fast_pending_entities,
 )
 from tricycle_reaction_db.application.services.artifact_content import (
     detect_artifact_media_type,
@@ -2441,10 +2442,7 @@ def _persist_one_new_inference(
         # failed inference is recorded so the next task cannot reuse a binding
         # that never committed.
         _restore_inference_context(topology_context, context_snapshot)
-        if pending_snapshot:
-            session.info["_fast_pending_entities"] = pending_snapshot
-        else:
-            session.info.pop("_fast_pending_entities", None)
+        _set_fast_pending_entities(session, pending_snapshot)
         _add_failed_inference(
             session,
             deferred=task.deferred,
@@ -2493,6 +2491,10 @@ _RECONCILIATION_CACHE_MUTABLE_FIELDS = (
     "new_node_geometry_ids",
     "thermodynamic_property_geometry_ids",
     "affected_reactions_by_id",
+    "logical_member_reactions_by_topology",
+    "endpoint_compatible_reactions_by_topology",
+    "reaction_lookup_topologies_loaded",
+    "new_mapped_reaction_ids",
 )
 
 
@@ -2602,10 +2604,7 @@ def _persist_inference_batch(
                     )
         except Exception:
             _restore_inference_context(topology_context, context_snapshot)
-            if pending_snapshot:
-                session.info["_fast_pending_entities"] = pending_snapshot
-            else:
-                session.info.pop("_fast_pending_entities", None)
+            _set_fast_pending_entities(session, pending_snapshot)
             for task in tasks:
                 _persist_one_new_inference(
                     session,
@@ -3122,7 +3121,7 @@ def _batch_results(
     *,
     parse_revision_by_ingestion_id: Mapping[UUID, UUID | None],
     parse_revision_created_by_ingestion_id: Mapping[UUID, bool | None],
-    completion_by_ingestion_id: Mapping[UUID, _IngestionCompletion],
+    inferences_by_ingestion_id: Mapping[UUID, list[TransitionStateInference]] | None = None,
 ) -> dict[UUID, ArtifactUploadResult]:
     """Build completed upload views with two set-based reads.
 
@@ -3139,15 +3138,17 @@ def _batch_results(
         .where(col(ArtifactIngestion.id).in_(ingestion_ids))
         .options(joinedload(cast(Any, ArtifactIngestion.artifact_file)))
     ).all()
-    inferences_by_ingestion_id: dict[UUID, list[TransitionStateInference]] = {
-        ingestion_id: [] for ingestion_id in ingestion_ids
-    }
-    for inference in session.exec(
-        select(TransitionStateInference)
-        .where(col(TransitionStateInference.artifact_ingestion_id).in_(ingestion_ids))
-        .order_by(col(TransitionStateInference.file_frame_index))
-    ).all():
-        inferences_by_ingestion_id.setdefault(inference.artifact_ingestion_id, []).append(inference)
+    if inferences_by_ingestion_id is None:
+        inferences_by_ingestion_id = {ingestion_id: [] for ingestion_id in ingestion_ids}
+        for inference in session.exec(
+            select(TransitionStateInference)
+            .where(col(TransitionStateInference.artifact_ingestion_id).in_(ingestion_ids))
+            .order_by(col(TransitionStateInference.file_frame_index))
+        ).all():
+            inferences_by_ingestion_id.setdefault(
+                inference.artifact_ingestion_id,
+                [],
+            ).append(inference)
 
     results: dict[UUID, ArtifactUploadResult] = {}
     for ingestion in ingestions:
@@ -3158,31 +3159,6 @@ def _batch_results(
             for row in inferences_by_ingestion_id[ingestion_id]
             if parse_revision_id is not None and row.parse_revision_id == parse_revision_id
         ]
-        completion = completion_by_ingestion_id.get(ingestion_id)
-        if completion is not None:
-            failures = sum(row.status is TransitionStateInferenceStatus.FAILED for row in rows)
-            ingestion.status = (
-                ArtifactIngestionStatus.PARTIAL
-                if failures or completion.parse_completeness is ParseCompleteness.PARTIAL
-                else ArtifactIngestionStatus.SUCCEEDED
-            )
-            ingestion.source_frame_count = completion.source_frame_count
-            ingestion.transition_state_frame_count = completion.transition_state_frame_count
-            ingestion.completed_at = completion.completed_at
-            ingestion.worker_lease_id = None
-            ingestion.worker_lease_expires_at = None
-            ingestion.error_code = None
-            ingestion.error_message = None
-            ingestion.parser_metadata = {
-                "source_format": completion.source_format,
-                "latest_parse_revision_id": str(completion.parse_revision_id),
-                "latest_parse_revision_created": completion.parse_revision_created,
-                "ts_selection": "frame.is_TS is True",
-                "inferred_reaction_identity": "shared topology-and-atom-mapping identity",
-                "parse_completeness": completion.parse_completeness.value,
-                "parse_diagnostics": list(completion.parse_diagnostics),
-            }
-            session.add(ingestion)
         views = [
             TransitionStateInferenceView(
                 id=_require_id(row, label="TransitionStateInference"),
@@ -3221,6 +3197,82 @@ def _batch_results(
             inferences=views,
         )
     return results
+
+
+def _finalize_batch_ingestions(
+    session: Session,
+    *,
+    ingestions_by_id: Mapping[UUID, ArtifactIngestion],
+    parse_revision_by_ingestion_id: Mapping[UUID, UUID | None],
+    completion_by_ingestion_id: Mapping[UUID, _IngestionCompletion],
+) -> dict[UUID, list[TransitionStateInference]]:
+    """Publish successful parse state before any dependent reconciliation.
+
+    A persistence microbatch deliberately defers its ingestion completion
+    update until the shared transaction is ready to reconcile geometry.  The
+    thermodynamic loader uses that status as part of its source visibility
+    predicate, so completion must be durable before reconciliation refreshes
+    mapped-reaction profiles.  Keep this as one set-based read and one state
+    update pass so the result builder remains read-only.
+    """
+
+    ingestion_ids = tuple(parse_revision_by_ingestion_id)
+    inferences_by_ingestion_id: dict[UUID, list[TransitionStateInference]] = {
+        ingestion_id: [] for ingestion_id in ingestion_ids
+    }
+    for inference in session.exec(
+        select(TransitionStateInference)
+        .where(col(TransitionStateInference.artifact_ingestion_id).in_(ingestion_ids))
+        .order_by(col(TransitionStateInference.file_frame_index))
+    ).all():
+        inferences_by_ingestion_id.setdefault(
+            inference.artifact_ingestion_id,
+            [],
+        ).append(inference)
+
+    completed: dict[UUID, tuple[UUID, _IngestionCompletion]] = {}
+    for ingestion_id, parse_revision_id in parse_revision_by_ingestion_id.items():
+        completion = completion_by_ingestion_id.get(ingestion_id)
+        if parse_revision_id is not None and completion is not None:
+            completed[ingestion_id] = (parse_revision_id, completion)
+    if not completed:
+        return inferences_by_ingestion_id
+
+    failed_revision_pairs = {
+        (inference.artifact_ingestion_id, inference.parse_revision_id)
+        for ingestion_id in completed
+        for inference in inferences_by_ingestion_id[ingestion_id]
+        if inference.status is TransitionStateInferenceStatus.FAILED
+    }
+
+    for ingestion_id, (parse_revision_id, completion) in completed.items():
+        ingestion = ingestions_by_id.get(ingestion_id)
+        if ingestion is None:
+            raise RuntimeError("artifact ingestion disappeared during batch finalization")
+        has_failed_inference = (ingestion_id, parse_revision_id) in failed_revision_pairs
+        ingestion.status = (
+            ArtifactIngestionStatus.PARTIAL
+            if has_failed_inference or completion.parse_completeness is ParseCompleteness.PARTIAL
+            else ArtifactIngestionStatus.SUCCEEDED
+        )
+        ingestion.source_frame_count = completion.source_frame_count
+        ingestion.transition_state_frame_count = completion.transition_state_frame_count
+        ingestion.completed_at = completion.completed_at
+        ingestion.worker_lease_id = None
+        ingestion.worker_lease_expires_at = None
+        ingestion.error_code = None
+        ingestion.error_message = None
+        ingestion.parser_metadata = {
+            "source_format": completion.source_format,
+            "latest_parse_revision_id": str(completion.parse_revision_id),
+            "latest_parse_revision_created": completion.parse_revision_created,
+            "ts_selection": "frame.is_TS is True",
+            "inferred_reaction_identity": "shared topology-and-atom-mapping identity",
+            "parse_completeness": completion.parse_completeness.value,
+            "parse_diagnostics": list(completion.parse_diagnostics),
+        }
+        session.add(ingestion)
+    return inferences_by_ingestion_id
 
 
 def _preload_batch_persistence_state(
@@ -3403,7 +3455,7 @@ def _run_persist_parsed_artifact_savepoint(
     except Exception:
         _restore_inference_context(context, context_snapshot)
         if typed_session.info.get("tricycle_fast_insert", False):
-            typed_session.info["_fast_pending_entities"] = pending_snapshot
+            _set_fast_pending_entities(typed_session, pending_snapshot)
         raise
 
 
@@ -3736,12 +3788,27 @@ def _run_batch_results(
     *,
     parse_revision_by_ingestion_id: Mapping[UUID, UUID | None],
     parse_revision_created_by_ingestion_id: Mapping[UUID, bool | None],
-    completion_by_ingestion_id: Mapping[UUID, _IngestionCompletion],
+    inferences_by_ingestion_id: Mapping[UUID, list[TransitionStateInference]] | None = None,
 ) -> dict[UUID, ArtifactUploadResult]:
     return _batch_results(
         cast(Session, session),
         parse_revision_by_ingestion_id=parse_revision_by_ingestion_id,
         parse_revision_created_by_ingestion_id=parse_revision_created_by_ingestion_id,
+        inferences_by_ingestion_id=inferences_by_ingestion_id,
+    )
+
+
+def _run_finalize_batch_ingestions(
+    session: SQLAlchemySession,
+    *,
+    ingestions_by_id: Mapping[UUID, ArtifactIngestion],
+    parse_revision_by_ingestion_id: Mapping[UUID, UUID | None],
+    completion_by_ingestion_id: Mapping[UUID, _IngestionCompletion],
+) -> dict[UUID, list[TransitionStateInference]]:
+    return _finalize_batch_ingestions(
+        cast(Session, session),
+        ingestions_by_id=ingestions_by_id,
+        parse_revision_by_ingestion_id=parse_revision_by_ingestion_id,
         completion_by_ingestion_id=completion_by_ingestion_id,
     )
 
@@ -5312,6 +5379,7 @@ class ArtifactUploadService:
                             _run_persist_deferred_inferences,
                             deferred_inferences=deferred_inferences,
                             topology_context=geometry_context,
+                            defer_thermodynamic_refresh=True,
                         )
                     )
                     timings["persist_deferred_inferences_ms"] = (
@@ -5321,6 +5389,35 @@ class ArtifactUploadService:
                     # Inference persistence can queue additional rows after
                     # the initial revision-local flush. Make them visible
                     # before the reconciliation barrier.
+                    await session.run_sync(_run_flush)
+
+                window_parse_indices = [
+                    index for index in completed_indices if index in local_index_by_original
+                ]
+                parse_revision_by_ingestion_id: dict[UUID, UUID | None] = {}
+                parse_revision_created_by_ingestion_id: dict[UUID, bool | None] = {}
+                batch_inferences_by_ingestion_id: dict[UUID, list[TransitionStateInference]] = {}
+                for original_index in window_parse_indices:
+                    ingestion_id = _require_prepared_ingestion_id(prepared[original_index])
+                    persisted_revision = persisted_revisions_by_index.get(original_index)
+                    if persisted_revision is not None:
+                        parse_revision_by_ingestion_id[ingestion_id] = persisted_revision[0]
+                        parse_revision_created_by_ingestion_id[ingestion_id] = persisted_revision[1]
+                    else:
+                        parse_revision_by_ingestion_id[ingestion_id] = None
+                        parse_revision_created_by_ingestion_id[ingestion_id] = False
+
+                if parse_revision_by_ingestion_id:
+                    batch_inferences_by_ingestion_id = await session.run_sync(
+                        partial(
+                            _run_finalize_batch_ingestions,
+                            ingestions_by_id=persistence_ingestions_by_id,
+                            parse_revision_by_ingestion_id=parse_revision_by_ingestion_id,
+                            completion_by_ingestion_id=completion_by_ingestion_id,
+                        )
+                    )
+                    # The thermodynamic source predicate reads ingestion
+                    # status, so publish completion before reconciliation.
                     await session.run_sync(_run_flush)
 
                 reconcile_started = perf_counter()
@@ -5335,22 +5432,6 @@ class ArtifactUploadService:
                     + (perf_counter() - reconcile_started) * 1000
                 )
 
-                window_parse_indices = [
-                    index for index in completed_indices if index in local_index_by_original
-                ]
-                parse_revision_by_ingestion_id: dict[UUID, UUID | None] = {}
-                parse_revision_created_by_ingestion_id: dict[UUID, bool | None] = {}
-                for original_index in window_parse_indices:
-                    reservation = prepared[original_index]
-                    ingestion_id = _require_prepared_ingestion_id(prepared[original_index])
-                    persisted_revision = persisted_revisions_by_index.get(original_index)
-                    if persisted_revision is not None:
-                        parse_revision_by_ingestion_id[ingestion_id] = persisted_revision[0]
-                        parse_revision_created_by_ingestion_id[ingestion_id] = persisted_revision[1]
-                    else:
-                        parse_revision_by_ingestion_id[ingestion_id] = None
-                        parse_revision_created_by_ingestion_id[ingestion_id] = False
-
                 if parse_revision_by_ingestion_id:
                     result_started = perf_counter()
                     await session.run_sync(_run_flush)
@@ -5361,7 +5442,7 @@ class ArtifactUploadService:
                             parse_revision_created_by_ingestion_id=(
                                 parse_revision_created_by_ingestion_id
                             ),
-                            completion_by_ingestion_id=completion_by_ingestion_id,
+                            inferences_by_ingestion_id=batch_inferences_by_ingestion_id,
                         )
                     )
                     timings["persist_result_db_ms"] = (

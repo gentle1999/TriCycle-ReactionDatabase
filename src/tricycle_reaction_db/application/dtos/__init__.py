@@ -68,6 +68,10 @@ from tricycle_reaction_db.application.dtos.identity import (
     UserStatusUpdate,
     UserSummaryView,
 )
+from tricycle_reaction_db.application.dtos.project_data import (
+    ProjectDataRemovalPreview,
+    ProjectDataRemovalResult,
+)
 from tricycle_reaction_db.application.dtos.query_views import (
     ArtifactIngestionPage,
     ArtifactIngestionSummary,
@@ -219,6 +223,8 @@ __all__ = [
     "McpAccessTokenCreateResult",
     "McpAccessTokenView",
     "ProjectCreate",
+    "ProjectDataRemovalPreview",
+    "ProjectDataRemovalResult",
     "ProjectMemberRoleUpdate",
     "ProjectMemberUpsert",
     "ProjectMemberView",

@@ -522,6 +522,11 @@ class Geometry(SQLModel, table=True):
             "charge",
             "multiplicity",
         ),
+        # Geometry catalogue filters resolve hashes within one project before
+        # joining the project-local directory.  Keep the ownership and hash
+        # predicates together so this path does not walk every topology's
+        # geometry index entry.
+        Index("ix_geometry_project_hash_id", "project_id", "geometry_hash", "id"),
         Index("ix_geometry_created_id", "created_at", "id"),
         CheckConstraint(
             f"internal_coordinate_hash ~ '{_HASH_PATTERN}'",

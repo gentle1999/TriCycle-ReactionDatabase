@@ -3,6 +3,7 @@
 import json
 import os
 import secrets
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from hashlib import sha256
 from math import isnan
@@ -61,6 +62,9 @@ _FAST_RELATIONSHIP_BINDINGS: dict[type[Any], tuple[tuple[str, str, str], ...]] =
 _FAST_RELATIONSHIP_KEYS: dict[type[Any], frozenset[str]] = {}
 _FAST_RELATIONSHIPS: dict[type[Any], dict[str, Any]] = {}
 _FAST_MAPPERS: dict[type[Any], Any] = {}
+
+_FAST_PENDING_ENTITIES_KEY = "_fast_pending_entities"
+_FAST_PENDING_ENTITY_INDEX_KEY = "_fast_pending_entity_index"
 
 
 def _identity_lock_id(*parts: object) -> int:
@@ -149,6 +153,53 @@ def _entity_identity_key(entity: object) -> Any | None:
     return state.mapper.identity_key_from_primary_key(primary_key_values)
 
 
+def _set_fast_pending_entities(session: Session, entities: Iterable[object]) -> None:
+    """Replace the deferred-row queue and rebuild its identity index.
+
+    The fast persistence path keeps revision-local ORM objects out of the
+    unit-of-work until a batch boundary.  Relationship canonicalization used
+    to scan that growing list for every reference, turning a large write into
+    quadratic Python work.  Keep the list for insertion order and a second
+    map for identity resolution; direct restoration paths should use this
+    helper so the two views cannot diverge.
+    """
+
+    pending = entities if isinstance(entities, list) else list(entities)
+    if not pending:
+        session.info.pop(_FAST_PENDING_ENTITIES_KEY, None)
+        session.info.pop(_FAST_PENDING_ENTITY_INDEX_KEY, None)
+        return
+    session.info[_FAST_PENDING_ENTITIES_KEY] = pending
+    session.info[_FAST_PENDING_ENTITY_INDEX_KEY] = {
+        identity_key: entity
+        for entity in pending
+        if (identity_key := _entity_identity_key(entity)) is not None
+    }
+
+
+def _pop_fast_pending_entities(session: Session) -> list[object] | None:
+    """Remove and return the deferred-row queue plus its lookup index."""
+
+    pending = session.info.pop(_FAST_PENDING_ENTITIES_KEY, None)
+    session.info.pop(_FAST_PENDING_ENTITY_INDEX_KEY, None)
+    return pending if isinstance(pending, list) else None
+
+
+def _queue_fast_pending_entity(session: Session, entity: object) -> None:
+    """Append one deferred row and index its assigned ORM identity."""
+
+    pending = session.info.setdefault(_FAST_PENDING_ENTITIES_KEY, [])
+    if not isinstance(pending, list):
+        pending = list(pending)
+        session.info[_FAST_PENDING_ENTITIES_KEY] = pending
+    pending.append(entity)
+    identity_key = _entity_identity_key(entity)
+    if identity_key is not None:
+        index = session.info.setdefault(_FAST_PENDING_ENTITY_INDEX_KEY, {})
+        if isinstance(index, dict):
+            index.setdefault(identity_key, entity)
+
+
 def _copy_entity_scalar_values(
     target: object,
     source: object,
@@ -171,6 +222,11 @@ def _session_entity_for_identity(session: Session, entity: object) -> object:
     current = session.identity_map.get(identity_key)
     if current is not None:
         return current
+    pending_index = session.info.get(_FAST_PENDING_ENTITY_INDEX_KEY)
+    if isinstance(pending_index, dict):
+        current = pending_index.get(identity_key)
+        if current is not None:
+            return current
     current = next(
         (
             candidate
@@ -184,7 +240,7 @@ def _session_entity_for_identity(session: Session, entity: object) -> object:
     return next(
         (
             candidate
-            for candidate in session.info.get("_fast_pending_entities", ())
+            for candidate in session.info.get(_FAST_PENDING_ENTITIES_KEY, ())
             if candidate is not entity and _entity_identity_key(candidate) == identity_key
         ),
         entity,
@@ -401,12 +457,12 @@ def _prepare_new_entity(
 def _attach_pending_entities(session: Session) -> None:
     """Attach deferred fast-path rows in one ORM operation."""
 
-    pending = session.info.pop("_fast_pending_entities", None)
+    pending = _pop_fast_pending_entities(session)
     if pending:
         if session.info.get("tricycle_fast_insert", False) and not session.info.get(
             "tricycle_bulk_insert_disabled", False
         ):
-            session.info["_fast_pending_entities"] = pending
+            _set_fast_pending_entities(session, pending)
             _bulk_insert_pending_entities(session)
         else:
             # A persistence window may contain detached identity holders and a
@@ -414,12 +470,12 @@ def _attach_pending_entities(session: Session) -> None:
             # unconditional ``add_all`` attempts to attach both objects and
             # raises when their identity keys are equal.  Reuse the identity
             # map entry while copying the holder's scalar values instead.
-            session.info["_fast_pending_entities"] = pending
+            _set_fast_pending_entities(session, pending)
             try:
                 for entity in pending:
                     _attach_or_reuse_entity(session, entity)
             finally:
-                session.info.pop("_fast_pending_entities", None)
+                _set_fast_pending_entities(session, ())
 
 
 async def _copy_rows_to_postgresql(
@@ -453,7 +509,7 @@ def _bulk_insert_pending_entities(session: Session) -> None:
     reads use their UUIDs and normal SELECTs.
     """
 
-    pending = session.info.pop("_fast_pending_entities", None)
+    pending = _pop_fast_pending_entities(session)
     if not pending:
         return
     diagnostics = session.info.setdefault(
@@ -478,7 +534,7 @@ def _bulk_insert_pending_entities(session: Session) -> None:
         if object_identity in seen_entity_objects:
             continue
         seen_entity_objects.add(object_identity)
-        state = sa_inspect(entity)
+        state = cast(Any, sa_inspect(entity))
         state_name = (
             "transient"
             if state.transient
@@ -501,7 +557,7 @@ def _bulk_insert_pending_entities(session: Session) -> None:
             # identity de-duplication so a duplicate pending object cannot be
             # flushed later by the ORM after its Core row was inserted.
             session.expunge(entity)
-            state = sa_inspect(entity)
+            state = cast(Any, sa_inspect(entity))
         identity_key = _entity_identity_key(entity)
         if identity_key is not None:
             # A single persistence window can discover the same client-side
@@ -645,7 +701,7 @@ def _flush_new_entity(session: Session, entity: object, *, label: str) -> None:
     fast_insert = session.info.get("tricycle_fast_insert", False)
     _prepare_new_entity(session, entity, attach=not fast_insert)
     if fast_insert:
-        session.info.setdefault("_fast_pending_entities", []).append(entity)
+        _queue_fast_pending_entity(session, entity)
     # Defer new revision-local children so SQLAlchemy can batch them by table.
     if not fast_insert:
         session.flush()
@@ -671,7 +727,7 @@ def _flush_shared_entity(
     fast_insert = session.info.get("tricycle_fast_insert", False)
     _prepare_new_entity(session, entity, attach=not fast_insert)
     if fast_insert and defer_if_fast:
-        session.info.setdefault("_fast_pending_entities", []).append(entity)
+        _queue_fast_pending_entity(session, entity)
     elif fast_insert:
         entity = _attach_or_reuse_entity(session, entity)
     if not (defer_if_fast and fast_insert):
@@ -690,6 +746,9 @@ __all__ = [
     "_project_owner_predicate",
     "_flush_new_entity",
     "_flush_shared_entity",
+    "_pop_fast_pending_entities",
+    "_queue_fast_pending_entity",
+    "_set_fast_pending_entities",
     "_identity_lock_id",
     "_require_id",
     "_uuid7",

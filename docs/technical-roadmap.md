@@ -199,8 +199,8 @@ hash 必须幂等。
 | SQLModel | `0.0.39` | table entity 与 DTO 分离 |
 | Pydantic | `2.13.4` | API 与 MolOP 导出契约基础 |
 | FastAPI | `0.135.1` | 稳定 HTTP 边界 |
-| NexusX | `6.1.2` | 精确锁定；使用 DTO-first Compose executor、严格 selection 校验、可组合 ErManager 与 Voyager service cluster 能力 |
-| FastMCP | `3.1.x` | 保持 NexusX 的 `<3.2` 兼容约束 |
+| NexusX | `>=6.3` | 设定最低兼容版本；使用 DTO-first Compose executor、严格 selection 校验、可组合 ErManager 与 Voyager service cluster 能力 |
+| FastMCP | `>=3.2,<4`（`apps` extra） | 与 NexusX 的 Streamable HTTP MCP 集成兼容，并提供基于 Prefab 的无状态交互式 App；App 后端仍复用统一上传队列 |
 | MolOP / MolGR | PyPI `>=0.2.4` / `>=0.1.3` | 声明最低兼容版本；lock 升级后重跑真实样本与迁移门禁 |
 | 数据库迁移 | Alembic | 所有 schema 变更必须通过 migration |
 
@@ -353,7 +353,7 @@ deferred NPY 与迁移往返；`20260713_0004` 已实现 manifest、artifact bin
 参与物、路径、节点、坐标绑定和边，并以真实 DA 子集验证定向路径往返。
 `20260714_0005` 已采用固定 MolOP 提交的文件、segment、frame 和附加 dataclass 导出，
 完成 46 帧、123 个数组及能量/优化/振动/热化学/状态结果的原型录入。M6 已按 NexusX
-6.1.2 开发指南实现共用 `UseCaseService` 的只读 REST、Compose GraphQL、四层 MCP，并以
+6.3 及以上版本的开发指南实现共用 `UseCaseService` 的只读 REST、Compose GraphQL、四层 MCP，并以
 单数据库 member 的 `ComposedErManager` 为 Voyager 实体和 DTO 提供可配置 cluster/color；
 身份、OIDC 映射、组织/项目成员授权及公开 Artifact 匿名读取已由 `20260809_0013`
 实现；`20260809_0014` 已增加认证统一上传、MolOP 全帧持久化、TS 帧检测、虚频前后体

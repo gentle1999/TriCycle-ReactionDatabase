@@ -93,6 +93,8 @@ operation.
 | Organization | `list_organizations`, `create_organization` | Lists visible organizations; the creator becomes owner |
 | Organization members | `list_organization_members`, `upsert_organization_member`, `remove_organization_member` | Members can list; owners/admins can manage; the last owner cannot be removed or demoted |
 | Project | `create_project`, `list_projects`, `get_project`, `update_project` | Creation requires organization owner/admin; updates require project manager or organization admin |
+| Project data cleanup | `preview_project_cleanup`, `delete_project_data` | Project manager or organization admin only; deletion requires `confirmation` to exactly match the project slug and physically removes project scientific data, upload queues, and unshared RustFS objects; the project, memberships, and audit trail remain |
+| Single-artifact cleanup | `delete_artifact` | Requires project `artifact:delete`; keeps the ArtifactFile tombstone for source-audit continuity |
 | Project members | `list_project_members`, `upsert_project_member`, `remove_project_member` | Project manager or organization admin; the last project manager is preserved |
 | Project invitations | `list_project_invitations`, `create_project_invitation`, `revoke_project_invitation`, `resend_project_invitation`, `accept_project_invitation` | Project manager or organization admin; acceptance still checks the authenticated email |
 | Audit | `list_project_audit` | Project manager or organization admin |
@@ -104,6 +106,25 @@ default). The response contains the durable `UploadBatch` and item in `staged`/
 `pending` state. `success=true` means that the raw object reached RustFS and the
 parse queue, not that MolOP has completed; read the batch/item later for
 `ingestion_status`, `parse_revision_id`, frame counts, and TS inference results.
+
+#### FastMCP Apps interactive tool
+
+The MCP server also registers the FastMCP App tool
+`open_calculation_log_workspace`. MCP Apps-capable clients receive a Prefab UI
+that lets the user choose an active project where they have
+`artifact:upload`, select or drop one or more calculation logs, and submit them
+as one durable `UploadBatch`. File bytes are sent only by the app-only backend
+tool `stage_calculation_logs`; that backend is not exposed in the model-visible
+ordinary tool list, and it rechecks the project permission for the user carried
+by the current MCP token on every call.
+
+The App does not use FastMCP's built-in session-memory file store. This MCP
+endpoint uses stateless Streamable HTTP, so session memory would disappear
+between requests. The Prefab submit action calls
+`UploadBatchService.create_and_stage`, preserving the same RustFS staging,
+batch state, shared upload-worker/MolOP process pool, and persistence path used
+by REST, browser, CLI, and `upload_calculation_log`. Clients without MCP Apps
+support can continue using the direct MCP tools in the table above.
 
 For an explicit artifact reparse, a normal duplicate upload returns the same
 revision, while reparse first deletes every old `ParseRevision`, segment,

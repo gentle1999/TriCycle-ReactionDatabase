@@ -200,7 +200,7 @@ voyager_database_er_manager = ErManager(
 voyager_er_manager = ComposedErManager(members=[voyager_database_er_manager])
 voyager_subapp = create_use_case_voyager(
     services=list(config.services),
-    # NexusX 6.1.2 supports LoaderRegistry-compatible composed managers at
+    # Supported NexusX releases expose LoaderRegistry-compatible composed managers at
     # runtime, while this public parameter is still annotated as ErManager.
     er_manager=cast(Any, voyager_er_manager),
     name=settings.app_name,

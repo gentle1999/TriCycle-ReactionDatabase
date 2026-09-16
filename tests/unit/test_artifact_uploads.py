@@ -11,8 +11,13 @@ from molop import molopconfig
 from molop.io.base_models import Molecule as molop_molecule_module
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdChemReactions, rdDepictor
+from sqlmodel import Session
 
 from tricycle_reaction_db.application.services import artifact_uploads as upload_module
+from tricycle_reaction_db.application.services._persistence import (
+    _queue_fast_pending_entity,
+    _session_entity_for_identity,
+)
 from tricycle_reaction_db.application.services.artifact_upload_types import (
     _FailedInference,
     _SuccessfulInference,
@@ -76,6 +81,7 @@ def test_inference_context_snapshot_restores_nested_reconciliation_cache_lists()
     )
     cache.node_geometries_by_node[node_id] = [original_binding]
     cache.loaded_node_geometries.add(node_id)
+    cache.new_mapped_reaction_ids.add(node_id)
 
     snapshot = _snapshot_inference_context(context)
     cache.node_geometries_by_node[node_id].append(
@@ -94,6 +100,34 @@ def test_inference_context_snapshot_restores_nested_reconciliation_cache_lists()
 
     assert cache.node_geometries_by_node[node_id] == [original_binding]
     assert node_id in cache.loaded_node_geometries
+    assert node_id in cache.new_mapped_reaction_ids
+
+
+def test_fast_pending_identity_lookup_reuses_the_first_entity() -> None:
+    session = Session()
+    entity_id = UUID("00000000-0000-7000-8000-000000000010")
+    first = MappedReactionNodeGeometry(
+        id=entity_id,
+        mapped_reaction_node_id=entity_id,
+        geometry_id=entity_id,
+        component_key="transition-state",
+        component_index=0,
+        coordinate_index=0,
+        is_primary=False,
+    )
+    duplicate = MappedReactionNodeGeometry(
+        id=entity_id,
+        mapped_reaction_node_id=entity_id,
+        geometry_id=entity_id,
+        component_key="transition-state",
+        component_index=0,
+        coordinate_index=0,
+        is_primary=False,
+    )
+
+    _queue_fast_pending_entity(session, first)
+
+    assert _session_entity_for_identity(session, duplicate) is first
 
 
 def test_inference_cache_key_keeps_strict_stereo_variants_distinct() -> None:

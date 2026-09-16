@@ -6,15 +6,19 @@ import type { GeometryQueryFilters, GeometrySort } from "@/geometryQuery";
 
 import { usePaginatedQuery } from "./usePaginatedQuery";
 
-const GEOMETRY_PAGE_SIZE = 50;
-
-function geometryPageQueryKey(filters: GeometryQueryFilters, sort: GeometrySort, offset: number) {
-  return ["geometries", { filters, sort, offset, limit: GEOMETRY_PAGE_SIZE }] as const;
+function geometryPageQueryKey(
+  filters: GeometryQueryFilters,
+  sort: GeometrySort,
+  pageSize: number,
+  offset: number,
+) {
+  return ["geometries", { filters, sort, offset, limit: pageSize }] as const;
 }
 
 function fetchGeometryPage(
   filters: GeometryQueryFilters,
   sort: GeometrySort,
+  pageSize: number,
   offset: number,
   signal?: AbortSignal,
 ) {
@@ -22,7 +26,7 @@ function fetchGeometryPage(
     {
       ...filters,
       ...sort,
-      limit: GEOMETRY_PAGE_SIZE,
+      limit: pageSize,
       offset,
     },
     signal,
@@ -33,6 +37,7 @@ export function useGeometryQueries(
   projectId: Ref<string | null>,
   geometryId: Ref<string | null>,
   offset: Ref<number>,
+  pageSize: Ref<number>,
   sort: Ref<GeometrySort>,
   topologySmiles: Ref<string> = computed(() => ""),
   advancedFilters: Ref<GeometryQueryFilters | null> = computed(() => null),
@@ -51,12 +56,12 @@ export function useGeometryQueries(
     };
   });
   const list = usePaginatedQuery({
-    queryKey: computed(() => geometryPageQueryKey(activeFilters.value, sort.value, offset.value)),
+    queryKey: computed(() => geometryPageQueryKey(activeFilters.value, sort.value, pageSize.value, offset.value)),
     enabled: computed(() => projectId.value !== null),
     offset,
     fetchPage: (pageOffset, signal) =>
-      fetchGeometryPage(activeFilters.value, sort.value, pageOffset, signal),
-    queryKeyForOffset: (pageOffset) => geometryPageQueryKey(activeFilters.value, sort.value, pageOffset),
+      fetchGeometryPage(activeFilters.value, sort.value, pageSize.value, pageOffset, signal),
+    queryKeyForOffset: (pageOffset) => geometryPageQueryKey(activeFilters.value, sort.value, pageSize.value, pageOffset),
     staleTime: 30_000,
   });
 

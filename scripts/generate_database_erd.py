@@ -1,31 +1,21 @@
-"""Generate the complete physical database ERD from SQLAlchemy metadata."""
+"""Generate the complete physical database ERD with NexusX's native ER builder."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
+from nexusx import ErDiagram  # type: ignore[import-untyped]
 from sqlalchemy import (
-    BigInteger,
-    Boolean,
     CheckConstraint,
-    DateTime,
-    Float,
     Index,
-    Integer,
-    LargeBinary,
-    Numeric,
-    SmallInteger,
-    String,
-    Text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB
-from sqlalchemy.sql.schema import Column, ForeignKeyConstraint, Table
-from sqlalchemy.sql.sqltypes import Enum, Uuid
+from sqlmodel import SQLModel
 
+from tricycle_reaction_db.db import models as db_models
 from tricycle_reaction_db.db.models import metadata
 
-SCHEMA_REVISION = "0044_project_identity_provenance"
+SCHEMA_REVISION = "0050_profile_source_visibility"
 OUTPUT_PATH = Path(__file__).parents[1] / "docs" / "database-erd.md"
 
 POSTGRESQL_GROUPS = {
@@ -97,6 +87,7 @@ POSTGRESQL_GROUPS = {
         "logical_participant_concrete_topology",
         "mapped_reaction",
         "mapped_reaction_thermodynamic_profile",
+        "mapped_reaction_thermodynamic_profile_source",
         "mapped_reaction_participant",
         "mapped_reaction_node",
         "mapped_reaction_node_geometry",
@@ -133,115 +124,6 @@ def _assert_complete_grouping() -> None:
     unknown = set(grouped) - actual
     if missing or unknown:
         raise RuntimeError(f"ERD table grouping drifted: missing={missing}, unknown={unknown}")
-
-
-def _mermaid_type(column: Column[object]) -> str:
-    column_type = column.type
-    class_name = type(column_type).__name__.lower()
-    if class_name == "rdkitmol":
-        return "mol"
-    if class_name == "numpyarray":
-        return "bytea"
-    if class_name == "autostring":
-        return "string"
-    if isinstance(column_type, Uuid):
-        return "uuid"
-    if isinstance(column_type, JSONB):
-        return "jsonb"
-    if isinstance(column_type, ARRAY):
-        return "array"
-    if isinstance(column_type, LargeBinary):
-        return "bytea"
-    if isinstance(column_type, Boolean):
-        return "boolean"
-    if isinstance(column_type, DateTime):
-        return "datetime"
-    if isinstance(column_type, Float):
-        return "float"
-    if isinstance(column_type, Numeric):
-        return f"numeric({column_type.precision},{column_type.scale})"
-    if isinstance(column_type, BigInteger):
-        return "bigint"
-    if isinstance(column_type, SmallInteger):
-        return "smallint"
-    if isinstance(column_type, Integer):
-        return "integer"
-    if isinstance(column_type, Text):
-        return "text"
-    if isinstance(column_type, Enum):
-        return "enum"
-    if isinstance(column_type, String):
-        return "string"
-    return class_name
-
-
-def _single_column_unique_names(table: Table) -> set[str]:
-    unique_names = {
-        next(iter(constraint.columns)).name
-        for constraint in table.constraints
-        if isinstance(constraint, UniqueConstraint) and len(constraint.columns) == 1
-    }
-    unique_names.update(
-        next(iter(index.columns)).name
-        for index in table.indexes
-        if index.unique and len(index.columns) == 1
-    )
-    return unique_names
-
-
-def _unique_column_sets(table: Table) -> set[frozenset[str]]:
-    unique_sets = {
-        frozenset(column.name for column in constraint.columns)
-        for constraint in table.constraints
-        if isinstance(constraint, UniqueConstraint)
-    }
-    unique_sets.update(
-        frozenset(column.name for column in index.columns)
-        for index in table.indexes
-        if index.unique
-    )
-    unique_sets.add(frozenset(column.name for column in table.primary_key.columns))
-    return unique_sets
-
-
-def _column_line(table: Table, column: Column[object]) -> str:
-    markers: list[str] = []
-    if column.primary_key:
-        markers.append("PK")
-    if column.foreign_keys:
-        markers.append("FK")
-    if column.name in _single_column_unique_names(table):
-        markers.append("UK")
-    marker_text = f" {', '.join(markers)}" if markers else ""
-
-    comments: list[str] = []
-    if column.nullable:
-        comments.append("nullable")
-    if table.name == "artifact_file" and column.name in {"bucket", "object_key", "version_id"}:
-        comments.append("RustFS locator")
-    if _mermaid_type(column) == "mol":
-        comments.append("PostgreSQL RDKit cartridge")
-    if type(column.type).__name__.lower() == "numpyarray":
-        comments.append("NPY encoded BYTEA")
-    comment_text = f' "{"; ".join(comments)}"' if comments else ""
-    return f"        {_mermaid_type(column)} {column.name}{marker_text}{comment_text}"
-
-
-def _is_to_one(constraint: ForeignKeyConstraint) -> bool:
-    local_names = frozenset(element.parent.name for element in constraint.elements)
-    return local_names in _unique_column_sets(constraint.table)
-
-
-def _relationship_line(constraint: ForeignKeyConstraint) -> str:
-    elements = list(constraint.elements)
-    parent_table = elements[0].column.table.name
-    child_table = constraint.table.name
-    local_columns = [element.parent.name for element in elements]
-    required_parent = all(not element.parent.nullable for element in elements)
-    parent_cardinality = "||" if required_parent else "o|"
-    child_cardinality = "o|" if _is_to_one(constraint) else "o{"
-    label = "__".join(local_columns)
-    return f"    {parent_table} {parent_cardinality}--{child_cardinality} {child_table} : {label}"
 
 
 def _storage_boundary_diagram() -> list[str]:
@@ -298,31 +180,54 @@ def _storage_boundary_diagram() -> list[str]:
     return lines
 
 
+def _sqlmodel_entities() -> list[type[SQLModel]]:
+    """Return every exported physical SQLModel entity for NexusX's ER builder."""
+
+    entities: list[type[SQLModel]] = []
+    for export_name in db_models.__all__:
+        exported = getattr(db_models, export_name, None)
+        if (
+            isinstance(exported, type)
+            and issubclass(exported, SQLModel)
+            and getattr(exported, "__table__", None) is not None
+        ):
+            entities.append(exported)
+
+    entities = sorted(set(entities), key=lambda entity: entity.__name__)
+    entity_tables: set[str] = set()
+    for entity in entities:
+        table = getattr(entity, "__table__", None)
+        if table is not None:
+            entity_tables.add(str(table.name))
+    actual_tables = set(metadata.tables)
+    if entity_tables != actual_tables:
+        missing = actual_tables - entity_tables
+        unknown = entity_tables - actual_tables
+        raise RuntimeError(
+            "NexusX ERD entity registry drifted from SQLModel metadata: "
+            f"missing={missing}, unknown={unknown}"
+        )
+    return entities
+
+
 def _complete_erd() -> list[str]:
-    constraints = sorted(
-        (
-            constraint
-            for table in metadata.sorted_tables
-            for constraint in table.foreign_key_constraints
-        ),
-        key=lambda constraint: (
-            constraint.table.name,
-            tuple(element.parent.name for element in constraint.elements),
-        ),
-    )
-    lines = [
+    """Render the ERD through NexusX's SQLModel relationship inspector."""
+
+    diagram = ErDiagram.from_sqlmodel(_sqlmodel_entities())
+    # NexusX 6.3 currently emits field names without Mermaid's required type
+    # token. Keep entity and relationship discovery native, adding only the
+    # grammar-required generic scalar type before invoking its renderer.
+    for entity in diagram.entities:
+        entity.fields = [
+            field if len(field.split()) > 1 else f"string {field}" for field in entity.fields
+        ]
+    mermaid = diagram.to_mermaid()
+    return [
         "```mermaid",
-        "%% Generated from SQLAlchemy metadata. Do not hand-edit this block.",
-        "erDiagram",
+        "%% Generated by NexusX ErDiagram.from_sqlmodel. Do not hand-edit this block.",
+        mermaid,
+        "```",
     ]
-    lines.extend(_relationship_line(constraint) for constraint in constraints)
-    lines.append("")
-    for table in metadata.sorted_tables:
-        lines.append(f"    {table.name} {{")
-        lines.extend(_column_line(table, column) for column in table.columns)
-        lines.append("    }")
-    lines.append("```")
-    return lines
 
 
 def _constraint_inventory() -> list[str]:
@@ -372,7 +277,7 @@ def _document() -> str:
         "# 数据库实体关系图",
         "",
         f"> 当前 schema：Alembic `{SCHEMA_REVISION}`",
-        "> 生成来源：`tricycle_reaction_db.db.models.metadata`",
+        "> 生成来源：NexusX `ErDiagram.from_sqlmodel(...)`（实体来自 SQLModel 导出注册表）",
         f"> 完整性：{totals['tables']} 张表、{totals['columns']} 个列、",
         f"> {totals['foreign_keys']} 条外键约束，未省略物理表、列或 FK。",
         "",
@@ -429,12 +334,11 @@ def _document() -> str:
         "## 全量物理 ERD",
         "",
         (
-            f"下图逐列展开全部 {totals['tables']} 张 PostgreSQL 表，并为 "
-            f"{totals['foreign_keys']} 条外键约束各生成一条关系线。"
+            f"下图由 NexusX 从全部 {totals['tables']} 个 SQLModel 实体生成；实体字段和 ORM "
+            "关系来自模型注册表，不在脚本中重复维护。"
         ),
-        "关系标签是子表 FK 列名；复合 FK 使用 `__` 连接列名。`nullable` 表示列允许",
-        "SQL `NULL`。单列唯一键标为 `UK`；复合 UNIQUE、CHECK 和 index 在后续清单中",
-        "逐表计数，并以 SQLModel/Alembic 定义为权威。",
+        "物理 FK、UNIQUE、CHECK 和 index 的逐表计数在后续清单中列出，并以 SQLModel/Alembic",
+        "定义为权威。",
         "",
         *_complete_erd(),
         "",

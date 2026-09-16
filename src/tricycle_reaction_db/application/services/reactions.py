@@ -79,6 +79,21 @@ _ENDPOINT_NODE_KEY_ALIASES: dict[MappedReactionNodeRole, tuple[str, ...]] = {
 }
 
 
+def _mark_new_mapped_reaction_in_cache(
+    topology_context: Any | None,
+    mapped_reaction: MappedReaction,
+) -> None:
+    """Mark a just-created reaction as empty to the current reconciliation batch."""
+
+    cache = getattr(topology_context, "reconciliation_cache", None)
+    mapped_reaction_id = getattr(mapped_reaction, "id", None)
+    if cache is None or not isinstance(mapped_reaction_id, UUID):
+        return
+    cache.new_mapped_reaction_ids.add(mapped_reaction_id)
+    cache.nodes_by_reaction.setdefault(mapped_reaction_id, ())
+    cache.loaded_reaction_nodes.add(mapped_reaction_id)
+
+
 def _canonical_json(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
 
@@ -1507,6 +1522,7 @@ def persist_mapped_reaction(
             )
         )
         mapped_reaction = mapped_reaction_result.first()
+        mapped_reaction_created = mapped_reaction is None
         if mapped_reaction is None:
             mapped_reaction = _new_entity(
                 session,
@@ -1516,6 +1532,7 @@ def persist_mapped_reaction(
                 **record.model_dump(),
             )
             _flush_new_entity(session, mapped_reaction, label="MappedReaction")
+            _mark_new_mapped_reaction_in_cache(topology_context, mapped_reaction)
 
         for component_key in sorted(
             component_keys,
@@ -1530,6 +1547,7 @@ def persist_mapped_reaction(
                 atom_map_numbers=list(normalized_atom_maps[component_key]),
                 mapped_smiles=precomputed_mapped_smiles_by_template[component_key],
                 concrete_topology=concrete_topologies_by_key[component_key],
+                identity_is_new=mapped_reaction_created,
             )
         if not session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
             _register_mapped_reaction_concrete_identity(
@@ -1592,6 +1610,7 @@ def persist_mapped_reaction(
         )
     )
     mapped_reaction = mapped_reaction_result.first()
+    mapped_reaction_created = mapped_reaction is None
     if mapped_reaction is None:
         mapped_reaction = _new_entity(
             session,
@@ -1601,6 +1620,7 @@ def persist_mapped_reaction(
             **record.model_dump(),
         )
         _flush_new_entity(session, mapped_reaction, label="MappedReaction")
+        _mark_new_mapped_reaction_in_cache(topology_context, mapped_reaction)
 
     for side, templates in (
         (LogicalReactionParticipantSide.REACTANT, definition.GetReactants()),
@@ -1666,6 +1686,7 @@ def persist_mapped_reaction(
                 atom_map_numbers=atom_maps,
                 mapped_smiles=mapped_smiles,
                 concrete_topology=expected_concrete_topology,
+                identity_is_new=mapped_reaction_created,
             )
     return mapped_reaction
 
@@ -1680,6 +1701,7 @@ def persist_mapped_reaction_participant(
     mapped_smiles: str,
     concrete_topology: MolecularTopology | None = None,
     concrete_topology_id: UUID | None = None,
+    identity_is_new: bool = False,
 ) -> MappedReactionParticipant:
     mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
     logical_participant_id = _require_id(logical_participant, label="LogicalReactionParticipant")
@@ -1723,16 +1745,19 @@ def persist_mapped_reaction_participant(
         )
     if mapped_smiles_for_topology(concrete_topology, atom_map_numbers) != mapped_smiles:
         raise ValueError("mapped participant SMILES does not match its Topology atom maps")
-    _acquire_identity_locks(
-        session,
-        ("mapped_reaction_participant", mapped_reaction_id, logical_participant_id),
-    )
-    assignment = session.exec(
-        select(MappedReactionParticipant).where(
-            MappedReactionParticipant.mapped_reaction_id == mapped_reaction_id,
-            MappedReactionParticipant.logical_reaction_participant_id == logical_participant_id,
+    if identity_is_new:
+        assignment = None
+    else:
+        _acquire_identity_locks(
+            session,
+            ("mapped_reaction_participant", mapped_reaction_id, logical_participant_id),
         )
-    ).first()
+        assignment = session.exec(
+            select(MappedReactionParticipant).where(
+                MappedReactionParticipant.mapped_reaction_id == mapped_reaction_id,
+                MappedReactionParticipant.logical_reaction_participant_id == logical_participant_id,
+            )
+        ).first()
     if assignment is not None:
         if assignment.side is not logical_participant.side:
             raise ValueError("mapped participant resolved to different side")
@@ -1771,6 +1796,8 @@ def persist_mapped_reaction_node(
     session: Session,
     mapped_reaction: MappedReaction,
     record: MappedReactionNodeRecord,
+    *,
+    assume_absent: bool = False,
 ) -> MappedReactionNode:
     """Persist a logical path node, reordering an existing named node if needed.
 
@@ -1785,6 +1812,16 @@ def persist_mapped_reaction_node(
     mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
     aliases = _ENDPOINT_NODE_KEY_ALIASES.get(record.role, ())
     preferred_key = aliases[0] if record.node_key in aliases else record.node_key
+    node: MappedReactionNode | None
+    if assume_absent:
+        node = _new_entity(
+            session,
+            MappedReactionNode,
+            mapped_reaction=mapped_reaction,
+            **record.model_dump(),
+        )
+        _flush_new_entity(session, node, label="MappedReactionNode")
+        return node
     _acquire_identity_locks(
         session,
         ("mapped_reaction_node_order", mapped_reaction_id),
@@ -1866,6 +1903,7 @@ def persist_mapped_reaction_node_geometry(
     mapped_reaction_participant: MappedReactionParticipant | None = None,
     preloaded_bindings: list[MappedReactionNodeGeometry] | None = None,
     thermodynamic_property_verified: bool = False,
+    assume_absent: bool = False,
 ) -> MappedReactionNodeGeometry:
     """Bind one Geometry conformer to a logical path node.
 
@@ -1908,6 +1946,19 @@ def persist_mapped_reaction_node_geometry(
             raise ValueError("coordinate participant side does not match the node role")
     elif node.role in {MappedReactionNodeRole.REACTANT, MappedReactionNodeRole.PRODUCT}:
         raise ValueError("reactant/product coordinates require a MappedReactionParticipant")
+
+    binding: MappedReactionNodeGeometry | None
+    if assume_absent:
+        binding = _new_entity(
+            session,
+            MappedReactionNodeGeometry,
+            mapped_reaction_node=node,
+            geometry=geometry,
+            mapped_reaction_participant=mapped_reaction_participant,
+            **record.model_dump(),
+        )
+        _flush_new_entity(session, binding, label="MappedReactionNodeGeometry")
+        return binding
 
     lock_keys: list[tuple[object, ...]] = [
         (
@@ -2134,6 +2185,7 @@ def persist_mapped_reaction_edge(
     record: MappedReactionEdgeRecord,
     *,
     transition_state_node: MappedReactionNode | None = None,
+    assume_absent: bool = False,
 ) -> MappedReactionEdge:
     """Insert or reuse one directed elementary edge declared by the manifest."""
 
@@ -2158,13 +2210,19 @@ def persist_mapped_reaction_edge(
         if transition_state_id in {source_id, target_id}:
             raise ValueError("transition-state node must differ from both edge endpoints")
 
-    _acquire_identity_locks(session, ("mapped_reaction_edge", mapped_reaction_id, record.edge_key))
-    edge = session.exec(
-        select(MappedReactionEdge).where(
-            MappedReactionEdge.mapped_reaction_id == mapped_reaction_id,
-            MappedReactionEdge.edge_key == record.edge_key,
+    if assume_absent:
+        edge = None
+    else:
+        _acquire_identity_locks(
+            session,
+            ("mapped_reaction_edge", mapped_reaction_id, record.edge_key),
         )
-    ).first()
+        edge = session.exec(
+            select(MappedReactionEdge).where(
+                MappedReactionEdge.mapped_reaction_id == mapped_reaction_id,
+                MappedReactionEdge.edge_key == record.edge_key,
+            )
+        ).first()
     if edge is not None:
         if (
             edge.source_node_id != source_id

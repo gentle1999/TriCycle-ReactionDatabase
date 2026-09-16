@@ -1,7 +1,5 @@
 """NexusX query transport and authenticated organization/project control tools."""
 
-import base64
-import binascii
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime
@@ -18,6 +16,8 @@ from starlette.middleware import Middleware as ASGIMiddleware
 from starlette.responses import JSONResponse
 from starlette.types import Receive, Scope, Send
 
+from tricycle_reaction_db.api.mcp_apps import calculation_log_workspace_app
+from tricycle_reaction_db.api.mcp_payloads import decode_base64_payload
 from tricycle_reaction_db.api.nexusx import config
 from tricycle_reaction_db.api.query_guards import (
     project_scoped_use_case_methods,
@@ -42,6 +42,12 @@ from tricycle_reaction_db.application.query_cost import (
 from tricycle_reaction_db.application.rate_limits import (
     RateLimitBackendUnavailable,
     create_rate_limiter,
+)
+from tricycle_reaction_db.application.services.artifact_management import (
+    ArtifactManagementService,
+    ArtifactRemovalIntegrityError,
+    ArtifactRemovalNotFoundError,
+    ArtifactRemovalUnavailableError,
 )
 from tricycle_reaction_db.application.services.artifact_uploads import (
     ArtifactUploadConflictError,
@@ -81,6 +87,11 @@ from tricycle_reaction_db.application.services.organization_management import (
     OrganizationManagementConflictError,
     OrganizationManagementNotFoundError,
     OrganizationManagementService,
+)
+from tricycle_reaction_db.application.services.project_data_removal import (
+    ProjectDataRemovalConflictError,
+    ProjectDataRemovalNotFoundError,
+    ProjectDataRemovalService,
 )
 from tricycle_reaction_db.application.services.project_management import (
     ProjectManagementConflictError,
@@ -353,6 +364,8 @@ def _mcp_exception(error: Exception) -> dict[str, Any]:
             UploadBatchNotFoundError,
             InvitationNotFoundError,
             OrganizationManagementNotFoundError,
+            ProjectDataRemovalNotFoundError,
+            ArtifactRemovalNotFoundError,
         ),
     ):
         return _mcp_error("not_found", str(error))
@@ -373,9 +386,13 @@ def _mcp_exception(error: Exception) -> dict[str, Any]:
             UploadBatchConflictError,
             UploadBatchLimitError,
             ArtifactUploadConflictError,
+            ProjectDataRemovalConflictError,
+            ArtifactRemovalIntegrityError,
         ),
     ):
         return _mcp_error("conflict", str(error))
+    if isinstance(error, ArtifactRemovalUnavailableError):
+        return _mcp_error("storage_unavailable", str(error))
     if isinstance(error, (ArtifactUploadError, InvitationError)):
         return _mcp_error("invalid_argument", str(error))
     logger.exception("MCP control operation failed", exc_info=error)
@@ -391,22 +408,11 @@ def _require_mcp_principal() -> AuthenticatedPrincipal:
 
 def _decode_mcp_payload(content_base64: str) -> bytes:
     """Decode one MCP file payload while enforcing the configured byte budget."""
-
-    encoded = content_base64.strip()
-    if not encoded:
-        raise ValueError("content_base64 must not be empty")
-    maximum_encoded_length = 4 * ((get_settings().max_upload_bytes + 2) // 3)
-    if len(encoded) > maximum_encoded_length:
-        raise ArtifactUploadLimitError(
-            f"encoded calculation log exceeds the {get_settings().max_upload_bytes}-byte limit"
-        )
-    try:
-        payload = base64.b64decode(encoded, validate=True)
-    except (binascii.Error, UnicodeError, ValueError) as error:
-        raise ValueError("content_base64 must be valid standard base64") from error
-    if not payload:
-        raise ValueError("uploaded calculation log is empty")
-    return payload
+    return decode_base64_payload(
+        content_base64,
+        maximum_bytes=get_settings().max_upload_bytes,
+        payload_description="calculation log",
+    )
 
 
 @mcp_server.tool(name="list_organizations")  # type: ignore[untyped-decorator]
@@ -545,6 +551,56 @@ async def get_project(project_id: str) -> dict[str, Any]:
     try:
         principal = _require_mcp_principal()
         return _mcp_success(await ProjectManagementService.get_project(UUID(project_id), principal))
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="preview_project_cleanup")  # type: ignore[untyped-decorator]
+async def preview_project_cleanup(project_id: str) -> dict[str, Any]:
+    """Preview the project-owned records and RustFS objects a cleanup would remove."""
+
+    try:
+        principal = _require_mcp_principal()
+        return _mcp_success(
+            await ProjectDataRemovalService.preview(
+                UUID(project_id),
+                user_id=principal.user_id,
+            )
+        )
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="delete_project_data")  # type: ignore[untyped-decorator]
+async def delete_project_data(project_id: str, confirmation: str) -> dict[str, Any]:
+    """Permanently delete all project-owned scientific data after slug confirmation.
+
+    The project, its memberships, and its audit trail remain.  The operation
+    requires project-management permission and ``confirmation`` must exactly
+    equal the project slug.
+    """
+
+    try:
+        principal = _require_mcp_principal()
+        return _mcp_success(
+            await ProjectDataRemovalService.clear(
+                UUID(project_id),
+                user_id=principal.user_id,
+                confirmation=confirmation,
+            )
+        )
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="delete_artifact")  # type: ignore[untyped-decorator]
+async def delete_artifact(artifact_id: str) -> dict[str, Any]:
+    """Retire one artifact and remove its RustFS object when unshared."""
+
+    try:
+        principal = _require_mcp_principal()
+        await ArtifactManagementService.retire(UUID(artifact_id), user_id=principal.user_id)
+        return _mcp_success({"removed": True, "artifact_id": artifact_id})
     except Exception as error:
         return _mcp_exception(error)
 
@@ -884,6 +940,7 @@ async def cancel_import(import_job_id: str) -> dict[str, Any]:
 
 
 mcp_server.add_middleware(QueryGuardMiddleware())
+mcp_server.add_provider(calculation_log_workspace_app)
 mcp_http_app = mcp_server.http_app(
     path="/",
     middleware=[

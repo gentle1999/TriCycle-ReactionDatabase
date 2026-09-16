@@ -101,6 +101,21 @@ class ReconciliationBatchCache:
     new_node_geometry_ids: set[UUID] = field(default_factory=set)
     thermodynamic_property_geometry_ids: set[UUID] = field(default_factory=set)
     affected_reactions_by_id: dict[UUID, MappedReaction] = field(default_factory=dict)
+    # These fallback lookups depend only on the source topology during one
+    # reconciliation phase.  The preload barrier marks the topology set as
+    # complete after all deferred reaction rows have been flushed.
+    logical_member_reactions_by_topology: dict[UUID, tuple[MappedReaction, ...]] = field(
+        default_factory=dict
+    )
+    endpoint_compatible_reactions_by_topology: dict[UUID, tuple[MappedReaction, ...]] = field(
+        default_factory=dict
+    )
+    reaction_lookup_topologies_loaded: set[UUID] = field(default_factory=set)
+    # A mapped reaction inserted in this transaction cannot have pre-existing
+    # path rows.  This lets node/edge creation skip the idempotency read path
+    # while retaining the lock-and-recheck path for durable identities loaded
+    # from PostgreSQL.
+    new_mapped_reaction_ids: set[UUID] = field(default_factory=set)
 
 
 def _require_project_owner(entity: Any, *, label: str) -> UUID:
@@ -180,6 +195,7 @@ def resolve_endpoint_node(
         session,
         mapped_reaction,
         MappedReactionNodeRecord(node_key=node_key, node_index=node_index, role=role),
+        assume_absent=(cache is not None and mapped_reaction_id in cache.new_mapped_reaction_ids),
     )
     if cache is not None:
         cache.nodes_by_reaction[mapped_reaction_id] = (
@@ -260,22 +276,16 @@ def _find_or_create_node_geometry(
         if participant is not None
         else None
     )
-    _acquire_identity_locks(
-        session,
-        (
-            "reaction_geometry_reconciliation",
-            node_id,
-            participant_id or "unassigned",
-            geometry_id,
-        ),
-    )
-
     bindings: list[MappedReactionNodeGeometry] | None = None
     cache_node_geometries_complete = False
+    node_belongs_to_new_reaction = False
     existing = None
     if cache is not None:
         bindings = cache.node_geometries_by_node.setdefault(node_id, [])
-        cache_node_geometries_complete = node_id in cache.complete_node_geometries
+        node_belongs_to_new_reaction = node.mapped_reaction_id in cache.new_mapped_reaction_ids
+        cache_node_geometries_complete = (
+            node_id in cache.complete_node_geometries or node_belongs_to_new_reaction
+        )
         existing = next(
             (
                 binding
@@ -308,6 +318,21 @@ def _find_or_create_node_geometry(
             _cache_node_geometry_binding(cache, node_id, existing)
     if existing is not None:
         return existing
+
+    # A complete batch cache is authoritative for positive hits. Avoid an
+    # advisory-lock round trip for every repeated conformer; only a miss can
+    # allocate a new identity and therefore needs the lock before the database
+    # recheck/coordinate allocation below.
+    if not node_belongs_to_new_reaction:
+        _acquire_identity_locks(
+            session,
+            (
+                "reaction_geometry_reconciliation",
+                node_id,
+                participant_id or "unassigned",
+                geometry_id,
+            ),
+        )
 
     if cache is not None and bindings is not None and not cache_node_geometries_complete:
         # Keep unflushed fast-path bindings from the cache, and merge the
@@ -346,10 +371,11 @@ def _find_or_create_node_geometry(
         if component_identities:
             component_key, component_index = next(iter(component_identities))
 
-    _acquire_identity_locks(
-        session,
-        ("reaction_geometry_coordinate_allocation", node_id, component_key),
-    )
+    if not node_belongs_to_new_reaction:
+        _acquire_identity_locks(
+            session,
+            ("reaction_geometry_coordinate_allocation", node_id, component_key),
+        )
 
     component_bindings = (
         [binding for binding in bindings if binding.component_key == component_key]
@@ -382,6 +408,9 @@ def _find_or_create_node_geometry(
         mapped_reaction_participant=participant,
         preloaded_bindings=bindings,
         thermodynamic_property_verified=thermodynamic_property_verified,
+        assume_absent=(
+            cache is not None and node.mapped_reaction_id in cache.new_mapped_reaction_ids
+        ),
     )
     if cache is not None:
         _cache_node_geometry_binding(cache, node_id, binding)
@@ -570,6 +599,7 @@ def _target_node_for_source_node(
             node_index=source_node.node_index,
             role=source_node.role,
         ),
+        assume_absent=(cache is not None and target_id in cache.new_mapped_reaction_ids),
     )
     _cache_reaction_node(cache, target_mapped_reaction, target_node)
     return target_node
@@ -1011,29 +1041,48 @@ def reconcile_geometry_with_reactions(
         # The membership relation is the audited bridge for the thermodynamic
         # fallback loader; refresh every mapped reaction that can consume this
         # member.
-        logical_member_reactions = session.exec(
-            select(MappedReaction)
-            .join(
-                MappedReactionParticipant,
-                col(MappedReactionParticipant.mapped_reaction_id) == col(MappedReaction.id),
+        if (
+            cache is not None
+            and geometry.topology_id in cache.reaction_lookup_topologies_loaded
+            and geometry.topology_id in cache.logical_member_reactions_by_topology
+        ):
+            logical_member_reactions = cache.logical_member_reactions_by_topology.get(
+                geometry.topology_id,
+                (),
             )
-            .join(
-                LogicalParticipantConcreteTopology,
-                col(LogicalParticipantConcreteTopology.logical_reaction_participant_id)
-                == col(MappedReactionParticipant.logical_reaction_participant_id),
+        else:
+            logical_member_reactions = tuple(
+                session.exec(
+                    select(MappedReaction)
+                    .join(
+                        MappedReactionParticipant,
+                        col(MappedReactionParticipant.mapped_reaction_id) == col(MappedReaction.id),
+                    )
+                    .join(
+                        LogicalParticipantConcreteTopology,
+                        col(LogicalParticipantConcreteTopology.logical_reaction_participant_id)
+                        == col(MappedReactionParticipant.logical_reaction_participant_id),
+                    )
+                    .where(
+                        col(MappedReaction.project_id) == project_id,
+                        col(LogicalParticipantConcreteTopology.concrete_topology_id)
+                        == geometry.topology_id,
+                    )
+                    # ``mapped_reaction.reaction`` is a PostgreSQL custom type without
+                    # an equality operator, so a full-row DISTINCT cannot be planned.
+                    # The joins can produce several rows for one mapping; PostgreSQL
+                    # DISTINCT ON the UUID primary key removes only that join
+                    # multiplicity without comparing the custom reaction column.
+                    .distinct(col(MappedReaction.id))
+                ).all()
             )
-            .where(
-                col(MappedReaction.project_id) == project_id,
-                col(LogicalParticipantConcreteTopology.concrete_topology_id)
-                == geometry.topology_id,
-            )
-            # ``mapped_reaction.reaction`` is a PostgreSQL custom type without
-            # an equality operator, so a full-row DISTINCT cannot be planned.
-            # The joins can produce several rows for one mapping; PostgreSQL
-            # DISTINCT ON the UUID primary key removes only that join
-            # multiplicity without comparing the custom reaction column.
-            .distinct(col(MappedReaction.id))
-        ).all()
+            if (
+                cache is not None
+                and geometry.topology_id in cache.reaction_lookup_topologies_loaded
+            ):
+                cache.logical_member_reactions_by_topology[geometry.topology_id] = (
+                    logical_member_reactions
+                )
         for mapped_reaction in logical_member_reactions:
             mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
             affected_reactions[mapped_reaction_id] = mapped_reaction
@@ -1043,11 +1092,29 @@ def reconcile_geometry_with_reactions(
         # the derived thermodynamic profile.  The persistence loader will
         # accept it only if it is the unique eligible endpoint-compatible source
         # for that participant.
-        for mapped_reaction in _endpoint_compatible_mapped_reactions(
-            session,
-            geometry,
-            project_id=project_id,
+        if (
+            cache is not None
+            and geometry.topology_id in cache.reaction_lookup_topologies_loaded
+            and geometry.topology_id in cache.endpoint_compatible_reactions_by_topology
         ):
+            endpoint_compatible_reactions = cache.endpoint_compatible_reactions_by_topology.get(
+                geometry.topology_id,
+                (),
+            )
+        else:
+            endpoint_compatible_reactions = _endpoint_compatible_mapped_reactions(
+                session,
+                geometry,
+                project_id=project_id,
+            )
+            if (
+                cache is not None
+                and geometry.topology_id in cache.reaction_lookup_topologies_loaded
+            ):
+                cache.endpoint_compatible_reactions_by_topology[geometry.topology_id] = (
+                    endpoint_compatible_reactions
+                )
+        for mapped_reaction in endpoint_compatible_reactions:
             mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
             affected_reactions[mapped_reaction_id] = mapped_reaction
     if cache is None:
@@ -1096,6 +1163,21 @@ def preload_reconciliation_context(
 
     if not topology_ids:
         return
+    if cache is not None:
+        # Reaction participants/mappings are populated before this barrier.
+        # Invalidate only the topology keys being reloaded so a savepoint retry
+        # cannot reuse a lookup from an earlier, incomplete view.
+        cache.logical_member_reactions_by_topology = {
+            topology_id: reactions
+            for topology_id, reactions in cache.logical_member_reactions_by_topology.items()
+            if topology_id not in topology_ids
+        }
+        cache.endpoint_compatible_reactions_by_topology = {
+            topology_id: reactions
+            for topology_id, reactions in cache.endpoint_compatible_reactions_by_topology.items()
+            if topology_id not in topology_ids
+        }
+        cache.reaction_lookup_topologies_loaded.difference_update(topology_ids)
     participant_rows = session.exec(
         select(
             MappedReactionParticipant,
@@ -1128,18 +1210,25 @@ def preload_reconciliation_context(
             ),
         )
     ).all()
-    for topology_id in topology_ids:
-        participants_by_topology[topology_id] = ()
+    participants_by_topology.update(dict.fromkeys(topology_ids, ()))
+    participants_by_topology_lists: dict[UUID, list[MappedReactionParticipant]] = {
+        topology_id: [] for topology_id in topology_ids
+    }
     reaction_ids: set[UUID] = set()
     for participant, concrete_topology_id, logical_topology_id in participant_rows:
         topology_id = concrete_topology_id or logical_topology_id
         if not isinstance(topology_id, UUID):
             continue
-        participants_by_topology[topology_id] = (
-            *participants_by_topology[topology_id],
-            participant,
-        )
+        participants_by_topology_lists.setdefault(topology_id, []).append(participant)
         reaction_ids.add(participant.mapped_reaction_id)
+    participants_by_topology.update(
+        {
+            topology_id: tuple(participants)
+            for topology_id, participants in participants_by_topology_lists.items()
+        }
+    )
+    if cache is not None:
+        cache.reaction_lookup_topologies_loaded.update(topology_ids)
     if reaction_ids:
         mapped_reactions = session.exec(
             select(MappedReaction).where(
@@ -1333,6 +1422,7 @@ def _resolve_transition_state_node(
             node_index=node_index,
             role=MappedReactionNodeRole.TRANSITION_STATE,
         ),
+        assume_absent=(cache is not None and mapped_reaction_id in cache.new_mapped_reaction_ids),
     )
     if cache is not None:
         cache.nodes_by_reaction[mapped_reaction_id] = (
@@ -1354,6 +1444,7 @@ def _ensure_elementary_edge(
     reactant_node: MappedReactionNode,
     product_node: MappedReactionNode,
     transition_state_node: MappedReactionNode,
+    cache: ReconciliationBatchCache | None = None,
 ) -> MappedReactionEdge:
     mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
     reactant_node_id = _require_id(reactant_node, label="reactant MappedReactionNode")
@@ -1362,6 +1453,19 @@ def _ensure_elementary_edge(
         transition_state_node,
         label="transition-state MappedReactionNode",
     )
+    if cache is not None and mapped_reaction_id in cache.new_mapped_reaction_ids:
+        return persist_mapped_reaction_edge(
+            session,
+            mapped_reaction,
+            reactant_node,
+            product_node,
+            MappedReactionEdgeRecord(
+                edge_key="automatic-elementary-step",
+                edge_kind=MappedReactionEdgeKind.ELEMENTARY_STEP,
+            ),
+            transition_state_node=transition_state_node,
+            assume_absent=True,
+        )
     _acquire_identity_locks(session, ("automatic_elementary_edge", mapped_reaction_id))
     matching = session.exec(
         select(MappedReactionEdge).where(
@@ -1436,6 +1540,7 @@ def ensure_transition_state_path(
         reactant_node=reactant_node,
         product_node=product_node,
         transition_state_node=transition_state_node,
+        cache=cache,
     )
     if cache is not None:
         cache.transition_state_paths_ready.add(mapped_reaction_id)

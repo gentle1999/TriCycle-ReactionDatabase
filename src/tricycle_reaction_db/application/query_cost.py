@@ -79,12 +79,29 @@ def graphql_error_result(
     }
 
 
+def _graphql_data_is_null(value: Any) -> bool:
+    """Return whether an execution payload contains no non-null data values."""
+
+    if value is None:
+        return True
+    if isinstance(value, dict):
+        return all(_graphql_data_is_null(child) for child in value.values())
+    if isinstance(value, list):
+        return all(_graphql_data_is_null(child) for child in value)
+    return False
+
+
 def normalize_graphql_query_errors(result: dict[str, Any]) -> dict[str, Any]:
     """Add stable codes when a shared query exception crossed NexusX's error envelope."""
 
     errors = result.get("errors")
     if not isinstance(errors, list):
         return result
+    if errors and "data" in result and _graphql_data_is_null(result["data"]):
+        # NexusX 6.3 preserves the selected root fields as null when execution
+        # fails. Keep the transport contract used by the REST/GraphQL/MCP
+        # adapters: an execution error has no usable data payload.
+        result["data"] = None
     for item in errors:
         if not isinstance(item, dict):
             continue

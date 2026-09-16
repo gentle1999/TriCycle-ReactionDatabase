@@ -335,6 +335,14 @@ class MappedReactionKind(StrEnum):
     OTHER = "other"
 
 
+class ThermodynamicProfileSourceVisibility(StrEnum):
+    """Materialized visibility of a profile's selected source evidence."""
+
+    UNKNOWN = "unknown"
+    VISIBLE = "visible"
+    HIDDEN = "hidden"
+
+
 class MappedReactionNodeRole(StrEnum):
     REACTANT = "reactant"
     REACTANT_COMPLEX = "reactant_complex"
@@ -400,6 +408,7 @@ __all__ = [
     "MappedReactionEdgeKind",
     "MappedReactionKind",
     "MappedReactionNodeRole",
+    "ThermodynamicProfileSourceVisibility",
     "SCFStatus",
     "SelectedEnergyKind",
     "ScientificArrayKind",

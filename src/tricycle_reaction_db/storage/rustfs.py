@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+import logging
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -22,9 +23,11 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from mypy_boto3_s3 import S3Client
+    from mypy_boto3_s3.type_defs import ObjectIdentifierTypeDef
 
 
 _BUCKET_INITIALIZATION_LOCK = Lock()
+logger = logging.getLogger(__name__)
 
 
 class RustFSSettings(BaseSettings):
@@ -421,6 +424,37 @@ class RustFSObjectStore:
                 Key=key,
                 VersionId=version_id,
             )
+
+    def delete_many(self, objects: Iterable[tuple[str, str | None]]) -> tuple[int, int]:
+        """Delete object versions through S3's 1,000-entry multi-delete API."""
+
+        entries: list[ObjectIdentifierTypeDef] = []
+        for key, version_id in objects:
+            entry: ObjectIdentifierTypeDef = {"Key": key}
+            if version_id is not None:
+                entry["VersionId"] = version_id
+            entries.append(entry)
+        if not entries:
+            return 0, 0
+        deleted = 0
+        failed = 0
+        for offset in range(0, len(entries), 1000):
+            chunk = entries[offset : offset + 1000]
+            response = self._client.delete_objects(
+                Bucket=self.settings.bucket,
+                Delete={"Objects": chunk, "Quiet": True},
+            )
+            errors = response.get("Errors", [])
+            failed += len(errors)
+            deleted += len(chunk) - len(errors)
+            for error in errors:
+                STORAGE_FAILURES.labels(reason="delete").inc()
+                logger.warning(
+                    "RustFS multi-delete failed key=%s code=%s",
+                    error.get("Key", "unknown"),
+                    error.get("Code", "unknown"),
+                )
+        return deleted, failed
 
     def iter_objects(self, *, prefix: str, page_size: int = 1000) -> Iterator[ListedObject]:
         """Yield every object under ``prefix`` using ListObjectsV2 pagination.

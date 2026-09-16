@@ -387,6 +387,11 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/ac/14/6d950459cc831fa17fe2d1797926b6eb2d2f2af50f830e62d0c098cc1ec8/fastmcp-3.4.7-py3-none-any.whl", hash = "sha256:e4e7698cb4af5bc667b1901685261fa2f3526dc73d243a461fca42500c8dbe56", size = 8016, upload-time = "2026-08-10T21:17:51.391Z" },
 ]
 
+[package.optional-dependencies]
+apps = [
+    { name = "fastmcp-slim", extra = ["apps"] },
+]
+
 [[package]]
 name = "fastmcp-slim"
 version = "3.4.7"
@@ -405,6 +410,9 @@ wheels = [
 ]
 
 [package.optional-dependencies]
+apps = [
+    { name = "prefab-ui" },
+]
 client = [
     { name = "authlib" },
     { name = "exceptiongroup" },
@@ -949,7 +957,7 @@ wheels = [
 
 [[package]]
 name = "nexusx"
-version = "6.1.2"
+version = "6.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiodataloader" },
@@ -959,9 +967,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "sqlmodel" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/7a/1e/13519e089dc4aca9db9aa341a42c6fcd95c23d2969abfeeed4c89e029401/nexusx-6.1.2.tar.gz", hash = "sha256:84e31797e86aea4e9c0a8d716b181bfe81c75b0fcbbd6ae8fcb8fb4799b7ade8", size = 2067764, upload-time = "2026-08-20T02:15:04.39Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/32/8d/304be606cbc77d15e913e9dc4cc36fd484a75e5d65a8002630fb98a3b133/nexusx-6.3.0.tar.gz", hash = "sha256:0571b2813200b3483aca9623b76b769b5ebcbaac324f5514fd872aa73af8a96f", size = 2115963, upload-time = "2026-09-08T23:52:17.867Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6c/45/bd600932590cab5e8e0b0e833115e8e282b977b8fbbca2454bbf8caaa540/nexusx-6.1.2-py3-none-any.whl", hash = "sha256:8bf3a1c9b741363466b00d701bf360ca74de32d7a931bca2db4b2e3b4dea082d", size = 841840, upload-time = "2026-08-20T02:15:03.01Z" },
+    { url = "https://files.pythonhosted.org/packages/13/0f/34c5cfbc63d0e99ea6103590554a57080f4a362a268ca19118d35a73ae32/nexusx-6.3.0-py3-none-any.whl", hash = "sha256:baae880f1e48189e51a69392a71f9fc82a8bc8e306f3bc222d04920ee1b47d1d", size = 852091, upload-time = "2026-09-08T23:52:16.512Z" },
 ]
 
 [[package]]
@@ -1124,6 +1132,20 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/f9/e2/3e91f31a7d2b083fe6ef3fa267035b518369d9511ffab804f839851d2779/pluggy-1.6.0.tar.gz", hash = "sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3", size = 69412, upload-time = "2025-05-15T12:30:07.975Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746", size = 20538, upload-time = "2025-05-15T12:30:06.134Z" },
+]
+
+[[package]]
+name = "prefab-ui"
+version = "0.20.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cyclopts" },
+    { name = "pydantic" },
+    { name = "rich" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/41/99/4e61eb3d3f8b09bdaa28bda3c99971264555f486a485333cb8e6f56c7d8c/prefab_ui-0.20.2.tar.gz", hash = "sha256:4ac17ebf8ec1c5a918a188625837fc608157907430a59c4feb8adac80e01262b", size = 4118979, upload-time = "2026-06-03T02:13:49.312Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4a/d0/59b697dd5a44e632fcc4aba42ff5f88224df672ffea1f5e9a5a9e9e50698/prefab_ui-0.20.2-py3-none-any.whl", hash = "sha256:861d4914e4d9120996b4d5c6753788beeca433754d7bb3cfbd13f9dba7ea8e85", size = 1852274, upload-time = "2026-06-03T02:13:47.539Z" },
 ]
 
 [[package]]
@@ -1752,7 +1774,7 @@ dependencies = [
     { name = "boto3" },
     { name = "cryptography" },
     { name = "fastapi" },
-    { name = "fastmcp" },
+    { name = "fastmcp", extra = ["apps"] },
     { name = "httpx" },
     { name = "molalchemy" },
     { name = "molgr" },
@@ -1792,12 +1814,12 @@ requires-dist = [
     { name = "boto3", specifier = ">=1.43,<2" },
     { name = "cryptography", specifier = ">=50,<51" },
     { name = "fastapi", specifier = "==0.135.1" },
-    { name = "fastmcp", specifier = ">=3.2,<4" },
+    { name = "fastmcp", extras = ["apps"], specifier = ">=3.2,<4" },
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "molalchemy", specifier = "==0.0.7" },
     { name = "molgr", specifier = ">=0.1.9" },
     { name = "molop", specifier = ">=0.2.15" },
-    { name = "nexusx", specifier = "==6.1.2" },
+    { name = "nexusx", specifier = ">=6.3" },
     { name = "numpy", specifier = ">=2.2,<3" },
     { name = "pint", specifier = ">=0.25,<1" },
     { name = "prometheus-client", specifier = ">=0.24,<1" },

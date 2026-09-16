@@ -23,6 +23,7 @@ from tricycle_reaction_db.application.services._persistence import (
     LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
     _attach_or_reuse_entity,
     _attach_pending_entities,
+    _set_fast_pending_entities,
 )
 from tricycle_reaction_db.application.services.calculations import (
     finalize_parse_revision,
@@ -510,7 +511,8 @@ def persist_molop_calculation_artifact(
                 # only the preload savepoint and discard its cache additions.
                 _restore_geometry_context(active_geometry_context, preload_snapshot)
                 if effective_fast_insert:
-                    session.info["_fast_pending_entities"] = pending_snapshot
+                    assert pending_snapshot is not None
+                    _set_fast_pending_entities(session, pending_snapshot)
                 diagnostics.append(
                     {
                         "code": "geometry_preload_failed",
@@ -711,7 +713,7 @@ def persist_molop_calculation_artifact(
                     if frame_snapshot is not None:
                         _restore_geometry_context(active_geometry_context, frame_snapshot)
                     if pending_snapshot is not None:
-                        session.info["_fast_pending_entities"] = pending_snapshot
+                        _set_fast_pending_entities(session, pending_snapshot)
                     if array_counts_snapshot is not None:
                         array_counts.clear()
                         array_counts.update(array_counts_snapshot)
@@ -848,8 +850,6 @@ def reconcile_molop_geometry_context(
         reconciliation_cache = ReconciliationBatchCache()
     context.reconciliation_cache = reconciliation_cache
 
-    _attach_pending_entities(session)
-    session.flush()
     reconciliation_cache.thermodynamic_property_geometry_ids.update(reconcilable_ids)
     preload_reconciliation_context(
         session,

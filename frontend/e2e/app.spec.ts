@@ -1039,6 +1039,117 @@ test("catalog pagination jumps directly to a requested page", async ({ page }) =
   await expect(page.getByRole("spinbutton", { name: "页码" }).first()).toHaveValue("1");
 });
 
+test("catalog page size settings enforce view-specific maximums", async ({ page }) => {
+  const projectId = "00000000-0000-7000-8000-000000000201";
+  const reactionFixture = (index: number) => ({
+    id: `00000000-0000-7000-8001-${String(index).padStart(12, "0")}`,
+    reaction_key: `page-size-reaction-${index}`,
+    label: `Page size reaction ${index}`,
+    reaction_class: "cycloaddition",
+    cycloaddition_pattern: null,
+    mapped_reaction_count: 0,
+    similarity_score: null,
+    reactant_product_changed: null,
+    created_at: null,
+    reactant_topology_ids: [],
+    product_topology_ids: [],
+    transition_state_geometry_id: null,
+    minimum_activation_gibbs_free_energy_kcal_mol: null,
+    maximum_activation_gibbs_free_energy_kcal_mol: null,
+    minimum_reaction_gibbs_free_energy_kcal_mol: null,
+    maximum_reaction_gibbs_free_energy_kcal_mol: null,
+  });
+  const reactions = Array.from({ length: 20 }, (_, index) => reactionFixture(index + 1));
+  const reactionLimits: number[] = [];
+  await page.route("**/api/auth/me", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "00000000-0000-7000-8000-000000000002",
+        display_name: "Page Size User",
+        primary_email: "page-size@example.test",
+        is_service_account: false,
+        identity: { issuer: "development", subject: "page-size" },
+        projects: [{
+          project_id: projectId,
+          project_slug: "page-size-project",
+          project_name: "Page Size Project",
+          organization_id: "00000000-0000-7000-8000-000000000101",
+          organization_slug: "page-size-organization",
+          organization_name: "Page Size Organization",
+          organization_role: "owner",
+          project_role: "manager",
+          permissions: ["artifact:read"],
+        }],
+      }),
+    });
+  });
+  await page.route("**/api/logical-reactions?*", async (route) => {
+    const url = new URL(route.request().url());
+    const limit = Number(url.searchParams.get("limit") ?? "0");
+    const offset = Number(url.searchParams.get("offset") ?? "0");
+    reactionLimits.push(limit);
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: reactions.slice(offset, offset + limit),
+        page: { total: reactions.length, limit, offset },
+      }),
+    });
+  });
+
+  await page.goto(`/reactions?project_id=${projectId}`);
+  const reactionPageSize = page.getByRole("spinbutton", { name: "每页数量" }).first();
+  await expect(reactionPageSize).toHaveAttribute("max", "12");
+  await expect(reactionPageSize).toHaveValue("12");
+  await reactionPageSize.fill("13");
+  await reactionPageSize.press("Enter");
+  await expect(reactionPageSize).toHaveValue("12");
+  await reactionPageSize.fill("6");
+  await reactionPageSize.press("Enter");
+  await expect.poll(() => reactionLimits).toContain(6);
+  await expect(page.locator(".reaction-path-card")).toHaveCount(6);
+
+  const artifacts = [{
+    id: "00000000-0000-7000-8000-000000000301",
+    original_filename: "page-size.log",
+    size_bytes: 12,
+    content_sha256: "1".repeat(64),
+    visibility: "project",
+    artifact_kind: "calculation_output",
+    storage_status: "available",
+    ingestion_status: "succeeded",
+    project_id: projectId,
+    created_by_user_id: "00000000-0000-7000-8000-000000000002",
+    media_type: "text/plain",
+    storage_verified_at: "2026-08-16T00:00:00Z",
+    preview_available: true,
+  }];
+  const artifactLimits: number[] = [];
+  await page.route("**/api/artifacts?*", async (route) => {
+    const url = new URL(route.request().url());
+    const limit = Number(url.searchParams.get("limit") ?? "0");
+    const offset = Number(url.searchParams.get("offset") ?? "0");
+    artifactLimits.push(limit);
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: offset === 0 ? artifacts : [],
+        page: { total: 1_000, limit, offset },
+      }),
+    });
+  });
+
+  await page.goto(`/artifacts?project_id=${projectId}`);
+  const artifactPageSize = page.getByRole("spinbutton", { name: "每页数量" }).first();
+  await expect(artifactPageSize).toHaveAttribute("max", "500");
+  await expect(artifactPageSize).toHaveValue("50");
+  await artifactPageSize.fill("501");
+  await artifactPageSize.press("Enter");
+  await expect(artifactPageSize).toHaveValue("500");
+  await expect.poll(() => artifactLimits).toContain(500);
+});
+
 test("mapped reaction shows every partial thermodynamic profile and level", async ({ page }, testInfo) => {
   const state = {
     topologies: [],
@@ -1727,6 +1838,75 @@ test("artifact catalog sorts directly from table headers", async ({ page }) => {
   await expect(page.locator('th[aria-sort="descending"] button[data-sort-by="original_filename"]')).toHaveCount(1);
 });
 
+test("selected artifact files download as one archive", async ({ page }) => {
+  const projectId = "00000000-0000-7000-8000-000000000201";
+  const artifacts = ["archive-first.log", "archive-second.log"].map((original_filename, index) => ({
+    id: `00000000-0000-7000-8000-${String(index + 301).padStart(12, "0")}`,
+    original_filename,
+    size_bytes: 12 + index,
+    content_sha256: String(index + 3).repeat(64),
+    visibility: "project",
+    artifact_kind: "calculation_output",
+    storage_status: "available",
+    project_id: projectId,
+    created_by_user_id: "00000000-0000-7000-8000-000000000302",
+    media_type: "text/plain",
+    storage_verified_at: "2026-08-16T00:00:00Z",
+    preview_available: true,
+  }));
+  let requestedIds: string[] = [];
+
+  await page.route("**/api/auth/me", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "00000000-0000-7000-8000-000000000302",
+        display_name: "Artifact Viewer",
+        primary_email: "viewer@example.test",
+        is_service_account: false,
+        identity: { issuer: "https://issuer.example.test", subject: "artifact-viewer" },
+        projects: [{
+          project_id: projectId,
+          project_slug: "download-project",
+          project_name: "Download Project",
+          organization_id: "00000000-0000-7000-8000-000000000303",
+          organization_slug: "test-organization",
+          organization_name: "Test Organization",
+          organization_role: "member",
+          project_role: "viewer",
+          permissions: ["artifact:read", "artifact:download"],
+        }],
+      }),
+    });
+  });
+  await page.route("**/api/artifacts?*", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ items: artifacts, page: { total: artifacts.length, limit: 50, offset: 0 } }),
+    });
+  });
+  await page.route("**/api/artifacts/batch-download/form?*", async (route) => {
+    expect(route.request().method()).toBe("POST");
+    const body = new URLSearchParams(route.request().postData() ?? "");
+    requestedIds = body.getAll("artifact_ids");
+    await route.fulfill({
+      contentType: "application/zip",
+      headers: { "content-disposition": 'attachment; filename="artifacts.zip"' },
+      body: Buffer.from("mock zip"),
+    });
+  });
+
+  await page.goto(`/artifacts?project_id=${projectId}`);
+  for (const artifact of artifacts) {
+    await page.getByRole("checkbox", { name: `选择文件 ${artifact.original_filename}` }).check();
+  }
+  const download = page.waitForEvent("download");
+  await page.getByRole("button", { name: "批量下载 2 个" }).click();
+  expect((await download).suggestedFilename()).toBe("artifacts.zip");
+  expect(requestedIds).toEqual(artifacts.map((artifact) => artifact.id));
+  await expect(page.getByRole("status")).toContainText("已开始下载：2 个文件");
+});
+
 test("geometry catalog scrolling uses static SVG without WebGL contexts", async ({ page }) => {
   const contextWarnings: string[] = [];
   page.on("console", (message) => {
@@ -2277,6 +2457,123 @@ test("upload queue shows artifact parsing after transport succeeds", async ({ pa
   const row = page.locator(".upload-task-row").filter({ hasText: "background-parse.log" });
   await expect(row).toContainText("已上传，等待解析");
   await expect(row).not.toHaveClass(/is-parsing/);
+});
+
+test("upload queue refreshes the terminal parse state after staging", async ({ page }) => {
+  const batchId = "00000000-0000-7000-8000-000000000820";
+  let clientFileId = "";
+  let parseComplete = false;
+
+  await page.route("**/api/auth/me", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "00000000-0000-7000-8000-000000000822",
+        display_name: "Upload Tester",
+        primary_email: "upload-tester@example.test",
+        is_service_account: false,
+        identity: { issuer: "https://issuer.example.test", subject: "upload-tester" },
+        projects: [{
+          project_id: "00000000-0000-7000-8000-000000000201",
+          project_slug: "upload-project",
+          project_name: "Upload Project",
+          organization_id: "00000000-0000-7000-8000-000000000202",
+          organization_slug: "upload-organization",
+          organization_name: "Upload Organization",
+          organization_role: "member",
+          project_role: "member",
+          permissions: ["artifact:upload"],
+        }],
+      }),
+    });
+  });
+
+  await page.route("**/api/upload-batches**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (url.pathname === "/api/upload-batches" && request.method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ items: [], total: 0, limit: 8, offset: 0 }),
+      });
+      return;
+    }
+    if (url.pathname === "/api/upload-batches" && request.method() === "POST") {
+      const body = request.postDataJSON() as { files: Array<{ client_file_id: string }> };
+      clientFileId = body.files[0].client_file_id;
+      await route.fulfill({
+        status: 201,
+        contentType: "application/json",
+        body: JSON.stringify(uploadBatchFixture(batchId, {
+          total_count: 1,
+          total_bytes: 4,
+          artifact_kind: "calculation_output",
+        })),
+      });
+      return;
+    }
+    if (url.pathname === `/api/upload-batches/${batchId}` && request.method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify(uploadBatchFixture(batchId, {
+          status: parseComplete ? "completed" : "active",
+          total_count: 1,
+          total_bytes: 4,
+          succeeded_count: parseComplete ? 1 : 0,
+          staged_count: parseComplete ? 0 : 1,
+          processing_count: 0,
+        })),
+      });
+      return;
+    }
+    if (url.pathname === `/api/upload-batches/${batchId}/items` && request.method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          items: [uploadBatchItemFixture(clientFileId, "race-parse.log", {
+            size_bytes: 4,
+            status: parseComplete ? "succeeded" : "staged",
+            artifact_file_id: parseComplete
+              ? "00000000-0000-7000-8000-000000000821"
+              : null,
+            ingestion_status: parseComplete ? "succeeded" : "pending",
+          })],
+          total: 1,
+          limit: 100,
+          offset: 0,
+        }),
+      });
+      return;
+    }
+    if (url.pathname === `/api/upload-batches/${batchId}/files` && request.method() === "POST") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify([uploadBatchItemFixture(clientFileId, "race-parse.log", {
+          size_bytes: 4,
+          status: "staged",
+          artifact_file_id: "00000000-0000-7000-8000-000000000821",
+          ingestion_status: "pending",
+        })]),
+      });
+      return;
+    }
+    await route.fallback();
+  });
+
+  await page.goto("/uploads");
+  await page.locator('.upload-source-actions input[type="file"]').first().setInputFiles({
+    name: "race-parse.log",
+    mimeType: "text/plain",
+    buffer: Buffer.from("data"),
+  });
+  await page.getByRole("button", { name: "开始上传" }).click();
+  const row = page.locator(".upload-task-row").filter({ hasText: "race-parse.log" });
+  await expect(row).toContainText("已上传，等待解析");
+
+  // The worker finishes between two polls. The next poll must still fetch the
+  // item row even though the batch counters are already terminal.
+  parseComplete = true;
+  await expect(row).toContainText("解析完成", { timeout: 5_000 });
 });
 
 test("ten-thousand-file queue keeps the rendered list paginated", async ({ page }) => {

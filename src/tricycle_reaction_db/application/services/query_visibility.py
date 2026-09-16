@@ -56,6 +56,7 @@ from tricycle_reaction_db.domain.enums import (
     ParseCompleteness,
     ParseStatus,
     StorageStatus,
+    ThermodynamicProfileSourceVisibility,
 )
 
 
@@ -1160,7 +1161,11 @@ def _profile_state_is_visible(
     legacy_is_visible = and_(
         ~has_any_source_provenance,
         geometry_id.is_not(None),
-        geometry_id.in_(visible_geometry_ids(scope)),
+        (
+            _project_geometry_catalog_source_is_visible(scope, geometry_id)
+            if scope.uses_project_owned_fast_path
+            else geometry_id.in_(visible_geometry_ids(scope))
+        ),
     )
     selection_is_visible = or_(source_is_visible, legacy_is_visible)
     hidden_selection_exists = (
@@ -1185,11 +1190,46 @@ def _profile_state_is_visible(
 def thermodynamic_profile_is_visible(
     scope: QueryVisibilityScope,
     profile: Any = MappedReactionThermodynamicProfile,
+    *,
+    mapped_reaction_id: Any | None = None,
 ) -> Any:
     """Return a fail-closed source authorization predicate for one profile."""
 
     if scope.unrestricted:
         return true()
+    if scope.uses_project_owned_fast_path:
+        # Keep the parent check correlated to the profile row.  The previous
+        # ``profile.mapped_reaction_id IN (SELECT mapped_reaction.id ...)``
+        # shape made PostgreSQL rescan the whole mapped_reaction table for
+        # every profile while evaluating a project-scoped reaction filter.
+        mapped_reaction_table = getattr(
+            getattr(getattr(mapped_reaction_id, "table", None), "c", None),
+            "project_id",
+            None,
+        )
+        if mapped_reaction_table is not None:
+            # ``mapped_reaction_id`` is normally the outer MappedReaction.id
+            # from mapped_reaction_has_thermodynamic_profile().  Reuse its
+            # already-correlated project column instead of introducing a
+            # second mapped_reaction scan inside every profile row.
+            parent_is_owned = mapped_reaction_table == scope.requested_project_id
+        else:
+            parent_is_owned = (
+                select(1)
+                .select_from(MappedReaction)
+                .where(
+                    col(MappedReaction.id) == col(profile.mapped_reaction_id),
+                    col(MappedReaction.project_id) == scope.requested_project_id,
+                )
+                .correlate(profile)
+                .exists()
+            )
+    else:
+        parent_is_owned = col(profile.mapped_reaction_id).in_(
+            select(col(MappedReaction.id)).where(
+                _derived_project_owner_is_visible(scope, col(MappedReaction.project_id))
+            )
+        )
     standard_profile = and_(
         col(profile.reactants).is_not(None),
         _profile_state_is_visible(
@@ -1233,16 +1273,26 @@ def thermodynamic_profile_is_visible(
             required=False,
         ),
     )
+    profile_source_is_visible = or_(standard_profile, ts_only_profile)
+    if scope.uses_project_owned_fast_path:
+        # New profiles carry a database-maintained, project-scoped source
+        # visibility result.  Legacy/unknown rows retain the JSON provenance
+        # fallback until they are materialized, while an explicitly hidden
+        # row fails closed without expanding any JSON arrays.
+        profile_source_is_visible = or_(
+            col(profile.source_visibility_status) == ThermodynamicProfileSourceVisibility.VISIBLE,
+            and_(
+                col(profile.source_visibility_status)
+                == ThermodynamicProfileSourceVisibility.UNKNOWN,
+                profile_source_is_visible,
+            ),
+        )
     return and_(
         # The profile has no independent project column.  Its parent is the
         # ownership boundary, so keep this predicate safe even when a caller
         # uses it outside a query that already joins a visible MappedReaction.
-        col(profile.mapped_reaction_id).in_(
-            select(col(MappedReaction.id)).where(
-                _derived_project_owner_is_visible(scope, col(MappedReaction.project_id))
-            )
-        ),
-        or_(standard_profile, ts_only_profile),
+        parent_is_owned,
+        profile_source_is_visible,
     )
 
 

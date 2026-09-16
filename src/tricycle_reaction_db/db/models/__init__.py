@@ -62,6 +62,7 @@ from tricycle_reaction_db.db.models.reactions import (
     MappedReactionNodeGeometryMapping,
     MappedReactionParticipant,
     MappedReactionThermodynamicProfile,
+    MappedReactionThermodynamicProfileSource,
     WorkflowManifest,
 )
 from tricycle_reaction_db.db.models.storage import (
@@ -130,6 +131,7 @@ __all__ = [
     "MappedReactionEdge",
     "MappedReactionParticipant",
     "MappedReactionThermodynamicProfile",
+    "MappedReactionThermodynamicProfileSource",
     "MappedReactionNode",
     "MappedReactionNodeGeometry",
     "MappedReactionNodeGeometryMapping",

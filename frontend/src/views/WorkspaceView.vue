@@ -11,6 +11,17 @@ import { useCatalogQueries, type CatalogView } from "@/composables/useCatalogQue
 import { useProjectContext } from "@/composables/useProjectContext";
 import { useSession } from "@/composables/useSession";
 import { queryClient } from "@/queryClient";
+import {
+  ARTIFACT_PAGE_SIZE_STORAGE_KEY,
+  CATALOG_PAGE_SIZE_MAX,
+  DEFAULT_CATALOG_PAGE_SIZE,
+  DEFAULT_REACTION_PAGE_SIZE,
+  REACTION_PAGE_SIZE_MAX,
+  REACTION_PAGE_SIZE_STORAGE_KEY,
+  loadPageSize,
+  normalizePageSize,
+  savePageSize,
+} from "@/pagination";
 import { withoutAccessState } from "@/routeAccessState";
 import type { ReactionQueryFilters, ReactionSort } from "@/reactionQuery";
 import type { PageInfo } from "@/types";
@@ -21,9 +32,6 @@ const session = useSession();
 const projectContext = useProjectContext();
 const currentUser = session.user;
 const currentProjectId = projectContext.currentProjectId;
-
-const REACTION_PAGE_SIZE = 12;
-const ARTIFACT_PAGE_SIZE = 50;
 
 function pageNumberFromQuery(value: unknown): number {
   const candidate = Array.isArray(value) ? value[0] : value;
@@ -75,13 +83,23 @@ const artifactQueryFilters = computed<ArtifactFilterValues>(() => ({
 const selectedFrameId = ref<string | null>(null);
 const selectedArtifactId = ref<string | null>(null);
 const expandedArtifactId = ref<string | null>(null);
+const reactionPageSize = ref(loadPageSize(
+  REACTION_PAGE_SIZE_STORAGE_KEY,
+  DEFAULT_REACTION_PAGE_SIZE,
+  REACTION_PAGE_SIZE_MAX,
+));
+const artifactPageSize = ref(loadPageSize(
+  ARTIFACT_PAGE_SIZE_STORAGE_KEY,
+  DEFAULT_CATALOG_PAGE_SIZE,
+  CATALOG_PAGE_SIZE_MAX,
+));
 const reactionOffset = ref(
-  route.name === "reactions" ? offsetFromPage(route.query.page, REACTION_PAGE_SIZE) : 0,
+  route.name === "reactions" ? offsetFromPage(route.query.page, reactionPageSize.value) : 0,
 );
 const reactionFilters = ref<ReactionQueryFilters>({});
 const reactionSort = ref<ReactionSort>({ sortBy: "default", sortDirection: "asc" });
 const artifactOffset = ref(
-  route.name === "artifacts" ? offsetFromPage(route.query.page, ARTIFACT_PAGE_SIZE) : 0,
+  route.name === "artifacts" ? offsetFromPage(route.query.page, artifactPageSize.value) : 0,
 );
 const artifactSort = ref<ArtifactSort>({ sortBy: "created_at", sortDirection: "desc" });
 
@@ -89,9 +107,11 @@ const queries = useCatalogQueries({
   projectId: currentProjectId,
   activeView,
   reactionOffset,
+  reactionPageSize,
   reactionFilters,
   reactionSort,
   artifactOffset,
+  artifactPageSize,
   artifactSort,
   artifactFilterId,
   artifactKindFilter,
@@ -108,8 +128,8 @@ const reactions = computed(() => queries.reactions.data.value?.items ?? []);
 const artifacts = computed(() => queries.artifacts.data.value?.items ?? []);
 const selectedFrame = computed(() => queries.frame.data.value ?? null);
 const artifactPreview = computed(() => queries.artifactPreview.data.value ?? null);
-const reactionPage = computed<PageInfo>(() => queries.reactions.data.value?.page ?? { total: 0, limit: 12, offset: reactionOffset.value });
-const artifactPage = computed<PageInfo>(() => queries.artifacts.data.value?.page ?? { total: 0, limit: 50, offset: artifactOffset.value });
+const reactionPage = computed<PageInfo>(() => queries.reactions.data.value?.page ?? { total: 0, limit: reactionPageSize.value, offset: reactionOffset.value });
+const artifactPage = computed<PageInfo>(() => queries.artifacts.data.value?.page ?? { total: 0, limit: artifactPageSize.value, offset: artifactOffset.value });
 const loading = computed(() => activeView.value === "reactions" ? queries.reactions.isLoading.value : queries.artifacts.isLoading.value);
 const querying = computed(() => {
   const query = activeView.value === "reactions" ? queries.reactions : queries.artifacts;
@@ -160,10 +180,10 @@ watch(
   [() => route.name, () => route.query.page],
   ([name, page]) => {
     if (name === "reactions") {
-      const nextOffset = offsetFromPage(page, REACTION_PAGE_SIZE);
+      const nextOffset = offsetFromPage(page, reactionPageSize.value);
       if (reactionOffset.value !== nextOffset) reactionOffset.value = nextOffset;
     } else if (name === "artifacts") {
-      const nextOffset = offsetFromPage(page, ARTIFACT_PAGE_SIZE);
+      const nextOffset = offsetFromPage(page, artifactPageSize.value);
       if (artifactOffset.value !== nextOffset) artifactOffset.value = nextOffset;
     }
   },
@@ -232,6 +252,22 @@ function updateArtifactSort(sort: ArtifactSort): void {
   setArtifactPage(0, true);
 }
 
+function updateReactionPageSize(value: number): void {
+  const nextPageSize = normalizePageSize(value, reactionPageSize.value, REACTION_PAGE_SIZE_MAX);
+  if (nextPageSize === reactionPageSize.value) return;
+  reactionPageSize.value = nextPageSize;
+  savePageSize(REACTION_PAGE_SIZE_STORAGE_KEY, nextPageSize, REACTION_PAGE_SIZE_MAX);
+  setReactionPage(0, true);
+}
+
+function updateArtifactPageSize(value: number): void {
+  const nextPageSize = normalizePageSize(value, artifactPageSize.value, CATALOG_PAGE_SIZE_MAX);
+  if (nextPageSize === artifactPageSize.value) return;
+  artifactPageSize.value = nextPageSize;
+  savePageSize(ARTIFACT_PAGE_SIZE_STORAGE_KEY, nextPageSize, CATALOG_PAGE_SIZE_MAX);
+  setArtifactPage(0, true);
+}
+
 function closeArtifactPreview(): void {
   selectedArtifactId.value = null;
 }
@@ -268,7 +304,7 @@ function catalogPageQuery(page: number): LocationQueryRaw {
 function setReactionPage(offset: number, replace = false): void {
   const nextOffset = Math.max(0, offset);
   reactionOffset.value = nextOffset;
-  const page = pageNumberFromOffset(nextOffset, REACTION_PAGE_SIZE);
+  const page = pageNumberFromOffset(nextOffset, reactionPageSize.value);
   const navigate = replace ? router.replace : router.push;
   void navigate({ name: "reactions", query: catalogPageQuery(page) });
 }
@@ -276,7 +312,7 @@ function setReactionPage(offset: number, replace = false): void {
 function setArtifactPage(offset: number, replace = false): void {
   const nextOffset = Math.max(0, offset);
   artifactOffset.value = nextOffset;
-  const page = pageNumberFromOffset(nextOffset, ARTIFACT_PAGE_SIZE);
+  const page = pageNumberFromOffset(nextOffset, artifactPageSize.value);
   const navigate = replace ? router.replace : router.push;
   void navigate({ name: "artifacts", query: catalogPageQuery(page) });
 }
@@ -326,11 +362,13 @@ function jumpArtifactPage(offset: number): void { setArtifactPage(offset); }
       :project-id="currentProjectId"
       :total="reactionPage.total"
       :page="reactionPage"
+      :page-size="reactionPageSize"
       :query-filters="reactionFilters"
       :sort="reactionSort"
       @previous-page="previousReactionPage"
       @next-page="nextReactionPage"
       @jump-page="jumpReactionPage"
+      @page-size-change="updateReactionPageSize"
       @apply-filters="applyReactionFilters"
       @update-sort="updateReactionSort"
     />
@@ -349,6 +387,7 @@ function jumpArtifactPage(offset: number): void { setArtifactPage(offset); }
       :frames-error="queries.artifactFrames.error.value instanceof Error ? queries.artifactFrames.error.value.message : ''"
       :total="artifactPage.total"
       :page="artifactPage"
+      :page-size="artifactPageSize"
       :sort="artifactSort"
       @apply-filters="applyArtifactFilters"
       @update-sort="updateArtifactSort"
@@ -360,6 +399,7 @@ function jumpArtifactPage(offset: number): void { setArtifactPage(offset); }
       @previous-page="previousArtifactPage"
       @next-page="nextArtifactPage"
       @jump-page="jumpArtifactPage"
+      @page-size-change="updateArtifactPageSize"
     />
 
     <FrameDrawer :open="selectedFrameId !== null" :loading="queries.frame.isLoading.value" :error="drawerError" :frame="selectedFrame" :project-id="currentProjectId ?? undefined" @close="closeFrame" />

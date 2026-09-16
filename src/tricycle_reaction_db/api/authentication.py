@@ -35,6 +35,7 @@ _PUBLIC_PATHS = {
 }
 _ANONYMOUS_ARTIFACT_PATH = re.compile(r"^/api/artifacts/[^/]+(?:/(?:preview|download))?$")
 _ANONYMOUS_DEPICTION_PATH = re.compile(r"^/api/depictions/")
+_CSRF_FORM_PATHS = {"/api/artifacts/batch-download/form"}
 _bearer_scheme = HTTPBearer(auto_error=False)
 BearerCredential = Annotated[
     HTTPAuthorizationCredentials | None,
@@ -66,14 +67,23 @@ def _is_mcp_request(request: Request) -> bool:
     return request.url.path == "/mcp" or request.url.path.startswith("/mcp/")
 
 
-def _csrf_failure(request: Request, raw_session_token: str | None) -> str | None:
+def _csrf_failure(
+    request: Request,
+    raw_session_token: str | None,
+    *,
+    submitted_token: str | None = None,
+) -> str | None:
     if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
         return None
     if raw_session_token is None or request.headers.get("authorization") is not None:
         return None
     settings = get_settings()
     cookie_token = request.cookies.get(settings.csrf_cookie_name)
-    header_token = request.headers.get(settings.csrf_header_name)
+    header_token = (
+        request.headers.get(settings.csrf_header_name)
+        if submitted_token is None
+        else submitted_token
+    )
     expected = AuthenticationService.csrf_token(raw_session_token)
     if cookie_token is None or header_token is None:
         return "CSRF token is required for session-authenticated state changes"
@@ -83,6 +93,34 @@ def _csrf_failure(request: Request, raw_session_token: str | None) -> str | None
     ):
         return "CSRF token is invalid"
     return None
+
+
+async def _csrf_failure_for_request(
+    request: Request,
+    raw_session_token: str | None,
+) -> str | None:
+    """Validate the header token, or the hidden token used by native forms.
+
+    A browser form cannot set a custom HTTP header.  The archive download form
+    therefore submits the same double-submit token as a URL-encoded field;
+    only the explicitly registered form endpoints are allowed to use this
+    fallback.  Multipart uploads continue to use the header path and are not
+    parsed in middleware.
+    """
+
+    settings = get_settings()
+    submitted_token: str | None = None
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if (
+        request.url.path in _CSRF_FORM_PATHS
+        and content_type == "application/x-www-form-urlencoded"
+        and request.headers.get(settings.csrf_header_name) is None
+    ):
+        form = await request.form()
+        value = form.get(settings.csrf_header_name)
+        if isinstance(value, str):
+            submitted_token = value
+    return _csrf_failure(request, raw_session_token, submitted_token=submitted_token)
 
 
 class AuthenticationMiddleware(BaseHTTPMiddleware):
@@ -95,7 +133,7 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         authorization = request.headers.get("authorization")
         session_token = request.cookies.get(get_settings().session_cookie_name)
-        csrf_error = _csrf_failure(request, session_token)
+        csrf_error = await _csrf_failure_for_request(request, session_token)
         if csrf_error is not None:
             return JSONResponse(
                 status_code=status.HTTP_403_FORBIDDEN,

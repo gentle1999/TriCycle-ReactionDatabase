@@ -15,6 +15,14 @@ import { api } from "@/api";
 import { useGeometryQueries } from "@/composables/useGeometryQueries";
 import { useProjectContext } from "@/composables/useProjectContext";
 import { withoutAccessState } from "@/routeAccessState";
+import {
+  CATALOG_PAGE_SIZE_MAX,
+  DEFAULT_CATALOG_PAGE_SIZE,
+  GEOMETRY_PAGE_SIZE_STORAGE_KEY,
+  loadPageSize,
+  normalizePageSize,
+  savePageSize,
+} from "@/pagination";
 import type { GeometryQueryFilters, GeometrySort } from "@/geometryQuery";
 import type { CalculationFrameDetail, GeometryDetail } from "@/types";
 
@@ -23,6 +31,11 @@ const router = useRouter();
 const projectContext = useProjectContext();
 const currentProjectId = projectContext.currentProjectId;
 const offset = ref(0);
+const pageSize = ref(loadPageSize(
+  GEOMETRY_PAGE_SIZE_STORAGE_KEY,
+  DEFAULT_CATALOG_PAGE_SIZE,
+  CATALOG_PAGE_SIZE_MAX,
+));
 const initialTopologySmiles = typeof route.query.topology === "string" ? route.query.topology : "";
 const geometrySort = ref<GeometrySort>(initialTopologySmiles
   ? { sortBy: "similarity", sortDirection: "desc" }
@@ -43,7 +56,7 @@ let quickValidationController: AbortController | null = null;
 let quickValidationGeneration = 0;
 
 const selectedGeometryId = computed(() => typeof route.query.preview_geometry === "string" ? route.query.preview_geometry : null);
-const queries = useGeometryQueries(currentProjectId, selectedGeometryId, offset, geometrySort, topologySmiles, advancedFilters, thermodynamicOnly);
+const queries = useGeometryQueries(currentProjectId, selectedGeometryId, offset, pageSize, geometrySort, topologySmiles, advancedFilters, thermodynamicOnly);
 const databaseTotals = useQuery({
   queryKey: computed(() => ["catalog", "geometry-totals", { projectId: currentProjectId.value }]),
   queryFn: async ({ signal }) => {
@@ -68,7 +81,7 @@ const databaseTotals = useQuery({
 });
 const selectedGeometry = computed<GeometryDetail | null>(() => queries.detail.data.value ?? null);
 const geometries = computed(() => queries.list.data.value?.items ?? []);
-const page = computed(() => queries.list.data.value?.page ?? { total: 0, limit: 50, offset: offset.value });
+const page = computed(() => queries.list.data.value?.page ?? { total: 0, limit: pageSize.value, offset: offset.value });
 const listError = computed(() => {
   const error = queries.list.error.value;
   return error instanceof Error ? error.message : "";
@@ -196,6 +209,14 @@ function nextPage(): void { if (page.value.offset + page.value.limit < page.valu
 function previousPage(): void { if (page.value.offset > 0) offset.value = Math.max(0, offset.value - page.value.limit); }
 function jumpPage(nextOffset: number): void { offset.value = nextOffset; }
 
+function updatePageSize(value: number): void {
+  const nextPageSize = normalizePageSize(value, pageSize.value, CATALOG_PAGE_SIZE_MAX);
+  if (nextPageSize === pageSize.value) return;
+  pageSize.value = nextPageSize;
+  savePageSize(GEOMETRY_PAGE_SIZE_STORAGE_KEY, nextPageSize, CATALOG_PAGE_SIZE_MAX);
+  offset.value = 0;
+}
+
 async function openFrame(id: string): Promise<void> {
   selectedFrameId.value = id;
   frame.value = null;
@@ -250,7 +271,7 @@ onBeforeUnmount(() => {
             <label><span>排序</span><select v-model="geometrySort.sortBy" aria-label="几何构象排序字段"><option value="default">默认顺序</option><option v-if="topologySmiles" value="similarity">相似度</option><option value="created_at">创建时间</option><option value="atom_count">原子数</option><option value="calculation_count">计算帧数</option></select></label>
             <label><span>顺序</span><select v-model="geometrySort.sortDirection" aria-label="几何构象排序方向" :disabled="geometrySort.sortBy === 'default' || geometrySort.sortBy === 'similarity'"><option value="asc">升序</option><option value="desc">降序</option></select></label>
           </div>
-          <PaginationControls :page="page" label="几何构象分页" @previous="previousPage" @next="nextPage" @jump="jumpPage" />
+          <PaginationControls :page="page" :page-size="pageSize" :max-page-size="CATALOG_PAGE_SIZE_MAX" label="几何构象分页" @previous="previousPage" @next="nextPage" @jump="jumpPage" @page-size-change="updatePageSize" />
         </div>
       </header>
       <div class="catalog-query-status-slot" aria-live="polite">
@@ -262,7 +283,7 @@ onBeforeUnmount(() => {
       <div v-else class="geometry-card-grid">
         <GeometryCatalogCard v-for="geometry in geometries" :key="geometry.id" :geometry="geometry" :project-id="currentProjectId" :active="geometry.id === selectedGeometryId" @open="openGeometry" />
       </div>
-      <PaginationControls :page="page" label="几何构象分页（底部）" @previous="previousPage" @next="nextPage" @jump="jumpPage" />
+      <PaginationControls :page="page" :page-size="pageSize" :max-page-size="CATALOG_PAGE_SIZE_MAX" label="几何构象分页（底部）" @previous="previousPage" @next="nextPage" @jump="jumpPage" @page-size-change="updatePageSize" />
       <p class="table-summary">显示 {{ geometries.length }} / {{ page.total }} 个构象</p>
     </section>
 

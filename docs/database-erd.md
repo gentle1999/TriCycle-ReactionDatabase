@@ -1,9 +1,9 @@
 # 数据库实体关系图
 
-> 当前 schema：Alembic `0044_project_identity_provenance`
-> 生成来源：`tricycle_reaction_db.db.models.metadata`
-> 完整性：64 张表、794 个列、
-> 104 条外键约束，未省略物理表、列或 FK。
+> 当前 schema：Alembic `0050_profile_source_visibility`
+> 生成来源：NexusX `ErDiagram.from_sqlmodel(...)`（实体来自 SQLModel 导出注册表）
+> 完整性：65 张表、801 个列、
+> 106 条外键约束，未省略物理表、列或 FK。
 
 本文区分物理持久化后端和进程内对象。RustFS 与 PostgreSQL 不共享事务；
 `artifact_file` 只保存 RustFS locator、内容 hash 和状态，原始逻辑字节不进入
@@ -98,6 +98,7 @@ flowchart TB
                 logical_participant_concrete_topology["logical_participant_concrete_topology<br/>logical → concrete"]
                 mapped_reaction["mapped_reaction"]
                 mapped_reaction_thermodynamic_profile["mapped_reaction_thermodynamic_profile"]
+                mapped_reaction_thermodynamic_profile_source["mapped_reaction_thermodynamic_profile_source"]
                 mapped_reaction_participant["mapped_reaction_participant"]
                 mapped_reaction_node["mapped_reaction_node"]
                 mapped_reaction_node_geometry["mapped_reaction_node_geometry"]
@@ -123,14 +124,14 @@ flowchart TB
     classDef postgres fill:#eaf2ff,stroke:#0969da,color:#1f2328
     classDef memory fill:#f1f3f5,stroke:#57606a,color:#1f2328,stroke-dasharray: 5 5
     class rustfs_object rustfs
-    class user_account,auth_session,mcp_access_token,external_identity,organization,organization_membership,project,project_membership,project_invitation,audit_event,derived_data_isolation_quarantine,artifact_file,artifact_ingestion,upload_batch,upload_batch_item,calculation_protocol,parse_revision,calculation_segment,calculation_frame,storage_garbage_collection_state,storage_garbage_collection_run,molecular_formula,molecular_topology,molecular_topology_abstraction,molecular_topology_derivation,geometry,project_geometry_catalog,project_geometry_catalog_count,frame_energy_result,energy_observation,geometry_optimization_result,vibration_result,calculation_status_result,scientific_array,thermochemistry_result,molecular_orbital_result,charge_spin_population_result,atomic_population_series,polarizability_result,nmr_result,nmr_shielding_tensor,bond_order_result,total_spin_result,single_point_property_result,electronic_state_set,electronic_state,electronic_configuration,multireference_result,implicit_solvation_result,scientific_array_assignment,workflow_manifest,manifest_artifact_binding,logical_reaction,logical_reaction_participant,logical_participant_concrete_topology,mapped_reaction,mapped_reaction_thermodynamic_profile,mapped_reaction_participant,mapped_reaction_node,mapped_reaction_node_geometry,mapped_reaction_node_geometry_mapping,mapped_reaction_edge,transition_state_inference,transition_state_endpoint postgres
+    class user_account,auth_session,mcp_access_token,external_identity,organization,organization_membership,project,project_membership,project_invitation,audit_event,derived_data_isolation_quarantine,artifact_file,artifact_ingestion,upload_batch,upload_batch_item,calculation_protocol,parse_revision,calculation_segment,calculation_frame,storage_garbage_collection_state,storage_garbage_collection_run,molecular_formula,molecular_topology,molecular_topology_abstraction,molecular_topology_derivation,geometry,project_geometry_catalog,project_geometry_catalog_count,frame_energy_result,energy_observation,geometry_optimization_result,vibration_result,calculation_status_result,scientific_array,thermochemistry_result,molecular_orbital_result,charge_spin_population_result,atomic_population_series,polarizability_result,nmr_result,nmr_shielding_tensor,bond_order_result,total_spin_result,single_point_property_result,electronic_state_set,electronic_state,electronic_configuration,multireference_result,implicit_solvation_result,scientific_array_assignment,workflow_manifest,manifest_artifact_binding,logical_reaction,logical_reaction_participant,logical_participant_concrete_topology,mapped_reaction,mapped_reaction_thermodynamic_profile,mapped_reaction_thermodynamic_profile_source,mapped_reaction_participant,mapped_reaction_node,mapped_reaction_node_geometry,mapped_reaction_node_geometry_mapping,mapped_reaction_edge,transition_state_inference,transition_state_endpoint postgres
     class molop_models,runtime_objects memory
 ```
 
 | 数据形态 | 持久化后端 | 权威内容 |
 | --- | --- | --- |
 | 原始 Gaussian/ORCA/input/manifest bytes | RustFS | object bytes 和 object-store version/ETag |
-| Artifact 索引、解析、化学、反应与结果实体 | PostgreSQL | 64 张关系表及其约束 |
+| Artifact 索引、解析、化学、反应与结果实体 | PostgreSQL | 65 张关系表及其约束 |
 | 用户、外部身份、组织、项目与成员关系 | PostgreSQL | 本地授权主体、OIDC 映射和角色权限边界 |
 | `molecular_topology.mol`、`geometry.mol` | PostgreSQL + RDKit cartridge | 分子图与带坐标 mol |
 | `geometry.internal_coordinates`、`scientific_array.data` | PostgreSQL `BYTEA` | `allow_pickle=False` 的 NPY bytes |
@@ -140,1051 +141,1121 @@ flowchart TB
 
 ## 全量物理 ERD
 
-下图逐列展开全部 64 张 PostgreSQL 表，并为 104 条外键约束各生成一条关系线。
-关系标签是子表 FK 列名；复合 FK 使用 `__` 连接列名。`nullable` 表示列允许
-SQL `NULL`。单列唯一键标为 `UK`；复合 UNIQUE、CHECK 和 index 在后续清单中
-逐表计数，并以 SQLModel/Alembic 定义为权威。
+下图由 NexusX 从全部 65 个 SQLModel 实体生成；实体字段和 ORM 关系来自模型注册表，不在脚本中重复维护。
+物理 FK、UNIQUE、CHECK 和 index 的逐表计数在后续清单中列出，并以 SQLModel/Alembic
+定义为权威。
 
 ```mermaid
-%% Generated from SQLAlchemy metadata. Do not hand-edit this block.
+%% Generated by NexusX ErDiagram.from_sqlmodel. Do not hand-edit this block.
 erDiagram
-    user_account ||--o{ artifact_file : created_by_user_id
-    project ||--o{ artifact_file : project_id
-    artifact_file ||--o| artifact_ingestion : artifact_file_id
-    charge_spin_population_result ||--o{ atomic_population_series : result_id
-    user_account o|--o{ audit_event : actor_user_id
-    project o|--o{ audit_event : project_id
-    user_account ||--o{ auth_session : user_id
-    calculation_frame ||--o| bond_order_result : frame_id
-    geometry ||--o{ calculation_frame : geometry_id
-    calculation_segment ||--o{ calculation_frame : segment_id__parse_revision_id
-    molecular_topology_derivation ||--o{ calculation_frame : topology_derivation_id
-    project o|--o{ calculation_protocol : project_id
-    parse_revision ||--o{ calculation_segment : parse_revision_id
-    calculation_protocol o|--o{ calculation_segment : protocol_id
-    calculation_frame ||--o| calculation_status_result : frame_id
-    calculation_frame ||--o| charge_spin_population_result : frame_id
-    electronic_state ||--o{ electronic_configuration : electronic_state_id
-    electronic_state_set ||--o{ electronic_state : state_set_id
-    calculation_frame ||--o{ electronic_state_set : frame_id
-    frame_energy_result ||--o{ energy_observation : energy_result_id
-    user_account ||--o{ external_identity : user_id
-    calculation_frame ||--o| frame_energy_result : frame_id
-    project o|--o{ geometry : project_id
-    molecular_topology ||--o{ geometry : topology_id
-    calculation_frame ||--o| geometry_optimization_result : frame_id
-    calculation_frame ||--o| implicit_solvation_result : frame_id
-    molecular_topology ||--o{ logical_participant_concrete_topology : concrete_topology_id
-    logical_reaction_participant ||--o{ logical_participant_concrete_topology : logical_reaction_participant_id
-    project o|--o{ logical_reaction : project_id
-    logical_reaction ||--o{ logical_reaction_participant : logical_reaction_id
-    molecular_topology ||--o{ logical_reaction_participant : topology_id
-    artifact_file o|--o{ manifest_artifact_binding : artifact_file_id
-    workflow_manifest ||--o{ manifest_artifact_binding : workflow_manifest_id
-    manifest_artifact_binding o|--o{ manifest_artifact_binding : workflow_manifest_id__source_geometry_artifact_key
-    logical_reaction ||--o{ mapped_reaction : logical_reaction_id
-    project o|--o{ mapped_reaction : project_id
-    mapped_reaction ||--o{ mapped_reaction_edge : mapped_reaction_id
-    mapped_reaction_node ||--o{ mapped_reaction_edge : mapped_reaction_id__source_node_id
-    mapped_reaction_node ||--o{ mapped_reaction_edge : mapped_reaction_id__target_node_id
-    mapped_reaction_node o|--o{ mapped_reaction_edge : mapped_reaction_id__transition_state_node_id
-    mapped_reaction ||--o{ mapped_reaction_node : mapped_reaction_id
-    geometry ||--o{ mapped_reaction_node_geometry : geometry_id
-    mapped_reaction_node ||--o{ mapped_reaction_node_geometry : mapped_reaction_node_id
-    mapped_reaction_participant o|--o{ mapped_reaction_node_geometry : mapped_reaction_participant_id
-    mapped_reaction_node_geometry ||--o| mapped_reaction_node_geometry_mapping : mapped_reaction_node_geometry_id
-    molecular_topology o|--o{ mapped_reaction_participant : concrete_topology_id
-    logical_reaction_participant ||--o{ mapped_reaction_participant : logical_reaction_participant_id
-    mapped_reaction ||--o{ mapped_reaction_participant : mapped_reaction_id
-    mapped_reaction ||--o{ mapped_reaction_thermodynamic_profile : mapped_reaction_id
-    user_account ||--o{ mcp_access_token : user_id
-    project o|--o{ molecular_formula : project_id
-    calculation_frame ||--o| molecular_orbital_result : frame_id
-    molecular_formula ||--o{ molecular_topology : formula_id
-    project o|--o{ molecular_topology : project_id
-    molecular_topology ||--o{ molecular_topology_abstraction : general_topology_id
-    project o|--o{ molecular_topology_abstraction : project_id
-    molecular_topology ||--o{ molecular_topology_abstraction : specific_topology_id
-    project o|--o{ molecular_topology_derivation : project_id
-    molecular_topology ||--o{ molecular_topology_derivation : topology_id
-    electronic_state_set o|--o| multireference_result : electronic_state_set_id
-    calculation_frame ||--o| multireference_result : frame_id
-    calculation_frame ||--o| nmr_result : frame_id
-    nmr_result ||--o{ nmr_shielding_tensor : result_id
-    organization ||--o{ organization_membership : organization_id
-    user_account ||--o{ organization_membership : user_id
-    artifact_file ||--o{ parse_revision : artifact_file_id
-    parse_revision o|--o{ parse_revision : reparse_of_id
-    calculation_frame ||--o| polarizability_result : frame_id
-    user_account o|--o{ project : created_by_user_id
-    organization ||--o{ project : organization_id
-    user_account o|--o{ project : owner_user_id
-    user_account ||--o{ project_invitation : invited_by_user_id
-    project ||--o{ project_invitation : project_id
-    project ||--o{ project_membership : project_id
-    user_account ||--o{ project_membership : user_id
-    calculation_frame ||--o{ scientific_array : frame_id
-    atomic_population_series o|--o{ scientific_array_assignment : atomic_population_series_id
-    bond_order_result o|--o{ scientific_array_assignment : bond_order_result_id
-    electronic_state o|--o{ scientific_array_assignment : electronic_state_id
-    molecular_orbital_result o|--o{ scientific_array_assignment : molecular_orbital_result_id
-    nmr_result o|--o{ scientific_array_assignment : nmr_result_id
-    nmr_shielding_tensor o|--o{ scientific_array_assignment : nmr_shielding_tensor_id
-    polarizability_result o|--o{ scientific_array_assignment : polarizability_result_id
-    scientific_array ||--o| scientific_array_assignment : scientific_array_id
-    single_point_property_result o|--o{ scientific_array_assignment : single_point_property_result_id
-    calculation_frame ||--o| single_point_property_result : frame_id
-    storage_garbage_collection_state ||--o{ storage_garbage_collection_run : state_id
-    calculation_frame ||--o| thermochemistry_result : frame_id
-    calculation_frame ||--o| total_spin_result : frame_id
-    calculation_frame ||--o{ transition_state_endpoint : calculation_frame_id
-    molecular_topology ||--o{ transition_state_endpoint : topology_id
-    artifact_ingestion ||--o{ transition_state_inference : artifact_ingestion_id
-    calculation_frame o|--o{ transition_state_inference : calculation_frame_id
-    logical_reaction o|--o{ transition_state_inference : logical_reaction_id
-    mapped_reaction o|--o{ transition_state_inference : mapped_reaction_id
-    parse_revision ||--o{ transition_state_inference : parse_revision_id
-    user_account ||--o{ upload_batch : created_by_user_id
-    project ||--o{ upload_batch : project_id
-    artifact_file o|--o{ upload_batch_item : artifact_file_id
-    upload_batch ||--o{ upload_batch_item : batch_id
-    parse_revision o|--o{ upload_batch_item : parse_revision_id
-    calculation_frame ||--o| vibration_result : frame_id
-    artifact_file ||--o| workflow_manifest : artifact_file_id
-    workflow_manifest o|--o{ workflow_manifest : manifest_key__supersedes_id
-
-    derived_data_isolation_quarantine {
-        text object_type PK
-        uuid object_id PK
-        jsonb source_project_ids
-        text reason
-        datetime created_at
-    }
-    organization {
-        uuid id PK
-        datetime created_at
-        string slug UK
-        text name
-        enum status
-    }
-    project_geometry_catalog {
-        uuid project_id PK
-        uuid geometry_id PK
-        bigint frame_count
-        datetime geometry_created_at
-        boolean has_frequency_data
-        boolean has_imaginary_frequency
-        boolean has_thermodynamic_property
-    }
-    project_geometry_catalog_count {
-        uuid project_id PK
-        bigint geometry_count
-    }
-    storage_garbage_collection_state {
-        uuid id PK
-        datetime created_at
+    ArtifactFile {
+        string id
+        string created_at
+        string project_id
+        string created_by_user_id
+        string visibility
         string bucket
-        text root_prefix
-        datetime watermark_at
-        datetime updated_at
-        uuid last_successful_run_id "nullable"
-    }
-    user_account {
-        uuid id PK
-        datetime created_at
-        text display_name
-        string primary_email "nullable"
-        enum status
-        boolean is_service_account
-        datetime last_authenticated_at "nullable"
-    }
-    auth_session {
-        uuid id PK
-        datetime created_at
-        uuid user_id FK
-        string token_hash UK
-        datetime expires_at
-        datetime last_seen_at
-        datetime revoked_at "nullable"
-        text user_agent "nullable"
-        string ip_address "nullable"
-    }
-    external_identity {
-        uuid id PK
-        datetime created_at
-        uuid user_id FK
-        string issuer
-        string subject
-        string email "nullable"
-        jsonb claims
-        datetime last_authenticated_at "nullable"
-    }
-    mcp_access_token {
-        uuid id PK
-        datetime created_at
-        uuid user_id FK
-        string name
-        string token_hash UK
-        datetime expires_at
-        datetime last_used_at "nullable"
-        datetime revoked_at "nullable"
-    }
-    organization_membership {
-        uuid id PK
-        datetime created_at
-        uuid organization_id FK
-        uuid user_id FK
-        enum role
-    }
-    project {
-        uuid id PK
-        datetime created_at
-        uuid organization_id FK
-        uuid owner_user_id FK "nullable"
-        uuid created_by_user_id FK "nullable"
-        string slug
-        text name
-        jsonb data_source
-        jsonb model_checkpoint
-        jsonb calculation_protocol
-        enum status
-    }
-    storage_garbage_collection_run {
-        uuid id PK
-        datetime created_at
-        uuid state_id FK
-        datetime started_at
-        datetime completed_at "nullable"
-        datetime scan_after
-        datetime scan_until
-        enum status
-        bigint objects_seen
-        bigint objects_deleted
-        bigint objects_retained
-        bigint objects_failed
-        text error_message "nullable"
-    }
-    artifact_file {
-        uuid id PK
-        datetime created_at
-        uuid project_id FK
-        uuid created_by_user_id FK
-        enum visibility
-        string bucket "RustFS locator"
-        text object_key "RustFS locator"
-        text version_id "nullable; RustFS locator"
+        string object_key
+        string version_id
         string content_sha256
-        bigint size_bytes
-        text original_filename
-        text source_relative_path "nullable"
+        string size_bytes
+        string original_filename
+        string source_relative_path
         string media_type
-        enum artifact_kind
-        enum storage_status
-        text etag "nullable"
-        datetime storage_verified_at "nullable"
+        string artifact_kind
+        string storage_status
+        string etag
+        string storage_verified_at
     }
-    audit_event {
-        uuid id PK
-        datetime created_at
-        uuid actor_user_id FK "nullable"
-        uuid project_id FK "nullable"
-        string action
-        string entity_type
-        uuid entity_id "nullable"
-        jsonb metadata_json
-    }
-    calculation_protocol {
-        uuid id PK
-        datetime created_at
-        uuid project_id FK "nullable"
-        string protocol_hash
-        string spec_schema_version
-        enum qm_software
-        string qm_software_version
-        string method_family "nullable"
-        string method "nullable"
-        string reference_method "nullable"
-        string functional "nullable"
-        string basis_set "nullable"
-        string auxiliary_basis_set "nullable"
-        string dispersion_model "nullable"
-        string solvation_model "nullable"
-        string solvent "nullable"
-        string relativistic_method "nullable"
-        array task_requests
-        jsonb normalized_spec
-    }
-    logical_reaction {
-        uuid id PK
-        datetime created_at
-        uuid project_id FK "nullable"
-        text reaction_key
-        text label "nullable"
-        enum reaction_class "nullable"
-        string cycloaddition_pattern "nullable"
-        string reaction_hash
-        array reactant_sort_key "nullable"
-    }
-    molecular_formula {
-        uuid id PK
-        datetime created_at
-        uuid project_id FK "nullable"
-        text hill_formula
-        jsonb composition
-        string composition_schema_version
-        integer atom_count
-        string composition_hash
-        array element_count_vector
-        string element_count_vector_schema_version
-        array element_count_tokens
-    }
-    project_invitation {
-        uuid id PK
-        datetime created_at
-        uuid project_id FK
-        uuid invited_by_user_id FK
-        string email
-        enum role
-        string token_hash UK
-        datetime expires_at
-        datetime accepted_at "nullable"
-        datetime revoked_at "nullable"
-        string delivery_status
-        text delivery_error "nullable"
-        datetime delivery_sent_at "nullable"
-    }
-    project_membership {
-        uuid id PK
-        datetime created_at
-        uuid project_id FK
-        uuid user_id FK
-        enum role
-    }
-    upload_batch {
-        uuid id PK
-        datetime created_at
-        datetime updated_at
-        uuid project_id FK
-        uuid created_by_user_id FK
-        enum artifact_kind
-        enum status
-        jsonb shared_metadata
-        string archive_sha256 "nullable"
-        string manifest_sha256 "nullable"
-        string manifest_schema_version "nullable"
-        integer total_count
-        bigint total_bytes
-        integer succeeded_count
-        integer failed_count
-        integer cancelled_count
-        integer uploading_count
-        integer staged_count
-        integer processing_count
-    }
-    artifact_ingestion {
-        uuid id PK
-        datetime created_at
-        uuid artifact_file_id FK, UK
-        enum status
+    ArtifactIngestion {
+        string id
+        string created_at
+        string artifact_file_id
+        string status
         string parser_name
         string parser_version
-        integer source_frame_count "nullable"
-        integer transition_state_frame_count "nullable"
-        datetime started_at "nullable"
-        datetime completed_at "nullable"
-        integer processing_attempt_count
-        uuid worker_lease_id "nullable"
-        datetime worker_lease_expires_at "nullable"
-        string error_code "nullable"
-        text error_message "nullable"
-        jsonb parser_metadata
+        string source_frame_count
+        string transition_state_frame_count
+        string started_at
+        string completed_at
+        string processing_attempt_count
+        string worker_lease_id
+        string worker_lease_expires_at
+        string error_code
+        string error_message
+        string parser_metadata
     }
-    mapped_reaction {
-        uuid id PK
-        datetime created_at
-        uuid project_id FK "nullable"
-        uuid logical_reaction_id FK
-        text mapped_reaction_key
-        text label "nullable"
-        enum mapped_reaction_kind
-        text mapped_reaction_smiles
-        rdkitreaction reaction
-        rdkitbitfingerprint reaction_structural_bfp
-        text reaction_structural_bfp_schema_version
+    AtomicPopulationSeries {
+        string id
+        string created_at
+        string result_id
+        string series_key
+        string scheme
+        string quantity
+        string value_count
+        string spin_channel
+        string source_label
+        string series_metadata
+    }
+    AuditEvent {
+        string id
+        string created_at
+        string actor_user_id
+        string project_id
+        string action
+        string entity_type
+        string entity_id
+        string metadata_json
+    }
+    AuthSession {
+        string id
+        string created_at
+        string user_id
+        string token_hash
+        string expires_at
+        string last_seen_at
+        string revoked_at
+        string user_agent
+        string ip_address
+    }
+    BondOrderResult {
+        string id
+        string created_at
+        string frame_id
+        string matrix_count
+        string source_schema_version
+    }
+    CalculationFrame {
+        string id
+        string created_at
+        string parse_revision_id
+        string segment_id
+        string frame_index
+        string file_frame_index
+        string frame_role
+        string source_start_byte
+        string source_end_byte
+        string source_start_char
+        string source_end_char
+        string source_start_line
+        string source_end_line
+        string source_block_sha256
+        string parse_presence
+        string parse_completeness
+        string parse_diagnostics
+        string geometry_id
+        string topology_derivation_id
+        string charge
+        string multiplicity
+        string coordinate_decimal_places
+        string geometry_assignment_kind
+        string observed_coordinates
+        string observed_coordinate_hash
+        string observed_to_geometry_atom_indices
+        string observed_to_geometry_transform
+        string geometry_assignment_rmsd_angstrom
+        string geometry_assignment_max_abs_angstrom
+        string geometry_assignment_policy_version
+        string electronic_state_kind
+        string electronic_state_index
+        string scf_status
+        string optimization_status
+        string electronic_total_energy_hartree
+        string reference_total_energy_hartree
+        string mp2_total_energy_hartree
+        string mp3_total_energy_hartree
+        string mp4_total_energy_hartree
+        string mp5_total_energy_hartree
+        string ccsd_total_energy_hartree
+        string ccsd_t_total_energy_hartree
+        string selected_energy_hartree
+        string selected_energy_kind
+        string energy_selection_policy_version
+        string energy_change_hartree
+        string energy_change_threshold_hartree
+        string energy_change_converged
+        string rms_force_hartree_per_bohr
+        string rms_force_threshold_hartree_per_bohr
+        string rms_force_converged
+        string max_force_hartree_per_bohr
+        string max_force_threshold_hartree_per_bohr
+        string max_force_converged
+        string rms_displacement_bohr
+        string rms_displacement_threshold_bohr
+        string rms_displacement_converged
+        string max_displacement_bohr
+        string max_displacement_threshold_bohr
+        string max_displacement_converged
+        string running_time_seconds
+        string frequency_count
+        string negative_frequency_count
+        string lowest_frequency_cm1
+        string program_metadata_schema_version
+        string program_metadata
+    }
+    CalculationProtocol {
+        string id
+        string created_at
+        string project_id
+        string protocol_hash
+        string spec_schema_version
+        string qm_software
+        string qm_software_version
+        string method_family
+        string method
+        string reference_method
+        string functional
+        string basis_set
+        string auxiliary_basis_set
+        string dispersion_model
+        string solvation_model
+        string solvent
+        string relativistic_method
+        string task_requests
+        string normalized_spec
+    }
+    CalculationSegment {
+        string id
+        string created_at
+        string parse_revision_id
+        string protocol_id
+        string segment_index
+        string segment_label
+        string source_start_byte
+        string source_end_byte
+        string source_start_char
+        string source_end_char
+        string source_start_line
+        string source_end_line
+        string source_block_sha256
+        string source_frame_count
+        string parse_presence
+        string parse_completeness
+        string parse_diagnostics
+        string requested_cpu_count
+        string requested_memory_mb
+        string termination_status
+        string scf_status
+        string wall_time_seconds
+        string program_metadata
+    }
+    CalculationStatusResult {
+        string id
+        string created_at
+        string frame_id
+        string scf_converged
+        string normal_terminated
+        string source_schema_version
+    }
+    ChargeSpinPopulationResult {
+        string id
+        string created_at
+        string frame_id
+        string series_count
+        string source_schema_version
+    }
+    DerivedDataIsolationQuarantine {
+        string object_type
+        string object_id
+        string source_project_ids
+        string reason
+        string created_at
+    }
+    ElectronicConfiguration {
+        string id
+        string created_at
+        string electronic_state_id
+        string configuration_ordinal
+        string label
+        string coefficient
+        string weight
+        string occupation
+        string orbital_indices
+        string raw
+    }
+    ElectronicState {
+        string id
+        string created_at
+        string state_set_id
+        string state_ordinal
+        string state_index
+        string root
+        string label
+        string multiplicity
+        string spin
+        string irrep
+        string method
+        string energy_hartree
+        string excitation_energy_ev
+        string oscillator_strength
+        string state_properties
+        string source
+    }
+    ElectronicStateSet {
+        string id
+        string created_at
+        string frame_id
+        string kind
+        string state_count
+        string source_schema_version
+    }
+    EnergyObservation {
+        string id
+        string created_at
+        string energy_result_id
+        string observation_index
+        string method
+        string quantity_semantics
+        string value_hartree
+        string source_label
+    }
+    ExternalIdentity {
+        string id
+        string created_at
+        string user_id
+        string issuer
+        string subject
+        string email
+        string claims
+        string last_authenticated_at
+    }
+    FrameEnergyResult {
+        string id
+        string created_at
+        string frame_id
+        string electronic_energy_hartree
+        string reference_energy_hartree
+        string mp2_energy_hartree
+        string mp3_energy_hartree
+        string mp4_energy_hartree
+        string mp5_energy_hartree
+        string ccsd_energy_hartree
+        string ccsd_t_energy_hartree
+        string source_schema_version
+    }
+    Geometry {
+        string id
+        string created_at
+        string project_id
+        string topology_id
+        string mol
+        string internal_coordinates
+        string internal_coordinate_distances_angstrom
+        string internal_coordinate_angles_degrees
+        string internal_coordinate_dihedrals_degrees
+        string minimum_coordinate_decimal_places
+        string internal_coordinate_hash
+        string geometry_hash
+        string charge
+        string multiplicity
+        string canonicalization_version
+    }
+    GeometryOptimizationResult {
+        string id
+        string created_at
+        string frame_id
+        string geometry_optimized
+        string convergence_multiplier
+        string source_converged
+        string source_labels
+        string energy_change_hartree
+        string energy_change_threshold_hartree
+        string energy_change_converged
+        string rms_force_hartree_per_bohr
+        string rms_force_threshold_hartree_per_bohr
+        string rms_force_converged
+        string max_force_hartree_per_bohr
+        string max_force_threshold_hartree_per_bohr
+        string max_force_converged
+        string rms_displacement_bohr
+        string rms_displacement_threshold_bohr
+        string rms_displacement_converged
+        string max_displacement_bohr
+        string max_displacement_threshold_bohr
+        string max_displacement_converged
+        string source_schema_version
+    }
+    ImplicitSolvationResult {
+        string id
+        string created_at
+        string frame_id
+        string solvent
+        string solvent_model
+        string atomic_radii
+        string solvent_epsilon
+        string solvent_epsilon_infinite
+        string source_schema_version
+    }
+    LogicalParticipantConcreteTopology {
+        string id
+        string created_at
+        string logical_reaction_participant_id
+        string concrete_topology_id
+        string match_policy_version
+        string match_status
+        string match_metadata
+    }
+    LogicalReaction {
+        string id
+        string created_at
+        string project_id
+        string reaction_key
+        string label
+        string reaction_class
+        string cycloaddition_pattern
+        string reaction_hash
+        string reactant_sort_key
+    }
+    LogicalReactionParticipant {
+        string id
+        string created_at
+        string logical_reaction_id
+        string topology_id
+        string side
+        string participant_index
+        string role
+        string stoichiometric_coefficient
+    }
+    ManifestArtifactBinding {
+        string id
+        string created_at
+        string workflow_manifest_id
+        string artifact_key
+        string artifact_file_id
+        string expected_content_sha256
+        string artifact_role
+        string reaction_key
+        string path_key
+        string node_key
+        string segment_index
+        string frame_index
+        string source_geometry_artifact_key
+        string resolution_status
+    }
+    MappedReaction {
+        string id
+        string created_at
+        string project_id
+        string logical_reaction_id
+        string mapped_reaction_key
+        string label
+        string mapped_reaction_kind
+        string mapped_reaction_smiles
+        string reaction
+        string reaction_structural_bfp
+        string reaction_structural_bfp_schema_version
         string mapping_hash
-        text thermodynamic_profile_policy_version "nullable"
-        float minimum_activation_gibbs_free_energy_kcal_mol "nullable"
-        float maximum_activation_gibbs_free_energy_kcal_mol "nullable"
-        float minimum_reaction_gibbs_free_energy_kcal_mol "nullable"
-        float maximum_reaction_gibbs_free_energy_kcal_mol "nullable"
+        string thermodynamic_profile_policy_version
+        string minimum_activation_gibbs_free_energy_kcal_mol
+        string maximum_activation_gibbs_free_energy_kcal_mol
+        string minimum_reaction_gibbs_free_energy_kcal_mol
+        string maximum_reaction_gibbs_free_energy_kcal_mol
     }
-    molecular_topology {
-        uuid id PK
-        datetime created_at
-        uuid project_id FK "nullable"
-        uuid formula_id FK
-        mol mol "PostgreSQL RDKit cartridge"
-        rdkitbitfingerprint morgan_bfp "nullable"
+    MappedReactionEdge {
+        string id
+        string created_at
+        string mapped_reaction_id
+        string edge_key
+        string source_node_id
+        string target_node_id
+        string transition_state_node_id
+        string edge_kind
+    }
+    MappedReactionNode {
+        string id
+        string created_at
+        string mapped_reaction_id
+        string node_key
+        string node_index
+        string role
+    }
+    MappedReactionNodeGeometry {
+        string id
+        string created_at
+        string mapped_reaction_node_id
+        string geometry_id
+        string mapped_reaction_participant_id
+        string component_key
+        string component_index
+        string coordinate_index
+        string is_primary
+    }
+    MappedReactionNodeGeometryMapping {
+        string id
+        string created_at
+        string mapped_reaction_node_geometry_id
+        string geometry_atom_map_numbers
+        string mapped_smiles
+        string mapping_method
+        string mapping_version
+        string verified
+    }
+    MappedReactionParticipant {
+        string id
+        string created_at
+        string mapped_reaction_id
+        string logical_reaction_participant_id
+        string concrete_topology_id
+        string side
+        string template_index
+        string atom_map_numbers
+        string mapped_smiles
+    }
+    MappedReactionThermodynamicProfile {
+        string id
+        string created_at
+        string mapped_reaction_id
+        string source_visibility_status
+        string source_evidence_complete
+        string policy_version
+        string source_key_hash
+        string electronic_level
+        string thermochemistry_level
+        string temperature_kelvin
+        string pressure_atm
+        string reactants
+        string transition_state
+        string products
+        string reactants_enthalpy_hartree
+        string reactants_gibbs_free_energy_hartree
+        string reactants_entropy_cal_mol_k
+        string transition_state_enthalpy_hartree
+        string transition_state_gibbs_free_energy_hartree
+        string transition_state_entropy_cal_mol_k
+        string products_enthalpy_hartree
+        string products_gibbs_free_energy_hartree
+        string products_entropy_cal_mol_k
+        string reactants_running_time_seconds
+        string transition_state_running_time_seconds
+        string products_running_time_seconds
+        string total_running_time_seconds
+        string activation_enthalpy_kcal_mol
+        string activation_gibbs_free_energy_kcal_mol
+        string activation_entropy_cal_mol_k
+        string reaction_enthalpy_kcal_mol
+        string reaction_gibbs_free_energy_kcal_mol
+        string reaction_entropy_cal_mol_k
+    }
+    MappedReactionThermodynamicProfileSource {
+        string id
+        string created_at
+        string profile_id
+        string calculation_frame_id
+        string allow_partial_ingestion
+    }
+    McpAccessToken {
+        string id
+        string created_at
+        string user_id
+        string name
+        string token_hash
+        string expires_at
+        string last_used_at
+        string revoked_at
+    }
+    MolecularFormula {
+        string id
+        string created_at
+        string project_id
+        string hill_formula
+        string composition
+        string composition_schema_version
+        string atom_count
+        string composition_hash
+        string element_count_vector
+        string element_count_vector_schema_version
+        string element_count_tokens
+    }
+    MolecularOrbitalResult {
+        string id
+        string created_at
+        string frame_id
+        string electronic_state
+        string alpha_orbital_count
+        string beta_orbital_count
+        string coefficient_count
+        string alpha_occupancies
+        string beta_occupancies
+        string alpha_symmetries
+        string beta_symmetries
+        string source_schema_version
+    }
+    MolecularTopology {
+        string id
+        string created_at
+        string project_id
+        string formula_id
+        string mol
+        string morgan_bfp
         string morgan_bfp_schema_version
-        text canonical_isomeric_smiles "nullable"
+        string canonical_isomeric_smiles
         string graph_hash
         string identity_schema_version
-        integer atom_count
-        integer heavy_atom_count
-        smallint formal_charge
-        smallint radical_electron_count
-        smallint fragment_count
-        enum stereo_status
-        boolean is_stereo_abstraction_upstream
-        enum sanitization_status
-        text sanitization_error "nullable"
+        string atom_count
+        string heavy_atom_count
+        string formal_charge
+        string radical_electron_count
+        string fragment_count
+        string stereo_status
+        string is_stereo_abstraction_upstream
+        string sanitization_status
+        string sanitization_error
     }
-    parse_revision {
-        uuid id PK
-        datetime created_at
-        uuid artifact_file_id FK
-        integer revision_number
-        uuid reparse_of_id FK "nullable"
+    MolecularTopologyAbstraction {
+        string id
+        string created_at
+        string project_id
+        string specific_topology_id
+        string general_topology_id
+        string abstraction_policy_version
+        string abstraction_metadata
+    }
+    MolecularTopologyDerivation {
+        string id
+        string created_at
+        string project_id
+        string topology_id
+        string reconstruction_method
+        string reconstruction_version
+        string reconstruction_metadata
+        string provenance_schema_version
+        string provenance_hash
+    }
+    MultireferenceResult {
+        string id
+        string created_at
+        string frame_id
+        string electronic_state_set_id
+        string method
+        string reference_method
+        string ci_type
+        string active_space_electrons
+        string active_space_orbitals
+        string active_space_roots
+        string active_orbitals
+        string inactive_orbitals
+        string frozen_orbitals
+        string active_space_raw
+        string active_space_options
+        string corrections
+        string diagnostics
+        string result_properties
+        string source_schema_version
+    }
+    NMRResult {
+        string id
+        string created_at
+        string frame_id
+        string gauge
+        string shielding_count
+        string coupling_atom_indices
+        string source_schema_version
+    }
+    NMRShieldingTensor {
+        string id
+        string created_at
+        string result_id
+        string atom_index
+        string atom_symbol
+        string isotropic_ppm
+        string anisotropy_ppm
+        string anisotropy_convention
+        string orientation
+    }
+    Organization {
+        string id
+        string created_at
+        string slug
+        string name
+        string status
+    }
+    OrganizationMembership {
+        string id
+        string created_at
+        string organization_id
+        string user_id
+        string role
+    }
+    ParseRevision {
+        string id
+        string created_at
+        string artifact_file_id
+        string revision_number
+        string reparse_of_id
         string export_schema_version
         string parser_name
         string parser_version
         string parser_id
         string molop_version
-        string parser_commit "nullable"
-        string molgr_version "nullable"
-        string molgr_commit "nullable"
+        string parser_commit
+        string molgr_version
+        string molgr_commit
         string rdkit_version
-        jsonb parser_provenance
+        string parser_provenance
         string parser_provenance_hash
         string parser_config_hash
         string reconstruction_config_hash
-        enum source_format
+        string source_format
         string source_encoding
-        string source_content_sha256 "nullable"
-        bigint source_size_bytes "nullable"
-        string source_compression "nullable"
-        float running_time_seconds "nullable"
-        boolean source_complete "nullable"
-        enum parse_completeness
-        jsonb parse_diagnostics
-        string record_sha256 "nullable"
-        enum status
-        string error_code "nullable"
-        text error_message "nullable"
-        jsonb error_metadata "nullable"
-        datetime started_at "nullable"
-        datetime completed_at "nullable"
+        string source_content_sha256
+        string source_size_bytes
+        string source_compression
+        string running_time_seconds
+        string source_complete
+        string parse_completeness
+        string parse_diagnostics
+        string record_sha256
+        string status
+        string error_code
+        string error_message
+        string error_metadata
+        string started_at
+        string completed_at
     }
-    workflow_manifest {
-        uuid id PK
-        datetime created_at
-        uuid artifact_file_id FK, UK
-        text manifest_key FK
-        integer revision
-        string schema_version
+    PolarizabilityResult {
+        string id
+        string created_at
+        string frame_id
+        string electronic_spatial_extent_bohr2
+        string isotropic_polarizability_bohr3
+        string anisotropic_polarizability_bohr3
+        string source_schema_version
+    }
+    Project {
+        string id
+        string created_at
+        string organization_id
+        string owner_user_id
+        string created_by_user_id
+        string slug
+        string name
+        string data_source
+        string model_checkpoint
+        string calculation_protocol
+        string status
+    }
+    ProjectGeometryCatalog {
+        string project_id
+        string geometry_id
+        string frame_count
+        string geometry_created_at
+        string has_frequency_data
+        string has_imaginary_frequency
+        string has_thermodynamic_property
+    }
+    ProjectGeometryCatalogCount {
+        string project_id
+        string geometry_count
+    }
+    ProjectInvitation {
+        string id
+        string created_at
+        string project_id
+        string invited_by_user_id
+        string email
+        string role
+        string token_hash
+        string expires_at
+        string accepted_at
+        string revoked_at
+        string delivery_status
+        string delivery_error
+        string delivery_sent_at
+    }
+    ProjectMembership {
+        string id
+        string created_at
+        string project_id
+        string user_id
+        string role
+    }
+    ScientificArray {
+        string id
+        string created_at
+        string frame_id
+        string kind
+        string ordinal
+        string unit
+        string dtype
+        string shape
+        string array_nbytes
         string payload_sha256
-        string qc_policy_version
-        enum status
-        uuid supersedes_id FK "nullable"
-        jsonb validation_metadata
-        datetime published_at "nullable"
+        string data
+        string metadata_schema_version
+        string array_metadata
     }
-    calculation_segment {
-        uuid id PK
-        datetime created_at
-        uuid parse_revision_id FK
-        uuid protocol_id FK "nullable"
-        integer segment_index
-        text segment_label "nullable"
-        bigint source_start_byte "nullable"
-        bigint source_end_byte "nullable"
-        bigint source_start_char "nullable"
-        bigint source_end_char "nullable"
-        integer source_start_line "nullable"
-        integer source_end_line "nullable"
-        string source_block_sha256 "nullable"
-        integer source_frame_count "nullable"
-        jsonb parse_presence
-        enum parse_completeness
-        jsonb parse_diagnostics
-        integer requested_cpu_count "nullable"
-        bigint requested_memory_mb "nullable"
-        enum termination_status
-        enum scf_status
-        float wall_time_seconds "nullable"
-        jsonb program_metadata
+    ScientificArrayAssignment {
+        string id
+        string created_at
+        string scientific_array_id
+        string slot
+        string slot_ordinal
+        string molecular_orbital_result_id
+        string atomic_population_series_id
+        string polarizability_result_id
+        string nmr_result_id
+        string nmr_shielding_tensor_id
+        string bond_order_result_id
+        string single_point_property_result_id
+        string electronic_state_id
     }
-    geometry {
-        uuid id PK
-        datetime created_at
-        uuid project_id FK "nullable"
-        uuid topology_id FK
-        mol mol "PostgreSQL RDKit cartridge"
-        bytea internal_coordinates "NPY encoded BYTEA"
-        array internal_coordinate_distances_angstrom
-        array internal_coordinate_angles_degrees
-        array internal_coordinate_dihedrals_degrees
-        smallint minimum_coordinate_decimal_places "nullable"
-        string internal_coordinate_hash
-        string geometry_hash
-        smallint charge
-        smallint multiplicity
-        string canonicalization_version
+    SinglePointPropertyResult {
+        string id
+        string created_at
+        string frame_id
+        string vertical_ionization_potential_ev
+        string vertical_electron_affinity_ev
+        string global_electrophilicity_index_ev
+        string source_schema_version
     }
-    logical_reaction_participant {
-        uuid id PK
-        datetime created_at
-        uuid logical_reaction_id FK
-        uuid topology_id FK
-        enum side
-        smallint participant_index
-        enum role "nullable"
-        smallint stoichiometric_coefficient
+    StorageGarbageCollectionRun {
+        string id
+        string created_at
+        string state_id
+        string started_at
+        string completed_at
+        string scan_after
+        string scan_until
+        string status
+        string objects_seen
+        string objects_deleted
+        string objects_retained
+        string objects_failed
+        string error_message
     }
-    manifest_artifact_binding {
-        uuid id PK
-        datetime created_at
-        uuid workflow_manifest_id FK
-        text artifact_key
-        uuid artifact_file_id FK "nullable"
-        string expected_content_sha256 "nullable"
-        enum artifact_role
-        text reaction_key
-        text path_key
-        text node_key
-        integer segment_index "nullable"
-        integer frame_index "nullable"
-        text source_geometry_artifact_key FK "nullable"
-        enum resolution_status
+    StorageGarbageCollectionState {
+        string id
+        string created_at
+        string bucket
+        string root_prefix
+        string watermark_at
+        string updated_at
+        string last_successful_run_id
     }
-    mapped_reaction_node {
-        uuid id PK
-        datetime created_at
-        uuid mapped_reaction_id FK
-        text node_key
-        integer node_index
-        enum role
+    ThermochemistryResult {
+        string id
+        string created_at
+        string frame_id
+        string temperature_kelvin
+        string pressure_atm
+        string zpe_correction_hartree
+        string thermal_energy_correction_hartree
+        string thermal_enthalpy_correction_hartree
+        string thermal_gibbs_correction_hartree
+        string zero_point_energy_hartree
+        string thermal_internal_energy_hartree
+        string enthalpy_hartree
+        string gibbs_free_energy_hartree
+        string entropy_cal_mol_k
+        string heat_capacity_cv_cal_mol_k
+        string molecular_mass_amu
+        string rotational_symmetry_number
+        string source_schema_version
     }
-    mapped_reaction_thermodynamic_profile {
-        uuid id PK
-        datetime created_at
-        uuid mapped_reaction_id FK
-        text policy_version
-        string source_key_hash
-        jsonb electronic_level
-        jsonb thermochemistry_level
-        float temperature_kelvin
-        float pressure_atm
-        jsonb reactants "nullable"
-        jsonb transition_state "nullable"
-        jsonb products "nullable"
-        float reactants_enthalpy_hartree "nullable"
-        float reactants_gibbs_free_energy_hartree "nullable"
-        float reactants_entropy_cal_mol_k "nullable"
-        float transition_state_enthalpy_hartree "nullable"
-        float transition_state_gibbs_free_energy_hartree "nullable"
-        float transition_state_entropy_cal_mol_k "nullable"
-        float products_enthalpy_hartree "nullable"
-        float products_gibbs_free_energy_hartree "nullable"
-        float products_entropy_cal_mol_k "nullable"
-        float reactants_running_time_seconds "nullable"
-        float transition_state_running_time_seconds "nullable"
-        float products_running_time_seconds "nullable"
-        float total_running_time_seconds "nullable"
-        float activation_enthalpy_kcal_mol "nullable"
-        float activation_gibbs_free_energy_kcal_mol "nullable"
-        float activation_entropy_cal_mol_k "nullable"
-        float reaction_enthalpy_kcal_mol "nullable"
-        float reaction_gibbs_free_energy_kcal_mol "nullable"
-        float reaction_entropy_cal_mol_k "nullable"
+    TotalSpinResult {
+        string id
+        string created_at
+        string frame_id
+        string spin_square
+        string spin_quantum_number
+        string source_schema_version
     }
-    molecular_topology_abstraction {
-        uuid id PK
-        datetime created_at
-        uuid project_id FK "nullable"
-        uuid specific_topology_id FK
-        uuid general_topology_id FK
-        string abstraction_policy_version
-        jsonb abstraction_metadata
+    TransitionStateEndpoint {
+        string id
+        string created_at
+        string calculation_frame_id
+        string topology_id
+        string charge
+        string multiplicity
+        string direction
+        string atom_count
+        string displacement_ratio
+        string source_coordinates
+        string source_coordinate_hash
+        string source_to_topology_atom_indices
+        string provenance
     }
-    molecular_topology_derivation {
-        uuid id PK
-        datetime created_at
-        uuid project_id FK "nullable"
-        uuid topology_id FK
-        string reconstruction_method
-        string reconstruction_version
-        jsonb reconstruction_metadata
-        string provenance_schema_version
-        string provenance_hash
+    TransitionStateInference {
+        string id
+        string created_at
+        string artifact_ingestion_id
+        string parse_revision_id
+        string file_frame_index
+        string imaginary_mode_index
+        string imaginary_frequency_cm1
+        string status
+        string inference_method
+        string inference_settings
+        string logical_reaction_id
+        string mapped_reaction_id
+        string calculation_frame_id
+        string error_code
+        string error_message
     }
-    upload_batch_item {
-        uuid id PK
-        datetime created_at
-        datetime updated_at
-        uuid batch_id FK
-        uuid client_file_id
-        integer position
-        text original_filename
-        text relative_path
-        bigint size_bytes
+    UploadBatch {
+        string id
+        string created_at
+        string updated_at
+        string project_id
+        string created_by_user_id
+        string artifact_kind
+        string status
+        string shared_metadata
+        string archive_sha256
+        string manifest_sha256
+        string manifest_schema_version
+        string total_count
+        string total_bytes
+        string succeeded_count
+        string failed_count
+        string cancelled_count
+        string uploading_count
+        string staged_count
+        string processing_count
+    }
+    UploadBatchItem {
+        string id
+        string created_at
+        string updated_at
+        string batch_id
+        string client_file_id
+        string position
+        string original_filename
+        string relative_path
+        string size_bytes
         string media_type
-        enum status
-        integer attempt_count
-        integer processing_attempt_count
-        string content_sha256 "nullable"
-        string expected_file_sha256 "nullable"
-        text staged_file_path "nullable"
-        boolean is_gaussian_log
+        string status
+        string attempt_count
+        string processing_attempt_count
+        string content_sha256
+        string expected_file_sha256
+        string staged_file_path
+        string is_gaussian_log
         string selection_status
         string parse_status
         string materialization_status
-        uuid parse_revision_id FK "nullable"
-        uuid worker_lease_id "nullable"
-        datetime worker_lease_expires_at "nullable"
-        uuid artifact_file_id FK "nullable"
-        string error_code "nullable"
-        text error_message "nullable"
-        jsonb metadata_json
+        string parse_revision_id
+        string worker_lease_id
+        string worker_lease_expires_at
+        string artifact_file_id
+        string error_code
+        string error_message
+        string metadata_json
     }
-    calculation_frame {
-        uuid id PK
-        datetime created_at
-        uuid parse_revision_id FK
-        uuid segment_id FK
-        integer frame_index
-        integer file_frame_index
-        enum frame_role
-        bigint source_start_byte "nullable"
-        bigint source_end_byte "nullable"
-        bigint source_start_char "nullable"
-        bigint source_end_char "nullable"
-        integer source_start_line "nullable"
-        integer source_end_line "nullable"
-        string source_block_sha256 "nullable"
-        jsonb parse_presence
-        enum parse_completeness
-        jsonb parse_diagnostics
-        uuid geometry_id FK
-        uuid topology_derivation_id FK
-        smallint charge
-        smallint multiplicity
-        smallint coordinate_decimal_places "nullable"
-        enum geometry_assignment_kind
-        bytea observed_coordinates "NPY encoded BYTEA"
-        string observed_coordinate_hash
-        array observed_to_geometry_atom_indices
-        array observed_to_geometry_transform
-        float geometry_assignment_rmsd_angstrom
-        float geometry_assignment_max_abs_angstrom
-        string geometry_assignment_policy_version
-        enum electronic_state_kind
-        smallint electronic_state_index
-        enum scf_status
-        enum optimization_status
-        numeric(24,6) electronic_total_energy_hartree "nullable"
-        numeric(24,6) reference_total_energy_hartree "nullable"
-        numeric(24,6) mp2_total_energy_hartree "nullable"
-        numeric(24,6) mp3_total_energy_hartree "nullable"
-        numeric(24,6) mp4_total_energy_hartree "nullable"
-        numeric(24,6) mp5_total_energy_hartree "nullable"
-        numeric(24,6) ccsd_total_energy_hartree "nullable"
-        numeric(24,6) ccsd_t_total_energy_hartree "nullable"
-        numeric(24,6) selected_energy_hartree "nullable"
-        enum selected_energy_kind "nullable"
-        string energy_selection_policy_version "nullable"
-        float energy_change_hartree "nullable"
-        float energy_change_threshold_hartree "nullable"
-        boolean energy_change_converged "nullable"
-        float rms_force_hartree_per_bohr "nullable"
-        float rms_force_threshold_hartree_per_bohr "nullable"
-        boolean rms_force_converged "nullable"
-        float max_force_hartree_per_bohr "nullable"
-        float max_force_threshold_hartree_per_bohr "nullable"
-        boolean max_force_converged "nullable"
-        float rms_displacement_bohr "nullable"
-        float rms_displacement_threshold_bohr "nullable"
-        boolean rms_displacement_converged "nullable"
-        float max_displacement_bohr "nullable"
-        float max_displacement_threshold_bohr "nullable"
-        boolean max_displacement_converged "nullable"
-        float running_time_seconds "nullable"
-        integer frequency_count "nullable"
-        integer negative_frequency_count "nullable"
-        float lowest_frequency_cm1 "nullable"
-        string program_metadata_schema_version
-        jsonb program_metadata
+    UserAccount {
+        string id
+        string created_at
+        string display_name
+        string primary_email
+        string status
+        string is_service_account
+        string last_authenticated_at
     }
-    logical_participant_concrete_topology {
-        uuid id PK
-        datetime created_at
-        uuid logical_reaction_participant_id FK
-        uuid concrete_topology_id FK
-        text match_policy_version
-        text match_status
-        jsonb match_metadata
-    }
-    mapped_reaction_edge {
-        uuid id PK
-        datetime created_at
-        uuid mapped_reaction_id FK
-        text edge_key
-        uuid source_node_id FK
-        uuid target_node_id FK
-        uuid transition_state_node_id FK "nullable"
-        enum edge_kind
-    }
-    mapped_reaction_participant {
-        uuid id PK
-        datetime created_at
-        uuid mapped_reaction_id FK
-        uuid logical_reaction_participant_id FK
-        uuid concrete_topology_id FK "nullable"
-        enum side
-        smallint template_index
-        array atom_map_numbers
-        text mapped_smiles
-    }
-    bond_order_result {
-        uuid id PK
-        datetime created_at
-        uuid frame_id FK, UK
-        integer matrix_count
+    VibrationResult {
+        string id
+        string created_at
+        string frame_id
+        string mode_count
+        string imaginary_mode_count
+        string lowest_frequency_cm1
+        string mode_indices
+        string axis_order
+        string atom_order
+        string normalization
+        string mass_weighting
         string source_schema_version
     }
-    calculation_status_result {
-        uuid id PK
-        datetime created_at
-        uuid frame_id FK, UK
-        boolean scf_converged "nullable"
-        boolean normal_terminated "nullable"
-        string source_schema_version
-    }
-    charge_spin_population_result {
-        uuid id PK
-        datetime created_at
-        uuid frame_id FK, UK
-        integer series_count
-        string source_schema_version
-    }
-    electronic_state_set {
-        uuid id PK
-        datetime created_at
-        uuid frame_id FK
-        enum kind
-        integer state_count
-        string source_schema_version
-    }
-    frame_energy_result {
-        uuid id PK
-        datetime created_at
-        uuid frame_id FK, UK
-        numeric(24,6) electronic_energy_hartree "nullable"
-        numeric(24,6) reference_energy_hartree "nullable"
-        numeric(24,6) mp2_energy_hartree "nullable"
-        numeric(24,6) mp3_energy_hartree "nullable"
-        numeric(24,6) mp4_energy_hartree "nullable"
-        numeric(24,6) mp5_energy_hartree "nullable"
-        numeric(24,6) ccsd_energy_hartree "nullable"
-        numeric(24,6) ccsd_t_energy_hartree "nullable"
-        string source_schema_version
-    }
-    geometry_optimization_result {
-        uuid id PK
-        datetime created_at
-        uuid frame_id FK, UK
-        boolean geometry_optimized "nullable"
-        float convergence_multiplier
-        jsonb source_converged "nullable"
-        jsonb source_labels "nullable"
-        float energy_change_hartree "nullable"
-        float energy_change_threshold_hartree "nullable"
-        boolean energy_change_converged "nullable"
-        float rms_force_hartree_per_bohr "nullable"
-        float rms_force_threshold_hartree_per_bohr "nullable"
-        boolean rms_force_converged "nullable"
-        float max_force_hartree_per_bohr "nullable"
-        float max_force_threshold_hartree_per_bohr "nullable"
-        boolean max_force_converged "nullable"
-        float rms_displacement_bohr "nullable"
-        float rms_displacement_threshold_bohr "nullable"
-        boolean rms_displacement_converged "nullable"
-        float max_displacement_bohr "nullable"
-        float max_displacement_threshold_bohr "nullable"
-        boolean max_displacement_converged "nullable"
-        string source_schema_version
-    }
-    implicit_solvation_result {
-        uuid id PK
-        datetime created_at
-        uuid frame_id FK, UK
-        string solvent "nullable"
-        string solvent_model "nullable"
-        string atomic_radii "nullable"
-        float solvent_epsilon "nullable"
-        float solvent_epsilon_infinite "nullable"
-        string source_schema_version
-    }
-    mapped_reaction_node_geometry {
-        uuid id PK
-        datetime created_at
-        uuid mapped_reaction_node_id FK
-        uuid geometry_id FK
-        uuid mapped_reaction_participant_id FK "nullable"
-        text component_key
-        smallint component_index
-        smallint coordinate_index
-        boolean is_primary
-    }
-    molecular_orbital_result {
-        uuid id PK
-        datetime created_at
-        uuid frame_id FK, UK
-        string electronic_state "nullable"
-        integer alpha_orbital_count
-        integer beta_orbital_count
-        integer coefficient_count
-        array alpha_occupancies
-        array beta_occupancies
-        array alpha_symmetries
-        array beta_symmetries
-        string source_schema_version
-    }
-    nmr_result {
-        uuid id PK
-        datetime created_at
-        uuid frame_id FK, UK
-        string gauge "nullable"
-        integer shielding_count
-        array coupling_atom_indices
-        string source_schema_version
-    }
-    polarizability_result {
-        uuid id PK
-        datetime created_at
-        uuid frame_id FK, UK
-        float electronic_spatial_extent_bohr2 "nullable"
-        float isotropic_polarizability_bohr3 "nullable"
-        float anisotropic_polarizability_bohr3 "nullable"
-        string source_schema_version
-    }
-    scientific_array {
-        uuid id PK
-        datetime created_at
-        uuid frame_id FK
-        enum kind
-        smallint ordinal
-        string unit
-        string dtype
-        array shape
-        bigint array_nbytes
+    WorkflowManifest {
+        string id
+        string created_at
+        string artifact_file_id
+        string manifest_key
+        string revision
+        string schema_version
         string payload_sha256
-        bytea data "NPY encoded BYTEA"
-        string metadata_schema_version "nullable"
-        jsonb metadata "nullable"
+        string qc_policy_version
+        string status
+        string supersedes_id
+        string validation_metadata
+        string published_at
     }
-    single_point_property_result {
-        uuid id PK
-        datetime created_at
-        uuid frame_id FK, UK
-        float vertical_ionization_potential_ev "nullable"
-        float vertical_electron_affinity_ev "nullable"
-        float global_electrophilicity_index_ev "nullable"
-        string source_schema_version
-    }
-    thermochemistry_result {
-        uuid id PK
-        datetime created_at
-        uuid frame_id FK, UK
-        float temperature_kelvin
-        float pressure_atm
-        numeric(24,6) zpe_correction_hartree "nullable"
-        numeric(24,6) thermal_energy_correction_hartree "nullable"
-        numeric(24,6) thermal_enthalpy_correction_hartree "nullable"
-        numeric(24,6) thermal_gibbs_correction_hartree "nullable"
-        numeric(24,6) zero_point_energy_hartree "nullable"
-        numeric(24,6) thermal_internal_energy_hartree "nullable"
-        numeric(24,6) enthalpy_hartree "nullable"
-        numeric(24,6) gibbs_free_energy_hartree "nullable"
-        float entropy_cal_mol_k "nullable"
-        float heat_capacity_cv_cal_mol_k "nullable"
-        float molecular_mass_amu "nullable"
-        integer rotational_symmetry_number "nullable"
-        string source_schema_version
-    }
-    total_spin_result {
-        uuid id PK
-        datetime created_at
-        uuid frame_id FK, UK
-        float spin_square "nullable"
-        float spin_quantum_number "nullable"
-        string source_schema_version
-    }
-    transition_state_endpoint {
-        uuid id PK
-        datetime created_at
-        uuid calculation_frame_id FK
-        uuid topology_id FK
-        smallint charge
-        smallint multiplicity
-        enum direction
-        integer atom_count
-        float displacement_ratio
-        bytea source_coordinates "NPY encoded BYTEA"
-        string source_coordinate_hash
-        array source_to_topology_atom_indices
-        jsonb provenance
-    }
-    transition_state_inference {
-        uuid id PK
-        datetime created_at
-        uuid artifact_ingestion_id FK
-        uuid parse_revision_id FK
-        integer file_frame_index
-        integer imaginary_mode_index
-        float imaginary_frequency_cm1
-        enum status
-        string inference_method
-        jsonb inference_settings
-        uuid logical_reaction_id FK "nullable"
-        uuid mapped_reaction_id FK "nullable"
-        uuid calculation_frame_id FK "nullable"
-        string error_code "nullable"
-        text error_message "nullable"
-    }
-    vibration_result {
-        uuid id PK
-        datetime created_at
-        uuid frame_id FK, UK
-        integer mode_count
-        integer imaginary_mode_count
-        float lowest_frequency_cm1 "nullable"
-        array mode_indices
-        array axis_order "nullable"
-        string atom_order "nullable"
-        string normalization "nullable"
-        string mass_weighting "nullable"
-        string source_schema_version
-    }
-    atomic_population_series {
-        uuid id PK
-        datetime created_at
-        uuid result_id FK
-        string series_key
-        string scheme
-        string quantity
-        integer value_count
-        string spin_channel "nullable"
-        text source_label "nullable"
-        jsonb metadata
-    }
-    electronic_state {
-        uuid id PK
-        datetime created_at
-        uuid state_set_id FK
-        integer state_ordinal
-        integer state_index "nullable"
-        integer root "nullable"
-        string label "nullable"
-        integer multiplicity "nullable"
-        float spin "nullable"
-        string irrep "nullable"
-        string method "nullable"
-        numeric(24,6) energy_hartree "nullable"
-        float excitation_energy_ev "nullable"
-        float oscillator_strength "nullable"
-        jsonb properties
-        text source "nullable"
-    }
-    energy_observation {
-        uuid id PK
-        datetime created_at
-        uuid energy_result_id FK
-        smallint observation_index
-        string method
-        enum quantity_semantics
-        numeric(24,6) value_hartree
-        string source_label
-    }
-    mapped_reaction_node_geometry_mapping {
-        uuid id PK
-        datetime created_at
-        uuid mapped_reaction_node_geometry_id FK, UK
-        array geometry_atom_map_numbers
-        text mapped_smiles
-        string mapping_method
-        string mapping_version
-        boolean verified
-    }
-    multireference_result {
-        uuid id PK
-        datetime created_at
-        uuid frame_id FK, UK
-        uuid electronic_state_set_id FK, UK "nullable"
-        string method "nullable"
-        string reference_method "nullable"
-        string ci_type "nullable"
-        integer active_space_electrons "nullable"
-        integer active_space_orbitals "nullable"
-        integer active_space_roots "nullable"
-        array active_orbitals
-        array inactive_orbitals
-        array frozen_orbitals
-        text active_space_raw
-        jsonb active_space_options
-        jsonb corrections
-        array diagnostics
-        jsonb properties
-        string source_schema_version
-    }
-    nmr_shielding_tensor {
-        uuid id PK
-        datetime created_at
-        uuid result_id FK
-        integer atom_index
-        string atom_symbol
-        float isotropic_ppm "nullable"
-        float anisotropy_ppm "nullable"
-        string anisotropy_convention "nullable"
-        string orientation
-    }
-    electronic_configuration {
-        uuid id PK
-        datetime created_at
-        uuid electronic_state_id FK
-        integer configuration_ordinal
-        string label "nullable"
-        float coefficient "nullable"
-        float weight "nullable"
-        array occupation
-        array orbital_indices
-        text raw
-    }
-    scientific_array_assignment {
-        uuid id PK
-        datetime created_at
-        uuid scientific_array_id FK, UK
-        string slot
-        integer slot_ordinal
-        uuid molecular_orbital_result_id FK "nullable"
-        uuid atomic_population_series_id FK "nullable"
-        uuid polarizability_result_id FK "nullable"
-        uuid nmr_result_id FK "nullable"
-        uuid nmr_shielding_tensor_id FK "nullable"
-        uuid bond_order_result_id FK "nullable"
-        uuid single_point_property_result_id FK "nullable"
-        uuid electronic_state_id FK "nullable"
-    }
+    ArtifactFile ||--o{ ParseRevision : parse_revisions
+    ArtifactFile ||--o{ WorkflowManifest : workflow_manifest
+    ArtifactFile ||--o{ ManifestArtifactBinding : manifest_artifact_bindings
+    Project ||--o{ ArtifactFile : project
+    UserAccount ||--o{ ArtifactFile : created_by_user
+    ArtifactFile ||--o{ ArtifactIngestion : ingestion
+    ArtifactFile ||--o{ ArtifactIngestion : artifact_file
+    ArtifactIngestion ||--o{ TransitionStateInference : transition_state_inferences
+    ChargeSpinPopulationResult ||--o{ AtomicPopulationSeries : result
+    AtomicPopulationSeries ||--o{ ScientificArrayAssignment : array_assignments
+    CalculationFrame ||--o{ BondOrderResult : frame
+    BondOrderResult ||--o{ ScientificArrayAssignment : array_assignments
+    CalculationSegment ||--o{ CalculationFrame : segment
+    Geometry ||--o{ CalculationFrame : geometry
+    MolecularTopologyDerivation ||--o{ CalculationFrame : topology_derivation
+    CalculationFrame ||--o{ ScientificArray : scientific_arrays
+    CalculationFrame ||--o{ FrameEnergyResult : energy_result
+    CalculationFrame ||--o{ GeometryOptimizationResult : optimization_result
+    CalculationFrame ||--o{ VibrationResult : vibration_result
+    CalculationFrame ||--o{ CalculationStatusResult : status_result
+    CalculationFrame ||--o{ ThermochemistryResult : thermochemistry_result
+    CalculationFrame ||--o{ MolecularOrbitalResult : molecular_orbital_result
+    CalculationFrame ||--o{ ChargeSpinPopulationResult : charge_spin_population_result
+    CalculationFrame ||--o{ PolarizabilityResult : polarizability_result
+    CalculationFrame ||--o{ NMRResult : nmr_result
+    CalculationFrame ||--o{ BondOrderResult : bond_order_result
+    CalculationFrame ||--o{ TotalSpinResult : total_spin_result
+    CalculationFrame ||--o{ SinglePointPropertyResult : single_point_property_result
+    CalculationFrame ||--o{ ElectronicStateSet : electronic_state_sets
+    CalculationFrame ||--o{ MultireferenceResult : multireference_result
+    CalculationFrame ||--o{ ImplicitSolvationResult : implicit_solvation_result
+    CalculationFrame ||--o{ TransitionStateEndpoint : transition_state_endpoints
+    CalculationProtocol ||--o{ CalculationSegment : segments
+    Project ||--o{ CalculationProtocol : project
+    ParseRevision ||--o{ CalculationSegment : parse_revision
+    CalculationProtocol ||--o{ CalculationSegment : protocol
+    CalculationSegment ||--o{ CalculationFrame : frames
+    CalculationFrame ||--o{ CalculationStatusResult : frame
+    CalculationFrame ||--o{ ChargeSpinPopulationResult : frame
+    ChargeSpinPopulationResult ||--o{ AtomicPopulationSeries : series
+    ElectronicState ||--o{ ElectronicConfiguration : electronic_state
+    ElectronicStateSet ||--o{ ElectronicState : state_set
+    ElectronicState ||--o{ ElectronicConfiguration : configurations
+    ElectronicState ||--o{ ScientificArrayAssignment : array_assignments
+    CalculationFrame ||--o{ ElectronicStateSet : frame
+    ElectronicStateSet ||--o{ ElectronicState : states
+    ElectronicStateSet ||--o{ MultireferenceResult : multireference_result
+    FrameEnergyResult ||--o{ EnergyObservation : energy_result
+    UserAccount ||--o{ ExternalIdentity : user
+    CalculationFrame ||--o{ FrameEnergyResult : frame
+    FrameEnergyResult ||--o{ EnergyObservation : observations
+    MolecularTopology ||--o{ Geometry : topology
+    Geometry ||--o{ CalculationFrame : calculation_frames
+    Geometry ||--o{ MappedReactionNodeGeometry : mapped_reaction_node_geometries
+    CalculationFrame ||--o{ GeometryOptimizationResult : frame
+    CalculationFrame ||--o{ ImplicitSolvationResult : frame
+    LogicalReactionParticipant ||--o{ LogicalParticipantConcreteTopology : logical_reaction_participant
+    MolecularTopology ||--o{ LogicalParticipantConcreteTopology : concrete_topology
+    LogicalReaction ||--o{ LogicalReactionParticipant : participants
+    LogicalReaction ||--o{ MappedReaction : mapped_reactions
+    LogicalReaction ||--o{ LogicalReactionParticipant : logical_reaction
+    MolecularTopology ||--o{ LogicalReactionParticipant : topology
+    LogicalReactionParticipant ||--o{ LogicalParticipantConcreteTopology : concrete_topology_memberships
+    LogicalReactionParticipant ||--o{ MappedReactionParticipant : mapped_participants
+    WorkflowManifest ||--o{ ManifestArtifactBinding : workflow_manifest
+    ArtifactFile ||--o{ ManifestArtifactBinding : artifact_file
+    ManifestArtifactBinding ||--o{ ManifestArtifactBinding : source_geometry_binding
+    ManifestArtifactBinding ||--o{ ManifestArtifactBinding : dependent_bindings
+    LogicalReaction ||--o{ MappedReaction : logical_reaction
+    MappedReaction ||--o{ MappedReactionParticipant : participants
+    MappedReaction ||--o{ MappedReactionNode : nodes
+    MappedReaction ||--o{ MappedReactionEdge : edges
+    MappedReaction ||--o{ MappedReactionThermodynamicProfile : thermodynamic_profiles
+    MappedReaction ||--o{ MappedReactionEdge : mapped_reaction
+    MappedReactionNode ||--o{ MappedReactionEdge : source_node
+    MappedReactionNode ||--o{ MappedReactionEdge : target_node
+    MappedReactionNode ||--o{ MappedReactionEdge : transition_state_node
+    MappedReaction ||--o{ MappedReactionNode : mapped_reaction
+    MappedReactionNode ||--o{ MappedReactionNodeGeometry : geometry_bindings
+    MappedReactionNode ||--o{ MappedReactionEdge : outgoing_edges
+    MappedReactionNode ||--o{ MappedReactionEdge : incoming_edges
+    MappedReactionNode ||--o{ MappedReactionEdge : transition_state_edges
+    MappedReactionNode ||--o{ MappedReactionNodeGeometry : mapped_reaction_node
+    Geometry ||--o{ MappedReactionNodeGeometry : geometry
+    MappedReactionParticipant ||--o{ MappedReactionNodeGeometry : mapped_reaction_participant
+    MappedReactionNodeGeometry ||--o{ MappedReactionNodeGeometryMapping : mapping_bindings
+    MappedReactionNodeGeometry ||--o{ MappedReactionNodeGeometryMapping : mapped_reaction_node_geometry
+    MappedReaction ||--o{ MappedReactionParticipant : mapped_reaction
+    LogicalReactionParticipant ||--o{ MappedReactionParticipant : logical_reaction_participant
+    MolecularTopology ||--o{ MappedReactionParticipant : concrete_topology
+    MappedReactionParticipant ||--o{ MappedReactionNodeGeometry : node_geometries
+    MappedReaction ||--o{ MappedReactionThermodynamicProfile : mapped_reaction
+    UserAccount ||--o{ McpAccessToken : user
+    MolecularFormula ||--o{ MolecularTopology : topologies
+    CalculationFrame ||--o{ MolecularOrbitalResult : frame
+    MolecularOrbitalResult ||--o{ ScientificArrayAssignment : array_assignments
+    MolecularFormula ||--o{ MolecularTopology : formula
+    MolecularTopology ||--o{ MolecularTopologyDerivation : derivations
+    MolecularTopology ||--o{ Geometry : geometries
+    MolecularTopology ||--o{ LogicalReactionParticipant : logical_reaction_participants
+    MolecularTopology ||--o{ LogicalParticipantConcreteTopology : logical_participant_concrete_topologies
+    MolecularTopology ||--o{ MappedReactionParticipant : mapped_reaction_participants
+    MolecularTopology ||--o{ TransitionStateEndpoint : transition_state_endpoints
+    MolecularTopology ||--o{ MolecularTopologyAbstraction : generalization_edges
+    MolecularTopology ||--o{ MolecularTopologyAbstraction : specialization_edges
+    MolecularTopology ||--o{ MolecularTopologyAbstraction : specific_topology
+    MolecularTopology ||--o{ MolecularTopologyAbstraction : general_topology
+    MolecularTopology ||--o{ MolecularTopologyDerivation : topology
+    MolecularTopologyDerivation ||--o{ CalculationFrame : calculation_frames
+    CalculationFrame ||--o{ MultireferenceResult : frame
+    ElectronicStateSet ||--o{ MultireferenceResult : electronic_state_set
+    CalculationFrame ||--o{ NMRResult : frame
+    NMRResult ||--o{ NMRShieldingTensor : shielding_tensors
+    NMRResult ||--o{ ScientificArrayAssignment : array_assignments
+    NMRResult ||--o{ NMRShieldingTensor : result
+    NMRShieldingTensor ||--o{ ScientificArrayAssignment : array_assignments
+    Organization ||--o{ OrganizationMembership : memberships
+    Organization ||--o{ Project : projects
+    Organization ||--o{ OrganizationMembership : organization
+    UserAccount ||--o{ OrganizationMembership : user
+    ArtifactFile ||--o{ ParseRevision : artifact_file
+    ParseRevision ||--o{ ParseRevision : reparse_of
+    ParseRevision ||--o{ ParseRevision : reparses
+    ParseRevision ||--o{ CalculationSegment : segments
+    ParseRevision ||--o{ TransitionStateInference : transition_state_inferences
+    CalculationFrame ||--o{ PolarizabilityResult : frame
+    PolarizabilityResult ||--o{ ScientificArrayAssignment : array_assignments
+    Organization ||--o{ Project : organization
+    Project ||--o{ ProjectMembership : memberships
+    Project ||--o{ ArtifactFile : artifacts
+    Project ||--o{ CalculationProtocol : calculation_protocols
+    Project ||--o{ ProjectMembership : project
+    UserAccount ||--o{ ProjectMembership : user
+    CalculationFrame ||--o{ ScientificArray : frame
+    ScientificArray ||--o{ ScientificArrayAssignment : assignment
+    ScientificArray ||--o{ ScientificArrayAssignment : scientific_array
+    MolecularOrbitalResult ||--o{ ScientificArrayAssignment : molecular_orbital_result
+    AtomicPopulationSeries ||--o{ ScientificArrayAssignment : atomic_population_series
+    PolarizabilityResult ||--o{ ScientificArrayAssignment : polarizability_result
+    NMRResult ||--o{ ScientificArrayAssignment : nmr_result
+    NMRShieldingTensor ||--o{ ScientificArrayAssignment : nmr_shielding_tensor
+    BondOrderResult ||--o{ ScientificArrayAssignment : bond_order_result
+    SinglePointPropertyResult ||--o{ ScientificArrayAssignment : single_point_property_result
+    ElectronicState ||--o{ ScientificArrayAssignment : electronic_state
+    CalculationFrame ||--o{ SinglePointPropertyResult : frame
+    SinglePointPropertyResult ||--o{ ScientificArrayAssignment : array_assignments
+    StorageGarbageCollectionState ||--o{ StorageGarbageCollectionRun : state
+    StorageGarbageCollectionState ||--o{ StorageGarbageCollectionRun : runs
+    CalculationFrame ||--o{ ThermochemistryResult : frame
+    CalculationFrame ||--o{ TotalSpinResult : frame
+    CalculationFrame ||--o{ TransitionStateEndpoint : calculation_frame
+    MolecularTopology ||--o{ TransitionStateEndpoint : topology
+    ArtifactIngestion ||--o{ TransitionStateInference : artifact_ingestion
+    ParseRevision ||--o{ TransitionStateInference : parse_revision
+    LogicalReaction ||--o{ TransitionStateInference : logical_reaction
+    MappedReaction ||--o{ TransitionStateInference : mapped_reaction
+    CalculationFrame ||--o{ TransitionStateInference : calculation_frame
+    UserAccount ||--o{ ExternalIdentity : identities
+    UserAccount ||--o{ OrganizationMembership : organization_memberships
+    UserAccount ||--o{ ProjectMembership : project_memberships
+    UserAccount ||--o{ McpAccessToken : mcp_access_tokens
+    UserAccount ||--o{ ArtifactFile : created_artifacts
+    CalculationFrame ||--o{ VibrationResult : frame
+    ArtifactFile ||--o{ WorkflowManifest : artifact_file
+    WorkflowManifest ||--o{ ManifestArtifactBinding : artifact_bindings
+    WorkflowManifest ||--o{ WorkflowManifest : supersedes
+    WorkflowManifest ||--o{ WorkflowManifest : superseded_by
 ```
 
 ## Schema 完整性清单
 
-- `64` tables；
-- `794` columns；
-- `104` FK；
-- `77` UNIQUE；
-- `209` CHECK；
-- `176` indexes。
+- `65` tables；
+- `801` columns；
+- `106` FK；
+- `78` UNIQUE；
+- `210` CHECK；
+- `180` indexes。
 
 | table | columns | FK constraints | UNIQUE constraints | CHECK constraints | indexes |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -1209,16 +1280,16 @@ erDiagram
 | `project_membership` | 5 | 2 | 1 | 1 | 3 |
 | `upload_batch` | 19 | 2 | 0 | 8 | 5 |
 | `artifact_ingestion` | 16 | 1 | 1 | 7 | 2 |
-| `mapped_reaction` | 17 | 2 | 2 | 3 | 10 |
+| `mapped_reaction` | 17 | 2 | 2 | 3 | 11 |
 | `molecular_topology` | 19 | 2 | 1 | 8 | 7 |
 | `parse_revision` | 34 | 2 | 1 | 11 | 4 |
 | `workflow_manifest` | 12 | 2 | 3 | 6 | 2 |
 | `calculation_segment` | 23 | 2 | 2 | 12 | 2 |
-| `geometry` | 15 | 2 | 1 | 4 | 5 |
+| `geometry` | 15 | 2 | 1 | 4 | 6 |
 | `logical_reaction_participant` | 8 | 2 | 1 | 4 | 3 |
 | `manifest_artifact_binding` | 14 | 3 | 1 | 8 | 4 |
 | `mapped_reaction_node` | 6 | 1 | 3 | 2 | 2 |
-| `mapped_reaction_thermodynamic_profile` | 31 | 1 | 1 | 5 | 2 |
+| `mapped_reaction_thermodynamic_profile` | 33 | 1 | 1 | 6 | 3 |
 | `molecular_topology_abstraction` | 7 | 3 | 1 | 1 | 4 |
 | `molecular_topology_derivation` | 9 | 2 | 2 | 1 | 2 |
 | `upload_batch_item` | 27 | 3 | 2 | 10 | 8 |
@@ -1234,6 +1305,7 @@ erDiagram
 | `geometry_optimization_result` | 23 | 1 | 1 | 0 | 0 |
 | `implicit_solvation_result` | 9 | 1 | 1 | 2 | 0 |
 | `mapped_reaction_node_geometry` | 9 | 3 | 3 | 1 | 4 |
+| `mapped_reaction_thermodynamic_profile_source` | 5 | 2 | 1 | 0 | 1 |
 | `molecular_orbital_result` | 12 | 1 | 1 | 1 | 0 |
 | `nmr_result` | 7 | 1 | 1 | 1 | 0 |
 | `polarizability_result` | 7 | 1 | 1 | 0 | 0 |

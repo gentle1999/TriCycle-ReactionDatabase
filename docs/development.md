@@ -194,6 +194,8 @@ MCP token 是用户级凭据，不绑定固定组织、项目或静态 scope。�
 | 组织 | `list_organizations`、`create_organization` | 列出当前用户可见组织；创建后当前用户自动成为 owner |
 | 组织成员 | `list_organization_members`、`upsert_organization_member`、`remove_organization_member` | 成员可查看；owner/admin 可管理；不能移除或降级最后一个 owner |
 | 项目 | `create_project`、`list_projects`、`get_project`、`update_project` | 创建要求组织 owner/admin；修改要求项目 manager 或组织 admin |
+| 项目数据清理 | `preview_project_cleanup`、`delete_project_data` | 仅项目 manager 或组织 admin；删除工具要求 `confirmation` 精确等于项目 slug，并物理删除项目科学数据、上传队列和未共享 RustFS 对象；项目、成员和审计记录保留 |
+| 单文件清理 | `delete_artifact` | 需要项目 `artifact:delete`；保留 ArtifactFile tombstone 以维持单文件来源审计 |
 | 项目成员 | `list_project_members`、`upsert_project_member`、`remove_project_member` | 项目 manager 或组织 admin；服务层保留最后一个 project manager |
 | 项目邀请 | `list_project_invitations`、`create_project_invitation`、`revoke_project_invitation`、`resend_project_invitation`、`accept_project_invitation` | 项目 manager 或组织 admin；接受邀请仍校验登录邮箱匹配 |
 | 审计 | `list_project_audit` | 项目 manager 或组织 admin |
@@ -204,6 +206,21 @@ MCP token 是用户级凭据，不绑定固定组织、项目或静态 scope。�
 item 的 `staged`/`pending` 状态；MCP 的 `success=true` 只表示原始文件已经写入 RustFS
 并进入解析队列，不表示 MolOP 已完成。通过批次查询接口读取最终的 `ingestion_status`、
 `parse_revision_id`、帧数量和 TS 推断结果。
+
+#### FastMCP Apps 交互式工具
+
+MCP server 同时注册了 FastMCP App 的 `open_calculation_log_workspace` 交互式工具。
+支持 MCP Apps 的客户端会打开 Prefab UI：先从当前用户有 `artifact:upload` 权限的活动项目
+中选择目标项目，再拖放或选择一个或多个日志文件，最后一次性提交为一个 durable
+`UploadBatch`。文件内容只在 UI 提交动作中传给 app-only 的 `stage_calculation_logs` 后端
+工具；该工具不会出现在模型可见的普通工具列表中，且每次调用仍由当前 MCP token 对应的
+用户重新校验项目权限。
+
+这个 App 不使用 FastMCP 内置的会话内存文件存储：当前 MCP 使用无状态 Streamable HTTP，
+内存文件会跨请求丢失。Prefab 的提交动作直接复用 `UploadBatchService.create_and_stage`，
+因此 RustFS 暂存、批次状态、统一 upload-worker/MolOP 进程池和后续持久化与 REST、浏览器、
+CLI 及 `upload_calculation_log` 完全相同。不支持 MCP Apps 的客户端仍可使用上表中的直接
+MCP 工具。
 
 普通认证请求只读会话；`last_seen_at` 最多每 5 分钟条件更新一次。过期会话和撤销超过 30 天
 的会话由调度器定期执行 `make auth-session-cleanup`（或
@@ -473,17 +490,17 @@ Formula/Topology；计算文件通过独立导入流程补充 Geometry 和 Frame
 }
 ```
 
-NexusX 6.1.2 Compose executor 暂不支持 variables；参数必须 inline，带非空
+NexusX 6.3 及以上版本的 Compose executor 暂不支持 variables；参数必须 inline，带非空
 `variables` 的请求返回 HTTP 400。MCP 按开发指南提供四层渐进披露工具：
 `list_apps`、`describe_compose_schema`、`describe_compose_method` 和
 `compose_query`。
 
-当前运行时使用 NexusX 6.1.2 的 DTO-first Compose executor、严格 selection 校验、
+当前运行时使用 NexusX 6.3 及以上版本的 DTO-first Compose executor、严格 selection 校验、
 `UseCaseAppConfig`、新版 `create_use_case_voyager` 和 Streamable HTTP MCP server。
-NexusX 6.1.2 同时为 federation 的 `page_by_*_in` 根提供声明式默认排序；本项目当前
+NexusX 6.3 及以上版本同时为 federation 的 `page_by_*_in` 根提供声明式默认排序；本项目当前
 使用单数据库 member，未启用跨数据库 federation，因此该能力由依赖保留，待新增独立
 engine 时通过实体 `__federation_keys__` 与 `__pagination_orders__` 显式开启。为启用
-6.1.2 的 Voyager member cluster/color，数据库实体和应用 DTO 登记在一个带
+6.3 及以上版本的 Voyager member cluster/color，数据库实体和应用 DTO 登记在一个带
 `service_name`、`color` 的 `ErManager`
 中，再作为单个 member 交给 `ComposedErManager`。ER 图和 UseCase 图的数据库归属标签及颜色
 分别由 `TRICYCLE_NEXUSX_DATABASE_CLUSTER_NAME` 和
@@ -532,7 +549,7 @@ writer endpoint 对应用呈现为同一个逻辑 engine，节点数量不会变
 描述符、Murcko scaffold、手性和匹配次数等逐候选计算必须先通过 Formula、
 Topology 或
 其他廉价关系条件缩小候选集。SMARTS 和带阈值的相似度以 RDKit GiST 谓词筛选后的实际
-候选集计数；纯 Top-K 相似度由 fingerprint GiST KNN 和 API 的 `limit <= 200` 限界，
+候选集计数；纯 Top-K 相似度由 fingerprint GiST KNN 和 API 的 `limit <= 500` 限界，
 不会仅因整表规模超过候选上限被拒绝。
 
 只读、上传、管理写操作、分子查询和 `GET /api/depictions/*` 分别计数，避免批量上传或卡片图片挤占登录态与目录读取额度。稳定错误语义如下：REST 对预算超限返回 HTTP 413 `query_budget_exceeded`，限流返回

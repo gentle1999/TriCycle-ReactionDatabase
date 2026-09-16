@@ -127,8 +127,15 @@ PostgreSQL -> Alembic migration -> bootstrap -> API/upload-worker；RustFS 与�
 `caddy-data` 和 `caddy-config` named volume 中。生产环境必须将域名解析到算力服务器，并让
 TCP 80/443 可被 ACME issuer 访问，Caddy 会自动申请和续期证书。生产 `.env` 至少设置：
 
+若开发环境还需要通过固定局域网 IP 访问 HTTPS，将这些地址加入
+`CADDY_CERT_NAMES`；Caddy 会为每个固定名称/IP 申请匹配的证书。DHCP 或 IPv6 临时地址
+不应写入该变量，因为它们会变化。
+
 ~~~dotenv
 CADDY_SERVER_NAME=app.example.com
+# Optional comma-separated DNS names for the certificate; defaults to
+# CADDY_SERVER_NAME. Private LAN IPs are for internal-CA deployments only.
+CADDY_CERT_NAMES=app.example.com
 CADDY_BIND_ADDRESS=0.0.0.0
 CADDY_HTTP_PORT=80
 CADDY_HTTPS_PORT=443
@@ -263,7 +270,7 @@ Alembic 和 migrations，可单独执行 `docker compose run --rm migrate`。
 | `TRICYCLE_COMPOSE_DATABASE_URL` | Compose API 容器使用的 PostgreSQL URL | 容器运行时连接配置 |
 | `TRICYCLE_COMPOSE_RUSTFS_ENDPOINT_URL` | Compose API 容器使用的 S3 endpoint | 容器运行时连接配置 |
 | `TRICYCLE_RUSTFS_BUCKET` | 实际对象存储 bucket | 运行时存储配置 |
-| `CADDY_SERVER_NAME` / `CADDY_*_PORT` | HTTPS 域名、HTTP/HTTPS 监听端口和 ACME 证书状态 | Compose 边缘入口配置 |
+| `CADDY_SERVER_NAME` / `CADDY_CERT_NAMES` / `CADDY_*_PORT` | HTTPS 默认域名、证书名称/IP 集合、HTTP/HTTPS 监听端口和 ACME 证书状态 | Compose 边缘入口配置 |
 | `TRICYCLE_OIDC_CA_BUNDLE` / `TRICYCLE_RUSTFS_CA_BUNDLE` / `TRICYCLE_SMTP_CA_BUNDLE` | 私有 CA 的绝对 PEM 路径 | 可选 TLS 信任链 |
 | `TRICYCLE_BOOTSTRAP_ORGANIZATION_*` | 初始组织 slug 和显示名 | 首次 bootstrap 注入 |
 | `TRICYCLE_BOOTSTRAP_PROJECT_*` | 初始项目 slug 和显示名 | 首次 bootstrap 注入 |
@@ -374,13 +381,13 @@ TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS=60
 
 该模型要求生产环境只运行一个 `upload-worker` 实例：它是共享 MolOP 进程池和单一活动持久化消费者的边界。API 节点可以横向扩展，但不要横向扩展 upload-worker；多个 worker 副本会各自创建解析池和持久化消费者，从而改变本节描述的串行组和资源上限语义。
 
-Voyager 使用 NexusX 6.1.2 的 `ComposedErManager` member cluster/color。当前所有数据库实体
+Voyager 使用 NexusX 6.3 及以上版本的 `ComposedErManager` member cluster/color。当前所有数据库实体
 属于同一个 PostgreSQL 逻辑 engine，因此配置中只有一个数据库 cluster；即使
 `db-rw.internal.example` 后面有多台主备节点，也不能为每台机器创建一个 member。只有新增
 拥有互斥实体集合和独立 session factory 的数据库 engine 时，才应在代码中增加 member 和
 对应的跨 engine relationship。
 
-NexusX 6.1.2 的 Compose executor 会在执行前严格校验字段 selection；未知字段、缺少嵌套
+NexusX 6.3 及以上版本的 Compose executor 会在执行前严格校验字段 selection；未知字段、缺少嵌套
 selection 或对标量附加 selection 都会返回结构化错误，不会静默丢字段。该版本还支持
 federation `page_by_*_in` 根的默认排序；本项目没有启用跨数据库 federation，新增 engine
 时必须显式声明实体的 `__federation_keys__` 和 `__pagination_orders__`，并在上线验收中

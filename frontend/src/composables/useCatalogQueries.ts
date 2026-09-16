@@ -14,9 +14,11 @@ interface CatalogQueryOptions {
   projectId: Ref<string | null>;
   activeView: ComputedRef<CatalogView>;
   reactionOffset: Ref<number>;
+  reactionPageSize: Ref<number>;
   reactionFilters: Ref<ReactionQueryFilters>;
   reactionSort: Ref<ReactionSort>;
   artifactOffset: Ref<number>;
+  artifactPageSize: Ref<number>;
   artifactSort: Ref<ArtifactSort>;
   artifactFilterId: ComputedRef<string | null>;
   artifactKindFilter: ComputedRef<string | null>;
@@ -96,7 +98,7 @@ export function useCatalogQueries(options: CatalogQueryOptions) {
       projectId: options.projectId.value,
       reactionFilters: options.reactionFilters.value,
       sort: options.reactionSort.value,
-      limit: 12,
+      limit: options.reactionPageSize.value,
       offset,
     }] as const;
   }
@@ -106,7 +108,7 @@ export function useCatalogQueries(options: CatalogQueryOptions) {
       projectId: options.projectId.value ?? undefined,
       ...options.reactionFilters.value,
       ...options.reactionSort.value,
-      limit: 12,
+      limit: options.reactionPageSize.value,
       offset,
     }, signal);
   }
@@ -148,7 +150,7 @@ export function useCatalogQueries(options: CatalogQueryOptions) {
       storageStatus: options.artifactStorageStatusFilter.value,
       ingestionStatus: options.artifactIngestionStatusFilter.value,
       sort: options.artifactSort.value,
-      limit: 50,
+      limit: options.artifactPageSize.value,
       offset,
     }] as const;
   }
@@ -163,7 +165,7 @@ export function useCatalogQueries(options: CatalogQueryOptions) {
       storageStatus: options.artifactStorageStatusFilter.value ?? undefined,
       ingestionStatus: options.artifactIngestionStatusFilter.value ?? undefined,
       ...options.artifactSort.value,
-      limit: 50,
+      limit: options.artifactPageSize.value,
       offset,
     }, signal);
   }

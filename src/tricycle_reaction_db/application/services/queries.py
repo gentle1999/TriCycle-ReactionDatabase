@@ -163,7 +163,7 @@ from tricycle_reaction_db.domain.fingerprints import (
 )
 from tricycle_reaction_db.domain.precision import round_energy_hartree
 
-PageLimit = Annotated[int, Field(ge=1, le=200, description="Maximum rows to return.")]
+PageLimit = Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")]
 PageOffset = Annotated[int, Field(ge=0, description="Number of rows to skip.")]
 
 
@@ -529,7 +529,11 @@ def mapped_reaction_has_thermodynamic_profile(
     profile = MappedReactionThermodynamicProfile
     predicates: list[Any] = [
         col(profile.mapped_reaction_id) == mapped_reaction_id,
-        thermodynamic_profile_is_visible(scope, profile),
+        thermodynamic_profile_is_visible(
+            scope,
+            profile,
+            mapped_reaction_id=mapped_reaction_id,
+        ),
     ]
     if minimum_activation_gibbs_free_energy_kcal_mol is not None:
         predicates.append(

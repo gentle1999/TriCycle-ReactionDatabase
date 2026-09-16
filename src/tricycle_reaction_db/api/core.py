@@ -1,14 +1,19 @@
 """NexusX Core API routes built from explicit DTO subsets and resolvers."""
 
+import asyncio
 import re
+import tempfile
+from contextlib import suppress
+from pathlib import Path
 from typing import Annotated, Any, cast
 from urllib.parse import quote
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import Response, StreamingResponse
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, status
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from nexusx import DefineSubset, ErDiagram, ErManager  # type: ignore[import-untyped]
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
+from starlette.background import BackgroundTask
 
 from tricycle_reaction_db.api.authentication import get_optional_principal
 from tricycle_reaction_db.application.dtos import (
@@ -32,6 +37,7 @@ from tricycle_reaction_db.application.dtos import (
 )
 from tricycle_reaction_db.application.services import (
     ArtifactContentService,
+    ArtifactDownload,
     ArtifactForbiddenError,
     ArtifactNotFoundError,
     ArtifactObjectIntegrityError,
@@ -50,7 +56,9 @@ from tricycle_reaction_db.application.services import (
     ScientificArrayNotFoundError,
     ScientificArrayPayloadTooLargeError,
     iter_artifact_download,
+    write_artifact_archive,
 )
+from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import MolecularFormula, MolecularTopology
 from tricycle_reaction_db.db.session import session_factory
 from tricycle_reaction_db.domain.enums import (
@@ -65,7 +73,7 @@ from tricycle_reaction_db.domain.enums import (
     StorageStatus,
 )
 
-CoreLimit = Annotated[int, Query(ge=1, le=200)]
+CoreLimit = Annotated[int, Query(ge=1, le=500)]
 CoreOffset = Annotated[int, Query(ge=0)]
 ProjectQueryId = Annotated[
     UUID,
@@ -89,6 +97,14 @@ class ReactionThermodynamicAnalyticsQuery(BaseModel):
     filter_expression: str | None = None
     has_activation_gibbs_free_energy: bool | None = None
     has_reaction_gibbs_free_energy: bool | None = None
+
+
+class ArtifactBatchDownloadRequest(BaseModel):
+    """The artifact IDs selected for one authorized ZIP download."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_ids: list[UUID] = Field(min_length=1, max_length=500)
 
 
 class MolecularFormulaCoreDTO(DefineSubset):  # type: ignore[misc]
@@ -246,6 +262,109 @@ async def list_artifacts(
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _remove_temporary_archive(path: str) -> None:
+    with suppress(FileNotFoundError):
+        Path(path).unlink()
+
+
+async def _create_artifact_batch_download(
+    artifact_ids: list[UUID],
+    principal: OptionalPrincipal,
+    project_id: ProjectQueryId,
+) -> FileResponse:
+    """Return one ZIP containing selected artifacts authorized for the project."""
+
+    if not 1 <= len(artifact_ids) <= 500:
+        raise HTTPException(
+            status_code=422,
+            detail="artifact_ids must contain between 1 and 500 items",
+        )
+    if len(set(artifact_ids)) != len(artifact_ids):
+        raise HTTPException(status_code=422, detail="artifact_ids must be unique")
+
+    user_id = principal.user_id if principal is not None else None
+    download_slots = asyncio.Semaphore(16)
+
+    async def resolve(artifact_id: UUID) -> ArtifactDownload:
+        async with download_slots:
+            return await ArtifactContentService.download(
+                artifact_id,
+                user_id=user_id,
+                project_id=project_id,
+            )
+
+    try:
+        downloads = list(
+            await asyncio.gather(*(resolve(artifact_id) for artifact_id in artifact_ids))
+        )
+    except (ArtifactNotFoundError, ArtifactForbiddenError) as error:
+        raise HTTPException(status_code=404, detail="artifact not found") from error
+    except ArtifactUnavailableError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ArtifactObjectIntegrityError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+
+    total_bytes = sum(download.size_bytes for download in downloads)
+    maximum_bytes = get_settings().max_batch_bytes
+    if total_bytes > maximum_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"artifact archive exceeds the {maximum_bytes}-byte limit",
+        )
+
+    with tempfile.NamedTemporaryFile(
+        prefix="artifact-download-",
+        suffix=".zip",
+        delete=False,
+    ) as temporary:
+        archive_path = Path(temporary.name)
+    try:
+        await asyncio.to_thread(write_artifact_archive, downloads, archive_path)
+    except Exception as error:
+        _remove_temporary_archive(str(archive_path))
+        raise HTTPException(
+            status_code=502,
+            detail="artifact archive could not be created",
+        ) from error
+
+    return FileResponse(
+        archive_path,
+        media_type="application/zip",
+        filename="artifacts.zip",
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+        background=BackgroundTask(_remove_temporary_archive, str(archive_path)),
+    )
+
+
+@router.post("/artifacts/batch-download", response_class=FileResponse)
+async def download_artifact_batch(
+    payload: ArtifactBatchDownloadRequest,
+    principal: OptionalPrincipal,
+    project_id: ProjectQueryId,
+) -> FileResponse:
+    """Return one ZIP containing selected artifacts authorized for the project."""
+
+    return await _create_artifact_batch_download(
+        payload.artifact_ids,
+        principal,
+        project_id,
+    )
+
+
+@router.post("/artifacts/batch-download/form", response_class=FileResponse)
+async def download_artifact_batch_form(
+    artifact_ids: Annotated[list[UUID], Form()],
+    principal: OptionalPrincipal,
+    project_id: ProjectQueryId,
+) -> FileResponse:
+    """Stream a native-browser ZIP download without materializing it in JS."""
+
+    return await _create_artifact_batch_download(artifact_ids, principal, project_id)
 
 
 @router.get("/artifacts/{artifact_id}", response_model=ArtifactSummary)

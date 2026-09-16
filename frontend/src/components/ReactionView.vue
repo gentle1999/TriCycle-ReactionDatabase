@@ -5,6 +5,7 @@ import { RouterLink } from "vue-router";
 
 import { api } from "@/api";
 import QueryValidationIndicator from "@/components/QueryValidationIndicator.vue";
+import { REACTION_PAGE_SIZE_MAX } from "@/pagination";
 import type { LogicalReactionSummary, PageInfo } from "@/types";
 import type { ReactionQueryFilters, ReactionSort, ReactionSortBy } from "@/reactionQuery";
 
@@ -19,6 +20,7 @@ const props = defineProps<{
   projectId: string | null;
   total: number;
   page: PageInfo;
+  pageSize: number;
   queryFilters: ReactionQueryFilters;
   sort: ReactionSort;
 }>();
@@ -27,6 +29,7 @@ const emit = defineEmits<{
   previousPage: [];
   nextPage: [];
   jumpPage: [offset: number];
+  pageSizeChange: [pageSize: number];
   applyFilters: [filters: ReactionQueryFilters];
   updateSort: [sort: ReactionSort];
 }>();
@@ -336,7 +339,7 @@ onBeforeUnmount(() => {
             <label><span>排序</span><select :value="sort.sortBy" aria-label="反应排序字段" @change="updateSortBy"><option value="default">默认顺序</option><option v-if="queryFilters.similarityReactionSmiles" value="similarity">相似度</option><option value="created_at">创建时间</option><option value="reaction_key">反应键</option><option value="reaction_class">反应类型</option><option value="minimum_activation_gibbs_free_energy">最低 ΔG‡</option><option value="minimum_reaction_gibbs_free_energy">最低 ΔG</option></select></label>
             <label><span>顺序</span><select :value="sort.sortDirection" aria-label="反应排序方向" :disabled="sort.sortBy === 'default' || sort.sortBy === 'similarity'" @change="updateSortDirection"><option value="asc">升序</option><option value="desc">降序</option></select></label>
           </div>
-          <PaginationControls :page="page" label="反应分页（顶部）" @previous="emit('previousPage')" @next="emit('nextPage')" @jump="emit('jumpPage', $event)" />
+          <PaginationControls :page="page" :page-size="pageSize" :max-page-size="REACTION_PAGE_SIZE_MAX" label="反应分页（顶部）" @previous="emit('previousPage')" @next="emit('nextPage')" @jump="emit('jumpPage', $event)" @page-size-change="emit('pageSizeChange', $event)" />
         </div>
       </header>
       <div class="catalog-query-status-slot" aria-live="polite">
@@ -352,7 +355,7 @@ onBeforeUnmount(() => {
           />
         </template>
       </div>
-      <PaginationControls :page="page" label="反应分页（底部）" @previous="emit('previousPage')" @next="emit('nextPage')" @jump="emit('jumpPage', $event)" />
+      <PaginationControls :page="page" :page-size="pageSize" :max-page-size="REACTION_PAGE_SIZE_MAX" label="反应分页（底部）" @previous="emit('previousPage')" @next="emit('nextPage')" @jump="emit('jumpPage', $event)" @page-size-change="emit('pageSizeChange', $event)" />
     </section>
 
     <ReactionAdvancedQueryModal

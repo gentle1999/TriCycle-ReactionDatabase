@@ -3061,6 +3061,38 @@ table.data-table {
   min-height: 30px;
 }
 
+.pagination-page-size {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.pagination-page-size label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.pagination-page-size input {
+  width: 54px;
+  height: 30px;
+  padding: 0 6px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  text-align: center;
+}
+
+.pagination-page-size-limit {
+  color: var(--ink-muted);
+  font-size: 9px;
+}
+
 .catalog-page-jump {
   display: inline-flex;
   align-items: center;

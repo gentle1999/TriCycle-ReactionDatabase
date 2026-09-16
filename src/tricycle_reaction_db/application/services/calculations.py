@@ -1062,6 +1062,16 @@ def persist_multireference_result(
         if electronic_state_set is not None
         else None
     )
+    if _fast_insert_enabled(session):
+        new_result = _new_entity(
+            session,
+            MultireferenceResult,
+            frame=frame,
+            electronic_state_set=electronic_state_set,
+            **_dto_values(record),
+        )
+        _flush_new_entity(session, new_result, label="MultireferenceResult")
+        return new_result
     _acquire_identity_locks(session, ("MultireferenceResult", frame_id))
     result = session.exec(
         select(MultireferenceResult).where(MultireferenceResult.frame_id == frame_id)

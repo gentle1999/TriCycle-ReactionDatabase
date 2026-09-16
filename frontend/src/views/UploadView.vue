@@ -82,6 +82,8 @@ const MOLOP_BATCH_MAX_BYTES = 256 * 1024 * 1024;
 const BATCH_COMPLETION_RESET_DELAY_MS = 2_000;
 const PAGE_SIZE = 100;
 const UPLOAD_PROGRESS_METADATA_KEY = "__tricycle_upload_progress";
+const UPLOAD_PROGRESS_POLL_INTERVAL_MS = 1_500;
+const UPLOAD_PROGRESS_UPDATE_INTERVAL_MS = 100;
 const route = useRoute();
 const router = useRouter();
 const session = useSession();
@@ -116,6 +118,9 @@ let viewMounted = false;
 let preserveQueueOnUnmount = false;
 let progressPollTimer: number | null = null;
 let progressPollInFlight = false;
+let nextTaskClaimIndex = 0;
+let deferredTaskQueue: QueueTask[] = [];
+let deferredTaskQueueHead = 0;
 
 onBeforeRouteLeave(() => {
   preserveQueueOnUnmount = true;
@@ -141,11 +146,20 @@ function uploadCount(value: number | null | undefined): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
-const uploadedBytes = computed(() => tasks.value.reduce((total, task) => {
-  if (["staged", "processing", "succeeded"].includes(task.status)) return total + task.size;
-  if (task.status === "uploading") return total + Math.min(task.loaded, task.size);
-  return total;
-}, 0));
+const uploadedBytes = ref(0);
+
+function replaceLocalTasks(nextTasks: QueueTask[]): void {
+  tasks.value = nextTasks;
+  uploadedBytes.value = nextTasks.reduce((total, task) => total + task.loaded, 0);
+}
+
+function setTaskLoaded(task: QueueTask, loaded: number): void {
+  const nextLoaded = Math.min(task.size, Math.max(0, Math.round(loaded)));
+  if (nextLoaded === task.loaded) return;
+  uploadedBytes.value += nextLoaded - task.loaded;
+  task.loaded = nextLoaded;
+}
+
 const totalBytes = computed(() => tasks.value.reduce((total, task) => total + task.size, 0));
 const overallPercent = computed(() => totalBytes.value
   ? Math.round((uploadedBytes.value / totalBytes.value) * 100)
@@ -409,7 +423,23 @@ async function pollUploadProgress(): Promise<void> {
       await refreshRemoteItems();
       return;
     }
-    await refreshLocalItems(changedSince);
+    // While a multipart request is still transferring, its item rows remain
+    // in the browser-owned upload state.  Re-reading the whole changed slice
+    // every poll only adds database and Vue work; the terminal XHR response
+    // supplies those rows, and polling is needed only after staging starts.
+    const localParsePending = tasks.value.some((task) =>
+      task.status === "staged" || task.status === "processing",
+    );
+    if (
+      batch.value.uploading_count === 0
+      && (
+        batch.value.staged_count > 0
+        || batch.value.processing_count > 0
+        || localParsePending
+      )
+    ) {
+      await refreshLocalItems(changedSince);
+    }
   } catch {
     // The upload request remains authoritative; a transient progress poll may fail.
   } finally {
@@ -461,7 +491,8 @@ async function openBatch(batchId: string): Promise<void> {
     selectedProjectId.value = batch.value.project_id;
     artifactKind.value = batch.value.artifact_kind;
     remoteMode.value = true;
-    tasks.value = [];
+    resetTaskClaimQueue();
+    replaceLocalTasks([]);
     queuePage.value = 0;
     statusFilter.value = "all";
     await refreshRemoteItems();
@@ -528,10 +559,10 @@ async function reattachSelectedFiles(event: Event): Promise<void> {
       tasks.value.flatMap((task) => task.file ? [[task.relativePath, task.file] as const] : []),
     );
     for (const file of files) fileMap.set(fileRelativePath(file), file);
-    tasks.value = items.map((item) => {
+    replaceLocalTasks(items.map((item) => {
       const file = fileMap.get(item.relative_path) ?? null;
       return queueTaskFromRemote(item, file && file.size === item.size_bytes ? file : null);
-    });
+    }));
     const missing = tasks.value.filter((task) => task.status === "queued" && !task.file).length;
     remoteMode.value = false;
     queuePage.value = 0;
@@ -586,8 +617,8 @@ async function ensureBatch(): Promise<UploadBatch> {
 function applyItem(task: QueueTask, item: UploadBatchItem): void {
   task.status = item.status;
   task.attempt = item.attempt_count;
-  if (["staged", "processing", "succeeded"].includes(item.status)) task.loaded = task.size;
-  else if (item.status !== "uploading") task.loaded = 0;
+  if (["staged", "processing", "succeeded"].includes(item.status)) setTaskLoaded(task, task.size);
+  else if (item.status !== "uploading") setTaskLoaded(task, 0);
   task.error = item.error_message ?? item.ingestion_error_message ?? "";
   task.artifactId = item.artifact_file_id;
   task.ingestionStatus = item.ingestion_status;
@@ -612,21 +643,39 @@ function updateBatchProgress(selected: QueueTask[], loaded: number, total: numbe
     ? Math.min(selectedBytes, Math.round((loaded / total) * selectedBytes))
     : 0;
   for (const task of selected) {
-    task.loaded = Math.min(task.size, remaining);
+    setTaskLoaded(task, remaining);
     remaining = Math.max(0, remaining - task.size);
   }
+}
+
+function resetTaskClaimQueue(): void {
+  nextTaskClaimIndex = 0;
+  deferredTaskQueue = [];
+  deferredTaskQueueHead = 0;
 }
 
 function claimTaskBatch(): QueueTask[] {
   const selected: QueueTask[] = [];
   let selectedBytes = 0;
-  for (const task of tasks.value) {
+  const deferred: QueueTask[] = [];
+  while (selected.length < MOLOP_BATCH_MAX_FILES) {
+    const task = deferredTaskQueueHead < deferredTaskQueue.length
+      ? deferredTaskQueue[deferredTaskQueueHead++]
+      : tasks.value[nextTaskClaimIndex++];
+    if (!task) break;
     if (task.status !== "queued" || !task.file || task.reserved) continue;
-    if (selected.length >= MOLOP_BATCH_MAX_FILES) break;
-    if (selected.length && selectedBytes + task.size > MOLOP_BATCH_MAX_BYTES) continue;
+    if (selected.length && selectedBytes + task.size > MOLOP_BATCH_MAX_BYTES) {
+      deferred.push(task);
+      continue;
+    }
     task.reserved = true;
     selected.push(task);
     selectedBytes += task.size;
+  }
+  deferredTaskQueue.push(...deferred);
+  if (deferredTaskQueueHead > 1024 && deferredTaskQueueHead * 2 >= deferredTaskQueue.length) {
+    deferredTaskQueue = deferredTaskQueue.slice(deferredTaskQueueHead);
+    deferredTaskQueueHead = 0;
   }
   return selected;
 }
@@ -638,7 +687,7 @@ async function runTaskBatch(selected: QueueTask[], runId: number): Promise<void>
       for (const task of selected) {
         task.status = "uploading";
         task.attempt += 1;
-        task.loaded = 0;
+        setTaskLoaded(task, 0);
         task.error = "";
         task.parsePhase = "uploading";
         task.parseCompleted = 0;
@@ -646,13 +695,24 @@ async function runTaskBatch(selected: QueueTask[], runId: number): Promise<void>
       }
       const controller = new AbortController();
       for (const task of selected) task.controller = controller;
+      let lastProgressAt = 0;
+      let lastProgressLoaded = -1;
       try {
         const items = await api.uploadBatchFiles(
           batch.value.id,
           selected.map((task) => ({ clientFileId: task.clientFileId, file: task.file! })),
           (loaded, total) => {
+            const complete = total > 0 && loaded >= total;
+            const now = Date.now();
+            if (
+              !complete
+              && (now - lastProgressAt < UPLOAD_PROGRESS_UPDATE_INTERVAL_MS
+                || loaded === lastProgressLoaded)
+            ) return;
+            lastProgressAt = now;
+            lastProgressLoaded = loaded;
             updateBatchProgress(selected, loaded, total);
-            if (total > 0 && loaded >= total) {
+            if (complete) {
               for (const task of selected) {
                 if (task.status === "uploading") task.parsePhase = "parsing";
               }
@@ -689,7 +749,7 @@ async function runTaskBatch(selected: QueueTask[], runId: number): Promise<void>
           const midpoint = Math.ceil(selected.length / 2);
           for (const task of selected) {
             task.status = "queued";
-            task.loaded = 0;
+            setTaskLoaded(task, 0);
             task.error = "正在调整批次大小";
             task.parsePhase = null;
           }
@@ -756,6 +816,7 @@ async function startQueue(): Promise<void> {
     }
     queuePaused.value = false;
     queueCancelled.value = false;
+    resetTaskClaimQueue();
     queueRunning.value = true;
     const runId = ++queueRunId;
     markUploadBatchActive(activeBatch.id);
@@ -888,7 +949,8 @@ async function newBatch(): Promise<void> {
   queueRunId += 1;
   for (const task of tasks.value) task.controller?.abort();
   batch.value = null;
-  tasks.value = [];
+  resetTaskClaimQueue();
+  replaceLocalTasks([]);
   remoteItems.value = [];
   remoteMode.value = false;
   remoteTotal.value = 0;
@@ -930,7 +992,10 @@ watch([statusFilter, queuePage], () => {
 watch(statusFilter, () => { queuePage.value = 0; });
 onMounted(async () => {
   viewMounted = true;
-  progressPollTimer = window.setInterval(() => void pollUploadProgress(), 750);
+  progressPollTimer = window.setInterval(
+    () => void pollUploadProgress(),
+    UPLOAD_PROGRESS_POLL_INTERVAL_MS,
+  );
   await refreshRecentBatches();
   const routeBatch = typeof route.query.batch === "string" ? route.query.batch : null;
   const lastBatch = window.localStorage.getItem("tricycle.lastUploadBatch");

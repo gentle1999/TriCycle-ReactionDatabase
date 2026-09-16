@@ -9,6 +9,7 @@ import pytest
 from mcp.types import TextContent
 
 from tricycle_reaction_db.api import mcp as mcp_module
+from tricycle_reaction_db.api import mcp_apps
 from tricycle_reaction_db.api.mcp import QueryGuardMiddleware, _mcp_success, mcp_server
 from tricycle_reaction_db.application.dtos import (
     OrganizationAccessView,
@@ -141,6 +142,9 @@ async def test_mcp_exposes_query_management_and_import_tools() -> None:
         "create_project",
         "list_projects",
         "get_project",
+        "preview_project_cleanup",
+        "delete_project_data",
+        "delete_artifact",
         "update_project",
         "list_project_members",
         "upsert_project_member",
@@ -160,6 +164,7 @@ async def test_mcp_exposes_query_management_and_import_tools() -> None:
         "pause_import",
         "resume_import",
         "cancel_import",
+        "open_calculation_log_workspace",
     }
 
 
@@ -176,6 +181,224 @@ async def test_mcp_control_tools_require_transport_authentication() -> None:
             "message": "authenticated MCP principal is required",
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_mcp_project_cleanup_tools_use_authenticated_user_and_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id = UUID("00000000-0000-7000-8000-000000000714")
+    artifact_id = UUID("00000000-0000-7000-8000-000000000715")
+    observed: dict[str, Any] = {}
+
+    async def preview(requested_project_id: UUID, *, user_id: UUID) -> dict[str, Any]:
+        observed["preview"] = (requested_project_id, user_id)
+        return {"project_id": requested_project_id, "artifact_count": 2}
+
+    async def clear(
+        requested_project_id: UUID,
+        *,
+        user_id: UUID,
+        confirmation: str,
+    ) -> dict[str, Any]:
+        observed["clear"] = (requested_project_id, user_id, confirmation)
+        return {"project_id": requested_project_id, "rustfs_objects_deleted": 2}
+
+    async def retire(requested_artifact_id: UUID, *, user_id: UUID) -> None:
+        observed["artifact"] = (requested_artifact_id, user_id)
+
+    monkeypatch.setattr(
+        mcp_module.ProjectDataRemovalService,
+        "preview",
+        staticmethod(preview),
+    )
+    monkeypatch.setattr(
+        mcp_module.ProjectDataRemovalService,
+        "clear",
+        staticmethod(clear),
+    )
+    monkeypatch.setattr(
+        mcp_module.ArtifactManagementService,
+        "retire",
+        staticmethod(retire),
+    )
+
+    preview_result = await _call_as_development_user(
+        "preview_project_cleanup",
+        {"project_id": str(project_id)},
+    )
+    clear_result = await _call_as_development_user(
+        "delete_project_data",
+        {"project_id": str(project_id), "confirmation": "rits-zero-shot-da"},
+    )
+    artifact_result = await _call_as_development_user(
+        "delete_artifact",
+        {"artifact_id": str(artifact_id)},
+    )
+
+    assert preview_result["data"]["artifact_count"] == 2
+    assert clear_result["data"]["rustfs_objects_deleted"] == 2
+    assert artifact_result["data"] == {"removed": True, "artifact_id": str(artifact_id)}
+    assert observed["preview"] == (project_id, DEVELOPMENT_USER_ID)
+    assert observed["clear"] == (project_id, DEVELOPMENT_USER_ID, "rits-zero-shot-da")
+    assert observed["artifact"] == (artifact_id, DEVELOPMENT_USER_ID)
+
+
+@pytest.mark.asyncio
+async def test_mcp_apps_render_a_project_scoped_calculation_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = ProjectView.model_validate(
+        {
+            "id": "00000000-0000-7000-8000-000000000730",
+            "organization_id": "00000000-0000-7000-8000-000000000731",
+            "organization_slug": "research",
+            "organization_name": "Research",
+            "slug": "cycloaddition",
+            "name": "Cycloaddition",
+            "status": ProjectStatus.ACTIVE,
+            "permissions": ["artifact:upload"],
+        }
+    )
+
+    async def list_projects(
+        _principal: AuthenticatedPrincipal,
+        *,
+        include_archived: bool = False,
+    ) -> list[ProjectView]:
+        assert include_archived is False
+        return [project]
+
+    monkeypatch.setattr(
+        mcp_apps.ProjectManagementService,
+        "list_projects",
+        staticmethod(list_projects),
+    )
+
+    principal = AuthenticatedPrincipal(
+        user_id=DEVELOPMENT_USER_ID,
+        display_name="Development User",
+        primary_email="developer@localhost",
+        is_service_account=False,
+        issuer=DEVELOPMENT_IDENTITY_ISSUER,
+        subject=DEVELOPMENT_IDENTITY_SUBJECT,
+    )
+    token = set_current_principal(principal)
+    try:
+        result = await mcp_server.call_tool("open_calculation_log_workspace", {})
+    finally:
+        reset_current_principal(token)
+
+    assert result.structured_content is not None
+    assert result.structured_content["$prefab"]["version"] == "0.3"
+    assert result.structured_content["state"] == {
+        "project_id": "00000000-0000-7000-8000-000000000730",
+        "pending": [],
+        "staged": [],
+    }
+    serialized = json.dumps(result.structured_content)
+    assert "Drop calculation logs here" in serialized
+    assert "stage_calculation_logs" in serialized
+    assert "{{ pending }}" in serialized
+
+
+@pytest.mark.asyncio
+async def test_mcp_app_stages_all_selected_files_in_one_upload_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id = UUID("00000000-0000-7000-8000-000000000732")
+    project = ProjectView.model_validate(
+        {
+            "id": str(project_id),
+            "organization_id": "00000000-0000-7000-8000-000000000733",
+            "organization_slug": "research",
+            "organization_name": "Research",
+            "slug": "cycloaddition",
+            "name": "Cycloaddition",
+            "status": ProjectStatus.ACTIVE,
+            "permissions": ["artifact:upload"],
+        }
+    )
+    observed: dict[str, Any] = {}
+
+    async def get_project(
+        requested_project_id: UUID,
+        _principal: AuthenticatedPrincipal,
+    ) -> ProjectView:
+        assert requested_project_id == project_id
+        return project
+
+    async def create_and_stage(**kwargs: Any) -> Any:
+        observed.update(kwargs)
+        items = tuple(
+            SimpleNamespace(
+                batch_id=UUID("00000000-0000-7000-8000-000000000734"),
+                id=UUID(f"00000000-0000-7000-8000-00000000073{5 + index}"),
+                original_filename=upload.filename,
+                size_bytes=len(upload.payload or b""),
+                status=UploadBatchItemStatus.STAGED,
+                parse_status=ImportParseStatus.PENDING,
+                ingestion_status=ArtifactIngestionStatus.PENDING,
+            )
+            for index, upload in enumerate(kwargs["files"])
+        )
+        return SimpleNamespace(items=items)
+
+    monkeypatch.setattr(
+        mcp_apps.ProjectManagementService,
+        "get_project",
+        staticmethod(get_project),
+    )
+    monkeypatch.setattr(
+        mcp_apps.UploadBatchService,
+        "create_and_stage",
+        staticmethod(create_and_stage),
+    )
+
+    principal = AuthenticatedPrincipal(
+        user_id=DEVELOPMENT_USER_ID,
+        display_name="Development User",
+        primary_email="developer@localhost",
+        is_service_account=False,
+        issuer=DEVELOPMENT_IDENTITY_ISSUER,
+        subject=DEVELOPMENT_IDENTITY_SUBJECT,
+    )
+    tool = await mcp_apps.calculation_log_workspace_app._get_tool("stage_calculation_logs")
+    assert tool is not None
+    hash_prefix = tool.meta["fastmcp"]["_tool_hash"]
+    token = set_current_principal(principal)
+    try:
+        result = await mcp_server.call_tool(
+            f"{hash_prefix}_{tool.name}",
+            {
+                "project_id": str(project_id),
+                "files": [
+                    {
+                        "name": "reactant.log",
+                        "type": "text/plain",
+                        "data": base64.b64encode(b"reactant").decode("ascii"),
+                    },
+                    {
+                        "name": "product.log",
+                        "type": "text/plain",
+                        "data": base64.b64encode(b"product").decode("ascii"),
+                    },
+                ],
+            },
+        )
+    finally:
+        reset_current_principal(token)
+
+    assert result.structured_content is not None
+    assert len(result.structured_content["result"]) == 2
+    assert observed["project_id"] == project_id
+    assert observed["user_id"] == DEVELOPMENT_USER_ID
+    assert observed["artifact_kind"] is ArtifactKind.CALCULATION_OUTPUT
+    assert [upload.filename for upload in observed["files"]] == [
+        "reactant.log",
+        "product.log",
+    ]
+    assert [upload.payload for upload in observed["files"]] == [b"reactant", b"product"]
 
 
 @pytest.mark.asyncio

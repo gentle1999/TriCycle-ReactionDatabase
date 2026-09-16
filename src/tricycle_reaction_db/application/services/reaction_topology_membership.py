@@ -43,11 +43,73 @@ class ConcreteTopologyMembershipError(ValueError):
     """The proposed concrete topology cannot instantiate a logical participant."""
 
 
+_PENDING_MEMBERSHIP_INDEX_KEY = "_fast_pending_membership_index"
+_PENDING_MEMBERSHIP_INDEX_MARKER_KEY = "_fast_pending_membership_index_marker"
+
+
 def _pending_entities(session: Session) -> tuple[object, ...]:
     return (
         *tuple(session.new),
         *tuple(session.info.get("_fast_pending_entities", ())),
     )
+
+
+def _pending_membership_index(
+    session: Session,
+) -> dict[tuple[UUID, UUID], LogicalParticipantConcreteTopology]:
+    """Build one lookup for the current deferred-row queue.
+
+    Membership persistence is called once per mapped participant.  Scanning
+    the complete deferred queue for each call made a large inference window
+    quadratic in Python time.  The queue helper replaces the list on every
+    rollback/flush, so its object identity and length are a cheap invalidation
+    marker for this derived index.
+    """
+
+    pending = session.info.get("_fast_pending_entities")
+    previous_marker = session.info.get(_PENDING_MEMBERSHIP_INDEX_MARKER_KEY)
+    marker = (id(pending), len(pending)) if isinstance(pending, list) else None
+    if (
+        isinstance(pending, list)
+        and isinstance(previous_marker, tuple)
+        and len(previous_marker) == 2
+        and previous_marker[0] == id(pending)
+        and isinstance(previous_marker[1], int)
+        and 0 <= previous_marker[1] <= len(pending)
+    ):
+        cached = session.info.get(_PENDING_MEMBERSHIP_INDEX_KEY)
+        if isinstance(cached, dict):
+            for entity in pending[previous_marker[1] :]:
+                if not isinstance(entity, LogicalParticipantConcreteTopology):
+                    continue
+                logical_participant_id = entity.logical_reaction_participant_id
+                concrete_topology_id = entity.concrete_topology_id
+                if isinstance(logical_participant_id, UUID) and isinstance(
+                    concrete_topology_id,
+                    UUID,
+                ):
+                    cached.setdefault((logical_participant_id, concrete_topology_id), entity)
+            session.info[_PENDING_MEMBERSHIP_INDEX_MARKER_KEY] = marker
+            return cast(
+                dict[tuple[UUID, UUID], LogicalParticipantConcreteTopology],
+                cached,
+            )
+    if previous_marker != marker:
+        index: dict[tuple[UUID, UUID], LogicalParticipantConcreteTopology] = {}
+        for entity in _pending_entities(session):
+            if not isinstance(entity, LogicalParticipantConcreteTopology):
+                continue
+            logical_participant_id = entity.logical_reaction_participant_id
+            concrete_topology_id = entity.concrete_topology_id
+            if isinstance(logical_participant_id, UUID) and isinstance(
+                concrete_topology_id,
+                UUID,
+            ):
+                index.setdefault((logical_participant_id, concrete_topology_id), entity)
+        session.info[_PENDING_MEMBERSHIP_INDEX_KEY] = index
+        session.info[_PENDING_MEMBERSHIP_INDEX_MARKER_KEY] = marker
+    cached = session.info.get(_PENDING_MEMBERSHIP_INDEX_KEY)
+    return cached if isinstance(cached, dict) else {}
 
 
 def _membership_cache(
@@ -118,6 +180,10 @@ def _find_pending_membership(
     logical_participant_id: UUID,
     concrete_topology_id: UUID,
 ) -> LogicalParticipantConcreteTopology | None:
+    if session.info.get("tricycle_fast_insert", False):
+        return _pending_membership_index(session).get(
+            (logical_participant_id, concrete_topology_id)
+        )
     for entity in _pending_entities(session):
         if not isinstance(entity, LogicalParticipantConcreteTopology):
             continue
