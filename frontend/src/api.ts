@@ -796,6 +796,13 @@ export const api = {
       `/api/artifacts/${encodeURIComponent(id)}${options.projectId ? `?project_id=${encodeURIComponent(options.projectId)}` : ""}`,
       signal,
     ),
+  updateArtifactNotes: (id: string, notes: string | null, signal?: AbortSignal) =>
+    requestMutation<ArtifactSummary>(
+      "/api/artifacts/" + encodeURIComponent(id),
+      "PATCH",
+      { notes },
+      signal,
+    ) as Promise<ArtifactSummary>,
   geometries: (
     options: GeometryQueryFilters & Partial<GeometrySort> & { limit?: number; offset?: number } = {},
     signal?: AbortSignal,

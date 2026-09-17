@@ -24,6 +24,7 @@ from tricycle_reaction_db.api.query_guards import (
     validate_graphql_project_scope,
 )
 from tricycle_reaction_db.application.dtos import (
+    ArtifactMetadataUpdate,
     OrganizationCreate,
     OrganizationMemberUpsert,
     ProjectCreate,
@@ -601,6 +602,27 @@ async def delete_artifact(artifact_id: str) -> dict[str, Any]:
         principal = _require_mcp_principal()
         await ArtifactManagementService.retire(UUID(artifact_id), user_id=principal.user_id)
         return _mcp_success({"removed": True, "artifact_id": artifact_id})
+    except Exception as error:
+        return _mcp_exception(error)
+
+
+@mcp_server.tool(name="update_artifact_notes")  # type: ignore[untyped-decorator]
+async def update_artifact_notes(artifact_id: str, notes: str | None) -> dict[str, Any]:
+    """Set or clear the user-maintained notes for one artifact.
+
+    The nullable argument allows callers to explicitly clear an existing note.
+    The authenticated user must have artifact-management permission in the
+    artifact's project.
+    """
+
+    try:
+        principal = _require_mcp_principal()
+        result = await ArtifactManagementService.update_metadata(
+            UUID(artifact_id),
+            ArtifactMetadataUpdate(notes=notes),
+            user_id=principal.user_id,
+        )
+        return _mcp_success(result)
     except Exception as error:
         return _mcp_exception(error)
 

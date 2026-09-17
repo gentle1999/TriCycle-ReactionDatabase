@@ -67,6 +67,38 @@ docker compose -f compose.yaml -f compose.compute.yaml up -d --build --wait
 local-import CLI uses the same verified PostgreSQL/RustFS endpoints as the API;
 it does not start a HTTP uploader.
 
+### Build mirrors
+
+The images default to digest-pinned official Python, Node, and Nginx base images,
+plus the official PyPI, npm, and Debian repositories. Build-only variables can
+replace any of these sources without changing runtime API, RustFS, or PostgreSQL
+endpoints. For example, to use ZJU's PyPI and Debian main mirrors:
+
+```bash
+TRICYCLE_PYPI_INDEX_URL=https://mirrors.zju.edu.cn/pypi/web/simple \
+TRICYCLE_DEBIAN_MIRROR=https://mirrors.zju.edu.cn/debian \
+docker compose -f compose.yaml -f compose.compute.yaml build --pull=false api frontend
+```
+
+The same variables can be stored in `.env` and then used by the normal Compose
+or `make stack-build` commands:
+
+| Variable | Default | Use |
+| --- | --- | --- |
+| `TRICYCLE_PYPI_INDEX_URL` | `https://pypi.org/simple` | uv and Python dependencies in the API builder |
+| `TRICYCLE_DEBIAN_MIRROR` | `https://deb.debian.org/debian` | Debian main repository in the API runtime |
+| `TRICYCLE_DEBIAN_SECURITY_MIRROR` | `https://security.debian.org/debian-security` | Security repository; official by default |
+| `TRICYCLE_NPM_REGISTRY` | `https://registry.npmjs.org` | npm dependencies in the frontend builder |
+| `TRICYCLE_PYTHON_BASE_IMAGE` | pinned official Python image | Complete API builder/runtime base-image reference |
+| `TRICYCLE_NODE_BASE_IMAGE` | pinned official Node image | Complete frontend builder base-image reference |
+| `TRICYCLE_NGINX_BASE_IMAGE` | pinned official Nginx image | Complete frontend runtime base-image reference |
+
+Base-image overrides should remain compatible, complete references with a digest,
+such as an internally cached `python:3.12-slim-bookworm@sha256:...`. Keep Debian
+security updates on the official source unless the mirror's freshness is known;
+the npm registry is configured independently rather than assuming that ZJU hosts
+one.
+
 ## Capacity and Parsing
 
 `TRICYCLE_MOLOP_BATCH_N_JOBS` is the shared worker parser-pool admission limit.

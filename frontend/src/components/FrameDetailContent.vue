@@ -6,7 +6,7 @@ import { RouterLink, useRoute } from "vue-router";
 import { api, scientificArrayDownloadUrl } from "@/api";
 import { formatBytes, formatDurationSeconds, formatEnergy, formatNumber, labelFor, shortId, statusTone } from "@/format";
 import { withoutAccessState } from "@/routeAccessState";
-import type { CalculationFrameDetail, ScientificArrayPreview } from "@/types";
+import type { CalculationFrameDetail, ParsedComment, ScientificArrayPreview } from "@/types";
 
 import ChemDoodleGeometry3D from "./ChemDoodleGeometry3D.vue";
 import ChemDoodleTransitionStateMode3D from "./ChemDoodleTransitionStateMode3D.vue";
@@ -23,6 +23,7 @@ const navigationQuery = computed(() => withoutAccessState(route.query));
 const protocolEntries = computed(() => displayEntries(props.frame.protocol));
 const energyEntries = computed(() => displayEntries(props.frame.energy));
 const thermochemistryEntries = computed(() => displayEntries(props.frame.thermochemistry));
+const frameComments = computed(() => props.frame.comments?.items ?? []);
 
 type OptimizationMetric = {
   label: string;
@@ -211,6 +212,10 @@ function convergenceTone(value: boolean | null): string {
   return "neutral";
 }
 
+function commentMetadataText(comment: ParsedComment): string {
+  return comment.metadata_json !== "{}" ? comment.metadata_json : "";
+}
+
 watch(
   () => props.frame.id,
   () => {
@@ -279,6 +284,25 @@ onBeforeUnmount(() => previewController?.abort());
         <span class="status-dot" :class="statusTone(frame.optimization_status)">优化 {{ frame.optimization_status }}</span>
         <span class="role-pill">{{ frame.parse_completeness }}</span>
       </div>
+    </section>
+
+    <section v-if="frameComments.length" class="drawer-section parsed-comments-section" aria-labelledby="frame-comments-title">
+      <header class="parsed-comments-header">
+        <h3 id="frame-comments-title">源文件 comments</h3>
+        <span>{{ frameComments.length }} 条</span>
+      </header>
+      <ol class="parsed-comments-list">
+        <li v-for="(comment, index) in frameComments" :key="index" class="parsed-comment">
+          <div class="parsed-comment-meta">
+            <span class="role-pill">{{ comment.kind }}</span>
+            <span v-if="comment.source_format">{{ comment.source_format }}</span>
+            <span v-if="comment.source_line !== null">line {{ comment.source_line + 1 }}</span>
+          </div>
+          <p>{{ comment.text }}</p>
+          <code v-if="comment.raw && comment.raw !== comment.text">{{ comment.raw }}</code>
+          <small v-if="commentMetadataText(comment)">{{ commentMetadataText(comment) }}</small>
+        </li>
+      </ol>
     </section>
 
     <section v-if="frame.optimization" class="drawer-section">

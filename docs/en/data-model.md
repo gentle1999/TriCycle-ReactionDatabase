@@ -33,6 +33,17 @@ MolecularTopology -> Geometry` holds reusable chemical facts. The axes meet at
 a frame's Geometry binding. Organizations, projects, memberships, and external
 identities form a separate authorization axis.
 
+ArtifactFile.notes is project-managed metadata for experiment-batch context,
+source explanations, or follow-up processing information that is not present in
+the source file itself. It is not part of the RustFS content hash and is not
+overwritten by reparsing. MolOP 0.2.18's unified `comments` container is stored
+as parsed provenance: the file-level container is `ParseRevision.comments`, and
+the frame-level container is `CalculationFrame.comments`. Both preserve ordered
+`items` with text, semantic kind, source format, raw spelling, and format-specific
+metadata. They are read-only parse results and are not conflated with the
+user-editable `ArtifactFile.notes`; reparsing replaces them with the new revision's
+containers.
+
 ## Formula, Topology, and Geometry
 
 `MolecularFormula` records elements and isotopes only. Its authoritative range

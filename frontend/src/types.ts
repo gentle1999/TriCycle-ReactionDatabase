@@ -93,6 +93,20 @@ export interface LogicalReactionDetail extends LogicalReactionSummary {
   mapped_reactions: MappedReactionSummary[];
 }
 
+export interface ParsedComment {
+  text: string;
+  kind: string;
+  marker: string | null;
+  source_format: string | null;
+  source_line: number | null;
+  raw: string | null;
+  metadata_json: string;
+}
+
+export interface ParsedComments {
+  items: ParsedComment[];
+}
+
 export interface CalculationFrameSummary {
   id: string;
   artifact_file_id: string;
@@ -355,6 +369,7 @@ export interface SourceSpan {
 export interface CalculationFrameDetail extends CalculationFrameSummary {
   source_span: SourceSpan | null;
   parse_completeness: string;
+  comments: ParsedComments;
   geometry_assignment_kind: string;
   observed_coordinate_hash: string;
   observed_to_geometry_atom_indices: number[];
@@ -457,6 +472,7 @@ export interface ArtifactSummary {
   created_at?: string | null;
   visibility: "public" | "project";
   original_filename: string;
+  notes: string | null;
   content_sha256: string;
   size_bytes: number;
   media_type: string;
@@ -488,6 +504,7 @@ export interface ParseRevisionSummary {
   running_time_seconds: number | null;
   error_code: string | null;
   error_message: string | null;
+  comments: ParsedComments;
   started_at: string | null;
   completed_at: string | null;
 }

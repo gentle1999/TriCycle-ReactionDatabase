@@ -45,6 +45,7 @@ from tricycle_reaction_db.application.dtos import (
     ThermodynamicStateView,
     TransitionStateInferencePage,
     TransitionStateInferenceSummary,
+    parsed_comments_view,
 )
 from tricycle_reaction_db.application.query_cost import enforce_structure_input_budget
 from tricycle_reaction_db.application.services.geometry_energy import (
@@ -457,6 +458,7 @@ def _parse_revision_summary(revision: ParseRevision) -> ParseRevisionSummary:
             else None
         ),
         parse_diagnostics_json=json.dumps(revision.parse_diagnostics, sort_keys=True),
+        comments=parsed_comments_view(revision.comments),
         started_at=revision.started_at,
         completed_at=revision.completed_at,
     )

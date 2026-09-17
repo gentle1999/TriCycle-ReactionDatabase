@@ -15,7 +15,7 @@ from sqlmodel import SQLModel
 from tricycle_reaction_db.db import models as db_models
 from tricycle_reaction_db.db.models import metadata
 
-SCHEMA_REVISION = "0050_profile_source_visibility"
+SCHEMA_REVISION = "0053_molop_comments"
 OUTPUT_PATH = Path(__file__).parents[1] / "docs" / "database-erd.md"
 
 POSTGRESQL_GROUPS = {

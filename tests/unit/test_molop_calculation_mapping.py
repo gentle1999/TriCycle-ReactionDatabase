@@ -72,6 +72,7 @@ def test_latest_molop_models_map_complete_da_fixture(
             revision.parser_config_hash
         )
         assert revision.source_complete is True
+        assert revision.comments == chem_file.comments.model_dump(mode="json")
         assert chem_file.file_content == ""
         assert all(frame.frame_content == "" for frame in chem_file)
         assert [
@@ -93,6 +94,10 @@ def test_latest_molop_models_map_complete_da_fixture(
         )
         assert all(
             record.frame.coordinate_decimal_places == frame.coordinate_decimal_places
+            for record, frame in zip(records, chem_file, strict=True)
+        )
+        assert all(
+            record.frame.comments == frame.comments.model_dump(mode="json")
             for record, frame in zip(records, chem_file, strict=True)
         )
 

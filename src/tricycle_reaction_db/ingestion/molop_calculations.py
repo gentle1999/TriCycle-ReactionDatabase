@@ -124,6 +124,18 @@ def _model_dump(
     return payload
 
 
+def _comments_payload(value: Any) -> dict[str, Any]:
+    """Return MolOP's cross-format comment container in JSON-safe form."""
+
+    if value is None:
+        return {"items": []}
+    payload = _model_dump(value, mode="json")
+    items = payload.get("items")
+    if not isinstance(items, list):
+        raise TypeError("MolOP comments container must expose an items list")
+    return payload
+
+
 def _model_json(value: Any) -> dict[str, Any]:
     return _model_dump(value, mode="json")
 
@@ -258,6 +270,7 @@ def parse_revision_record_from_molop(
             else file_payload.get("artifact_size_bytes")
         ),
         source_compression=source_compression,
+        comments=_comments_payload(getattr(chem_file, "comments", file_payload.get("comments"))),
         running_time_seconds=_quantity(file_payload.get("running_time"), "second"),
         source_complete=file_payload.get("source_complete"),
         parse_completeness=ParseCompleteness(
@@ -350,6 +363,9 @@ def frame_records_from_molop(
             "force_source_field",
             "force_transformation",
         ),
+    )
+    frame_payload["comments"] = _comments_payload(
+        getattr(frame, "comments", frame_payload.get("comments"))
     )
     molecule = normalize_molop_frame(frame)
     energy = _energy_record(frame_payload["energies"], export_schema_version)
@@ -957,6 +973,7 @@ def _frame_record(
         parse_completeness=ParseCompleteness(
             _enum_value(frame.get("parse_completeness") or ParseCompleteness.NOT_ASSESSED)
         ),
+        comments=frame.get("comments") or {"items": []},
         parse_diagnostics=parse_diagnostics,
         charge=frame["charge"],
         multiplicity=frame["multiplicity"],

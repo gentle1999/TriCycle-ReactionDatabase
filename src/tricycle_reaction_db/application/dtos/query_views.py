@@ -1,5 +1,6 @@
 """Stable read-only DTOs shared by REST, GraphQL, and MCP query surfaces."""
 
+import json
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -29,6 +30,7 @@ class ArtifactSummary(QueryView):
     visibility: str
     original_filename: str
     source_relative_path: str | None = None
+    notes: str | None = None
     content_sha256: str
     size_bytes: int
     media_type: str
@@ -58,6 +60,53 @@ class ArtifactPreview(QueryView):
 class ArtifactPage(QueryView):
     items: list[ArtifactSummary]
     page: PageInfo
+
+
+class ParsedCommentView(QueryView):
+    """One format-neutral comment exposed by a parsed artifact."""
+
+    text: str
+    kind: str
+    marker: str | None = None
+    source_format: str | None = None
+    source_line: int | None = None
+    raw: str | None = None
+    metadata_json: str = "{}"
+
+
+class ParsedCommentsView(QueryView):
+    """Ordered comments from MolOP's file or frame container."""
+
+    items: list[ParsedCommentView] = Field(default_factory=list)
+
+
+def parsed_comments_view(value: Any) -> ParsedCommentsView:
+    """Convert the persisted JSONB container to the public typed view."""
+
+    if not isinstance(value, dict) or not isinstance(value.get("items"), list):
+        return ParsedCommentsView()
+
+    items: list[ParsedCommentView] = []
+    for item in value["items"]:
+        if not isinstance(item, dict):
+            continue
+        metadata = item.get("metadata")
+        items.append(
+            ParsedCommentView(
+                text=str(item.get("text") or ""),
+                kind=str(item.get("kind") or "comment"),
+                marker=item.get("marker"),
+                source_format=item.get("source_format"),
+                source_line=item.get("source_line"),
+                raw=item.get("raw"),
+                metadata_json=json.dumps(
+                    metadata if isinstance(metadata, dict) else {},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+        )
+    return ParsedCommentsView(items=items)
 
 
 class MolecularFormulaSummary(QueryView):
@@ -389,6 +438,7 @@ class ParseRevisionSummary(QueryView):
     error_message: str | None = None
     error_metadata_json: str | None = None
     parse_diagnostics_json: str = "[]"
+    comments: ParsedCommentsView = Field(default_factory=ParsedCommentsView)
     started_at: datetime | None = None
     completed_at: datetime | None = None
 
@@ -850,6 +900,7 @@ class MolecularTopologyDerivationDetail(MolecularTopologyDerivationSummary):
 class CalculationFrameDetail(CalculationFrameSummary):
     source_span: SourceSpanView | None = None
     parse_completeness: str
+    comments: ParsedCommentsView = Field(default_factory=ParsedCommentsView)
     geometry_assignment_kind: str
     observed_coordinate_hash: str
     observed_to_geometry_atom_indices: list[int]

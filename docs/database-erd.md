@@ -1,8 +1,8 @@
 # 数据库实体关系图
 
-> 当前 schema：Alembic `0050_profile_source_visibility`
+> 当前 schema：Alembic `0053_molop_comments`
 > 生成来源：NexusX `ErDiagram.from_sqlmodel(...)`（实体来自 SQLModel 导出注册表）
-> 完整性：65 张表、801 个列、
+> 完整性：65 张表、804 个列、
 > 106 条外键约束，未省略物理表、列或 FK。
 
 本文区分物理持久化后端和进程内对象。RustFS 与 PostgreSQL 不共享事务；
@@ -161,6 +161,7 @@ erDiagram
         string size_bytes
         string original_filename
         string source_relative_path
+        string notes
         string media_type
         string artifact_kind
         string storage_status
@@ -243,6 +244,7 @@ erDiagram
         string parse_presence
         string parse_completeness
         string parse_diagnostics
+        string comments
         string geometry_id
         string topology_derivation_id
         string charge
@@ -804,6 +806,7 @@ erDiagram
         string source_complete
         string parse_completeness
         string parse_diagnostics
+        string comments
         string record_sha256
         string status
         string error_code
@@ -1251,7 +1254,7 @@ erDiagram
 ## Schema 完整性清单
 
 - `65` tables；
-- `801` columns；
+- `804` columns；
 - `106` FK；
 - `78` UNIQUE；
 - `210` CHECK；
@@ -1271,7 +1274,7 @@ erDiagram
 | `organization_membership` | 5 | 2 | 1 | 1 | 3 |
 | `project` | 11 | 3 | 1 | 2 | 4 |
 | `storage_garbage_collection_run` | 13 | 1 | 0 | 6 | 3 |
-| `artifact_file` | 17 | 2 | 1 | 5 | 11 |
+| `artifact_file` | 18 | 2 | 1 | 5 | 11 |
 | `audit_event` | 8 | 2 | 0 | 0 | 4 |
 | `calculation_protocol` | 19 | 1 | 1 | 2 | 4 |
 | `logical_reaction` | 9 | 1 | 1 | 2 | 7 |
@@ -1282,7 +1285,7 @@ erDiagram
 | `artifact_ingestion` | 16 | 1 | 1 | 7 | 2 |
 | `mapped_reaction` | 17 | 2 | 2 | 3 | 11 |
 | `molecular_topology` | 19 | 2 | 1 | 8 | 7 |
-| `parse_revision` | 34 | 2 | 1 | 11 | 4 |
+| `parse_revision` | 35 | 2 | 1 | 11 | 4 |
 | `workflow_manifest` | 12 | 2 | 3 | 6 | 2 |
 | `calculation_segment` | 23 | 2 | 2 | 12 | 2 |
 | `geometry` | 15 | 2 | 1 | 4 | 6 |
@@ -1293,7 +1296,7 @@ erDiagram
 | `molecular_topology_abstraction` | 7 | 3 | 1 | 1 | 4 |
 | `molecular_topology_derivation` | 9 | 2 | 2 | 1 | 2 |
 | `upload_batch_item` | 27 | 3 | 2 | 10 | 8 |
-| `calculation_frame` | 66 | 3 | 3 | 38 | 9 |
+| `calculation_frame` | 67 | 3 | 3 | 38 | 9 |
 | `logical_participant_concrete_topology` | 7 | 2 | 1 | 1 | 2 |
 | `mapped_reaction_edge` | 8 | 4 | 2 | 2 | 5 |
 | `mapped_reaction_participant` | 9 | 3 | 2 | 3 | 3 |

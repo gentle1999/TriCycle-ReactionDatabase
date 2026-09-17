@@ -90,12 +90,21 @@ async def test_artifact_removal_retires_catalogue_and_deletes_object() -> None:
             ArtifactMetadataUpdate(
                 original_filename="renamed-before-removal.txt",
                 visibility=ArtifactVisibility.PUBLIC,
+                notes="uploaded from an external experiment",
             ),
             user_id=DEVELOPMENT_USER_ID,
         )
         assert updated.original_filename == "renamed-before-removal.txt"
         assert updated.visibility == ArtifactVisibility.PUBLIC
+        assert updated.notes == "uploaded from an external experiment"
         assert updated.content_sha256 == sha256(payload).hexdigest()
+
+        cleared = await ArtifactManagementService.update_metadata(
+            artifact_id,
+            ArtifactMetadataUpdate(notes=None),
+            user_id=DEVELOPMENT_USER_ID,
+        )
+        assert cleared.notes is None
 
         await ArtifactManagementService.retire(artifact_id, user_id=DEVELOPMENT_USER_ID)
 

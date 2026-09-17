@@ -82,6 +82,11 @@ credentials, raw binary Mols, internal JSON, or `ScientificArray.data`.
 
 ### MCP organization, project, and calculation-log operations
 
+Artifact notes are managed by update_artifact_notes. The caller needs
+artifact:manage permission in the artifact's project; the operation changes only
+the PostgreSQL user note and never the RustFS source object. Passing null clears
+an existing note.
+
 An MCP token is a user-level credential. It has no fixed organization, project,
 or static scope. Each call resolves the current organization and project
 memberships for the token's user, so membership changes take effect without
@@ -95,6 +100,7 @@ operation.
 | Project | `create_project`, `list_projects`, `get_project`, `update_project` | Creation requires organization owner/admin; updates require project manager or organization admin |
 | Project data cleanup | `preview_project_cleanup`, `delete_project_data` | Project manager or organization admin only; deletion requires `confirmation` to exactly match the project slug and physically removes project scientific data, upload queues, and unshared RustFS objects; the project, memberships, and audit trail remain |
 | Single-artifact cleanup | `delete_artifact` | Requires project `artifact:delete`; keeps the ArtifactFile tombstone for source-audit continuity |
+| Artifact notes | `update_artifact_notes` | Requires project `artifact:manage`; changes only the user-maintained PostgreSQL note and never the RustFS source object |
 | Project members | `list_project_members`, `upsert_project_member`, `remove_project_member` | Project manager or organization admin; the last project manager is preserved |
 | Project invitations | `list_project_invitations`, `create_project_invitation`, `revoke_project_invitation`, `resend_project_invitation`, `accept_project_invitation` | Project manager or organization admin; acceptance still checks the authenticated email |
 | Audit | `list_project_audit` | Project manager or organization admin |
@@ -538,7 +544,11 @@ The Makefile equivalents are `IMPORT_INCLUDE_SUFFIXES`,
 
 ## Dependency Upgrades
 
-MolOP `>=0.2.12` and MolGR `>=0.1.8` are installed from PyPI. After changing
+MolOP `>=0.2.18` and MolGR `>=0.1.8` are installed from PyPI. MolOP's unified
+file- and frame-level `comments` containers are persisted in
+`ParseRevision.comments` and `CalculationFrame.comments`; artifact and frame
+detail pages expose them as read-only parsed provenance, separate from editable
+`ArtifactFile.notes`. After changing
 MolOP, MolGR, OpenBabel, or RDKit, run:
 
 ```bash

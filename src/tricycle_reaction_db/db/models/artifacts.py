@@ -123,6 +123,8 @@ class ArtifactFile(SQLModel, table=True):
     # Archive-relative provenance is distinct from the download basename. It
     # is nullable for legacy/direct uploads that never had an archive path.
     source_relative_path: str | None = Field(default=None, sa_type=Text, nullable=True)
+    # User-maintained context that is not part of the immutable source bytes.
+    notes: str | None = Field(default=None, sa_type=Text, nullable=True)
     media_type: str = Field(max_length=255, nullable=False)
     artifact_kind: ArtifactKind = Field(
         sa_column=Column(

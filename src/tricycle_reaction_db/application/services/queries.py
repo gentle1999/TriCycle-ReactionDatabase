@@ -78,6 +78,7 @@ from tricycle_reaction_db.application.dtos import (
     ThermochemistryView,
     TransitionStateEndpointView,
     VibrationView,
+    parsed_comments_view,
 )
 from tricycle_reaction_db.application.query_cost import (
     QueryBudgetExceeded,
@@ -1155,6 +1156,7 @@ def _artifact_summary(
         visibility=_enum_value(artifact.visibility),
         original_filename=artifact.original_filename,
         source_relative_path=artifact.source_relative_path,
+        notes=artifact.notes,
         content_sha256=artifact.content_sha256,
         size_bytes=artifact.size_bytes,
         media_type=artifact.media_type,
@@ -3923,6 +3925,7 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
                 else None
             ),
             parse_completeness=_enum_value(frame.parse_completeness),
+            comments=parsed_comments_view(frame.comments),
             geometry_assignment_kind=_enum_value(frame.geometry_assignment_kind),
             observed_coordinate_hash=frame.observed_coordinate_hash,
             observed_to_geometry_atom_indices=frame.observed_to_geometry_atom_indices,

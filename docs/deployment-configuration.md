@@ -239,6 +239,35 @@ RustFS。直接存量导入脚本若在宿主机运行，除了 Compose 变量�
 `VITE_API_BASE_URL` 应保持为空，使浏览器通过同一个 HTTPS origin 访问 API。API 镜像也包含
 Alembic 和 migrations，可单独执行 `docker compose run --rm migrate`。
 
+### 4.1.2 镜像构建源
+
+镜像默认使用已经锁定摘要的官方 Python、Node 和 Nginx 基础镜像，以及官方 PyPI、npm 和
+Debian 源。构建时可以只替换需要加速的源；这些变量只影响构建，不会改变运行时 API、RustFS
+或 PostgreSQL 的访问地址。例如使用浙江大学镜像站的 PyPI 和 Debian 主仓库：
+
+```bash
+TRICYCLE_PYPI_INDEX_URL=https://mirrors.zju.edu.cn/pypi/web/simple \
+TRICYCLE_DEBIAN_MIRROR=https://mirrors.zju.edu.cn/debian \
+docker compose -f compose.yaml -f compose.compute.yaml build --pull=false api frontend
+```
+
+也可以把它们写入 `.env`，之后正常运行 `make stack-build` 或 Compose 构建即可：
+
+| 构建变量 | 默认值 | 用途 |
+| --- | --- | --- |
+| `TRICYCLE_PYPI_INDEX_URL` | `https://pypi.org/simple` | API builder 安装 uv 和 Python 依赖 |
+| `TRICYCLE_DEBIAN_MIRROR` | `https://deb.debian.org/debian` | API runtime 的 Debian 主仓库 |
+| `TRICYCLE_DEBIAN_SECURITY_MIRROR` | `https://security.debian.org/debian-security` | API runtime 的安全更新仓库；默认保留官方源 |
+| `TRICYCLE_NPM_REGISTRY` | `https://registry.npmjs.org` | 前端 builder 安装 npm 依赖 |
+| `TRICYCLE_PYTHON_BASE_IMAGE` | 锁定的官方 Python 镜像 | API builder/runtime 基础镜像完整引用 |
+| `TRICYCLE_NODE_BASE_IMAGE` | 锁定的官方 Node 镜像 | 前端 builder 基础镜像完整引用 |
+| `TRICYCLE_NGINX_BASE_IMAGE` | 锁定的官方 Nginx 镜像 | 前端 runtime 基础镜像完整引用 |
+
+基础镜像覆盖值必须是兼容的、完整的镜像引用，生产环境仍应包含摘要，例如内部 registry
+缓存后的 `python:3.12-slim-bookworm@sha256:...`。ZJU 文档建议安全更新优先使用官方源，
+因此只有确认镜像同步策略后才设置 `TRICYCLE_DEBIAN_SECURITY_MIRROR`；npm 源独立配置，
+不假定 ZJU 提供 npm registry。
+
 ### 4.2 部署名称
 
 名称分成“部署显示名”和“稳定协议标识”。Python distribution 名、HTTP 路由、GraphQL

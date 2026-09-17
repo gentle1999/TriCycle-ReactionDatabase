@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ArrowLeft, Download, FileText } from "@lucide/vue";
+import { ArrowLeft, Download, FileText, LoaderCircle, Save } from "@lucide/vue";
 import { useQuery } from "@tanstack/vue-query";
 import { computed, ref, watch } from "vue";
 import { RouterLink, useRoute } from "vue-router";
@@ -11,8 +11,9 @@ import ChemDoodleFrameMovie3D from "@/components/ChemDoodleFrameMovie3D.vue";
 import FrameDrawer from "@/components/FrameDrawer.vue";
 import { useProjectContext } from "@/composables/useProjectContext";
 import { formatBytes, formatDurationSeconds, labelFor, shortId, statusTone } from "@/format";
+import { queryClient } from "@/queryClient";
 import { withoutAccessState } from "@/routeAccessState";
-import type { CalculationFrameSummary, Page } from "@/types";
+import type { ArtifactSummary, CalculationFrameSummary, Page, ParseRevisionSummary } from "@/types";
 
 const route = useRoute();
 const projectContext = useProjectContext();
@@ -30,6 +31,75 @@ const artifactQuery = useQuery({
 });
 
 const artifact = computed(() => artifactQuery.data.value ?? null);
+const parseRevisionsQuery = useQuery({
+  queryKey: computed(() => ["artifact-detail-parse-revisions", { artifactId: artifactId.value, projectId: currentProjectId.value }]),
+  queryFn: ({ signal }) => api.parseRevisions({
+    artifactFileId: artifactId.value ?? "",
+    projectId: currentProjectId.value ?? undefined,
+    limit: 50,
+    offset: 0,
+  }, signal),
+  enabled: computed(() => artifact.value !== null && currentProjectId.value !== null),
+  staleTime: 30_000,
+});
+
+const latestParseRevision = computed<ParseRevisionSummary | null>(() => {
+  const revisions = parseRevisionsQuery.data.value?.items ?? [];
+  return revisions.reduce<ParseRevisionSummary | null>(
+    (latest, revision) => latest === null || revision.revision_number > latest.revision_number ? revision : latest,
+    null,
+  );
+});
+const fileComments = computed(() => latestParseRevision.value?.comments?.items ?? []);
+const canManageNotes = computed(() => projectContext.can("artifact:manage"));
+const noteDraft = ref("");
+const noteSaving = ref(false);
+const noteError = ref("");
+const noteSaved = ref("");
+
+watch(
+  () => artifact.value?.id,
+  () => {
+    noteDraft.value = artifact.value?.notes ?? "";
+    noteError.value = "";
+    noteSaved.value = "";
+  },
+  { immediate: true },
+);
+
+async function saveArtifactNotes(): Promise<void> {
+  if (!artifact.value || noteSaving.value) return;
+  noteSaving.value = true;
+  noteError.value = "";
+  noteSaved.value = "";
+  try {
+    const updated = await api.updateArtifactNotes(
+      artifact.value.id,
+      noteDraft.value.trim() || null,
+    );
+    noteDraft.value = updated.notes ?? "";
+    queryClient.setQueryData(
+      ["artifact-detail", { id: updated.id, projectId: currentProjectId.value }],
+      updated,
+    );
+    queryClient.setQueriesData<Page<ArtifactSummary>>(
+      { queryKey: ["catalog", "artifacts"] },
+      (page) => {
+        if (!page) return page;
+        const items = page.items.map((item) => item.id === updated.id ? updated : item);
+        return items.some((item, index) => item !== page.items[index])
+          ? { ...page, items }
+          : page;
+      },
+    );
+    noteSaved.value = "备注已保存";
+  } catch (error) {
+    noteError.value = error instanceof Error ? error.message : "备注保存失败";
+  } finally {
+    noteSaving.value = false;
+  }
+}
+
 const previewQuery = useQuery({
   queryKey: computed(() => ["artifact-detail-preview", { id: artifactId.value, projectId: artifact.value?.project_id }]),
   queryFn: ({ signal }) => api.artifactPreview(artifactId.value ?? "", { projectId: artifact.value?.project_id }, signal),
@@ -76,6 +146,7 @@ watch(
     if (["pending", "processing"].includes(previousStatus ?? "")
       && !["pending", "processing"].includes(status ?? "")) {
       void framesQuery.refetch();
+      void parseRevisionsQuery.refetch();
     }
   },
 );
@@ -142,6 +213,51 @@ const frameError = computed(() => frameQuery.error.value instanceof Error ? fram
           <div><dt>项目 ID</dt><dd><code>{{ artifact.project_id }}</code></dd></div>
           <div><dt>验证时间</dt><dd>{{ artifact.storage_verified_at ? new Date(artifact.storage_verified_at).toLocaleString("zh-CN") : "—" }}</dd></div>
         </dl>
+      </section>
+
+      <section class="artifact-detail-section artifact-notes-section" aria-labelledby="artifact-notes-title">
+        <header class="artifact-detail-section-header">
+          <div><span class="eyebrow">User metadata</span><h2 id="artifact-notes-title">文件备注</h2></div>
+          <span>不会修改原始文件</span>
+        </header>
+        <p class="artifact-notes-help">记录文件内容之外的实验批次、来源说明或后续处理信息。</p>
+        <textarea
+          v-model="noteDraft"
+          class="artifact-notes-input"
+          maxlength="16384"
+          rows="4"
+          placeholder="填写文件备注（可留空以清除）"
+          aria-label="文件备注"
+          :readonly="!canManageNotes"
+        ></textarea>
+        <div class="artifact-notes-actions">
+          <button v-if="canManageNotes" class="command-button" type="button" :disabled="noteSaving" @click="saveArtifactNotes">
+            <LoaderCircle v-if="noteSaving" class="is-spinning" :size="15" aria-hidden="true" />
+            <Save v-else :size="15" aria-hidden="true" />
+            保存备注
+          </button>
+          <span v-else class="artifact-notes-permission">仅项目管理员可编辑文件备注</span>
+          <span v-if="noteSaved" class="upload-result" role="status">{{ noteSaved }}</span>
+          <span v-if="noteError" class="inline-error" role="alert">{{ noteError }}</span>
+        </div>
+      </section>
+
+      <section v-if="fileComments.length" class="artifact-detail-section parsed-comments-section" aria-labelledby="artifact-comments-title">
+        <header class="artifact-detail-section-header">
+          <div><span class="eyebrow">MolOP comments</span><h2 id="artifact-comments-title">文件 comments</h2></div>
+          <span>{{ fileComments.length }} 条 · revision {{ latestParseRevision?.revision_number }}</span>
+        </header>
+        <ol class="parsed-comments-list">
+          <li v-for="(comment, index) in fileComments" :key="index" class="parsed-comment">
+            <div class="parsed-comment-meta">
+              <span class="role-pill">{{ comment.kind }}</span>
+              <span v-if="comment.source_format">{{ comment.source_format }}</span>
+              <span v-if="comment.source_line !== null">line {{ comment.source_line + 1 }}</span>
+            </div>
+            <p>{{ comment.text }}</p>
+            <code v-if="comment.raw && comment.raw !== comment.text">{{ comment.raw }}</code>
+          </li>
+        </ol>
       </section>
 
       <section v-if="artifact.ingestion_status === 'filtered'" class="artifact-detail-section" aria-label="解析结果">

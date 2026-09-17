@@ -56,6 +56,7 @@ def _artifact_summary(artifact: ArtifactFile) -> ArtifactSummary:
         visibility=artifact.visibility.value,
         original_filename=artifact.original_filename,
         source_relative_path=artifact.source_relative_path,
+        notes=artifact.notes,
         content_sha256=artifact.content_sha256,
         size_bytes=artifact.size_bytes,
         media_type=artifact.media_type,
@@ -101,7 +102,11 @@ class ArtifactManagementService:
         *,
         user_id: UUID,
     ) -> ArtifactSummary:
-        if payload.original_filename is None and payload.visibility is None:
+        if (
+            payload.original_filename is None
+            and payload.visibility is None
+            and "notes" not in payload.model_fields_set
+        ):
             raise ArtifactMetadataConflictError("at least one artifact field must be supplied")
         filename = (
             payload.original_filename.strip() if payload.original_filename is not None else None
@@ -129,6 +134,9 @@ class ArtifactManagementService:
                 artifact.original_filename = filename
             if payload.visibility is not None:
                 artifact.visibility = payload.visibility
+            if "notes" in payload.model_fields_set:
+                normalized_notes = payload.notes.strip() if payload.notes is not None else None
+                artifact.notes = normalized_notes or None
             session.add(artifact)
             await session.commit()
             await session.refresh(artifact)

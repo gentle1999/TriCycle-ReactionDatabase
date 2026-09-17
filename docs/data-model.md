@@ -29,6 +29,13 @@ MappedReactionParticipant -> concrete MolecularTopology
 身份。`MolecularFormula -> MolecularTopology -> Geometry` 是可复用的化学事实；二者在
 CalculationFrame 对 Geometry 的绑定处相遇。组织、项目、成员和外部身份独立组成访问控制轴。
 
+ArtifactFile.notes 是项目管理元数据，用于记录原始文件内容之外的实验批次、来源说明或
+后续处理信息；它不参与 RustFS 对象内容哈希，也不会被重解析覆盖。MolOP 0.2.18 的
+统一 `comments` 容器则作为解析事实保存：文件级容器位于 `ParseRevision.comments`，帧级
+容器位于 `CalculationFrame.comments`，均保留有序的 `items` 及每项的文本、语义类型、来源
+格式、原始拼写和格式扩展 metadata。两者都是解析修订的只读结果，不与用户可编辑的
+`ArtifactFile.notes` 混用；重解析会用新 revision 的容器替换旧解析结果。
+
 ## Formula、Topology 和 Geometry
 
 `MolecularFormula` 仅描述元素与同位素组成。权威范围检索数据是按原子序数排列的

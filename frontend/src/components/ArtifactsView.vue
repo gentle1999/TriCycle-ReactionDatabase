@@ -610,6 +610,7 @@ watch(
                 <span>
                 <strong>{{ artifact.original_filename }}</strong>
                 <span>{{ artifact.media_type }}</span>
+                <span v-if="artifact.notes" class="artifact-note-preview" :title="artifact.notes">备注：{{ artifact.notes }}</span>
                 </span>
               </button>
             </td>

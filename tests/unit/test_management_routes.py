@@ -219,10 +219,12 @@ async def test_artifact_update_and_delete_routes_use_management_service(
         assert user_id == DEVELOPMENT_USER_ID
         assert payload.original_filename == "renamed.log"
         assert payload.visibility is ArtifactVisibility.PUBLIC
+        assert payload.notes == "managed artifact note"
         return _artifact().model_copy(
             update={
                 "original_filename": payload.original_filename,
                 "visibility": payload.visibility,
+                "notes": payload.notes,
             }
         )
 
@@ -242,13 +244,18 @@ async def test_artifact_update_and_delete_routes_use_management_service(
     ) as client:
         updated = await client.patch(
             f"/api/artifacts/{ARTIFACT_ID}",
-            json={"original_filename": "renamed.log", "visibility": "public"},
+            json={
+                "original_filename": "renamed.log",
+                "visibility": "public",
+                "notes": "managed artifact note",
+            },
         )
         removed = await client.delete(f"/api/artifacts/{ARTIFACT_ID}")
 
     assert updated.status_code == 200
     assert updated.json()["original_filename"] == "renamed.log"
     assert updated.json()["visibility"] == "public"
+    assert updated.json()["notes"] == "managed artifact note"
     assert removed.status_code == 204
     assert observed == [(ARTIFACT_ID, DEVELOPMENT_USER_ID)]
 

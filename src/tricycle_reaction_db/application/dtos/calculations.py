@@ -154,6 +154,7 @@ class ParseRevisionRecord(BaseModel):
     running_time_seconds: float | None = Field(default=None, ge=0)
     source_complete: bool | None = None
     parse_completeness: ParseCompleteness = ParseCompleteness.NOT_ASSESSED
+    comments: dict[str, Any] = Field(default_factory=lambda: {"items": []})
     parse_diagnostics: list[dict[str, Any]] = Field(default_factory=list)
     record_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     status: ParseStatus = ParseStatus.PENDING
@@ -278,6 +279,7 @@ class CalculationFrameRecord(BaseModel):
     source_block_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     parse_presence: dict[str, str] = Field(default_factory=dict)
     parse_completeness: ParseCompleteness = ParseCompleteness.NOT_ASSESSED
+    comments: dict[str, Any] = Field(default_factory=lambda: {"items": []})
     parse_diagnostics: list[dict[str, Any]] = Field(default_factory=list)
     charge: int
     multiplicity: int = Field(gt=0)

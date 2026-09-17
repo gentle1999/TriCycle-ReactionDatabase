@@ -2741,6 +2741,62 @@ table.data-table {
   font-size: 12px;
 }
 
+.parsed-comments-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.parsed-comments-header > span,
+.parsed-comment-meta,
+.parsed-comment small {
+  color: var(--ink-soft);
+  font-size: 9px;
+}
+
+.parsed-comments-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.parsed-comment {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--paper);
+}
+
+.parsed-comment-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+}
+
+.parsed-comment p {
+  margin: 0;
+  color: var(--ink);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.parsed-comment code,
+.parsed-comment small {
+  overflow-wrap: anywhere;
+}
+
+.parsed-comment code {
+  color: var(--ink-soft);
+  font-size: 9px;
+  white-space: pre-wrap;
+}
+
 .status-row {
   display: flex;
   flex-wrap: wrap;
@@ -5881,6 +5937,7 @@ table.data-table {
 .artifact-name-button > span { min-width: 0; display: grid; gap: 3px; }
 .artifact-name-button strong,.artifact-name-button span span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .artifact-name-button span span { color: var(--ink-soft); font-size: 10px; }
+.artifact-name-button span .artifact-note-preview { color: var(--teal); }
 .artifact-name-button svg { margin-top: 1px; flex: 0 0 auto; transition: transform 160ms ease; }
 .artifact-name-button svg.is-rotated { transform: rotate(180deg); }
 .artifact-frames-row > td { padding: 0 !important; background: #f8faf7; }
@@ -6571,6 +6628,51 @@ table.data-table {
 .artifact-detail-section-header > span {
   color: var(--ink-soft);
   font-family: var(--mono);
+  font-size: 10px;
+}
+
+.artifact-notes-help {
+  margin: -2px 0 10px;
+  color: var(--ink-soft);
+  font-size: 11px;
+}
+
+.artifact-notes-input {
+  display: block;
+  width: 100%;
+  min-height: 96px;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.55;
+  resize: vertical;
+}
+
+.artifact-notes-input:focus {
+  outline: 2px solid color-mix(in srgb, var(--teal) 35%, transparent);
+  border-color: var(--teal);
+}
+
+.artifact-notes-input[readonly] {
+  color: var(--ink-soft);
+  background: var(--surface-muted);
+}
+
+.artifact-notes-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.artifact-notes-permission {
+  color: var(--ink-soft);
   font-size: 10px;
 }
 

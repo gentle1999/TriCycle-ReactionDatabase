@@ -179,6 +179,10 @@ class ParseRevision(SQLModel, table=True):
         default_factory=list,
         sa_column=Column(JSONB, nullable=False, server_default="[]"),
     )
+    comments: dict[str, Any] = Field(
+        default_factory=lambda: {"items": []},
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{\"items\": []}'::jsonb")),
+    )
     record_sha256: str | None = Field(default=None, max_length=64)
     status: ParseStatus = Field(
         default=ParseStatus.PENDING,
@@ -600,6 +604,10 @@ class CalculationFrame(SQLModel, table=True):
     parse_diagnostics: list[dict[str, Any]] = Field(
         default_factory=list,
         sa_column=Column(JSONB, nullable=False, server_default="[]"),
+    )
+    comments: dict[str, Any] = Field(
+        default_factory=lambda: {"items": []},
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{\"items\": []}'::jsonb")),
     )
     geometry_id: UUID = Field(
         foreign_key="geometry.id",

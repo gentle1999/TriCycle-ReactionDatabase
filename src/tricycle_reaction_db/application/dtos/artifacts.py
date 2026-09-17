@@ -28,6 +28,7 @@ class ArtifactFileRecord(BaseModel):
     size_bytes: int = Field(ge=0)
     original_filename: str
     source_relative_path: str | None = None
+    notes: str | None = Field(default=None, max_length=16_384)
     media_type: str
     artifact_kind: ArtifactKind
     storage_status: StorageStatus

@@ -6,7 +6,15 @@ x-api-service: &api-service
     context: .
     dockerfile: Dockerfile.api
     args:
+      PYTHON_BASE_IMAGE: "${TRICYCLE_PYTHON_BASE_IMAGE:-python:3.12-slim-bookworm@sha256:a116514e19457bcb7af7efe9c3dd0b9b71e85b317694e7882a1c52aa15a78134}"
       UV_VERSION: ${UV_VERSION:-0.9.13}
+      PYPI_INDEX_URL: "${TRICYCLE_PYPI_INDEX_URL:-https://pypi.org/simple}"
+      DEBIAN_MIRROR: "${TRICYCLE_DEBIAN_MIRROR:-https://deb.debian.org/debian}"
+      DEBIAN_SECURITY_MIRROR: "${TRICYCLE_DEBIAN_SECURITY_MIRROR:-https://security.debian.org/debian-security}"
+      http_proxy: "${http_proxy:-}"
+      https_proxy: "${https_proxy:-}"
+      HTTP_PROXY: "${HTTP_PROXY:-}"
+      HTTPS_PROXY: "${HTTPS_PROXY:-}"
   env_file:
     - path: .env
       required: false
@@ -180,6 +188,13 @@ services:
       context: .
       dockerfile: Dockerfile.frontend
       args:
+        NODE_BASE_IMAGE: "${TRICYCLE_NODE_BASE_IMAGE:-node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436}"
+        NGINX_BASE_IMAGE: "${TRICYCLE_NGINX_BASE_IMAGE:-nginx:1.28-alpine@sha256:a8b39bd9cf0f83869a2162827a0caf6137ddf759d50a171451b335cecc87d236}"
+        NPM_REGISTRY: "${TRICYCLE_NPM_REGISTRY:-https://registry.npmjs.org}"
+        http_proxy: "${http_proxy:-}"
+        https_proxy: "${https_proxy:-}"
+        HTTP_PROXY: "${HTTP_PROXY:-}"
+        HTTPS_PROXY: "${HTTPS_PROXY:-}"
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
         VITE_APP_NAME: ${VITE_APP_NAME:-Example Chemistry Database}
         VITE_BRAND_NAME: ${VITE_BRAND_NAME:-Example Research Platform}

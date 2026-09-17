@@ -198,6 +198,19 @@ def test_calculation_facts_round_trip_through_relationships(tmp_path) -> None:
                 reconstruction_config_hash="3" * 64,
                 source_format=SourceFormat.GAUSSIAN_LOG,
                 source_encoding="ascii",
+                comments={
+                    "items": [
+                        {
+                            "text": "relationship-level title",
+                            "kind": "title",
+                            "marker": None,
+                            "source_format": "g16log",
+                            "source_line": None,
+                            "raw": None,
+                            "metadata": {},
+                        }
+                    ]
+                },
                 status=ParseStatus.PENDING,
                 started_at=now,
             )
@@ -251,6 +264,19 @@ def test_calculation_facts_round_trip_through_relationships(tmp_path) -> None:
                 frequency_count=1,
                 negative_frequency_count=0,
                 lowest_frequency_cm1=812.0,
+                comments={
+                    "items": [
+                        {
+                            "text": "frame-level title",
+                            "kind": "title",
+                            "marker": None,
+                            "source_format": "gaussian",
+                            "source_line": None,
+                            "raw": None,
+                            "metadata": {},
+                        }
+                    ]
+                },
                 **_exact_geometry_assignment(molecule_record),
             )
             with pytest.raises(ValueError, match="byte span must be contained"):
@@ -437,8 +463,10 @@ def test_calculation_facts_round_trip_through_relationships(tmp_path) -> None:
             loaded_segment = loaded_revision.segments[0]
             loaded_frame = loaded_segment.frames[0]
             assert loaded_revision.artifact_file.id == artifact_id
+            assert loaded_revision.comments["items"][0]["text"] == "relationship-level title"
             assert loaded_segment.protocol.id == protocol_id
             assert loaded_frame.geometry.id == geometry_id
+            assert loaded_frame.comments["items"][0]["text"] == "frame-level title"
             assert loaded_frame.coordinate_decimal_places == 8
             assert loaded_frame.topology_derivation.provenance_hash == (
                 molecule_record.topology_derivation.provenance_hash

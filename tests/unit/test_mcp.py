@@ -145,6 +145,7 @@ async def test_mcp_exposes_query_management_and_import_tools() -> None:
         "preview_project_cleanup",
         "delete_project_data",
         "delete_artifact",
+        "update_artifact_notes",
         "update_project",
         "list_project_members",
         "upsert_project_member",
@@ -242,6 +243,48 @@ async def test_mcp_project_cleanup_tools_use_authenticated_user_and_confirmation
     assert observed["preview"] == (project_id, DEVELOPMENT_USER_ID)
     assert observed["clear"] == (project_id, DEVELOPMENT_USER_ID, "rits-zero-shot-da")
     assert observed["artifact"] == (artifact_id, DEVELOPMENT_USER_ID)
+
+
+@pytest.mark.asyncio
+async def test_mcp_artifact_notes_use_authenticated_management_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_id = UUID("00000000-0000-7000-8000-000000000716")
+    observed: list[tuple[UUID, UUID, str | None]] = []
+
+    async def update_metadata(
+        requested_artifact_id: UUID,
+        payload: Any,
+        *,
+        user_id: UUID,
+    ) -> dict[str, Any]:
+        observed.append((requested_artifact_id, user_id, payload.notes))
+        return {"artifact_id": requested_artifact_id, "notes": payload.notes}
+
+    monkeypatch.setattr(
+        mcp_module.ArtifactManagementService,
+        "update_metadata",
+        staticmethod(update_metadata),
+    )
+
+    updated = await _call_as_development_user(
+        "update_artifact_notes",
+        {"artifact_id": str(artifact_id), "notes": "external experiment context"},
+    )
+    cleared = await _call_as_development_user(
+        "update_artifact_notes",
+        {"artifact_id": str(artifact_id), "notes": None},
+    )
+
+    assert updated["data"] == {
+        "artifact_id": str(artifact_id),
+        "notes": "external experiment context",
+    }
+    assert cleared["data"] == {"artifact_id": str(artifact_id), "notes": None}
+    assert observed == [
+        (artifact_id, DEVELOPMENT_USER_ID, "external experiment context"),
+        (artifact_id, DEVELOPMENT_USER_ID, None),
+    ]
 
 
 @pytest.mark.asyncio

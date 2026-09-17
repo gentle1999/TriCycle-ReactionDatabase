@@ -185,6 +185,10 @@ token；撤销后原值立即失效。对应 API 为：
 
 #### MCP 组织、项目和计算日志操作
 
+文件备注由 update_artifact_notes 管理。它要求当前用户在文件所属项目拥有
+artifact:manage 权限，只修改 PostgreSQL 中的用户备注，不修改 RustFS 原始文件；
+传入空值可以清除已有备注。
+
 MCP token 是用户级凭据，不绑定固定组织、项目或静态 scope。每次调用都会按 token 对应的
 用户重新读取当前组织/项目成员关系，因此用户被加入或移除组织后，MCP 权限会同步变化；
 撤销 token 也会立即生效。所有以下工具都要求有效 MCP/OIDC 身份，业务权限由服务层再次校验。
@@ -196,6 +200,7 @@ MCP token 是用户级凭据，不绑定固定组织、项目或静态 scope。�
 | 项目 | `create_project`、`list_projects`、`get_project`、`update_project` | 创建要求组织 owner/admin；修改要求项目 manager 或组织 admin |
 | 项目数据清理 | `preview_project_cleanup`、`delete_project_data` | 仅项目 manager 或组织 admin；删除工具要求 `confirmation` 精确等于项目 slug，并物理删除项目科学数据、上传队列和未共享 RustFS 对象；项目、成员和审计记录保留 |
 | 单文件清理 | `delete_artifact` | 需要项目 `artifact:delete`；保留 ArtifactFile tombstone 以维持单文件来源审计 |
+| 文件备注 | `update_artifact_notes` | 需要项目 `artifact:manage`；只修改 PostgreSQL 中的用户备注，不修改 RustFS 原始文件 |
 | 项目成员 | `list_project_members`、`upsert_project_member`、`remove_project_member` | 项目 manager 或组织 admin；服务层保留最后一个 project manager |
 | 项目邀请 | `list_project_invitations`、`create_project_invitation`、`revoke_project_invitation`、`resend_project_invitation`、`accept_project_invitation` | 项目 manager 或组织 admin；接受邀请仍校验登录邮箱匹配 |
 | 审计 | `list_project_audit` | 项目 manager 或组织 admin |
@@ -903,9 +908,13 @@ payload hash 和 metadata。
 
 ## 依赖约束
 
-MolOP `>=0.2.12` 与 MolGR `>=0.1.8` 直接从官方 PyPI 安装；`pyproject.toml` 声明最低
+MolOP `>=0.2.18` 与 MolGR `>=0.1.8` 直接从官方 PyPI 安装；`pyproject.toml` 声明最低
 兼容版本，`uv.lock` 记录当前解析版本。项目不再使用内网 Git source 或
 `override-dependencies`。
+
+MolOP 0.2.18 的文件级和帧级统一 `comments` 容器分别写入
+`ParseRevision.comments` 和 `CalculationFrame.comments`；文件详情和计算帧详情会展示这些
+解析出的只读 comments。它们与可编辑的 `ArtifactFile.notes` 是两个独立字段。
 
 更新 MolOP、MolGR、OpenBabel 或 RDKit 时，
 必须重新运行：

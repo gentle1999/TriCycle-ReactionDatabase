@@ -213,10 +213,17 @@ def _revision_record_hash(
     records: list[MolOPFrameRecords],
 ) -> str:
     artifact_sha256 = artifact.content_sha256 if isinstance(artifact, ArtifactFile) else artifact
+    file_comments = getattr(chem_file, "comments", None)
+    if file_comments is None:
+        comments_dump: object = {"items": []}
+    else:
+        model_dump = getattr(file_comments, "model_dump", None)
+        comments_dump = model_dump(mode="json") if callable(model_dump) else file_comments
     return _json_sha256(
         {
             "artifact_sha256": artifact_sha256,
             "export_schema_version": chem_file.schema_version,
+            "comments": comments_dump,
             "segments": [
                 segment.model_dump(mode="json", exclude_none=True)
                 for segment in chem_file.source_segments

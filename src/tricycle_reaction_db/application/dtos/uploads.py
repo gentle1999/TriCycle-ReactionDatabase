@@ -109,6 +109,7 @@ class ArtifactMetadataUpdate(BaseModel):
 
     original_filename: str | None = Field(default=None, min_length=1, max_length=1024)
     visibility: ArtifactVisibility | None = None
+    notes: str | None = Field(default=None, max_length=16_384)
 
 
 class UploadBatchFileCreate(BaseModel):
