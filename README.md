@@ -243,6 +243,7 @@ Frequently changed settings include:
 | `TRICYCLE_OIDC_*` | OIDC issuer, audience, JWKS, and browser client settings |
 | `TRICYCLE_MOLOP_BATCH_N_JOBS` | Bounded file parser worker count |
 | `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` | Maximum files per durable queue claim |
+| `TRICYCLE_UPLOAD_WORKER_PROFILE_REFRESH_MAX_DELAY_SECONDS` | Maximum delay before deferred thermodynamic profiles are refreshed |
 | `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS` | Per-file parsing baseline timeout |
 | `TRICYCLE_QUERY_STATEMENT_TIMEOUT_MS` | PostgreSQL statement timeout for query traffic |
 | `TRICYCLE_STRUCTURE_CANDIDATE_LIMIT` | Upper bound before expensive structure post-processing |

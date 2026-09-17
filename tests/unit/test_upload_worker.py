@@ -68,9 +68,11 @@ async def test_worker_merges_compatibility_ingestions_into_one_project_microbatc
         user_id: UUID,
         force_reparse: bool,
         refresh_statistics: bool,
+        defer_thermodynamic_refresh: bool,
     ) -> dict[UUID, object]:
         reparse_calls.append((tuple(artifact_ids), user_id, force_reparse))
         assert refresh_statistics is False
+        assert defer_thermodynamic_refresh is True
         return {artifact_id: object() for artifact_id in artifact_ids}
 
     async def fail_pending_ingestion(
@@ -111,9 +113,11 @@ async def test_worker_merges_single_file_batches_into_one_project_microbatch(
         user_id: UUID,
         force_reparse: bool,
         refresh_statistics: bool,
+        defer_thermodynamic_refresh: bool,
     ) -> dict[UUID, object]:
         reparse_calls.append((tuple(artifact_ids), user_id, force_reparse))
         assert refresh_statistics is False
+        assert defer_thermodynamic_refresh is True
         return {artifact_id: object() for artifact_id in artifact_ids}
 
     async def finish_processing_batch(
@@ -156,11 +160,13 @@ async def test_worker_processes_project_microbatches_sequentially(
         user_id: UUID,
         force_reparse: bool,
         refresh_statistics: bool,
+        defer_thermodynamic_refresh: bool,
     ) -> dict[UUID, object]:
         nonlocal active_calls, maximum_active_calls
         assert user_id == USER_ID
         assert force_reparse is True
         assert refresh_statistics is False
+        assert defer_thermodynamic_refresh is True
         active_calls += 1
         maximum_active_calls = max(maximum_active_calls, active_calls)
         call_projects.append(PROJECT_A if artifact_ids == [jobs[0].artifact_file_id] else PROJECT_B)
@@ -206,6 +212,72 @@ async def test_worker_flushes_one_statistics_refresh_for_coalesced_projects(
     await worker._flush_statistics()
 
     assert calls == [({PROJECT_A, PROJECT_B}, "upload-worker-queue-drained")]
+
+
+@pytest.mark.asyncio
+async def test_worker_defers_profile_refresh_until_queue_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[tuple[UUID, ...] | None, str]] = []
+
+    async def refresh_dirty_profiles(
+        project_ids: tuple[UUID, ...] | None,
+        *,
+        reason: str,
+    ) -> bool:
+        calls.append((project_ids, reason))
+        return True
+
+    monkeypatch.setattr(
+        worker_module,
+        "refresh_dirty_mapped_reaction_profiles",
+        refresh_dirty_profiles,
+    )
+    worker = UploadBatchWorker()
+    worker._mark_profiles_dirty((PROJECT_A,))
+
+    await worker._flush_profiles()
+    assert calls == []
+
+    await worker._flush_profiles(force=True)
+    assert calls == [(None, "upload-worker-queue-drained")]
+
+
+@pytest.mark.asyncio
+async def test_worker_refreshes_profiles_after_the_max_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[tuple[UUID, ...] | None, str]] = []
+
+    async def refresh_dirty_profiles(
+        project_ids: tuple[UUID, ...] | None,
+        *,
+        reason: str,
+    ) -> bool:
+        calls.append((project_ids, reason))
+        return True
+
+    monkeypatch.setattr(
+        worker_module,
+        "refresh_dirty_mapped_reaction_profiles",
+        refresh_dirty_profiles,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "get_settings",
+        lambda: Settings(
+            _env_file=None,
+            upload_worker_profile_refresh_max_delay_seconds=10.0,
+        ),
+    )
+    monkeypatch.setattr(worker_module, "monotonic", lambda: 100.0)
+    worker = UploadBatchWorker()
+    worker._mark_profiles_dirty((PROJECT_A,))
+    worker._profile_dirty_since[PROJECT_A] = 0.0
+
+    await worker._flush_profiles()
+
+    assert calls == [((PROJECT_A,), "upload-worker-profile-refresh-max-delay")]
 
 
 @pytest.mark.asyncio

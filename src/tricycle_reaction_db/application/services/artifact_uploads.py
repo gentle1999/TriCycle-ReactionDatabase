@@ -124,6 +124,7 @@ from tricycle_reaction_db.application.services.database_statistics import (
     refresh_project_statistics,
 )
 from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics_persistence import (
+    mark_mapped_reactions_thermodynamics_dirty,
     refresh_mapped_reactions_thermodynamics,
 )
 from tricycle_reaction_db.application.services.molecular_geometry import (
@@ -2198,8 +2199,13 @@ def _resolve_and_bind_transition_state_reaction(
     inferred: _SuccessfulInference,
     calculation_frame: CalculationFrame,
     topology_context: GeometryPersistenceContext | None = None,
+    refresh_thermodynamics: bool | None = None,
 ) -> tuple[UUID, UUID]:
     """Create the mapped endpoint reaction and bind its TS coordinate evidence."""
+
+    effective_refresh_thermodynamics = (
+        topology_context is None if refresh_thermodynamics is None else refresh_thermodynamics
+    )
 
     legacy_bulk_import = bool(session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False))
     if topology_context is not None and legacy_bulk_import:
@@ -2306,7 +2312,7 @@ def _resolve_and_bind_transition_state_reaction(
             mapped_reaction=mapped_reaction,
             calculation_frame=calculation_frame,
             cache=(topology_context.reconciliation_cache if topology_context is not None else None),
-            refresh_thermodynamics=topology_context is None,
+            refresh_thermodynamics=effective_refresh_thermodynamics,
         )
     else:
         ensure_transition_state_path(
@@ -2327,12 +2333,14 @@ def _persist_successful_inference(
     topology_context: GeometryPersistenceContext | None = None,
     identity_is_new: bool = False,
     defer_flush: bool = False,
+    defer_thermodynamic_refresh: bool = False,
 ) -> TransitionStateInference:
     logical_reaction_id, mapped_reaction_id = _resolve_and_bind_transition_state_reaction(
         session,
         inferred=inferred,
         calculation_frame=calculation_frame,
         topology_context=topology_context,
+        refresh_thermodynamics=(topology_context is None and not defer_thermodynamic_refresh),
     )
     inference_values = {
         "artifact_ingestion_id": _require_id(ingestion, label="ArtifactIngestion"),
@@ -2427,6 +2435,7 @@ def _persist_one_new_inference(
     task: _InferencePersistenceTask,
     *,
     topology_context: GeometryPersistenceContext | None,
+    defer_thermodynamic_refresh: bool = False,
 ) -> None:
     context_snapshot = _snapshot_inference_context(topology_context)
     pending_snapshot = list(session.info.get("_fast_pending_entities", ()))
@@ -2441,6 +2450,7 @@ def _persist_one_new_inference(
                 topology_context=topology_context,
                 identity_is_new=task.deferred.revision_created,
                 defer_flush=False,
+                defer_thermodynamic_refresh=defer_thermodynamic_refresh,
             )
     except Exception as error:
         # The nested transaction rolls back database rows, but it cannot roll
@@ -2579,6 +2589,7 @@ def _persist_inference_batch(
                 session,
                 tasks[0],
                 topology_context=topology_context,
+                defer_thermodynamic_refresh=defer_thermodynamic_refresh,
             )
             if not defer_thermodynamic_refresh:
                 _refresh_inference_reaction_profiles(
@@ -2600,6 +2611,7 @@ def _persist_inference_batch(
                         topology_context=topology_context,
                         identity_is_new=task.deferred.revision_created,
                         defer_flush=True,
+                        defer_thermodynamic_refresh=defer_thermodynamic_refresh,
                     )
                 _attach_pending_entities(session)
                 session.flush()
@@ -2616,6 +2628,7 @@ def _persist_inference_batch(
                     session,
                     task,
                     topology_context=topology_context,
+                    defer_thermodynamic_refresh=defer_thermodynamic_refresh,
                 )
             if not defer_thermodynamic_refresh:
                 _refresh_inference_reaction_profiles(
@@ -2655,8 +2668,9 @@ def _refresh_cleared_reaction_profiles(
     session: Session,
     *,
     cleanup: ParseCleanupSummary,
+    defer_thermodynamic_refresh: bool = False,
 ) -> None:
-    """Rebuild profiles after stale revision-owned bindings are removed."""
+    """Refresh or defer profiles after stale revision-owned bindings are removed."""
 
     if not cleanup.affected_mapped_reaction_ids:
         return
@@ -2666,7 +2680,10 @@ def _refresh_cleared_reaction_profiles(
             col(MappedReaction.id).in_(cleanup.affected_mapped_reaction_ids)
         )
     ).all()
-    refresh_mapped_reactions_thermodynamics(session, reactions)
+    if defer_thermodynamic_refresh:
+        mark_mapped_reactions_thermodynamics_dirty(session, reactions)
+    else:
+        refresh_mapped_reactions_thermodynamics(session, reactions)
 
 
 def _persist_artifact_inferences(
@@ -2674,11 +2691,13 @@ def _persist_artifact_inferences(
     deferred: _DeferredArtifactInferences,
     *,
     topology_context: GeometryPersistenceContext | None = None,
+    defer_thermodynamic_refresh: bool = False,
 ) -> None:
     _persist_artifact_inferences_batch(
         session,
         [deferred],
         topology_context=topology_context,
+        defer_thermodynamic_refresh=defer_thermodynamic_refresh,
     )
 
 
@@ -2748,6 +2767,9 @@ def _persist_artifact_inferences_batch(
                                 if topology_context is not None
                                 else None
                             ),
+                            refresh_thermodynamics=(
+                                topology_context is None and not defer_thermodynamic_refresh
+                            ),
                         )
                     if isinstance(inferred, _SuccessfulInference):
                         _persist_transition_state_endpoints(
@@ -2803,6 +2825,7 @@ def _persist_parsed_artifact(
     existing_revision_ids: set[UUID] | None = None,
     defer_ingestion_completion: bool = False,
     defer_reconciliation: bool = False,
+    defer_thermodynamic_refresh: bool = False,
     deferred_inferences: list[_DeferredArtifactInferences] | None = None,
 ) -> tuple[UUID, bool]:
     ingestion = ingestion or session.get(ArtifactIngestion, ingestion_id)
@@ -2831,7 +2854,11 @@ def _persist_parsed_artifact(
             session,
             artifact_file_ids=(_require_id(artifact, label="ArtifactFile"),),
         )
-        _refresh_cleared_reaction_profiles(session, cleanup=cleanup)
+        _refresh_cleared_reaction_profiles(
+            session,
+            cleanup=cleanup,
+            defer_thermodynamic_refresh=defer_thermodynamic_refresh,
+        )
         existing_revision_ids.clear()
     # Single-file uploads and reparses do not arrive through the batch
     # persistence coordinator, so they have no caller-owned geometry context.
@@ -2894,6 +2921,7 @@ def _persist_parsed_artifact(
             session,
             inference_work,
             topology_context=active_geometry_context,
+            defer_thermodynamic_refresh=defer_thermodynamic_refresh,
         )
     else:
         deferred_inferences.append(inference_work)
@@ -3496,8 +3524,13 @@ def _run_reconcile_molop_geometry_context(
     session: SQLAlchemySession,
     *,
     context: GeometryPersistenceContext,
-) -> None:
-    reconcile_molop_geometry_context(cast(Session, session), context)
+    defer_thermodynamic_refresh: bool = False,
+) -> set[UUID]:
+    return reconcile_molop_geometry_context(
+        cast(Session, session),
+        context,
+        refresh_thermodynamics=not defer_thermodynamic_refresh,
+    )
 
 
 def _run_clear_and_reset_parse_state(
@@ -3506,6 +3539,7 @@ def _run_clear_and_reset_parse_state(
     artifact_file_ids: Sequence[UUID],
     started_at: datetime,
     worker_lease_by_artifact_id: Mapping[UUID, tuple[UUID | None, datetime | None]] | None = None,
+    defer_thermodynamic_refresh: bool = False,
 ) -> ParseCleanupSummary:
     """Delete old materialization and reset ingestion rows in one transaction."""
 
@@ -3521,7 +3555,11 @@ def _run_clear_and_reset_parse_state(
         typed_session,
         artifact_file_ids=ordered_ids,
     )
-    _refresh_cleared_reaction_profiles(typed_session, cleanup=cleanup)
+    _refresh_cleared_reaction_profiles(
+        typed_session,
+        cleanup=cleanup,
+        defer_thermodynamic_refresh=defer_thermodynamic_refresh,
+    )
     ingestions = typed_session.exec(
         select(ArtifactIngestion)
         .where(col(ArtifactIngestion.artifact_file_id).in_(ordered_ids))
@@ -4063,6 +4101,7 @@ class ArtifactUploadService:
         worker_lease_by_artifact_id: Mapping[UUID, tuple[UUID | None, datetime | None]]
         | None = None,
         refresh_statistics: bool = True,
+        defer_thermodynamic_refresh: bool = False,
     ) -> ParseCleanupSummary:
         """Delete all materialized parse state before a clean reparse.
 
@@ -4110,6 +4149,7 @@ class ArtifactUploadService:
                     artifact_file_ids=ordered_ids,
                     started_at=started_at,
                     worker_lease_by_artifact_id=worker_lease_by_artifact_id,
+                    defer_thermodynamic_refresh=defer_thermodynamic_refresh,
                 )
             )
             await session.commit()
@@ -4166,6 +4206,7 @@ class ArtifactUploadService:
         force_reparse: bool = False,
         previous_results_cleared: bool = False,
         refresh_statistics: bool = False,
+        defer_thermodynamic_refresh: bool = False,
     ) -> dict[UUID, ArtifactUploadResult | Exception]:
         """Reparse staged objects through the existing bounded batch pipeline.
 
@@ -4176,7 +4217,9 @@ class ArtifactUploadService:
         shared eight-file/128-frame persistence microbatch. In particular, it does not
         create a second parser or a second persistence consumer; the shared
         process pool and batched writer are the same path used by the local
-        importer.
+        importer. ``defer_thermodynamic_refresh`` is used by the durable worker
+        so the queue-level profile refresher, rather than each persistence
+        microbatch, owns the expensive derived-profile rebuild.
         """
 
         ordered_ids = tuple(dict.fromkeys(artifact_ids))
@@ -4282,6 +4325,7 @@ class ArtifactUploadService:
                         user_id=user_id,
                         worker_lease_by_artifact_id=processing_lease_by_artifact_id,
                         refresh_statistics=False,
+                        defer_thermodynamic_refresh=defer_thermodynamic_refresh,
                     )
                 except Exception as error:
                     for artifact in artifact_chunk:
@@ -4357,6 +4401,7 @@ class ArtifactUploadService:
                     reparse_failed_ingestions=True,
                     force_reparse=force_reparse,
                     previous_results_cleared=previous_results_cleared,
+                    defer_thermodynamic_refresh=defer_thermodynamic_refresh,
                 )
             except Exception as error:
                 for artifact in upload_artifacts:
@@ -4497,6 +4542,7 @@ class ArtifactUploadService:
         reparse_failed_ingestions: bool = False,
         force_reparse: bool = False,
         previous_results_cleared: bool = False,
+        defer_thermodynamic_refresh: bool = False,
     ) -> tuple[
         dict[int, _PreparedCalculationUpload],
         dict[int, ArtifactBatchUploadItem],
@@ -4637,6 +4683,7 @@ class ArtifactUploadService:
                                     for artifact in artifacts_by_digest.values()
                                 ],
                                 started_at=datetime.now(UTC),
+                                defer_thermodynamic_refresh=defer_thermodynamic_refresh,
                             )
                         )
                     ingestions_by_artifact_id: dict[UUID, tuple[ArtifactIngestion, bool]] = {}
@@ -4801,6 +4848,7 @@ class ArtifactUploadService:
         reparse_failed_ingestions: bool = False,
         force_reparse: bool = False,
         previous_results_cleared: bool = False,
+        defer_thermodynamic_refresh: bool = False,
     ) -> ArtifactBatchUploadResult:
         """Prepare once, then advance files through an asynchronous pipeline.
 
@@ -4812,7 +4860,9 @@ class ArtifactUploadService:
         once per claim-sized context, after its deferred reaction rows have
         been flushed. ``reparse_failed_ingestions`` reopens existing failed or
         partial parse records so a retry runs MolOP instead of only confirming
-        the stored content-addressed object.
+        the stored content-addressed object. Set
+        ``defer_thermodynamic_refresh`` when a caller owns a later queue-drain
+        profile refresh.
         """
 
         if persistence_batch_files < 1:
@@ -4850,6 +4900,7 @@ class ArtifactUploadService:
             reparse_failed_ingestions=reparse_failed_ingestions,
             force_reparse=force_reparse,
             previous_results_cleared=previous_results_cleared,
+            defer_thermodynamic_refresh=defer_thermodynamic_refresh,
         )
         timings["prepare_db_ms"] = (perf_counter() - phase_started) * 1000
 
@@ -5253,6 +5304,7 @@ class ArtifactUploadService:
                                 ),
                                 defer_ingestion_completion=True,
                                 defer_reconciliation=True,
+                                defer_thermodynamic_refresh=defer_thermodynamic_refresh,
                                 deferred_inferences=deferred_inferences,
                             )
                         )
@@ -5451,6 +5503,7 @@ class ArtifactUploadService:
                     partial(
                         _run_reconcile_molop_geometry_context,
                         context=geometry_context,
+                        defer_thermodynamic_refresh=defer_thermodynamic_refresh,
                     )
                 )
                 timings["persist_reconcile_geometry_ms"] = (

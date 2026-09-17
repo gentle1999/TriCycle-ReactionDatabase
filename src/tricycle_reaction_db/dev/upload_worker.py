@@ -6,6 +6,7 @@ import asyncio
 import logging
 from collections.abc import Iterable
 from contextlib import suppress
+from time import monotonic
 from uuid import UUID
 
 from tricycle_reaction_db.application.dtos import ArtifactUploadResult
@@ -15,6 +16,9 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
 )
 from tricycle_reaction_db.application.services.database_statistics import (
     refresh_project_statistics,
+)
+from tricycle_reaction_db.application.services.thermodynamic_profile_refresh import (
+    refresh_dirty_mapped_reaction_profiles,
 )
 from tricycle_reaction_db.application.services.upload_batches import (
     PendingIngestionJob,
@@ -37,6 +41,10 @@ class UploadBatchWorker:
         # once per file or per persistence microbatch.
         self._statistics_dirty_project_ids: set[UUID] = set()
         self._statistics_refresh_failed = False
+        self._profile_dirty_project_ids: set[UUID] = set()
+        self._profile_dirty_since: dict[UUID, float] = {}
+        self._profile_refresh_retry_at: float | None = None
+        self._profile_recovery_checked = False
 
     def _mark_statistics_dirty(self, project_ids: Iterable[UUID]) -> None:
         self._statistics_dirty_project_ids.update(
@@ -59,6 +67,74 @@ class UploadBatchWorker:
             # A new claimed job resets this flag and creates another natural
             # retry boundary.
             self._statistics_refresh_failed = True
+
+    def _mark_profiles_dirty(self, project_ids: Iterable[UUID]) -> None:
+        now = monotonic()
+        for project_id in project_ids:
+            if not isinstance(project_id, UUID):
+                continue
+            self._profile_dirty_project_ids.add(project_id)
+            self._profile_dirty_since.setdefault(project_id, now)
+        self._profile_refresh_retry_at = None
+        self._profile_recovery_checked = False
+
+    async def _flush_profiles(self, *, force: bool = False) -> None:
+        """Refresh deferred profiles at queue drain or after the max delay."""
+
+        if (
+            self._profile_refresh_retry_at is not None
+            and monotonic() < self._profile_refresh_retry_at
+        ):
+            return
+        if force:
+            if not self._profile_dirty_project_ids and self._profile_recovery_checked:
+                return
+            # A forced drain also recovers dirty reactions left by a previous
+            # worker process, so do not narrow the query to this worker's
+            # in-memory project set.
+            project_ids: tuple[UUID, ...] | None = None
+        else:
+            if not self._profile_dirty_project_ids:
+                return
+            max_delay = get_settings().upload_worker_profile_refresh_max_delay_seconds
+            now = monotonic()
+            project_ids = tuple(
+                project_id
+                for project_id in self._profile_dirty_project_ids
+                if now - self._profile_dirty_since.get(project_id, now) >= max_delay
+            )
+            if not project_ids:
+                return
+
+        refreshed = await refresh_dirty_mapped_reaction_profiles(
+            project_ids,
+            reason=(
+                "upload-worker-queue-drained"
+                if force
+                else "upload-worker-profile-refresh-max-delay"
+            ),
+        )
+        if refreshed:
+            if project_ids is None:
+                self._profile_dirty_project_ids.clear()
+                self._profile_dirty_since.clear()
+                self._profile_recovery_checked = True
+            else:
+                for project_id in project_ids:
+                    self._profile_dirty_project_ids.discard(project_id)
+                    self._profile_dirty_since.pop(project_id, None)
+        else:
+            # Avoid turning a database maintenance outage into a tight retry
+            # loop, while still retrying durable dirty rows when the outage
+            # clears without requiring a new upload.
+            retry_delay = max(
+                5.0,
+                min(
+                    60.0,
+                    get_settings().upload_worker_profile_refresh_max_delay_seconds,
+                ),
+            )
+            self._profile_refresh_retry_at = monotonic() + retry_delay
 
     async def _renew_until_done(
         self,
@@ -125,6 +201,7 @@ class UploadBatchWorker:
                         user_id=group[0].user_id,
                         force_reparse=True,
                         refresh_statistics=False,
+                        defer_thermodynamic_refresh=True,
                     )
                 except Exception as error:
                     group_results = {job.artifact_file_id: error for job in group}
@@ -219,6 +296,7 @@ class UploadBatchWorker:
                         user_id=group[0].user_id,
                         force_reparse=True,
                         refresh_statistics=False,
+                        defer_thermodynamic_refresh=True,
                     )
                 except asyncio.CancelledError:
                     # Leave the reservations leased so normal stale-lease
@@ -305,7 +383,9 @@ class UploadBatchWorker:
                 )
                 if jobs:
                     self._mark_statistics_dirty(job.project_id for job in jobs)
+                    self._mark_profiles_dirty(job.project_id for job in jobs)
                     await self._process_jobs(jobs)
+                    await self._flush_profiles()
                     continue
                 pending_jobs = await UploadBatchService.claim_pending_ingestions(
                     # Compatibility reservations use the same bounded claim
@@ -317,8 +397,11 @@ class UploadBatchWorker:
                 )
                 if pending_jobs:
                     self._mark_statistics_dirty(job.project_id for job in pending_jobs)
+                    self._mark_profiles_dirty(job.project_id for job in pending_jobs)
                     await self._process_pending_jobs(pending_jobs)
+                    await self._flush_profiles()
                     continue
+                await self._flush_profiles(force=True)
                 await self._flush_statistics()
             except asyncio.CancelledError:
                 raise
@@ -339,6 +422,7 @@ class UploadBatchWorker:
         # finalized.  Flush the coalesced project set before returning so the
         # final import/reparse boundary gets the same statistics refresh as an
         # idle poll.
+        await self._flush_profiles(force=True)
         await self._flush_statistics()
 
 
@@ -350,6 +434,7 @@ async def _run_worker() -> None:
         # Cancellation can interrupt a parse group before ``run`` reaches its
         # normal idle boundary. Give the completed database work one final
         # post-commit statistics refresh before shutting down the shared pool.
+        await worker._flush_profiles(force=True)
         await worker._flush_statistics()
         await close_molop_process_pool()
         await dispose_engine()

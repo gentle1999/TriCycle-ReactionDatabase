@@ -89,6 +89,13 @@ class Settings(BaseSettings):
     # parsing so a page reload or API restart cannot discard accepted files.
     upload_worker_poll_interval_seconds: float = Field(default=1.0, gt=0.05, le=300.0)
     upload_worker_lease_seconds: int = Field(default=3_600, ge=60, le=86_400)
+    # Deferred thermodynamic profiles are refreshed at queue drain.  A
+    # continuous import still gets a bounded refresh point at this delay.
+    upload_worker_profile_refresh_max_delay_seconds: float = Field(
+        default=60.0,
+        gt=0.0,
+        le=86_400.0,
+    )
     upload_client_lease_seconds: int = Field(default=900, ge=60, le=86_400)
     # Compatibility recovery for calculation ingestions created before the
     # durable UploadBatch queue. Current API, MCP, and local-import paths all

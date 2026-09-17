@@ -540,6 +540,7 @@ writer endpoint 对应用呈现为同一个逻辑 engine，节点数量不会变
 | `TRICYCLE_UPLOAD_MAX_CONCURRENCY` | `8` | 单个 API 进程内同时处理的上传请求数 |
 | `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` | `2` | durable upload-worker 单次数据库领取的最大文件数 |
 | `TRICYCLE_UPLOAD_WORKER_LEASE_SECONDS` | `3600` | worker 处理 lease 的有效期；worker 用心跳续租，过期后可被重新领取 |
+| `TRICYCLE_UPLOAD_WORKER_PROFILE_REFRESH_MAX_DELAY_SECONDS` | `60` | 解析队列持续繁忙时，延迟 thermodynamic profile 刷新的最长时间；队列排空时立即刷新 |
 | `TRICYCLE_UPLOAD_CLIENT_LEASE_SECONDS` | `900` | HTTP 上传 lease 的恢复阈值；请求中断后超过此时间可回到队列 |
 | `TRICYCLE_UPLOAD_WORKER_POLL_INTERVAL_SECONDS` | `1` | upload-worker 轮询 staged 项和过期 lease 的间隔 |
 | `TRICYCLE_UPLOAD_WORKER_STATEMENT_TIMEOUT_MS` | `120000` | 后台解析/持久化单条 PostgreSQL statement 的独立超时；交互 API 仍使用 `TRICYCLE_QUERY_STATEMENT_TIMEOUT_MS` |
@@ -679,6 +680,7 @@ sequenceDiagram
     end
     P->>D: 当前领取窗口结束，提交剩余结果
     W->>D: 逐项完成 UploadBatchItem 状态
+    W->>D: 队列排空；在独立短事务中刷新 dirty thermodynamic profiles
     W->>D: 两个待处理队列均为空后刷新受影响项目统计
     D-->>W: 完成针对性 ANALYZE
     R->>S: GET 批次状态 / 解析结果
@@ -735,6 +737,12 @@ PostgreSQL 的自动 ANALYZE 阈值按整张表计算。单个项目即使刚刚
 在删除事务提交后立即执行一次；统一 `upload-worker` 将本轮处理过的 project ID 放入一个
 集合，在 staged 与兼容 pending 队列都为空时一次性执行；优雅停止也会执行最后一次刷新。
 连续的单文件上传只要队列未清空就不会各自触发 ANALYZE。
+
+解析微批只写入帧、几何、反应绑定和持久化队列状态，不在每个微批中重建全局
+thermodynamic profile。受影响的 `MappedReaction` 会持久化标记为 dirty；队列排空后，worker
+在独立短事务中按最多 256 个 reaction 分块刷新 profile，然后再执行项目级 `ANALYZE`。队列持续
+有任务时，`TRICYCLE_UPLOAD_WORKER_PROFILE_REFRESH_MAX_DELAY_SECONDS` 提供最长延迟兜底；worker
+重启后也会从 dirty 标记恢复未完成的刷新。
 
 刷新是一个独立的、提交后的维护事务，只针对 artifact、ingestion、parse、frame、geometry、
 project geometry catalogue 以及反应 profile 读路径所需的列级统计，不会把 ANALYZE 放进长时间

@@ -59,7 +59,10 @@ PROJECT_STATISTICS_ANALYZE_TARGETS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     ("public.project_geometry_catalog_count", ("project_id",)),
     ("public.logical_reaction", ("project_id",)),
-    ("public.mapped_reaction", ("project_id", "logical_reaction_id")),
+    (
+        "public.mapped_reaction",
+        ("project_id", "logical_reaction_id", "thermodynamic_profile_dirty"),
+    ),
     (
         "public.transition_state_inference",
         (

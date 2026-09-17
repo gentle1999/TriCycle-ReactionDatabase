@@ -22,6 +22,7 @@ from tricycle_reaction_db.application.services._persistence import (
     _require_id,
 )
 from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics_persistence import (
+    mark_mapped_reactions_thermodynamics_dirty,
     refresh_mapped_reaction_thermodynamics,
 )
 from tricycle_reaction_db.application.services.reaction_geometry_policy import (
@@ -920,8 +921,16 @@ def reconcile_geometry_with_reactions(
     participants_by_topology: dict[UUID, tuple[MappedReactionParticipant, ...]] | None = None,
     mapped_reactions_by_id: dict[UUID, MappedReaction] | None = None,
     cache: ReconciliationBatchCache | None = None,
+    refresh_thermodynamics: bool = True,
 ) -> ReactionGeometryReconciliationResult:
-    """Bind a converged Geometry to every matching reaction endpoint."""
+    """Bind a converged Geometry to every matching reaction endpoint.
+
+    A caller that owns a later reconciliation barrier can disable the derived
+    profile rebuild.  This is deliberately independent of ``cache``: a
+    savepoint retry or a direct caller may not have a batch cache, but must
+    still be able to defer the expensive refresh without silently rebuilding a
+    profile one reaction at a time.
+    """
 
     project_id = _require_project_owner(geometry, label="Geometry")
     thermodynamic_property_verified = False
@@ -1117,9 +1126,14 @@ def reconcile_geometry_with_reactions(
         for mapped_reaction in endpoint_compatible_reactions:
             mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
             affected_reactions[mapped_reaction_id] = mapped_reaction
-    if cache is None:
+    if cache is None and refresh_thermodynamics:
         for mapped_reaction in affected_reactions.values():
             refresh_mapped_reaction_thermodynamics(session, mapped_reaction)
+    elif cache is None:
+        mark_mapped_reactions_thermodynamics_dirty(
+            session,
+            tuple(affected_reactions.values()),
+        )
     else:
         cache.affected_reactions_by_id.update(affected_reactions)
     result = ReactionGeometryReconciliationResult(
@@ -1355,6 +1369,8 @@ def reconcile_mapped_reaction_with_geometries(
             node_geometries.extend(bindings)
     if refresh_thermodynamics:
         refresh_mapped_reaction_thermodynamics(session, mapped_reaction)
+    elif cache is None:
+        mark_mapped_reactions_thermodynamics_dirty(session, (mapped_reaction,))
     return ReactionGeometryReconciliationResult(
         node_geometry_ids=tuple(
             _require_id(binding, label="MappedReactionNodeGeometry") for binding in node_geometries
@@ -1617,6 +1633,8 @@ def bind_transition_state_frame(
         refresh_mapped_reaction_thermodynamics(session, mapped_reaction)
         if cache is not None:
             cache.thermodynamics_refreshed_reactions.add(mapped_reaction_id)
+    elif cache is None:
+        mark_mapped_reactions_thermodynamics_dirty(session, (mapped_reaction,))
     return node_geometry
 
 

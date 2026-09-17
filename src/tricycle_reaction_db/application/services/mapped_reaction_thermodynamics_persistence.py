@@ -922,8 +922,29 @@ def refresh_mapped_reaction_thermodynamics(
         float(bounds[3]) if bounds[3] is not None else None
     )
     session.add(mapped_reaction)
+    mapped_reaction.thermodynamic_profile_dirty = False
     session.flush()
     return result
+
+
+def mark_mapped_reactions_thermodynamics_dirty(
+    session: Session,
+    mapped_reactions: Sequence[MappedReaction],
+) -> tuple[UUID, ...]:
+    """Mark profiles for refresh after a deferred geometry/reaction update."""
+
+    if not mapped_reactions:
+        return ()
+    canonical_by_id: dict[UUID, MappedReaction] = {}
+    for mapped_reaction in mapped_reactions:
+        canonical = _attach_or_reuse_entity(session, mapped_reaction)
+        mapped_reaction_id = _require_id(canonical, label="MappedReaction")
+        canonical_by_id.setdefault(mapped_reaction_id, canonical)
+    for mapped_reaction in canonical_by_id.values():
+        mapped_reaction.thermodynamic_profile_dirty = True
+    session.add_all(tuple(canonical_by_id.values()))
+    session.flush()
+    return tuple(canonical_by_id)
 
 
 def refresh_mapped_reactions_thermodynamics(
@@ -1169,6 +1190,7 @@ def refresh_mapped_reactions_thermodynamics(
         mapped_reaction.thermodynamic_profile_policy_version = (
             MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION
         )
+        mapped_reaction.thermodynamic_profile_dirty = False
     session.add_all(mapped_reaction_values)
     session.flush()
     source_rows = [
@@ -1201,6 +1223,7 @@ def refresh_mapped_reactions_thermodynamics(
 
 
 __all__ = [
+    "mark_mapped_reactions_thermodynamics_dirty",
     "refresh_mapped_reaction_thermodynamics",
     "refresh_mapped_reactions_thermodynamics",
 ]

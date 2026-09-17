@@ -468,6 +468,10 @@ class MappedReaction(SQLModel, table=True):
             "project_id",
             "logical_reaction_id",
         ),
+        Index(
+            "ix_mapped_reaction_thermodynamic_profile_dirty",
+            "thermodynamic_profile_dirty",
+        ),
         CheckConstraint(f"mapping_hash ~ '{_HASH_PATTERN}'", name="ck_mapping_hash_hex"),
         CheckConstraint(
             f"reaction_structural_bfp_schema_version = '{REACTION_STRUCTURAL_BFP_SCHEMA_VERSION}'",
@@ -551,6 +555,14 @@ class MappedReaction(SQLModel, table=True):
     thermodynamic_profile_policy_version: str | None = Field(
         default=None,
         sa_column=Column(Text, nullable=True),
+    )
+    thermodynamic_profile_dirty: bool = Field(
+        default=False,
+        sa_column=Column(
+            Boolean,
+            nullable=False,
+            server_default=text("false"),
+        ),
     )
     minimum_activation_gibbs_free_energy_kcal_mol: float | None = Field(
         default=None,

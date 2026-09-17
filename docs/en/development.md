@@ -183,6 +183,7 @@ The default limits are documented in `.env.example`. In particular:
 | `TRICYCLE_UPLOAD_MAX_CONCURRENCY` | `8` | Concurrent HTTP upload requests per API process |
 | `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` | `2` | Maximum files in one durable queue claim |
 | `TRICYCLE_UPLOAD_WORKER_LEASE_SECONDS` | `3600` | Worker processing lease; heartbeats extend it and expiry permits recovery |
+| `TRICYCLE_UPLOAD_WORKER_PROFILE_REFRESH_MAX_DELAY_SECONDS` | `60` | Maximum delay for deferred thermodynamic profile refresh during a continuously busy queue; queue drain refreshes immediately |
 | `TRICYCLE_UPLOAD_CLIENT_LEASE_SECONDS` | `900` | Recovery threshold for an interrupted HTTP staging request |
 | `TRICYCLE_UPLOAD_WORKER_POLL_INTERVAL_SECONDS` | `1` | Worker polling interval for staged items and expired leases |
 | `TRICYCLE_UPLOAD_WORKER_STATEMENT_TIMEOUT_MS` | `120000` | Independent PostgreSQL statement budget for background parse/persistence; interactive API queries keep `TRICYCLE_QUERY_STATEMENT_TIMEOUT_MS` |
@@ -296,6 +297,7 @@ sequenceDiagram
     end
     P->>D: Claim window ends; commit remaining results
     W->>D: Finalize each UploadBatchItem state
+    W->>D: Queue drains; refresh durable dirty thermodynamic profiles
     W->>D: Refresh affected project statistics once both queues are empty
     D-->>W: Complete targeted ANALYZE
     R->>S: GET batch status / parse result
@@ -350,6 +352,15 @@ refreshes immediately after its delete transaction commits. The unified
 when both the staged queue and the compatibility pending-ingestion queue are
 empty; a graceful shutdown flushes the final set as well. Continuous one-file
 uploads therefore do not run ANALYZE once per file while the queue remains busy.
+
+Persistence microbatches write frames, geometries, reaction bindings, and queue
+state, but defer rebuilding the global thermodynamic profile. Affected mapped
+reactions receive a durable dirty marker. When the queue drains, the worker
+refreshes dirty profiles in independent transactions of at most 256 reactions
+and then runs the project-level `ANALYZE`. A continuously busy queue uses
+`TRICYCLE_UPLOAD_WORKER_PROFILE_REFRESH_MAX_DELAY_SECONDS` as the maximum
+refresh delay, and a worker restart can recover dirty markers left by an
+interrupted refresh.
 
 The refresh is a separate post-commit maintenance transaction over the targeted
 columns of the artifact, ingestion, parse, frame, geometry,

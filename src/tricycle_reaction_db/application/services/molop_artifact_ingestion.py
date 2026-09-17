@@ -55,6 +55,7 @@ from tricycle_reaction_db.application.services.calculations import (
 )
 from tricycle_reaction_db.application.services.catalog import persist_calculation_protocol
 from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics_persistence import (
+    mark_mapped_reactions_thermodynamics_dirty,
     refresh_mapped_reactions_thermodynamics,
 )
 from tricycle_reaction_db.application.services.molecular_geometry import (
@@ -835,7 +836,9 @@ def persist_molop_calculation_artifact(
 def reconcile_molop_geometry_context(
     session: Session,
     context: GeometryPersistenceContext,
-) -> None:
+    *,
+    refresh_thermodynamics: bool = True,
+) -> set[UUID]:
     """Reconcile all geometries from a batch after their rows are flushed."""
 
     project_id = context.project_id
@@ -883,6 +886,7 @@ def reconcile_molop_geometry_context(
                     participants_by_topology=context.reaction_participants_by_topology,
                     mapped_reactions_by_id=context.mapped_reactions_by_id,
                     cache=reconciliation_cache,
+                    refresh_thermodynamics=refresh_thermodynamics,
                 )
         if not session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
             # A mapped reaction may have been created after its endpoint
@@ -904,10 +908,16 @@ def reconcile_molop_geometry_context(
                 reconciliation_cache.affected_reactions_by_id[mapped_reaction_id] = mapped_reaction
         _attach_pending_entities(session)
         session.flush()
-        refresh_mapped_reactions_thermodynamics(
-            session,
-            tuple(reconciliation_cache.affected_reactions_by_id.values()),
-        )
+        affected_reactions = tuple(reconciliation_cache.affected_reactions_by_id.values())
+        if refresh_thermodynamics:
+            refresh_mapped_reactions_thermodynamics(session, affected_reactions)
+        else:
+            mark_mapped_reactions_thermodynamics_dirty(session, affected_reactions)
+        return {
+            mapped_reaction_id
+            for mapped_reaction_id in reconciliation_cache.affected_reactions_by_id
+            if isinstance(mapped_reaction_id, UUID)
+        }
     finally:
         session.autoflush = previous_autoflush
 

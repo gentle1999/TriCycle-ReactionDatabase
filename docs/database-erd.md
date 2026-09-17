@@ -1,8 +1,8 @@
 # 数据库实体关系图
 
-> 当前 schema：Alembic `0053_molop_comments`
+> 当前 schema：Alembic `0054_profile_refresh_dirty`
 > 生成来源：NexusX `ErDiagram.from_sqlmodel(...)`（实体来自 SQLModel 导出注册表）
-> 完整性：65 张表、804 个列、
+> 完整性：65 张表、805 个列、
 > 106 条外键约束，未省略物理表、列或 FK。
 
 本文区分物理持久化后端和进程内对象。RustFS 与 PostgreSQL 不共享事务；
@@ -548,6 +548,7 @@ erDiagram
         string reaction_structural_bfp_schema_version
         string mapping_hash
         string thermodynamic_profile_policy_version
+        string thermodynamic_profile_dirty
         string minimum_activation_gibbs_free_energy_kcal_mol
         string maximum_activation_gibbs_free_energy_kcal_mol
         string minimum_reaction_gibbs_free_energy_kcal_mol
@@ -1254,11 +1255,11 @@ erDiagram
 ## Schema 完整性清单
 
 - `65` tables；
-- `804` columns；
+- `805` columns；
 - `106` FK；
 - `78` UNIQUE；
 - `210` CHECK；
-- `180` indexes。
+- `181` indexes。
 
 | table | columns | FK constraints | UNIQUE constraints | CHECK constraints | indexes |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -1283,7 +1284,7 @@ erDiagram
 | `project_membership` | 5 | 2 | 1 | 1 | 3 |
 | `upload_batch` | 19 | 2 | 0 | 8 | 5 |
 | `artifact_ingestion` | 16 | 1 | 1 | 7 | 2 |
-| `mapped_reaction` | 17 | 2 | 2 | 3 | 11 |
+| `mapped_reaction` | 18 | 2 | 2 | 3 | 12 |
 | `molecular_topology` | 19 | 2 | 1 | 8 | 7 |
 | `parse_revision` | 35 | 2 | 1 | 11 | 4 |
 | `workflow_manifest` | 12 | 2 | 3 | 6 | 2 |
