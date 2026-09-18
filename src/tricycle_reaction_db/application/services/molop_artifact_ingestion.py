@@ -23,6 +23,7 @@ from tricycle_reaction_db.application.services._persistence import (
     _attach_or_reuse_entity,
     _attach_pending_entities,
     _fast_pending_entity_count,
+    _flush_if_needed,
     _set_fast_pending_entities,
     _truncate_fast_pending_entities,
 )
@@ -838,7 +839,7 @@ def reconcile_molop_geometry_context(
     if not isinstance(project_id, UUID):
         raise ValueError("MolOP reconciliation requires a project-owned Geometry context")
     _attach_pending_entities(session)
-    session.flush()
+    _flush_if_needed(session)
     reconcilable_ids = reconcilable_geometry_ids(
         session,
         set(context.geometries_to_reconcile),
@@ -900,7 +901,7 @@ def reconcile_molop_geometry_context(
                 )
                 reconciliation_cache.affected_reactions_by_id[mapped_reaction_id] = mapped_reaction
         _attach_pending_entities(session)
-        session.flush()
+        _flush_if_needed(session)
         affected_reactions = tuple(reconciliation_cache.affected_reactions_by_id.values())
         if refresh_thermodynamics:
             refresh_mapped_reactions_thermodynamics(session, affected_reactions)

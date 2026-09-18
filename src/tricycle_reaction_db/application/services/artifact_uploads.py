@@ -63,6 +63,7 @@ from tricycle_reaction_db.application.services._persistence import (
     _attach_pending_entities,
     _fast_insert_enabled,
     _fast_pending_entity_count,
+    _flush_if_needed,
     _flush_new_entity,
     _new_entity,
     _prepare_new_entity,
@@ -3773,7 +3774,7 @@ def _run_flush(session: SQLAlchemySession) -> dict[str, object]:
     typed_session.info["tricycle_fast_insert"] = True
     try:
         _attach_pending_entities(typed_session)
-        typed_session.flush()
+        _flush_if_needed(typed_session)
         diagnostics = typed_session.info.get("_fast_bulk_insert_diagnostics")
         return dict(diagnostics) if isinstance(diagnostics, dict) else {}
     finally:

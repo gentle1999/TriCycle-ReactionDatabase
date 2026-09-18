@@ -15,6 +15,7 @@ import numpy as np
 from pydantic import BaseModel
 from sqlalchemy import insert, text
 from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.exc import MissingGreenlet
 from sqlalchemy.orm import make_transient_to_detached
 from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.util import await_only
@@ -65,6 +66,7 @@ _FAST_MAPPERS: dict[type[Any], Any] = {}
 
 _FAST_PENDING_ENTITIES_KEY = "_fast_pending_entities"
 _FAST_PENDING_ENTITY_INDEX_KEY = "_fast_pending_entity_index"
+_FAST_COPY_MIN_ROWS = 32
 
 
 def _identity_lock_id(*parts: object) -> int:
@@ -491,6 +493,15 @@ def _attach_pending_entities(session: Session) -> None:
                 _set_fast_pending_entities(session, ())
 
 
+def _flush_if_needed(session: Session) -> bool:
+    """Flush only when the ORM still has work after deferred inserts."""
+
+    if not session.new and not session.dirty and not session.deleted:
+        return False
+    session.flush()
+    return True
+
+
 async def _copy_rows_to_postgresql(
     driver_connection: Any,
     statement: str,
@@ -501,6 +512,18 @@ async def _copy_rows_to_postgresql(
     async with driver_connection.cursor() as cursor, cursor.copy(statement) as copy_writer:
         for row in rows:
             await copy_writer.write_row(row)
+
+
+def _copy_rows_to_postgresql_sync(
+    driver_connection: Any,
+    statement: str,
+    rows: list[tuple[Any, ...]],
+) -> None:
+    """Synchronous psycopg COPY fallback for direct sync Session callers."""
+
+    with driver_connection.cursor() as cursor, cursor.copy(statement) as copy_writer:
+        for row in rows:
+            copy_writer.write_row(row)
 
 
 def _copy_compatible(columns: tuple[Any, ...]) -> bool:
@@ -664,7 +687,10 @@ def _bulk_insert_pending_entities(session: Session) -> None:
             # COPY is the normal fast-batch path.  Keep an explicit opt-out for
             # driver/cartridge environments that need the Core executemany
             # fallback while avoiding a deployment-specific performance switch.
-            use_copy = os.getenv("TRICYCLE_FAST_COPY", "1") != "0" and len(rows) >= 100
+            use_copy = (
+                os.getenv("TRICYCLE_FAST_COPY", "1") != "0"
+                and len(rows) >= _FAST_COPY_MIN_ROWS
+            )
             if use_copy and _copy_compatible(columns):
                 dialect = session.get_bind().dialect
                 bind_rows: list[tuple[Any, ...]] = []
@@ -688,7 +714,10 @@ def _bulk_insert_pending_entities(session: Session) -> None:
                 column_sql = ", ".join(preparer.quote(column.key) for column in signature_columns)
                 copy_sql = f"COPY {table_sql} ({column_sql}) FROM STDIN"
                 driver_connection = session.connection().connection.driver_connection
-                await_only(_copy_rows_to_postgresql(driver_connection, copy_sql, bind_rows))
+                try:
+                    await_only(_copy_rows_to_postgresql(driver_connection, copy_sql, bind_rows))
+                except MissingGreenlet:
+                    _copy_rows_to_postgresql_sync(driver_connection, copy_sql, bind_rows)
             else:
                 # Core executemany remains the fallback for RDKit cartridge
                 # columns and environments that do not opt into COPY.
@@ -760,6 +789,7 @@ __all__ = [
     "_project_owner_predicate",
     "_flush_new_entity",
     "_flush_shared_entity",
+    "_flush_if_needed",
     "_pop_fast_pending_entities",
     "_queue_fast_pending_entity",
     "_set_fast_pending_entities",
