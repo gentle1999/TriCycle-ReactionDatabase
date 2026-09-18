@@ -1744,11 +1744,11 @@ class UploadBatchService:
         async with session_factory() as session:
             rows = (await session.exec(statement)).all()
             lease_by_ingestion_id: dict[UUID, UUID] = {}
+            lease_expires_at = now + timedelta(seconds=settings.upload_worker_lease_seconds)
             for ingestion, artifact in rows:
                 ingestion_id = _required_uuid(ingestion.id, "ArtifactIngestion")
                 artifact_id = _required_uuid(artifact.id, "ArtifactFile")
                 lease_id = uuid4()
-                lease_expires_at = now + timedelta(seconds=settings.upload_worker_lease_seconds)
                 lease_by_ingestion_id[ingestion_id] = lease_id
                 jobs.append(
                     PendingIngestionJob(
@@ -1971,6 +1971,7 @@ class UploadBatchService:
             lease_by_item_id: dict[UUID, UUID] = {}
             lease_by_artifact_id: dict[UUID, UUID] = {}
             batch_deltas: dict[UUID, list[int]] = {}
+            lease_expires_at = now + timedelta(seconds=settings.upload_worker_lease_seconds)
             for item, batch in rows:
                 batch_id = _required_uuid(batch.id, "UploadBatch")
                 item_id = _required_uuid(item.id, "UploadBatchItem")
@@ -1994,7 +1995,6 @@ class UploadBatchService:
                     delta[2] += 1  # failed_count
                     continue
                 lease_id = uuid4()
-                lease_expires_at = now + timedelta(seconds=settings.upload_worker_lease_seconds)
                 item_statuses[item_id] = UploadBatchItemStatus.PROCESSING
                 item_parse_statuses[item_id] = ImportParseStatus.PENDING.value
                 item_materialization_statuses[item_id] = ImportMaterializationStatus.PENDING.value

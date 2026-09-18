@@ -1232,6 +1232,7 @@ def finalize_parse_revision(
     # from that deferred queue, falling back to the database when a caller has
     # already flushed it.  The regular path keeps the relationship-backed
     # validation semantics.
+    pending_entities: tuple[object, ...] = ()
     if _fast_insert_enabled(session):
         revision_id = _require_id(revision, label="ParseRevision")
         pending_entities = tuple(session.info.get("_fast_pending_entities", ()))
