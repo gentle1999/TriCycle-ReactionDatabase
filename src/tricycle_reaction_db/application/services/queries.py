@@ -103,6 +103,7 @@ from tricycle_reaction_db.application.services.query_visibility import (
     thermodynamic_profile_is_visible,
     topology_derivation_id_is_visible,
     topology_id_is_visible,
+    visible_calculation_frame_ingestion_predicate,
     visible_frame_ids,
 )
 from tricycle_reaction_db.application.services.reaction_geometry_policy import (
@@ -3722,7 +3723,7 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
             # when an artifact filter is present: PostgreSQL may scan every
             # frame before applying the selective artifact equality.
             frame_visibility_criterion = and_(
-                col(ArtifactIngestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+                visible_calculation_frame_ingestion_predicate(),
                 col(ParseRevision.status) == ParseStatus.SUCCEEDED,
                 col(Geometry.project_id) == scope.requested_project_id,
                 col(MolecularTopologyDerivation.project_id) == scope.requested_project_id,

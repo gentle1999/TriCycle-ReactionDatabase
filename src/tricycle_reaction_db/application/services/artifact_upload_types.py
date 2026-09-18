@@ -156,6 +156,10 @@ class ArtifactUploadPayload:
     spool_path: Path | None = None
     error_code: str | None = None
     error_message: str | None = None
+    # Transport preflight may intentionally retain only a bounded prefix of a
+    # rejected file. Keep the full observed size for queue bookkeeping without
+    # pretending that the truncated prefix is the uploaded artifact.
+    declared_size_bytes: int | None = None
     # Optional manifest identity. These values are checked against the bytes
     # after the source has been inspected, immediately before persistence.
     relative_path: str | None = None

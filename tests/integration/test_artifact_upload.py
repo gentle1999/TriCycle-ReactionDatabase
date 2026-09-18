@@ -22,6 +22,10 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
 )
 from tricycle_reaction_db.application.services.catalog import persist_artifact_file
 from tricycle_reaction_db.application.services.molecular_geometry import GeometryPersistenceContext
+from tricycle_reaction_db.application.services.query_visibility import (
+    QueryVisibilityScope,
+    visible_frame_ids,
+)
 from tricycle_reaction_db.application.services.reaction_commands import _create_reaction
 from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
     ReconciliationBatchCache,
@@ -642,6 +646,23 @@ def test_partial_frame_parse_persists_valid_sibling_frames(
             assert 22 in frame_ids
             assert ingestion.status is ArtifactIngestionStatus.PARTIAL
             assert revision.parse_completeness.value == "partial"
+            visibility_scope = QueryVisibilityScope(
+                principal=None,
+                project_ids=frozenset({artifact.project_id}),
+                requested_project_id=artifact.project_id,
+                requested_project_permitted=True,
+            )
+            visible_frame_id_values = session.exec(
+                visible_frame_ids(visibility_scope).where(
+                    CalculationFrame.parse_revision_id == revision_id
+                )
+            ).scalars().all()
+            visible_frame_indices = session.exec(
+                select(CalculationFrame.file_frame_index)
+                .where(CalculationFrame.id.in_(visible_frame_id_values))
+                .order_by(CalculationFrame.file_frame_index)
+            ).all()
+            assert visible_frame_indices == sorted(frame_ids)
     finally:
         transaction.rollback()
         connection.close()

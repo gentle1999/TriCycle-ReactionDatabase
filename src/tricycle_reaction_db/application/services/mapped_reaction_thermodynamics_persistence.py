@@ -6,6 +6,7 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
@@ -35,6 +36,7 @@ from tricycle_reaction_db.application.services.reaction_geometry_policy import (
 from tricycle_reaction_db.application.services.topology_compatibility import (
     source_geometry_compatible_topology,
 )
+from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
     ArtifactIngestion,
@@ -50,6 +52,7 @@ from tricycle_reaction_db.db.models import (
     MappedReactionNodeGeometry,
     MappedReactionParticipant,
     MappedReactionThermodynamicProfile,
+    MappedReactionThermodynamicProfileRefreshJob,
     MappedReactionThermodynamicProfileSource,
     MolecularTopology,
     ParseRevision,
@@ -62,6 +65,7 @@ from tricycle_reaction_db.domain.enums import (
     ParseCompleteness,
     ParseStatus,
     StorageStatus,
+    ThermodynamicProfileRefreshJobStatus,
     ThermodynamicProfileSourceVisibility,
 )
 
@@ -69,13 +73,15 @@ from tricycle_reaction_db.domain.enums import (
 def _thermodynamic_source_ingestion_predicate(
     transition_state_geometry_ids: set[UUID],
 ) -> Any:
-    """Allow complete TS evidence from a partially indexed artifact.
+    """Allow complete frame evidence from a partially indexed artifact.
 
     Some legacy autode artifacts were marked ``partial`` because one parse
-    revision in the artifact batch was incomplete, while the selected TS
-    frequency frame itself is complete and carries H/G/S.  Endpoint source
-    selection remains restricted to successful artifacts; this narrow
-    predicate only admits complete TS frames for TS-only profiles.
+    revision in the artifact batch was incomplete, while a selected frame is
+    complete and carries usable geometry/thermochemistry.  Keep the decision
+    at frame granularity so a partial file does not discard every sibling
+    frame.  Endpoint source selection remains restricted to successful
+    artifacts; this narrow predicate only admits complete TS frames for
+    TS-only profiles.
     """
 
     if not transition_state_geometry_ids:
@@ -85,8 +91,7 @@ def _thermodynamic_source_ingestion_predicate(
         and_(
             col(ArtifactIngestion.status) == ArtifactIngestionStatus.PARTIAL,
             col(CalculationFrame.geometry_id).in_(transition_state_geometry_ids),
-            col(ParseRevision.parse_completeness) == ParseCompleteness.COMPLETE,
-            col(ParseRevision.source_complete).is_(True),
+            col(CalculationFrame.parse_completeness) == ParseCompleteness.COMPLETE,
         ),
     )
 
@@ -840,6 +845,7 @@ def refresh_mapped_reaction_thermodynamics(
     *,
     _input: _MappedReactionThermodynamicsInput | None = None,
     source_frame_ids_by_geometry: Mapping[UUID, tuple[UUID | None, UUID | None]] | None = None,
+    clear_refresh_job: bool = True,
 ) -> MappedReactionThermodynamics:
     """Recompute and persist one mapping's profile after source facts change.
 
@@ -922,34 +928,127 @@ def refresh_mapped_reaction_thermodynamics(
         float(bounds[3]) if bounds[3] is not None else None
     )
     session.add(mapped_reaction)
-    mapped_reaction.thermodynamic_profile_dirty = False
+    mapped_reaction.thermodynamic_profile_materialized_generation = (
+        mapped_reaction.thermodynamic_profile_generation
+    )
+    if clear_refresh_job:
+        session.exec(
+            delete(MappedReactionThermodynamicProfileRefreshJob).where(
+                col(MappedReactionThermodynamicProfileRefreshJob.mapped_reaction_id)
+                == mapped_reaction_id
+            )
+        )
     session.flush()
     return result
+
+
+def enqueue_mapped_reaction_profile_refresh(
+    session: Session,
+    mapped_reactions: Sequence[MappedReaction],
+    *,
+    immediate: bool = False,
+    priority: int = 0,
+) -> tuple[UUID, ...]:
+    """Advance profile generations and coalesce durable refresh work.
+
+    This function deliberately runs in the caller's write transaction.  The
+    source rows and the refresh request therefore become visible atomically:
+    a worker can never observe a generation without its queue row, and a
+    failed source write cannot leave a phantom refresh request.
+    """
+
+    if not mapped_reactions:
+        return ()
+    if priority < 0 or priority > 100:
+        raise ValueError("profile refresh priority must be between 0 and 100")
+    canonical_by_id: dict[UUID, MappedReaction] = {}
+    for mapped_reaction in mapped_reactions:
+        canonical = _attach_or_reuse_entity(session, mapped_reaction)
+        mapped_reaction_id = _require_id(canonical, label="MappedReaction")
+        canonical_by_id.setdefault(mapped_reaction_id, canonical)
+
+    mapped_reaction_ids = tuple(canonical_by_id)
+    # Generation increments are part of the source-write transaction, but must
+    # still be serialized per reaction. This lock is held only for the
+    # increment/queue upsert; the expensive profile calculation never runs
+    # while it is held.
+    persisted_reactions = session.exec(
+        select(MappedReaction)
+        .where(col(MappedReaction.id).in_(mapped_reaction_ids))
+        .with_for_update()
+    ).all()
+    persisted_by_id = {
+        mapped_reaction.id: mapped_reaction
+        for mapped_reaction in persisted_reactions
+        if isinstance(mapped_reaction.id, UUID)
+    }
+    for mapped_reaction_id, canonical in tuple(canonical_by_id.items()):
+        managed = persisted_by_id.get(mapped_reaction_id, canonical)
+        managed.thermodynamic_profile_generation += 1
+        canonical_by_id[mapped_reaction_id] = managed
+    now = datetime.now(UTC)
+    available_at = now
+    if not immediate:
+        available_at += timedelta(
+            seconds=get_settings().upload_worker_profile_refresh_debounce_seconds
+        )
+    session.add_all(tuple(canonical_by_id.values()))
+    session.flush()
+
+    existing_jobs = {
+        job.mapped_reaction_id: job
+        for job in session.exec(
+            select(MappedReactionThermodynamicProfileRefreshJob).where(
+                col(MappedReactionThermodynamicProfileRefreshJob.mapped_reaction_id).in_(
+                    mapped_reaction_ids
+                )
+            ).with_for_update()
+        ).all()
+    }
+    new_jobs: list[MappedReactionThermodynamicProfileRefreshJob] = []
+    for mapped_reaction_id, mapped_reaction in canonical_by_id.items():
+        requested_generation = mapped_reaction.thermodynamic_profile_generation
+        job = existing_jobs.get(mapped_reaction_id)
+        if job is None:
+            new_jobs.append(
+                MappedReactionThermodynamicProfileRefreshJob(
+                    mapped_reaction_id=mapped_reaction_id,
+                    requested_generation=requested_generation,
+                    status=ThermodynamicProfileRefreshJobStatus.PENDING,
+                    priority=priority,
+                    requested_at=now,
+                    available_at=available_at,
+                )
+            )
+            continue
+        job.requested_generation = max(job.requested_generation, requested_generation)
+        job.priority = max(job.priority, priority)
+        job.requested_at = now
+        job.last_error = None
+        if job.status == ThermodynamicProfileRefreshJobStatus.PENDING:
+            job.available_at = min(job.available_at or available_at, available_at)
+            job.lease_id = None
+            job.lease_expires_at = None
+        session.add(job)
+    if new_jobs:
+        session.add_all(new_jobs)
+    return tuple(canonical_by_id)
 
 
 def mark_mapped_reactions_thermodynamics_dirty(
     session: Session,
     mapped_reactions: Sequence[MappedReaction],
 ) -> tuple[UUID, ...]:
-    """Mark profiles for refresh after a deferred geometry/reaction update."""
+    """Compatibility name for callers that defer thermodynamic refresh."""
 
-    if not mapped_reactions:
-        return ()
-    canonical_by_id: dict[UUID, MappedReaction] = {}
-    for mapped_reaction in mapped_reactions:
-        canonical = _attach_or_reuse_entity(session, mapped_reaction)
-        mapped_reaction_id = _require_id(canonical, label="MappedReaction")
-        canonical_by_id.setdefault(mapped_reaction_id, canonical)
-    for mapped_reaction in canonical_by_id.values():
-        mapped_reaction.thermodynamic_profile_dirty = True
-    session.add_all(tuple(canonical_by_id.values()))
-    session.flush()
-    return tuple(canonical_by_id)
+    return enqueue_mapped_reaction_profile_refresh(session, mapped_reactions)
 
 
 def refresh_mapped_reactions_thermodynamics(
     session: Session,
     mapped_reactions: Sequence[MappedReaction],
+    *,
+    clear_refresh_jobs: bool = True,
 ) -> tuple[MappedReactionThermodynamics, ...]:
     """Refresh several reaction profiles while sharing all source reads.
 
@@ -1190,7 +1289,9 @@ def refresh_mapped_reactions_thermodynamics(
         mapped_reaction.thermodynamic_profile_policy_version = (
             MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION
         )
-        mapped_reaction.thermodynamic_profile_dirty = False
+        mapped_reaction.thermodynamic_profile_materialized_generation = (
+            mapped_reaction.thermodynamic_profile_generation
+        )
     session.add_all(mapped_reaction_values)
     session.flush()
     source_rows = [
@@ -1218,11 +1319,20 @@ def refresh_mapped_reactions_thermodynamics(
         mapped_reaction.minimum_reaction_gibbs_free_energy_kcal_mol = bounds[2]
         mapped_reaction.maximum_reaction_gibbs_free_energy_kcal_mol = bounds[3]
     session.add_all(mapped_reaction_values)
+    if clear_refresh_jobs:
+        session.exec(
+            delete(MappedReactionThermodynamicProfileRefreshJob).where(
+                col(MappedReactionThermodynamicProfileRefreshJob.mapped_reaction_id).in_(
+                    mapped_reaction_ids
+                )
+            )
+        )
     session.flush()
     return tuple(results)
 
 
 __all__ = [
+    "enqueue_mapped_reaction_profile_refresh",
     "mark_mapped_reactions_thermodynamics_dirty",
     "refresh_mapped_reaction_thermodynamics",
     "refresh_mapped_reactions_thermodynamics",

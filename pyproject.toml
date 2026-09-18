@@ -36,6 +36,7 @@ dependencies = [
 [project.scripts]
 tricycle-api = "tricycle_reaction_db.__main__:main"
 tricycle-upload-worker = "tricycle_reaction_db.dev.upload_worker:main"
+tricycle-profile-refresh-worker = "tricycle_reaction_db.dev.profile_refresh_worker:main"
 tricycle-nexusx-services = "tricycle_reaction_db.api.run_services:main"
 tricycle-seed-da-bench = "tricycle_reaction_db.dev.seed_da_bench:main"
 tricycle-import-artifacts = "tricycle_reaction_db.dev.import_artifacts:main"

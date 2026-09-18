@@ -1096,7 +1096,7 @@ def persist_molecular_geometry(
                 Geometry.geometry_hash == record.geometry.geometry_hash,
                 Geometry.charge == record.charge,
                 Geometry.multiplicity == record.multiplicity,
-            )
+            ).limit(1)
         ).first()
         if geometry is not None and context is not None:
             context.geometries_by_hash[geometry_key] = geometry

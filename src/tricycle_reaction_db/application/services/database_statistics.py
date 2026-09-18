@@ -61,7 +61,16 @@ PROJECT_STATISTICS_ANALYZE_TARGETS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("public.logical_reaction", ("project_id",)),
     (
         "public.mapped_reaction",
-        ("project_id", "logical_reaction_id", "thermodynamic_profile_dirty"),
+        (
+            "project_id",
+            "logical_reaction_id",
+            "thermodynamic_profile_generation",
+            "thermodynamic_profile_materialized_generation",
+        ),
+    ),
+    (
+        "public.mapped_reaction_thermodynamic_profile_refresh_job",
+        ("mapped_reaction_id", "status", "available_at", "priority"),
     ),
     (
         "public.transition_state_inference",

@@ -7,6 +7,7 @@ from uuid import UUID
 from molalchemy.rdkit.index import RdkitIndex
 from molalchemy.rdkit.types import RdkitBitFingerprint, RdkitReaction
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
@@ -36,6 +37,7 @@ from tricycle_reaction_db.domain.enums import (
     MappedReactionKind,
     MappedReactionNodeRole,
     ReactionClass,
+    ThermodynamicProfileRefreshJobStatus,
     ThermodynamicProfileSourceVisibility,
     WorkflowManifestStatus,
     string_enum,
@@ -469,8 +471,10 @@ class MappedReaction(SQLModel, table=True):
             "logical_reaction_id",
         ),
         Index(
-            "ix_mapped_reaction_thermodynamic_profile_dirty",
-            "thermodynamic_profile_dirty",
+            "ix_mapped_reaction_thermodynamic_profile_generation",
+            "project_id",
+            "thermodynamic_profile_generation",
+            "thermodynamic_profile_materialized_generation",
         ),
         CheckConstraint(f"mapping_hash ~ '{_HASH_PATTERN}'", name="ck_mapping_hash_hex"),
         CheckConstraint(
@@ -556,12 +560,20 @@ class MappedReaction(SQLModel, table=True):
         default=None,
         sa_column=Column(Text, nullable=True),
     )
-    thermodynamic_profile_dirty: bool = Field(
-        default=False,
+    thermodynamic_profile_generation: int = Field(
+        default=0,
         sa_column=Column(
-            Boolean,
+            BigInteger,
             nullable=False,
-            server_default=text("false"),
+            server_default=text("0"),
+        ),
+    )
+    thermodynamic_profile_materialized_generation: int = Field(
+        default=0,
+        sa_column=Column(
+            BigInteger,
+            nullable=False,
+            server_default=text("0"),
         ),
     )
     minimum_activation_gibbs_free_energy_kcal_mol: float | None = Field(
@@ -790,6 +802,84 @@ class MappedReactionThermodynamicProfileSource(SQLModel, table=True):
     allow_partial_ingestion: bool = Field(
         default=False,
         sa_column=Column(Boolean, nullable=False, server_default=text("false")),
+    )
+
+
+class MappedReactionThermodynamicProfileRefreshJob(SQLModel, table=True):
+    """Durable, coalesced work item for one mapped-reaction profile."""
+
+    __tablename__ = "mapped_reaction_thermodynamic_profile_refresh_job"  # pyright: ignore[reportAssignmentType]
+    __table_args__ = (
+        CheckConstraint(
+            "requested_generation >= 0",
+            name="ck_profile_refresh_requested_generation_nonnegative",
+        ),
+        CheckConstraint(
+            "priority >= 0 AND priority <= 100",
+            name="ck_profile_refresh_priority_range",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_profile_refresh_attempts_nonnegative",
+        ),
+        Index(
+            "ix_profile_refresh_job_claim",
+            "status",
+            "available_at",
+            "priority",
+            "requested_at",
+        ),
+        Index(
+            "ix_profile_refresh_job_lease",
+            "status",
+            "lease_expires_at",
+        ),
+    )
+
+    mapped_reaction_id: UUID = Field(
+        primary_key=True,
+        foreign_key="mapped_reaction.id",
+        ondelete="CASCADE",
+        nullable=False,
+    )
+    requested_generation: int = Field(sa_column=Column(BigInteger, nullable=False))
+    status: ThermodynamicProfileRefreshJobStatus = Field(
+        default=ThermodynamicProfileRefreshJobStatus.PENDING,
+        sa_column=Column(
+            string_enum(
+                ThermodynamicProfileRefreshJobStatus,
+                name="thermodynamic_profile_refresh_job_status",
+            ),
+            nullable=False,
+            server_default=ThermodynamicProfileRefreshJobStatus.PENDING.value,
+        ),
+    )
+    priority: int = Field(default=0, nullable=False)
+    requested_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(
+            DateTime(timezone=True),
+            server_default=text("now()"),
+        ),
+    )
+    available_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(
+            DateTime(timezone=True),
+            server_default=text("now()"),
+        ),
+    )
+    lease_id: UUID | None = Field(default=None)
+    lease_expires_at: datetime | None = Field(default=None)
+    attempt_count: int = Field(default=0, nullable=False)
+    last_error: str | None = Field(default=None, sa_type=Text)
+    created_at: datetime | None = created_at_field()
+    updated_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(
+            DateTime(timezone=True),
+            server_default=text("now()"),
+        ),
     )
 
 

@@ -389,6 +389,7 @@ class UploadBatchService:
         *,
         user_id: UUID,
         manifest_registration: bool = False,
+        allow_transport_rejections: bool = False,
     ) -> UploadBatchView:
         settings = get_settings()
         if not manifest_registration and (
@@ -414,7 +415,7 @@ class UploadBatchService:
             (item for item in payload.files if item.size_bytes > settings.max_upload_bytes),
             None,
         )
-        if oversized is not None:
+        if oversized is not None and not allow_transport_rejections:
             raise UploadBatchLimitError(
                 f"{oversized.original_filename} exceeds the {settings.max_upload_bytes}-byte limit"
             )
@@ -587,7 +588,11 @@ class UploadBatchService:
         payloads: list[tuple[UUID, ArtifactUploadPayload]] = []
         seen_paths: set[str] = set()
         for index, upload in enumerate(files):
-            size_bytes = cls._payload_size(upload)
+            size_bytes = (
+                upload.declared_size_bytes
+                if upload.declared_size_bytes is not None
+                else cls._payload_size(upload)
+            )
             if size_bytes < 0:
                 raise UploadBatchConflictError("uploaded artifact has no payload")
             filename = Path(upload.filename).name
@@ -616,6 +621,7 @@ class UploadBatchService:
                         spool_path=upload.spool_path,
                         error_code=upload.error_code,
                         error_message=upload.error_message,
+                        declared_size_bytes=upload.declared_size_bytes,
                         relative_path=relative_path,
                         expected_sha256=upload.expected_sha256,
                         expected_size_bytes=upload.expected_size_bytes,
@@ -631,6 +637,7 @@ class UploadBatchService:
                 files=descriptors,
             ),
             user_id=user_id,
+            allow_transport_rejections=True,
         )
         items = await cls.upload_items(batch.id, files=payloads, user_id=user_id)
         refreshed = await cls.get(batch.id, user_id=user_id, project_id=project_id)
@@ -899,6 +906,8 @@ class UploadBatchService:
 
     @staticmethod
     def _payload_size(upload: ArtifactUploadPayload) -> int:
+        if upload.declared_size_bytes is not None:
+            return upload.declared_size_bytes
         if upload.payload is not None:
             return len(upload.payload)
         if upload.spool_path is not None:
@@ -1152,7 +1161,11 @@ class UploadBatchService:
         client_file_ids = [client_file_id for client_file_id, _ in files]
         if len(set(client_file_ids)) != len(client_file_ids):
             raise UploadBatchConflictError("client_file_id must be unique within an upload request")
-        total_bytes = sum(max(0, cls._payload_size(upload)) for _, upload in files)
+        total_bytes = sum(
+            max(0, cls._payload_size(upload))
+            for _, upload in files
+            if upload.error_code is None
+        )
         if len(files) > 1 and total_bytes > settings.max_batch_bytes:
             raise UploadBatchLimitError(
                 f"upload batch exceeds the {settings.max_batch_bytes}-byte limit"
@@ -1171,7 +1184,11 @@ class UploadBatchService:
 
         content_sha256_by_client_id = dict(
             await asyncio.gather(
-                *(calculate_digest(client_file_id, upload) for client_file_id, upload in files)
+                *(
+                    calculate_digest(client_file_id, upload)
+                    for client_file_id, upload in files
+                    if upload.error_code is None
+                )
             )
         )
         pending: list[tuple[UUID, ArtifactUploadPayload, str, str, str | None, int]] = []
@@ -1238,6 +1255,28 @@ class UploadBatchService:
                     raise UploadBatchConflictError("upload batch file is already being uploaded")
                 if item.status is UploadBatchItemStatus.CANCELLED:
                     raise UploadBatchConflictError("cancelled upload batch files cannot be retried")
+                if upload.error_code is not None:
+                    if item.status is UploadBatchItemStatus.FAILED:
+                        batch.failed_count = max(0, batch.failed_count - 1)
+                    item.status = UploadBatchItemStatus.FAILED
+                    item.parse_status = ImportParseStatus.FAILED.value
+                    item.materialization_status = ImportMaterializationStatus.FAILED.value
+                    item.error_code = upload.error_code
+                    item.error_message = upload.error_message or upload.error_code
+                    item.worker_lease_id = None
+                    item.worker_lease_expires_at = None
+                    item.metadata_json = _with_upload_progress(
+                        item.metadata_json,
+                        phase="failed",
+                        completed=1,
+                        total=1,
+                    )
+                    item.updated_at = now
+                    batch.failed_count += 1
+                    batch.updated_at = now
+                    session.add(item)
+                    views_by_client_id[client_file_id] = _item_view(item)
+                    continue
                 expected_sha256 = item.expected_file_sha256
                 actual_sha256 = content_sha256_by_client_id[client_file_id]
                 if expected_sha256 is not None and actual_sha256 != expected_sha256:
@@ -1299,11 +1338,11 @@ class UploadBatchService:
                 )
                 session.add(item)
 
-            if pending_count:
-                if batch.status is UploadBatchStatus.COMPLETED:
-                    batch.status = UploadBatchStatus.ACTIVE
-                batch.updated_at = now
-                session.add(batch)
+            if pending_count and batch.status is UploadBatchStatus.COMPLETED:
+                batch.status = UploadBatchStatus.ACTIVE
+            batch.updated_at = now
+            _finish_batch_if_terminal(batch)
+            session.add(batch)
             artifact_kind = batch.artifact_kind
             project_id = batch.project_id
             await session.commit()
@@ -1635,13 +1674,24 @@ class UploadBatchService:
                 _finish_batch_if_terminal(batches[batch_id])
                 session.add(batches[batch_id])
 
-            # Compatibility ingestions do not have an UploadBatchItem to
-            # drive recovery. Reset only those expired parser leases here;
-            # batch-owned rows are reconciled together with their item above.
-            has_upload_item = (
+            # Compatibility ingestions do not have an *active*
+            # UploadBatchItem to drive recovery. A terminal item may remain
+            # after an older worker crashed between publishing the item and
+            # finalizing ArtifactIngestion; it must not strand the ingestion
+            # forever. Active batch-owned rows are reconciled together with
+            # their item above.
+            has_active_upload_item = (
                 select(1)
                 .where(
-                    col(UploadBatchItem.artifact_file_id) == col(ArtifactIngestion.artifact_file_id)
+                    col(UploadBatchItem.artifact_file_id)
+                    == col(ArtifactIngestion.artifact_file_id),
+                    col(UploadBatchItem.status).in_(
+                        (
+                            UploadBatchItemStatus.UPLOADING,
+                            UploadBatchItemStatus.STAGED,
+                            UploadBatchItemStatus.PROCESSING,
+                        )
+                    ),
                 )
                 .exists()
             )
@@ -1662,7 +1712,7 @@ class UploadBatchService:
                     select(ArtifactIngestion)
                     .where(
                         compatibility_processing_recovery,
-                        ~has_upload_item,
+                        ~has_active_upload_item,
                     )
                     .order_by(col(ArtifactIngestion.started_at).nulls_first())
                     .limit(limit)

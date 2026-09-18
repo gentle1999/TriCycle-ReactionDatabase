@@ -8,7 +8,9 @@ from molop.config import molopconfig
 from molop.io.base_models.ChemFileFrame import BaseCalcFrame
 from rdkit import Chem
 
-from tricycle_reaction_db.application.dtos.chemistry import NormalizedMoleculeRecord
+from tricycle_reaction_db.application.dtos.chemistry import (
+    NormalizedMoleculeRecord,
+)
 from tricycle_reaction_db.core.units import ANGSTROM, magnitude_in
 from tricycle_reaction_db.ingestion.normalization import (
     normalize_molecule,
@@ -18,8 +20,6 @@ from tricycle_reaction_db.ingestion.normalization import (
 MOLOP_VERSION = version("molop")
 MOLGR_VERSION = version("molgr")
 MOLECULAR_GRAPH_RECONSTRUCTION_FAILURE_POLICY: Literal["return_suspicious"] = "return_suspicious"
-
-
 def configure_molecular_graph_reconstruction(*, allow_native_parallel: bool = False) -> None:
     """Keep calculation frames when MolGR can only return an untrusted topology.
 

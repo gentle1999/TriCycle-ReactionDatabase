@@ -27,7 +27,7 @@ from hashlib import sha256
 from importlib.metadata import version
 from pathlib import Path
 from queue import Queue
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -35,6 +35,7 @@ import numpy as np
 from molop import AutoFileParser
 from molop.config import molopconfig
 from molop.io.base_models.ChemFileFrame import BaseCalcFrame
+from molop.io.base_models.Molecule import reconstruct_topologies_batch
 from rdkit import Chem
 from sqlalchemy import case, text, update
 from sqlalchemy import cast as sa_cast
@@ -207,13 +208,14 @@ PERSISTENCE_BATCH_FRAME_LIMIT = 256
 # MolGR reconstruction is CPU-heavy and each frame crosses a process boundary.
 # Larger chunks amortize pickle/future overhead while retaining enough tasks to
 # keep all configured workers busy across a multi-file batch.
-FRAME_CONVERSION_CHUNK_SIZE = 32
+FRAME_CONVERSION_CHUNK_SIZE = 256
 INFERENCE_PERSIST_BATCH_SIZE = 16
 # The configured timeout is the budget for a 10 MiB source. Larger source
 # files receive a proportionally larger budget; smaller files retain the
 # configured baseline so normal parsing is not cut off by an arbitrarily low
 # byte-scaled timeout.
 MOLOP_PARSE_TIMEOUT_REFERENCE_BYTES = 10 * 1024 * 1024
+RUSTFS_PARSE_DOWNLOAD_CHUNK_SIZE = 4 * 1024 * 1024
 
 
 def _is_no_calculation_frames_message(message: str | None) -> bool:
@@ -465,23 +467,29 @@ def _fast_molop_ingestion_enabled() -> bool:
 def _parsed_artifact_requires_isolated_frame_persistence(
     parsed: _ParsedArtifact,
 ) -> bool:
-    """Use per-frame savepoints for parser results already known to be partial.
+    """Return whether a known persistence error requires a real savepoint.
 
-    The deferred writer batches revision-local rows by table.  That is fast for
-    a clean result, but a database constraint discovered only at the final
-    batch flush can otherwise roll back every frame in the file.  A parser
-    diagnostic or a partial frame record is already a reliable signal that
-    this file needs the regular per-frame boundary, which preserves all valid
-    sibling frames while keeping clean files on the bulk path.
+    MolOP parse/completeness diagnostics do not mean that the corresponding
+    frame rows are unsafe to write.  Routing every partial source through the
+    regular per-frame ORM path made a file with one bad frame discard the
+    batch writer for all of its valid sibling frames.  The deferred writer
+    already checkpoints its pending rows around each frame, so parser and
+    inference diagnostics can use the fast path and still retain the valid
+    records.
+
+    Only an explicit diagnostic from the persistence stage is evidence that a
+    final bulk flush might need an isolated database boundary.  Such a
+    diagnostic is normally produced by a retry/recovery caller rather than by
+    MolOP itself, but keeping the escape hatch makes the safety rule explicit.
     """
 
-    if parsed.parse_diagnostics:
-        return True
-    return any(
-        record.frame.parse_completeness is ParseCompleteness.PARTIAL
-        or bool(record.frame.parse_diagnostics)
+    diagnostics = (*parsed.parse_diagnostics,)
+    diagnostics += tuple(
+        diagnostic
         for record in parsed.frame_records
+        for diagnostic in record.frame.parse_diagnostics
     )
+    return any(diagnostic.get("stage") == "persistence" for diagnostic in diagnostics)
 
 
 def _get_molop_process_pool(n_jobs: int) -> ProcessPoolExecutor:
@@ -513,6 +521,44 @@ def _get_molop_process_pool(n_jobs: int) -> ProcessPoolExecutor:
     return process_pool
 
 
+def _warm_molop_process_worker(delay_seconds: float = 0.25) -> int:
+    """Return the child PID after the shared MolOP initializer has run.
+
+    The short delay is intentional: a zero-work warmup can be consumed by the
+    first child before ``ProcessPoolExecutor`` has finished spawning the rest
+    of the pool, so it does not actually remove the cold-start penalty from
+    the other workers.
+    """
+
+    sleep(delay_seconds)
+    return os.getpid()
+
+
+async def warm_molop_process_pool() -> int:
+    """Start every shared MolOP child before the first upload reaches it.
+
+    ``ProcessPoolExecutor`` starts children lazily.  Without an explicit warm
+    boundary, the first small upload pays the import/configuration cost once
+    per child while its files appear to be parsing serially.  Submit one
+    harmless task per configured worker so the durable upload worker reaches a
+    steady-state pool before claiming user work.
+    """
+
+    workers = molop_process_worker_count()
+    pool = _get_molop_process_pool(get_settings().molop_batch_n_jobs)
+    loop = asyncio.get_running_loop()
+    warmed: set[int] = set()
+    for _ in range(3):
+        warmup = asyncio.gather(
+            *(loop.run_in_executor(pool, _warm_molop_process_worker) for _ in range(workers))
+        )
+        results = await _await_cancellation_safe(warmup)
+        warmed.update(int(pid) for pid in results)
+        if len(warmed) >= workers:
+            break
+    return len(warmed)
+
+
 def _get_storage_process_pool(n_jobs: int) -> ProcessPoolExecutor:
     """Return the reusable process pool for RustFS upload and HEAD validation."""
 
@@ -538,6 +584,39 @@ def _get_storage_process_pool(n_jobs: int) -> ProcessPoolExecutor:
     if previous_pool is not None:
         previous_pool.shutdown(wait=True, cancel_futures=True)
     return process_pool
+
+
+def _warm_storage_process_worker(
+    settings: RustFSSettings,
+    delay_seconds: float = 0.25,
+) -> int:
+    """Initialize one RustFS child client before user work reaches the pool."""
+
+    _storage_worker_store_for(settings)
+    sleep(delay_seconds)
+    return os.getpid()
+
+
+async def warm_storage_process_pool() -> int:
+    """Start and initialize every shared RustFS storage child."""
+
+    workers = max(1, get_settings().upload_max_concurrency)
+    pool = _get_storage_process_pool(workers)
+    settings = RustFSSettings()
+    loop = asyncio.get_running_loop()
+    warmed: set[int] = set()
+    for _ in range(3):
+        warmup = asyncio.gather(
+            *(
+                loop.run_in_executor(pool, _warm_storage_process_worker, settings)
+                for _ in range(workers)
+            )
+        )
+        results = await _await_cancellation_safe(warmup)
+        warmed.update(int(pid) for pid in results)
+        if len(warmed) >= workers:
+            break
+    return len(warmed)
 
 
 async def close_molop_process_pool() -> None:
@@ -1027,22 +1106,49 @@ def _process_frame_chunk_worker(
 ) -> tuple[_ProcessedFrame, ...]:
     """Process a frame chunk after one-time worker initialization."""
 
+    # A frame-by-frame MolGR call pays the native boundary and topology
+    # scheduler overhead once per frame.  The outer ProcessPoolExecutor is
+    # already the shared CPU admission boundary, so use MolOP's native batch
+    # API inside one pool task with one native worker.  This keeps the total
+    # number of active CPU slots bounded by the shared process pool while
+    # still letting MolGR amortize its C++ setup over the whole frame chunk.
+    candidates = [
+        frame
+        for frame, _fallback_index in frames
+        if isinstance(frame, BaseCalcFrame)
+        and getattr(frame, "_rdmol", None) is None
+        and not frame.bonds
+        and bool(frame.atoms)
+        and frame.topology_reconstruction_status is None
+    ]
+    if candidates:
+        configure_molecular_graph_reconstruction(allow_native_parallel=True)
+        try:
+            results = reconstruct_topologies_batch(
+                candidates,
+                max_workers=1,
+                queue_size=max(1, len(candidates)),
+                ordered=False,
+                raise_on_error=False,
+                retain_results=True,
+            )
+        finally:
+            configure_molecular_graph_reconstruction()
+        if len(results) != len(candidates):
+            raise RuntimeError(
+                "MolOP native batch reconstruction returned an incomplete frame result set"
+            )
+        for frame, result in zip(candidates, results, strict=True):
+            frame._apply_batch_reconstruction_result(result)
+
     return tuple(
         _process_frame_chunk_item(frame, fallback_index, schema_version)
         for frame, fallback_index in frames
     )
 
 
-def _store_payload_worker(
-    settings: RustFSSettings,
-    object_key: str,
-    source: bytes | Path,
-    media_type: str,
-    content_sha256: str | None,
-    size_bytes: int | None,
-    check_existing_object: bool,
-) -> Any:
-    """Process-pool entry point for one RustFS transfer plus HEAD check."""
+def _storage_worker_store_for(settings: RustFSSettings) -> RustFSObjectStore:
+    """Return the child-local RustFS client, initializing its bucket once."""
 
     global _storage_worker_store, _storage_worker_store_key, _storage_worker_bucket_ready
     settings_key = (
@@ -1067,6 +1173,21 @@ def _store_payload_worker(
     if not _storage_worker_bucket_ready:
         store.ensure_bucket()
         _storage_worker_bucket_ready = True
+    return store
+
+
+def _store_payload_worker(
+    settings: RustFSSettings,
+    object_key: str,
+    source: bytes | Path,
+    media_type: str,
+    content_sha256: str | None,
+    size_bytes: int | None,
+    check_existing_object: bool,
+) -> Any:
+    """Process-pool entry point for one RustFS transfer plus HEAD check."""
+
+    store = _storage_worker_store_for(settings)
     if check_existing_object and store.exists(object_key):
         return store.head(object_key)
     if isinstance(source, Path):
@@ -1086,6 +1207,37 @@ def _store_payload_worker(
         content_type=media_type,
         metadata={"ingestion": "artifact-upload"},
     )
+
+
+def _download_payload_worker(
+    settings: RustFSSettings,
+    object_key: str,
+    destination: Path,
+    expected_size: int,
+    expected_sha256: str,
+) -> tuple[int, str]:
+    """Stream one staged object to the parser spool in a storage child."""
+
+    maximum = get_settings().max_upload_bytes
+    if expected_size > maximum:
+        raise ArtifactUploadError(f"uploaded artifact exceeds the {maximum}-byte limit")
+    digest = sha256()
+    size = 0
+    store = _storage_worker_store_for(settings)
+    with destination.open("wb") as output:
+        for chunk in store.iter_bytes(
+            object_key,
+            chunk_size=RUSTFS_PARSE_DOWNLOAD_CHUNK_SIZE,
+        ):
+            size += len(chunk)
+            if size > expected_size or size > maximum:
+                raise ArtifactUploadError("stored artifact bytes exceed database identity")
+            digest.update(chunk)
+            output.write(chunk)
+    actual_sha256 = digest.hexdigest()
+    if size != expected_size or actual_sha256 != expected_sha256:
+        raise ArtifactUploadError("stored artifact bytes do not match database identity")
+    return size, actual_sha256
 
 
 def _parsed_artifact_from_chem_file(
@@ -2941,7 +3093,14 @@ def _persist_parsed_artifact(
     # ``persist_parsed_files`` before calling us.
     if not parsed.frame_records and parsed.source_frame_count:
         parsed = _materialize_parsed_artifacts([parsed])[0]
-    isolated_frame_persistence = _parsed_artifact_requires_isolated_frame_persistence(parsed)
+    has_parser_diagnostics = bool(parsed.parse_diagnostics) or any(
+        record.frame.parse_completeness is ParseCompleteness.PARTIAL
+        or bool(record.frame.parse_diagnostics)
+        for record in parsed.frame_records
+    )
+    isolated_frame_persistence = _parsed_artifact_requires_isolated_frame_persistence(
+        parsed
+    ) or (has_parser_diagnostics and not defer_reconciliation)
     artifact = ingestion.artifact_file
     if existing_revision_ids is None:
         existing_revision_ids = {
@@ -4167,16 +4326,41 @@ class ArtifactUploadService:
             await session.commit()
 
         try:
-            stored = await asyncio.to_thread(
-                cls._store_payload,
-                settings,
-                object_key,
-                source,
-                resolved_media_type,
-                content_sha256=digest,
-                size_bytes=size_bytes,
-                check_existing_object=check_existing_object,
-            )
+            store_function = getattr(cls._store_payload, "__func__", cls._store_payload)
+            if store_function is not _ORIGINAL_STORE_PAYLOAD:
+                # Preserve the test/extension seam for callers that replace
+                # the legacy four-argument store hook.
+                stored = await asyncio.to_thread(
+                    cls._store_payload,
+                    settings,
+                    object_key,
+                    source,
+                    resolved_media_type,
+                    content_sha256=digest,
+                    size_bytes=size_bytes,
+                    check_existing_object=check_existing_object,
+                )
+            else:
+                # Single-file and batch staging must share the same persistent
+                # RustFS process pool. Creating a boto3 client and bucket
+                # session per HTTP upload makes many small files look serial;
+                # the child-local store keeps the connection warm across all
+                # upload sessions.
+                storage_pool = _get_storage_process_pool(get_settings().upload_max_concurrency)
+                loop = asyncio.get_running_loop()
+                stored = await _await_cancellation_safe(
+                    loop.run_in_executor(
+                        storage_pool,
+                        _store_payload_worker,
+                        settings,
+                        object_key,
+                        source,
+                        resolved_media_type,
+                        digest if isinstance(source, Path) else None,
+                        size_bytes if isinstance(source, Path) else None,
+                        check_existing_object,
+                    )
+                )
             if stored.size != size_bytes or stored.sha256 != digest:
                 raise ArtifactUploadError(
                     f"RustFS metadata mismatch for s3://{stored.bucket}/{stored.key}"
@@ -4309,22 +4493,29 @@ class ArtifactUploadService:
                 raise ArtifactUploadError("only calculation output artifacts can be parsed")
             if artifact.storage_status is not StorageStatus.AVAILABLE:
                 raise ArtifactUploadError("artifact bytes are not available for parsing")
-            async with _rustfs_download_submission_slots():
-                payload = await asyncio.to_thread(
-                    cls._load_payload,
-                    RustFSSettings().model_copy(update={"bucket": artifact.bucket}),
-                    artifact.object_key,
+            with tempfile.TemporaryDirectory(prefix="tricycle-staged-parse-") as directory:
+                parser_source = Path(directory) / _safe_parser_suffix(artifact.original_filename)
+                async with _rustfs_download_submission_slots():
+                    storage_pool = _get_storage_process_pool(
+                        get_settings().upload_max_concurrency
+                    )
+                    loop = asyncio.get_running_loop()
+                    await _await_cancellation_safe(
+                        loop.run_in_executor(
+                            storage_pool,
+                            _download_payload_worker,
+                            RustFSSettings().model_copy(update={"bucket": artifact.bucket}),
+                            artifact.object_key,
+                            parser_source,
+                            artifact.size_bytes,
+                            artifact.content_sha256,
+                        )
+                    )
+                parsed = await _run_molop_file_pipeline(
+                    parser_source,
+                    artifact.original_filename,
+                    artifact_sha256=artifact.content_sha256,
                 )
-            if len(payload) != artifact.size_bytes or sha256(payload).hexdigest() != (
-                artifact.content_sha256
-            ):
-                raise ArtifactUploadError("stored artifact bytes do not match database identity")
-            _require_upload_size(payload)
-            parsed = await _run_molop_file_pipeline(
-                payload,
-                artifact.original_filename,
-                artifact_sha256=artifact.content_sha256,
-            )
             return ParsedArtifactTask(artifact_id=artifact_id, started_at=started_at, parsed=parsed)
         except Exception as error:
             return ParsedArtifactTask(artifact_id=artifact_id, started_at=started_at, parsed=error)
@@ -4514,7 +4705,7 @@ class ArtifactUploadService:
         worker_lease_by_artifact_id: Mapping[UUID, tuple[UUID | None, datetime | None]]
         | None = None,
         refresh_statistics: bool = True,
-        defer_thermodynamic_refresh: bool = False,
+        defer_thermodynamic_refresh: bool = True,
     ) -> ParseCleanupSummary:
         """Delete all materialized parse state before a clean reparse.
 
@@ -4619,7 +4810,7 @@ class ArtifactUploadService:
         force_reparse: bool = False,
         previous_results_cleared: bool = False,
         refresh_statistics: bool = False,
-        defer_thermodynamic_refresh: bool = False,
+        defer_thermodynamic_refresh: bool = True,
     ) -> dict[UUID, ArtifactUploadResult | Exception]:
         """Reparse staged objects through the compatibility batch pipeline.
 
@@ -4953,7 +5144,7 @@ class ArtifactUploadService:
         reparse_failed_ingestions: bool = False,
         force_reparse: bool = False,
         previous_results_cleared: bool = False,
-        defer_thermodynamic_refresh: bool = False,
+        defer_thermodynamic_refresh: bool = True,
     ) -> tuple[
         dict[int, _PreparedCalculationUpload],
         dict[int, ArtifactBatchUploadItem],
@@ -5260,7 +5451,7 @@ class ArtifactUploadService:
         reparse_failed_ingestions: bool = False,
         force_reparse: bool = False,
         previous_results_cleared: bool = False,
-        defer_thermodynamic_refresh: bool = False,
+        defer_thermodynamic_refresh: bool = True,
         _preparsed_tasks: Mapping[int, ParsedArtifactTask] | None = None,
         _prepared_uploads: Mapping[int, _PreparedCalculationUpload] | None = None,
     ) -> ArtifactBatchUploadResult:
@@ -6238,4 +6429,6 @@ __all__ = [
     "ArtifactUploadService",
     "MolOPFileParseTimeoutError",
     "molop_process_worker_count",
+    "warm_molop_process_pool",
+    "warm_storage_process_pool",
 ]

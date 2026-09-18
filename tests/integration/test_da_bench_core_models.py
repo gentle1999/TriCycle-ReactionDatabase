@@ -172,14 +172,14 @@ def test_real_da_fixture_round_trips_through_core_business_models(
             assert artifact.artifact_kind is ArtifactKind.CALCULATION_OUTPUT
             assert loaded_protocol.qm_software is QMSoftware.GAUSSIAN
 
-            unloaded = session.exec(select(Geometry)).first()
+            unloaded = session.exec(select(Geometry).limit(1)).first()
             assert unloaded is not None
             assert "internal_coordinates" in inspect(unloaded).unloaded
             with pytest.raises(InvalidRequestError, match="raiseload"):
                 _ = unloaded.internal_coordinates
 
             loaded = session.exec(
-                select(Geometry).options(undefer(Geometry.internal_coordinates))
+                select(Geometry).options(undefer(Geometry.internal_coordinates)).limit(1)
             ).first()
             assert loaded is not None
             assert isinstance(loaded.internal_coordinates, np.ndarray)

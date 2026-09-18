@@ -34,3 +34,9 @@ services:
       bootstrap:
         condition: service_completed_successfully
     volumes: *compute-ca-volume
+
+  profile-refresh-worker:
+    depends_on: !override
+      bootstrap:
+        condition: service_completed_successfully
+    volumes: *compute-ca-volume

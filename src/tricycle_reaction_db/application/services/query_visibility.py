@@ -57,6 +57,7 @@ from tricycle_reaction_db.domain.enums import (
     ParseStatus,
     StorageStatus,
     ThermodynamicProfileSourceVisibility,
+    TransitionStateInferenceStatus,
 )
 
 
@@ -199,6 +200,31 @@ def visible_artifact_ids(scope: QueryVisibilityScope) -> Any:
     return select(col(ArtifactFile.id)).where(scope.artifact_predicate())
 
 
+def visible_calculation_frame_ingestion_predicate(
+    frame_model: Any = CalculationFrame,
+    revision_model: Any = ParseRevision,
+    ingestion_model: Any = ArtifactIngestion,
+) -> Any:
+    """Authorize one persisted frame from a successful or partial ingestion.
+
+    ``ArtifactIngestion.PARTIAL`` means that at least one piece of the file
+    failed; it does not mean that every persisted frame is unusable.  Frame
+    persistence is isolated at the frame boundary, so a frame marked
+    ``COMPLETE`` remains valid evidence even when a sibling frame or a TS
+    inference failed.  Keep the decision at frame granularity instead of
+    treating the ingestion status as an all-or-nothing visibility switch.
+    """
+
+    return or_(
+        col(ingestion_model.status) == ArtifactIngestionStatus.SUCCEEDED,
+        and_(
+            col(ingestion_model.status) == ArtifactIngestionStatus.PARTIAL,
+            col(revision_model.status) == ParseStatus.SUCCEEDED,
+            col(frame_model.parse_completeness) == ParseCompleteness.COMPLETE,
+        ),
+    )
+
+
 def visible_parse_revision_ids(scope: QueryVisibilityScope) -> Any:
     if scope.unrestricted:
         return select(col(ParseRevision.id))
@@ -215,7 +241,20 @@ def visible_parse_revision_ids(scope: QueryVisibilityScope) -> Any:
         .where(
             scope.derived_artifact_predicate(),
             col(ParseRevision.status) == ParseStatus.SUCCEEDED,
-            col(ArtifactIngestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+            or_(
+                col(ArtifactIngestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+                and_(
+                    col(ArtifactIngestion.status) == ArtifactIngestionStatus.PARTIAL,
+                    select(1)
+                    .select_from(CalculationFrame)
+                    .where(
+                        col(CalculationFrame.parse_revision_id) == col(ParseRevision.id),
+                        col(CalculationFrame.parse_completeness)
+                        == ParseCompleteness.COMPLETE,
+                    )
+                    .exists(),
+                ),
+            ),
         )
     )
 
@@ -250,7 +289,7 @@ def visible_frame_ids(scope: QueryVisibilityScope) -> Any:
             .where(
                 col(ArtifactFile.project_id) == scope.requested_project_id,
                 col(ArtifactFile.storage_status) != StorageStatus.RETIRED,
-                col(ArtifactIngestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+                visible_calculation_frame_ingestion_predicate(),
                 col(ParseRevision.status) == ParseStatus.SUCCEEDED,
                 col(Geometry.project_id) == scope.requested_project_id,
                 col(MolecularTopologyDerivation.project_id) == scope.requested_project_id,
@@ -289,7 +328,7 @@ def visible_frame_ids(scope: QueryVisibilityScope) -> Any:
         )
         .where(
             scope.derived_artifact_predicate(),
-            col(ArtifactIngestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+            visible_calculation_frame_ingestion_predicate(),
             _derived_project_owner_is_visible(scope, col(Geometry.project_id)),
             col(Geometry.project_id) == col(ArtifactFile.project_id),
             _protocol_project_is_visible(
@@ -343,7 +382,7 @@ def _visible_geometry_ids_from_frames(scope: QueryVisibilityScope) -> Any:
         )
         .where(
             scope.derived_artifact_predicate(),
-            col(ArtifactIngestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+            visible_calculation_frame_ingestion_predicate(),
             _derived_project_owner_is_visible(scope, col(Geometry.project_id)),
             col(Geometry.project_id) == col(ArtifactFile.project_id),
             _protocol_project_is_visible(
@@ -490,7 +529,7 @@ def _successful_source_project_ids_for_geometry(geometry_id: Any) -> Any:
             col(frame.geometry_id) == geometry_id,
             col(artifact.storage_status) != StorageStatus.RETIRED,
             col(revision.status) == ParseStatus.SUCCEEDED,
-            col(ingestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+            visible_calculation_frame_ingestion_predicate(frame, revision, ingestion),
         )
         .distinct()
     )
@@ -515,7 +554,7 @@ def _successful_source_project_ids_for_topology(topology_id: Any) -> Any:
             col(geometry.topology_id) == topology_id,
             col(artifact.storage_status) != StorageStatus.RETIRED,
             col(revision.status) == ParseStatus.SUCCEEDED,
-            col(ingestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+            visible_calculation_frame_ingestion_predicate(frame, revision, ingestion),
         )
     )
     endpoint = aliased(TransitionStateEndpoint, name="visibility_topology_endpoint")
@@ -549,7 +588,11 @@ def _successful_source_project_ids_for_topology(topology_id: Any) -> Any:
             col(endpoint.topology_id) == topology_id,
             col(endpoint_artifact.storage_status) != StorageStatus.RETIRED,
             col(endpoint_revision.status) == ParseStatus.SUCCEEDED,
-            col(endpoint_ingestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+            visible_calculation_frame_ingestion_predicate(
+                endpoint_frame,
+                endpoint_revision,
+                endpoint_ingestion,
+            ),
         )
     )
     return geometry_projects.union(endpoint_projects)
@@ -582,10 +625,14 @@ def _successful_source_project_ids_for_mapped_reaction(mapped_reaction_id: Any) 
             col(node.mapped_reaction_id) == mapped_reaction_id,
             col(artifact.storage_status) != StorageStatus.RETIRED,
             col(revision.status) == ParseStatus.SUCCEEDED,
-            col(ingestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+            visible_calculation_frame_ingestion_predicate(frame, revision, ingestion),
         )
     )
     inference = aliased(TransitionStateInference, name="visibility_mapped_inference")
+    inference_frame = aliased(
+        CalculationFrame,
+        name="visibility_mapped_inference_frame",
+    )
     inference_revision = aliased(ParseRevision, name="visibility_mapped_inference_revision")
     inference_artifact = aliased(ArtifactFile, name="visibility_mapped_inference_artifact")
     inference_ingestion = aliased(
@@ -595,6 +642,10 @@ def _successful_source_project_ids_for_mapped_reaction(mapped_reaction_id: Any) 
     inference_projects: Any = (
         select(col(inference_artifact.project_id).label("project_id"))
         .select_from(inference)
+        .join(
+            inference_frame,
+            col(inference_frame.id) == col(inference.calculation_frame_id),
+        )
         .join(
             inference_revision,
             col(inference.parse_revision_id) == col(inference_revision.id),
@@ -611,7 +662,12 @@ def _successful_source_project_ids_for_mapped_reaction(mapped_reaction_id: Any) 
             col(inference.mapped_reaction_id) == mapped_reaction_id,
             col(inference_artifact.storage_status) != StorageStatus.RETIRED,
             col(inference_revision.status) == ParseStatus.SUCCEEDED,
-            col(inference_ingestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+            col(inference.status) == TransitionStateInferenceStatus.SUCCEEDED,
+            visible_calculation_frame_ingestion_predicate(
+                inference_frame,
+                inference_revision,
+                inference_ingestion,
+            ),
         )
     )
     return calculation_projects.union(inference_projects)
@@ -649,10 +705,14 @@ def _successful_source_project_ids_for_logical_reaction(logical_reaction_id: Any
             col(mapped_reaction.logical_reaction_id) == logical_reaction_id,
             col(artifact.storage_status) != StorageStatus.RETIRED,
             col(revision.status) == ParseStatus.SUCCEEDED,
-            col(ingestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+            visible_calculation_frame_ingestion_predicate(frame, revision, ingestion),
         )
     )
     inference = aliased(TransitionStateInference, name="visibility_logical_inference")
+    inference_frame = aliased(
+        CalculationFrame,
+        name="visibility_logical_inference_frame",
+    )
     inference_mapped_reaction = aliased(
         MappedReaction,
         name="visibility_logical_inference_mapped_reaction",
@@ -666,6 +726,10 @@ def _successful_source_project_ids_for_logical_reaction(logical_reaction_id: Any
     inference_projects: Any = (
         select(col(inference_artifact.project_id).label("project_id"))
         .select_from(inference)
+        .join(
+            inference_frame,
+            col(inference_frame.id) == col(inference.calculation_frame_id),
+        )
         .join(
             inference_mapped_reaction,
             col(inference.mapped_reaction_id) == col(inference_mapped_reaction.id),
@@ -686,7 +750,12 @@ def _successful_source_project_ids_for_logical_reaction(logical_reaction_id: Any
             col(inference_mapped_reaction.logical_reaction_id) == logical_reaction_id,
             col(inference_artifact.storage_status) != StorageStatus.RETIRED,
             col(inference_revision.status) == ParseStatus.SUCCEEDED,
-            col(inference_ingestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+            col(inference.status) == TransitionStateInferenceStatus.SUCCEEDED,
+            visible_calculation_frame_ingestion_predicate(
+                inference_frame,
+                inference_revision,
+                inference_ingestion,
+            ),
         )
     )
     return calculation_projects.union(inference_projects)
@@ -875,7 +944,7 @@ def _frame_source_is_visible(scope: QueryVisibilityScope, frame_id: Any) -> Any:
                 col(frame.id) == frame_id,
                 col(artifact.project_id) == scope.requested_project_id,
                 col(artifact.storage_status) != StorageStatus.RETIRED,
-                col(ingestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+                visible_calculation_frame_ingestion_predicate(frame, revision, ingestion),
                 col(revision.status) == ParseStatus.SUCCEEDED,
                 col(geometry.project_id) == scope.requested_project_id,
                 col(derivation.project_id) == scope.requested_project_id,
@@ -905,7 +974,7 @@ def _frame_source_is_visible(scope: QueryVisibilityScope, frame_id: Any) -> Any:
         .where(
             col(frame.id) == frame_id,
             scope.derived_artifact_predicate(artifact),
-            col(ingestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+            visible_calculation_frame_ingestion_predicate(frame, revision, ingestion),
             col(revision.status) == ParseStatus.SUCCEEDED,
             _derived_project_owner_is_visible(scope, col(geometry.project_id)),
             col(geometry.project_id) == col(artifact.project_id),
@@ -1052,8 +1121,7 @@ def _profile_state_is_visible(
             ingestion_is_visible,
             and_(
                 col(ArtifactIngestion.status) == ArtifactIngestionStatus.PARTIAL,
-                col(ParseRevision.parse_completeness) == ParseCompleteness.COMPLETE,
-                col(ParseRevision.source_complete).is_(True),
+                col(CalculationFrame.parse_completeness) == ParseCompleteness.COMPLETE,
             ),
         )
     if scope.uses_project_owned_fast_path:
@@ -1129,6 +1197,7 @@ def _profile_state_is_visible(
                     col(ArtifactFile.storage_status) != StorageStatus.RETIRED,
                     ingestion_is_visible,
                     col(ParseRevision.status) == ParseStatus.SUCCEEDED,
+                    col(CalculationFrame.parse_completeness) == ParseCompleteness.COMPLETE,
                     _derived_project_owner_is_visible(scope, col(Geometry.project_id)),
                     col(Geometry.project_id) == col(ArtifactFile.project_id),
                     _protocol_project_is_visible(
@@ -1525,7 +1594,7 @@ def _mapped_reaction_ids_with_calculations(
         )
         .where(
             scope.derived_artifact_predicate(),
-            col(ArtifactIngestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+            visible_calculation_frame_ingestion_predicate(),
             col(ParseRevision.status) == ParseStatus.SUCCEEDED,
             col(Geometry.project_id) == col(ArtifactFile.project_id),
             _protocol_project_is_visible(
@@ -1560,6 +1629,7 @@ def _mapped_reaction_ids_with_calculations(
 def _mapped_reaction_ids_with_inferences(revision_ids: Any) -> Any:
     return select(col(TransitionStateInference.mapped_reaction_id)).where(
         col(TransitionStateInference.mapped_reaction_id).is_not(None),
+        col(TransitionStateInference.status) == TransitionStateInferenceStatus.SUCCEEDED,
         col(TransitionStateInference.parse_revision_id).in_(revision_ids),
     )
 
@@ -1639,9 +1709,17 @@ def _mapped_reaction_id_has_project_source(
         )
         .exists()
     )
+    inference_frame = aliased(
+        CalculationFrame,
+        name="visibility_project_inference_frame",
+    )
     inference_source = (
         select(1)
         .select_from(TransitionStateInference)
+        .join(
+            inference_frame,
+            col(inference_frame.id) == col(TransitionStateInference.calculation_frame_id),
+        )
         .join(
             ParseRevision,
             col(ParseRevision.id) == col(TransitionStateInference.parse_revision_id),
@@ -1656,7 +1734,12 @@ def _mapped_reaction_id_has_project_source(
             col(ArtifactFile.project_id) == scope.requested_project_id,
             col(ArtifactFile.storage_status) != StorageStatus.RETIRED,
             col(ParseRevision.status) == ParseStatus.SUCCEEDED,
-            col(ArtifactIngestion.status) == ArtifactIngestionStatus.SUCCEEDED,
+            col(TransitionStateInference.status) == TransitionStateInferenceStatus.SUCCEEDED,
+            visible_calculation_frame_ingestion_predicate(
+                inference_frame,
+                ParseRevision,
+                ArtifactIngestion,
+            ),
         )
         .exists()
     )
@@ -2226,6 +2309,7 @@ __all__ = [
     "topology_derivation_id_is_visible",
     "topology_id_is_visible",
     "visible_artifact_ids",
+    "visible_calculation_frame_ingestion_predicate",
     "visible_frame_ids",
     "visible_geometry_ids",
     "visible_parse_revision_ids",

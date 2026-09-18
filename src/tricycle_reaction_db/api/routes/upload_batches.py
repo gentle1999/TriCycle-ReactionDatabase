@@ -46,11 +46,10 @@ UPLOAD_PREFLIGHT_HEADERS = {"X-Upload-Rejection-Stage": "preflight"}
 async def _spool_upload(file: UploadFile, path: Path, *, maximum: int) -> int:
     size = 0
     with path.open("wb") as spool:
-        while chunk := await file.read(min(1024 * 1024, maximum + 1 - size)):
-            spool.write(chunk)
+        while chunk := await file.read(1024 * 1024):
             size += len(chunk)
-            if size > maximum:
-                break
+            if size <= maximum:
+                spool.write(chunk)
     return size
 
 
@@ -292,14 +291,23 @@ async def upload_batch_files(
                         maximum=settings.max_upload_bytes,
                     )
                     if size > settings.max_upload_bytes:
-                        raise HTTPException(
-                            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-                            detail=(
-                                "uploaded artifact exceeds the "
-                                f"{settings.max_upload_bytes}-byte limit"
-                            ),
-                            headers=UPLOAD_PREFLIGHT_HEADERS,
+                        payloads.append(
+                            (
+                                client_file_id,
+                                ArtifactUploadPayload(
+                                    filename=filename,
+                                    media_type=file.content_type or "application/octet-stream",
+                                    payload=None,
+                                    error_code="upload_file_too_large",
+                                    error_message=(
+                                        "uploaded artifact exceeds the "
+                                        f"{settings.max_upload_bytes}-byte limit"
+                                    ),
+                                    declared_size_bytes=size,
+                                ),
+                            )
                         )
+                        continue
                     total_bytes += size
                     if total_bytes > settings.max_batch_bytes:
                         raise HTTPException(

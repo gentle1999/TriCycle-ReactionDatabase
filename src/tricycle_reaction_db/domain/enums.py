@@ -343,6 +343,13 @@ class ThermodynamicProfileSourceVisibility(StrEnum):
     HIDDEN = "hidden"
 
 
+class ThermodynamicProfileRefreshJobStatus(StrEnum):
+    """Durable state of one coalesced mapped-reaction profile refresh job."""
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+
+
 class MappedReactionNodeRole(StrEnum):
     REACTANT = "reactant"
     REACTANT_COMPLEX = "reactant_complex"
@@ -409,6 +416,7 @@ __all__ = [
     "MappedReactionKind",
     "MappedReactionNodeRole",
     "ThermodynamicProfileSourceVisibility",
+    "ThermodynamicProfileRefreshJobStatus",
     "SCFStatus",
     "SelectedEnergyKind",
     "ScientificArrayKind",

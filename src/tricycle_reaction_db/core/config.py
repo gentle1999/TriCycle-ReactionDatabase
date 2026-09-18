@@ -89,12 +89,31 @@ class Settings(BaseSettings):
     # parsing so a page reload or API restart cannot discard accepted files.
     upload_worker_poll_interval_seconds: float = Field(default=1.0, gt=0.05, le=300.0)
     upload_worker_lease_seconds: int = Field(default=3_600, ge=60, le=86_400)
-    # Deferred thermodynamic profiles are refreshed at queue drain.  A
-    # continuous import still gets a bounded refresh point at this delay.
+    # Deferred thermodynamic profiles are coalesced in a durable queue.  A
+    # short debounce joins adjacent source writes, while the max delay keeps
+    # a continuously busy import from starving profile refreshes.
+    upload_worker_profile_refresh_debounce_seconds: float = Field(
+        default=2.0,
+        gt=0.0,
+        le=300.0,
+    )
     upload_worker_profile_refresh_max_delay_seconds: float = Field(
         default=60.0,
         gt=0.0,
         le=86_400.0,
+    )
+    upload_worker_profile_refresh_batch_size: int = Field(default=256, ge=1, le=2_048)
+    upload_worker_profile_refresh_lease_seconds: int = Field(
+        default=1_800,
+        ge=60,
+        le=86_400,
+    )
+    # Profile refresh is a separate maintenance process.  It is not started
+    # by the upload-worker; the optional Compose service uses this interval.
+    profile_refresh_worker_poll_interval_seconds: float = Field(
+        default=2.0,
+        gt=0.05,
+        le=300.0,
     )
     upload_client_lease_seconds: int = Field(default=900, ge=60, le=86_400)
     # Compatibility recovery for calculation ingestions created before the

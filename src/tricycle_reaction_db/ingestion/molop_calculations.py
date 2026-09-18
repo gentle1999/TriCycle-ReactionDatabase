@@ -88,6 +88,54 @@ class MolOPFrameRecords:
     array_assignments: tuple[ScientificArrayAssignmentRecord, ...]
 
 
+# Keep the frame adapter's Pydantic serialization focused on fields consumed by
+# the durable calculation DTOs.  MolOP frames also carry raw parser payloads,
+# title cards, resource requests, and duplicate coordinate arrays; serializing
+# those for every trajectory frame is a substantial CPU and allocation cost.
+_FRAME_RECORD_PAYLOAD_FIELDS = {
+    "comments",
+    "source_span",
+    "source_block_sha256",
+    "segment_index",
+    "segment_frame_index",
+    "file_frame_index",
+    "parse_presence",
+    "parse_diagnostics",
+    "parse_completeness",
+    "coordinate_source",
+    "coordinate_provenance",
+    "coordinate_decimal_places",
+    "charge",
+    "multiplicity",
+    "solvent",
+    "temperature",
+    "pressure",
+    "forces",
+    "hessian",
+    "rotation_constants",
+    "energies",
+    "thermal_informations",
+    "molecular_orbitals",
+    "vibrations",
+    "charge_spin_populations",
+    "polarizability",
+    "nmr",
+    "bond_orders",
+    "total_spin",
+    "single_point_properties",
+    "electronic_states",
+    "multireference_result",
+    "status",
+    "geometry_optimization_status",
+    "running_time",
+    "frame_role",
+    "force_source_field",
+    "force_transformation",
+    "topology_reconstruction_backend",
+    "topology_reconstruction_status",
+}
+
+
 class _SourceSpanValues(TypedDict):
     source_start_byte: int | None
     source_end_byte: int | None
@@ -360,6 +408,7 @@ def frame_records_from_molop(
 
     frame_payload = _model_dump(
         frame,
+        include=_FRAME_RECORD_PAYLOAD_FIELDS,
         computed_fields=(
             "parse_diagnostics",
             "coordinate_decimal_places",

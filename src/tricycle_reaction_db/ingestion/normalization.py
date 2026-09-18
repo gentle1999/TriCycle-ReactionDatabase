@@ -657,7 +657,10 @@ def normalize_molgr_stereochemistry(mol: Chem.Mol) -> Chem.Mol:
     """
 
     if mol.HasProp("_tricycle_molgr_stereo_normalized"):
-        return clear_inversion_labile_atom_chirality(mol)
+        # The marker is set only after the coordinate pass and inversion-labile
+        # cleanup have completed. Returning the marked graph avoids repeating
+        # the SMARTS scans when the same frame crosses the topology boundary.
+        return mol
     if _has_single_3d_conformer(mol):
         return infer_molgr_stereochemistry_from_3d(mol)
 
@@ -1015,6 +1018,13 @@ def ensure_serializable_double_bond_stereochemistry(
 ) -> Chem.Mol:
     """Create a writer projection and verify its physical E/Z round trip."""
 
+    if not any(
+        bond.GetStereo() in _SERIALIZED_DOUBLE_BOND_STEREO
+        for bond in mol.GetBonds()  # type: ignore[no-untyped-call]
+    ):
+        projected = Chem.Mol(mol)
+        _clear_bond_directions(projected)
+        return projected
     projected = project_serializable_double_bond_stereochemistry(
         mol,
         preserve_atom_maps=preserve_atom_maps,

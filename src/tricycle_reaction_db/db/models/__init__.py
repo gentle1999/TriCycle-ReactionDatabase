@@ -62,6 +62,7 @@ from tricycle_reaction_db.db.models.reactions import (
     MappedReactionNodeGeometryMapping,
     MappedReactionParticipant,
     MappedReactionThermodynamicProfile,
+    MappedReactionThermodynamicProfileRefreshJob,
     MappedReactionThermodynamicProfileSource,
     WorkflowManifest,
 )
@@ -131,6 +132,7 @@ __all__ = [
     "MappedReactionEdge",
     "MappedReactionParticipant",
     "MappedReactionThermodynamicProfile",
+    "MappedReactionThermodynamicProfileRefreshJob",
     "MappedReactionThermodynamicProfileSource",
     "MappedReactionNode",
     "MappedReactionNodeGeometry",

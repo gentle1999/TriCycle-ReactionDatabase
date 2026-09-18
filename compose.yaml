@@ -182,6 +182,24 @@ services:
         condition: service_healthy
     stop_grace_period: 30s
 
+  # Profile calculation calls synchronous ORM/CPU work. Keep this service
+  # opt-in so ordinary deployments cannot let thermodynamic refreshes block
+  # the upload parser and persistence worker.
+  profile-refresh-worker:
+    <<: *api-service
+    profiles:
+      - profile-refresh
+    command:
+      - tricycle-profile-refresh-worker
+    environment:
+      TRICYCLE_QUERY_STATEMENT_TIMEOUT_MS: ${TRICYCLE_PROFILE_REFRESH_STATEMENT_TIMEOUT_MS:-120000}
+    healthcheck:
+      disable: true
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    stop_grace_period: 30s
+
   frontend:
     image: ${TRICYCLE_FRONTEND_IMAGE:-tricycle-reaction-database-frontend:local}
     build:

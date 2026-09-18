@@ -12,6 +12,7 @@ execute Python/Pint code.
 """
 
 from functools import lru_cache
+from math import pi
 from typing import Any, Final
 
 from molop.unit import atom_ureg
@@ -65,6 +66,12 @@ def magnitude_in(value: Any, target_unit: Any) -> Any:
     # registry (``si_ureg``) is not combined with a Unit object from
     # ``atom_ureg``. Pint resolves the name in the quantity's own registry.
     target_name = target_unit if isinstance(target_unit, str) else str(target_unit)
+    # MolOP emits the common frame quantities in their canonical units.  Pint's
+    # generic ``to`` path is surprisingly expensive for NumPy-backed arrays;
+    # avoid rebuilding conversion metadata when no conversion is required.
+    value_units = getattr(value, "units", None)
+    if value_units is not None and str(value_units) == target_name:
+        return value.magnitude
     return value.to(target_name).magnitude
 
 
@@ -75,15 +82,15 @@ def convert_magnitude(value: Any, source_unit: Any, target_unit: Any) -> Any:
 
 
 def radians_to_degrees(value: Any) -> Any:
-    """Convert radians to degrees through the shared Pint registry."""
+    """Convert raw radians to degrees without entering Pint's hot path."""
 
-    return convert_magnitude(value, RADIAN, DEGREE)
+    return value * (180.0 / pi)
 
 
 def degrees_to_radians(value: Any) -> Any:
-    """Convert degrees to radians through the shared Pint registry."""
+    """Convert raw degrees to radians without entering Pint's hot path."""
 
-    return convert_magnitude(value, DEGREE, RADIAN)
+    return value * (pi / 180.0)
 
 
 def hartree_per_particle_to_kcal_per_mol(value: float) -> float:

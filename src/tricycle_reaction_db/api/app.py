@@ -1,3 +1,4 @@
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -38,14 +39,28 @@ from tricycle_reaction_db.api.routes.graphql import DIRECT_PLAYGROUND_QUERY, cre
 from tricycle_reaction_db.application.rate_limits import close_rate_limit_clients
 from tricycle_reaction_db.application.services.artifact_uploads import (
     close_molop_process_pool,
+    warm_storage_process_pool,
 )
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.session import dispose_engine
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     try:
+        try:
+            warmed_storage_workers = await warm_storage_process_pool()
+            logger.info(
+                "warmed shared RustFS storage process pool workers=%d configured=%d",
+                warmed_storage_workers,
+                get_settings().upload_max_concurrency,
+            )
+        except Exception:
+            # API startup should remain available during a transient RustFS
+            # outage; the persistent pool will retry lazily on the first stage.
+            logger.exception("failed to warm shared RustFS storage process pool")
         async with mcp_http_app.lifespan(mcp_http_app):
             yield
     finally:
