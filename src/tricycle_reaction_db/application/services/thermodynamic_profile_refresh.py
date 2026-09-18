@@ -69,9 +69,7 @@ async def _claim_profile_refresh_jobs(
 
     now = datetime.now(UTC)
     settings = get_settings()
-    lease_expires_at = now + timedelta(
-        seconds=settings.upload_worker_profile_refresh_lease_seconds
-    )
+    lease_expires_at = now + timedelta(seconds=settings.upload_worker_profile_refresh_lease_seconds)
     lease_id = uuid4()
     async with session_factory() as session:
         # A worker crash must not strand a job in ``processing``. Recovery is
@@ -84,10 +82,7 @@ async def _claim_profile_refresh_jobs(
                 == ThermodynamicProfileRefreshJobStatus.PROCESSING,
                 (
                     col(MappedReactionThermodynamicProfileRefreshJob.lease_expires_at).is_(None)
-                    | (
-                        col(MappedReactionThermodynamicProfileRefreshJob.lease_expires_at)
-                        <= now
-                    )
+                    | (col(MappedReactionThermodynamicProfileRefreshJob.lease_expires_at) <= now)
                 ),
             )
             .values(
@@ -107,13 +102,9 @@ async def _claim_profile_refresh_jobs(
         if project_ids is not None:
             predicates.append(col(MappedReaction.project_id).in_(project_ids))
         if not ignore_schedule and allow_while_busy:
-            max_delay = timedelta(
-                seconds=settings.upload_worker_profile_refresh_max_delay_seconds
-            )
+            max_delay = timedelta(seconds=settings.upload_worker_profile_refresh_max_delay_seconds)
             predicates.append(
-                (
-                    col(MappedReactionThermodynamicProfileRefreshJob.priority) > 0
-                )
+                (col(MappedReactionThermodynamicProfileRefreshJob.priority) > 0)
                 | (
                     col(MappedReactionThermodynamicProfileRefreshJob.requested_at)
                     <= now - max_delay
@@ -255,9 +246,7 @@ async def _process_profile_refresh_jobs(
                 )
             ).all()
             reactions_by_id = {
-                reaction.id: reaction
-                for reaction in reactions
-                if isinstance(reaction.id, UUID)
+                reaction.id: reaction for reaction in reactions if isinstance(reaction.id, UUID)
             }
             refreshable = tuple(
                 reaction
@@ -298,9 +287,9 @@ async def _process_profile_refresh_jobs(
             await _refresh_source_visibility(session, refreshed_ids)
             current_reactions = (
                 await session.exec(
-                    select(MappedReaction).where(
-                        col(MappedReaction.id).in_(mapped_reaction_ids)
-                    ).with_for_update()
+                    select(MappedReaction)
+                    .where(col(MappedReaction.id).in_(mapped_reaction_ids))
+                    .with_for_update()
                 )
             ).all()
             jobs = (
@@ -335,10 +324,7 @@ async def _process_profile_refresh_jobs(
                     continue
                 current_generation = reaction.thermodynamic_profile_generation
                 requested_generation = max(job.requested_generation, current_generation)
-                if (
-                    reaction.thermodynamic_profile_materialized_generation
-                    >= requested_generation
-                ):
+                if reaction.thermodynamic_profile_materialized_generation >= requested_generation:
                     await session.delete(job)
                     completed += 1
                     continue
@@ -408,8 +394,7 @@ async def refresh_pending_mapped_reaction_profiles(
         return False
 
     logger.info(
-        "thermodynamic profiles refreshed reason=%s projects=%s jobs=%d batches=%d "
-        "elapsed_ms=%.1f",
+        "thermodynamic profiles refreshed reason=%s projects=%s jobs=%d batches=%d elapsed_ms=%.1f",
         reason,
         ",".join(str(project_id) for project_id in normalized_project_ids or ()) or "all",
         processed,

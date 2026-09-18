@@ -249,8 +249,7 @@ def visible_parse_revision_ids(scope: QueryVisibilityScope) -> Any:
                     .select_from(CalculationFrame)
                     .where(
                         col(CalculationFrame.parse_revision_id) == col(ParseRevision.id),
-                        col(CalculationFrame.parse_completeness)
-                        == ParseCompleteness.COMPLETE,
+                        col(CalculationFrame.parse_completeness) == ParseCompleteness.COMPLETE,
                     )
                     .exists(),
                 ),

@@ -688,8 +688,7 @@ def _bulk_insert_pending_entities(session: Session) -> None:
             # driver/cartridge environments that need the Core executemany
             # fallback while avoiding a deployment-specific performance switch.
             use_copy = (
-                os.getenv("TRICYCLE_FAST_COPY", "1") != "0"
-                and len(rows) >= _FAST_COPY_MIN_ROWS
+                os.getenv("TRICYCLE_FAST_COPY", "1") != "0" and len(rows) >= _FAST_COPY_MIN_ROWS
             )
             if use_copy and _copy_compatible(columns):
                 dialect = session.get_bind().dialect

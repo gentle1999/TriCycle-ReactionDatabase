@@ -1089,14 +1089,16 @@ def persist_molecular_geometry(
         context is None or geometry_key not in context.exact_geometry_keys_loaded
     ):
         geometry = session.exec(
-            select(Geometry).where(
+            select(Geometry)
+            .where(
                 Geometry.topology_id == topology.id,
                 _project_owner_predicate(Geometry.project_id, project_id),
                 Geometry.canonicalization_version == record.geometry.canonicalization_version,
                 Geometry.geometry_hash == record.geometry.geometry_hash,
                 Geometry.charge == record.charge,
                 Geometry.multiplicity == record.multiplicity,
-            ).limit(1)
+            )
+            .limit(1)
         ).first()
         if geometry is not None and context is not None:
             context.geometries_by_hash[geometry_key] = geometry

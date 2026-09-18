@@ -5,7 +5,7 @@ from typing import Any, Literal, cast
 
 from alembic import context
 from molalchemy import alembic_helpers
-from molalchemy.rdkit.types import RdkitBitFingerprint, RdkitMol
+from molalchemy.rdkit.types import RdkitBitFingerprint, RdkitMol, RdkitReaction
 from sqlalchemy import engine_from_config, pool
 from sqlalchemy.dialects.postgresql.base import ischema_names
 from sqlmodel.sql.sqltypes import AutoString
@@ -19,6 +19,7 @@ config = context.config
 # MolAlchemy 0.0.7 does not register cartridge types for PostgreSQL reflection.
 ischema_names.setdefault("mol", RdkitMol)
 ischema_names.setdefault("bfp", RdkitBitFingerprint)
+ischema_names.setdefault("reaction", RdkitReaction)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name, disable_existing_loggers=False)

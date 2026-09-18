@@ -1162,9 +1162,7 @@ class UploadBatchService:
         if len(set(client_file_ids)) != len(client_file_ids):
             raise UploadBatchConflictError("client_file_id must be unique within an upload request")
         total_bytes = sum(
-            max(0, cls._payload_size(upload))
-            for _, upload in files
-            if upload.error_code is None
+            max(0, cls._payload_size(upload)) for _, upload in files if upload.error_code is None
         )
         if len(files) > 1 and total_bytes > settings.max_batch_bytes:
             raise UploadBatchLimitError(

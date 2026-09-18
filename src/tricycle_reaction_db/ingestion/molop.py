@@ -20,6 +20,8 @@ from tricycle_reaction_db.ingestion.normalization import (
 MOLOP_VERSION = version("molop")
 MOLGR_VERSION = version("molgr")
 MOLECULAR_GRAPH_RECONSTRUCTION_FAILURE_POLICY: Literal["return_suspicious"] = "return_suspicious"
+
+
 def configure_molecular_graph_reconstruction(*, allow_native_parallel: bool = False) -> None:
     """Keep calculation frames when MolGR can only return an untrusted topology.
 

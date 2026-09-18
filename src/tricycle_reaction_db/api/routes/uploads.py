@@ -144,6 +144,8 @@ async def upload_artifact_batch(
     with tempfile.TemporaryDirectory(prefix="tricycle-upload-batch-") as spool_directory:
         payloads: list[ArtifactUploadPayload] = []
         total_bytes = 0
+        oversized_message: str | None = None
+        staged_file_count = 0
         for index, file in enumerate(files):
             filename = file.filename or ""
             media_type = file.content_type or "application/octet-stream"
@@ -162,15 +164,15 @@ async def upload_artifact_batch(
             spool_path = Path(spool_directory) / f"{index:08d}.upload"
             size = await _spool_upload(file, spool_path, maximum=maximum)
             if size > maximum:
+                if oversized_message is None:
+                    oversized_message = f"uploaded artifact exceeds the {maximum}-byte limit"
                 payloads.append(
                     ArtifactUploadPayload(
                         filename=filename,
                         media_type=media_type,
                         payload=None,
                         error_code="upload_file_too_large",
-                        error_message=(
-                            f"uploaded artifact exceeds the {maximum}-byte limit"
-                        ),
+                        error_message=(f"uploaded artifact exceeds the {maximum}-byte limit"),
                         declared_size_bytes=size,
                     )
                 )
@@ -189,6 +191,13 @@ async def upload_artifact_batch(
                     payload=None,
                     spool_path=spool_path,
                 )
+            )
+            staged_file_count += 1
+        if oversized_message is not None and staged_file_count == 0:
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail=oversized_message,
+                headers=UPLOAD_PREFLIGHT_HEADERS,
             )
         try:
             submission = await UploadBatchService.create_and_stage(

@@ -3099,9 +3099,9 @@ def _persist_parsed_artifact(
         or bool(record.frame.parse_diagnostics)
         for record in parsed.frame_records
     )
-    isolated_frame_persistence = _parsed_artifact_requires_isolated_frame_persistence(
-        parsed
-    ) or (has_parser_diagnostics and not defer_reconciliation)
+    isolated_frame_persistence = _parsed_artifact_requires_isolated_frame_persistence(parsed) or (
+        has_parser_diagnostics and not defer_reconciliation
+    )
     artifact = ingestion.artifact_file
     if existing_revision_ids is None:
         existing_revision_ids = {
@@ -4497,9 +4497,7 @@ class ArtifactUploadService:
             with tempfile.TemporaryDirectory(prefix="tricycle-staged-parse-") as directory:
                 parser_source = Path(directory) / _safe_parser_suffix(artifact.original_filename)
                 async with _rustfs_download_submission_slots():
-                    storage_pool = _get_storage_process_pool(
-                        get_settings().upload_max_concurrency
-                    )
+                    storage_pool = _get_storage_process_pool(get_settings().upload_max_concurrency)
                     loop = asyncio.get_running_loop()
                     await _await_cancellation_safe(
                         loop.run_in_executor(

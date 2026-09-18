@@ -16,6 +16,7 @@ from sqlalchemy import (
     Float,
     ForeignKeyConstraint,
     Index,
+    Integer,
     Text,
     UniqueConstraint,
     text,
@@ -854,11 +855,15 @@ class MappedReactionThermodynamicProfileRefreshJob(SQLModel, table=True):
             server_default=ThermodynamicProfileRefreshJobStatus.PENDING.value,
         ),
     )
-    priority: int = Field(default=0, nullable=False)
+    priority: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default="0"),
+    )
     requested_at: datetime | None = Field(
         default=None,
         sa_column=Column(
             DateTime(timezone=True),
+            nullable=False,
             server_default=text("now()"),
         ),
     )
@@ -866,18 +871,26 @@ class MappedReactionThermodynamicProfileRefreshJob(SQLModel, table=True):
         default=None,
         sa_column=Column(
             DateTime(timezone=True),
+            nullable=False,
             server_default=text("now()"),
         ),
     )
     lease_id: UUID | None = Field(default=None)
-    lease_expires_at: datetime | None = Field(default=None)
-    attempt_count: int = Field(default=0, nullable=False)
+    lease_expires_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), nullable=True),
+    )
+    attempt_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default="0"),
+    )
     last_error: str | None = Field(default=None, sa_type=Text)
     created_at: datetime | None = created_at_field()
     updated_at: datetime | None = Field(
         default=None,
         sa_column=Column(
             DateTime(timezone=True),
+            nullable=False,
             server_default=text("now()"),
         ),
     )

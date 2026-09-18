@@ -146,8 +146,8 @@ async def test_profile_calculation_does_not_hold_upload_generation_lock(
     """A source write can advance a generation while profile calculation is paused."""
 
     sync_engine = create_engine(get_settings().database_url, pool_pre_ping=True)
-    organization_id, project_id, logical_reaction_id, mapped_reaction_id = (
-        _create_lock_test_graph(sync_engine)
+    organization_id, project_id, logical_reaction_id, mapped_reaction_id = _create_lock_test_graph(
+        sync_engine
     )
     started = Event()
     release = Event()
@@ -272,24 +272,19 @@ async def test_profile_refresh_replaces_stale_rows_and_coalesces_generations() -
             )
             geometry_id = _uuid(sample[4].id, label="Geometry")
             assert (
-                frame is not None
-                and mapped_reaction is not None
-                and logical_reaction is not None
+                frame is not None and mapped_reaction is not None and logical_reaction is not None
             )
             assert mapped_reaction.id is not None
             mapped_reaction_id = mapped_reaction.id
             old_profile = session.exec(
                 select(MappedReactionThermodynamicProfile).where(
-                    col(MappedReactionThermodynamicProfile.mapped_reaction_id)
-                    == mapped_reaction.id
+                    col(MappedReactionThermodynamicProfile.mapped_reaction_id) == mapped_reaction.id
                 )
             ).one()
             old_profile_id = _uuid(old_profile.id, label="old profile")
 
             thermochemistry = session.exec(
-                select(ThermochemistryResult).where(
-                    col(ThermochemistryResult.frame_id) == frame.id
-                )
+                select(ThermochemistryResult).where(col(ThermochemistryResult.frame_id) == frame.id)
             ).one()
             thermochemistry.enthalpy_hartree = -0.95
             thermochemistry.entropy_cal_mol_k = 10.0

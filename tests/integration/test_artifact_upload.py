@@ -652,11 +652,15 @@ def test_partial_frame_parse_persists_valid_sibling_frames(
                 requested_project_id=artifact.project_id,
                 requested_project_permitted=True,
             )
-            visible_frame_id_values = session.exec(
-                visible_frame_ids(visibility_scope).where(
-                    CalculationFrame.parse_revision_id == revision_id
+            visible_frame_id_values = (
+                session.exec(
+                    visible_frame_ids(visibility_scope).where(
+                        CalculationFrame.parse_revision_id == revision_id
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             visible_frame_indices = session.exec(
                 select(CalculationFrame.file_frame_index)
                 .where(CalculationFrame.id.in_(visible_frame_id_values))

@@ -998,11 +998,13 @@ def enqueue_mapped_reaction_profile_refresh(
     existing_jobs = {
         job.mapped_reaction_id: job
         for job in session.exec(
-            select(MappedReactionThermodynamicProfileRefreshJob).where(
+            select(MappedReactionThermodynamicProfileRefreshJob)
+            .where(
                 col(MappedReactionThermodynamicProfileRefreshJob.mapped_reaction_id).in_(
                     mapped_reaction_ids
                 )
-            ).with_for_update()
+            )
+            .with_for_update()
         ).all()
     }
     new_jobs: list[MappedReactionThermodynamicProfileRefreshJob] = []
