@@ -6488,6 +6488,14 @@ table.data-table {
   font-size: 12px;
 }
 
+.artifact-detail-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .entity-back-link {
   width: max-content;
   display: flex;
@@ -7114,6 +7122,10 @@ table.data-table {
 
   .entity-detail-header .command-button svg {
     flex: 0 0 auto;
+  }
+
+  .artifact-detail-actions {
+    max-width: 132px;
   }
 
   .topology-primary-facts,

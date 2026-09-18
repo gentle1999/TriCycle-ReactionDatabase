@@ -182,13 +182,12 @@ services:
         condition: service_healthy
     stop_grace_period: 30s
 
-  # Profile calculation calls synchronous ORM/CPU work. Keep this service
-  # opt-in so ordinary deployments cannot let thermodynamic refreshes block
-  # the upload parser and persistence worker.
+  # Profile calculation calls synchronous ORM/CPU work. It is a separate
+  # service so thermodynamic refreshes cannot block the upload parser and
+  # persistence worker, but it is part of the normal deployment: source
+  # writes enqueue durable refresh jobs and must have a consumer.
   profile-refresh-worker:
     <<: *api-service
-    profiles:
-      - profile-refresh
     command:
       - tricycle-profile-refresh-worker
     environment:

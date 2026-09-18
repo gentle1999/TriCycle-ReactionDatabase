@@ -11,6 +11,7 @@ from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics im
     format_composite_level_of_theory,
 )
 from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics_persistence import (
+    _index_calculation_source_rows,
     _runtime_for_geometry_ids,
 )
 
@@ -447,3 +448,23 @@ def test_profile_runtime_deduplicates_files_and_uses_latest_revision() -> None:
         {first_geometry, second_geometry},
         runtimes,
     ) == pytest.approx(155.0)
+
+
+def test_profile_source_index_reuses_one_query_for_runtime_and_selection() -> None:
+    first_geometry = uuid4()
+    second_geometry = uuid4()
+    first_frame = type("Frame", (), {"id": uuid4(), "geometry_id": first_geometry})()
+    second_frame = type("Frame", (), {"id": uuid4(), "geometry_id": second_geometry})()
+    rows = [
+        (first_frame, None, None, uuid4(), 1, 10.0),
+        (first_frame, None, None, uuid4(), 1, 30.0),
+        (second_frame, None, None, uuid4(), 1, 40.0),
+    ]
+
+    calculation_rows, runtimes, frame_ids = _index_calculation_source_rows(rows)
+
+    assert len(calculation_rows) == 3
+    assert frame_ids == frozenset({first_frame.id, second_frame.id})
+    assert sum(len(files) for files in runtimes.values()) == 3
+    assert runtimes[first_geometry]
+    assert runtimes[second_geometry]

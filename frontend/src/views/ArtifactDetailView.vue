@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { ArrowLeft, Download, FileText, LoaderCircle, Save } from "@lucide/vue";
+import { ArrowLeft, Download, FileText, LoaderCircle, RotateCcw, Save, Trash2 } from "@lucide/vue";
 import { useQuery } from "@tanstack/vue-query";
 import { computed, ref, watch } from "vue";
-import { RouterLink, useRoute } from "vue-router";
+import { RouterLink, useRoute, useRouter } from "vue-router";
 
 import { api, artifactDownloadUrl } from "@/api";
 import ArtifactIngestionStatus from "@/components/ArtifactIngestionStatus.vue";
@@ -16,6 +16,7 @@ import { withoutAccessState } from "@/routeAccessState";
 import type { ArtifactSummary, CalculationFrameSummary, Page, ParseRevisionSummary } from "@/types";
 
 const route = useRoute();
+const router = useRouter();
 const projectContext = useProjectContext();
 const currentProjectId = projectContext.currentProjectId;
 const artifactId = computed(() => typeof route.params.artifactId === "string" ? route.params.artifactId : null);
@@ -52,6 +53,24 @@ const latestParseRevision = computed<ParseRevisionSummary | null>(() => {
 });
 const fileComments = computed(() => latestParseRevision.value?.comments?.items ?? []);
 const canManageNotes = computed(() => projectContext.can("artifact:manage"));
+const canDownloadArtifact = computed(() => Boolean(
+  artifact.value
+  && artifact.value.storage_status === "available"
+  && (artifact.value.visibility === "public" || projectContext.can("artifact:download")),
+));
+const canReparseArtifact = computed(() => Boolean(
+  artifact.value
+  && artifact.value.artifact_kind === "calculation_output"
+  && artifact.value.storage_status === "available"
+  && !["pending", "processing"].includes(artifact.value.ingestion_status ?? "")
+  && projectContext.can("artifact:upload"),
+));
+const canDeleteArtifact = computed(() => projectContext.can("artifact:delete"));
+type ArtifactOperation = "delete" | "reparse";
+const artifactOperation = ref<ArtifactOperation | null>(null);
+const operationError = ref("");
+const operationResult = ref("");
+const operationBusy = computed(() => artifactOperation.value !== null);
 const noteDraft = ref("");
 const noteSaving = ref(false);
 const noteError = ref("");
@@ -97,6 +116,95 @@ async function saveArtifactNotes(): Promise<void> {
     noteError.value = error instanceof Error ? error.message : "备注保存失败";
   } finally {
     noteSaving.value = false;
+  }
+}
+
+function operationErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "操作失败";
+}
+
+function applyAcceptedReparse(item: { status?: string | null; ingestion_status?: string | null }): void {
+  if (!artifact.value) return;
+  const ingestionStatus: ArtifactSummary["ingestion_status"] =
+    item.status === "processing" || item.ingestion_status === "processing"
+      ? "processing"
+      : "pending";
+  const updated: ArtifactSummary = {
+    ...artifact.value,
+    ingestion_status: ingestionStatus,
+    source_frame_count: null,
+    transition_state_frame_count: null,
+    running_time_seconds: null,
+    ingestion_error_code: null,
+    ingestion_error_message: null,
+  };
+  queryClient.setQueryData(
+    ["artifact-detail", { id: updated.id, projectId: currentProjectId.value }],
+    updated,
+  );
+  queryClient.setQueriesData<Page<ArtifactSummary>>(
+    { queryKey: ["catalog", "artifacts"] },
+    (page) => {
+      if (!page) return page;
+      const items = page.items.map((item) => item.id === updated.id ? updated : item);
+      return items.some((item, index) => item !== page.items[index]) ? { ...page, items } : page;
+    },
+  );
+  queryClient.invalidateQueries({
+    queryKey: ["artifact-detail-parse-revisions", { artifactId: updated.id, projectId: currentProjectId.value }],
+  });
+  queryClient.invalidateQueries({
+    queryKey: ["artifact-detail-frames", { artifactId: updated.id, projectId: updated.project_id }],
+  });
+}
+
+async function reparseArtifact(): Promise<void> {
+  if (!artifact.value || !canReparseArtifact.value || operationBusy.value) return;
+  const currentArtifact = artifact.value;
+  const confirmed = window.confirm(
+    `确认重新解析“${currentArtifact.original_filename}”？\n\n系统会使用当前解析器生成新的解析结果，原文件内容和文件备注不会改变。`,
+  );
+  if (!confirmed) return;
+
+  artifactOperation.value = "reparse";
+  operationError.value = "";
+  operationResult.value = "";
+  try {
+    const accepted = await api.reparseArtifact(currentArtifact.id);
+    applyAcceptedReparse(accepted.item);
+    operationResult.value = `已提交重解析：${currentArtifact.original_filename}`;
+  } catch (error) {
+    operationError.value = operationErrorMessage(error);
+  } finally {
+    artifactOperation.value = null;
+  }
+}
+
+async function deleteArtifact(): Promise<void> {
+  if (!artifact.value || !canDeleteArtifact.value || operationBusy.value) return;
+  const currentArtifact = artifact.value;
+  const confirmed = window.confirm(
+    `确认删除“${currentArtifact.original_filename}”？\n\n文件将从列表中移除，RustFS 中的原始对象也会被删除。此操作无法撤销。`,
+  );
+  if (!confirmed) return;
+
+  artifactOperation.value = "delete";
+  operationError.value = "";
+  operationResult.value = "";
+  try {
+    await api.deleteArtifact(currentArtifact.id);
+    queryClient.removeQueries({ queryKey: ["artifact-detail", { id: currentArtifact.id }] });
+    queryClient.removeQueries({ queryKey: ["artifact-detail-preview", { id: currentArtifact.id }] });
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["catalog", "artifacts"] }),
+      queryClient.invalidateQueries({ queryKey: ["catalog", "totals"] }),
+      queryClient.invalidateQueries({ queryKey: ["catalog", "artifact-frames"] }),
+    ]);
+    await router.push({ name: "artifacts", query: navigationQuery.value });
+  } catch (error) {
+    operationError.value = operationErrorMessage(error);
+  } finally {
+    artifactOperation.value = null;
   }
 }
 
@@ -175,23 +283,50 @@ const frameError = computed(() => frameQuery.error.value instanceof Error ? fram
         <h1 id="artifact-detail-title">原始文件详情</h1>
         <p>{{ artifact?.original_filename ?? "查看原始计算文件的存储信息、内容和关联计算帧。" }}</p>
       </div>
-      <a
-        v-if="artifact"
-        class="command-button is-quiet"
-        :class="{ 'is-disabled': artifact.storage_status !== 'available' }"
-        :href="artifactDownloadUrl(artifact.id, artifact.project_id)"
-        :download="artifact.original_filename"
-        title="下载原始文件"
-        aria-label="下载原始文件"
-      >
-        <Download :size="15" aria-hidden="true" />下载文件
-      </a>
+      <div v-if="artifact" class="artifact-detail-actions" aria-label="文件操作">
+        <a
+          v-if="canDownloadArtifact"
+          class="command-button is-quiet"
+          :href="artifactDownloadUrl(artifact.id, artifact.project_id)"
+          :download="artifact.original_filename"
+          title="下载原始文件"
+          aria-label="下载原始文件"
+        >
+          <Download :size="15" aria-hidden="true" />下载文件
+        </a>
+        <button
+          v-if="canReparseArtifact"
+          class="command-button is-quiet"
+          type="button"
+          :disabled="operationBusy"
+          :aria-label="`重新解析文件 ${artifact.original_filename}`"
+          @click="reparseArtifact"
+        >
+          <LoaderCircle v-if="artifactOperation === 'reparse'" class="is-spinning" :size="15" aria-hidden="true" />
+          <RotateCcw v-else :size="15" aria-hidden="true" />
+          {{ artifactOperation === "reparse" ? "提交中" : "重新解析" }}
+        </button>
+        <button
+          v-if="canDeleteArtifact"
+          class="command-button command-button-danger"
+          type="button"
+          :disabled="operationBusy"
+          :aria-label="`删除文件 ${artifact.original_filename}`"
+          @click="deleteArtifact"
+        >
+          <LoaderCircle v-if="artifactOperation === 'delete'" class="is-spinning" :size="15" aria-hidden="true" />
+          <Trash2 v-else :size="15" aria-hidden="true" />
+          {{ artifactOperation === "delete" ? "删除中" : "删除文件" }}
+        </button>
+      </div>
     </header>
 
     <section v-if="artifactQuery.isLoading.value" class="entity-detail-loading"><div class="loading-block"></div><div class="loading-block is-wide"></div></section>
     <section v-else-if="detailError" class="entity-detail-state is-error" role="alert"><strong>原始文件无法读取</strong><p>{{ detailError }}</p></section>
     <section v-else-if="!artifact" class="entity-detail-state"><strong>原始文件不存在或当前账户不可见</strong></section>
     <template v-else>
+      <p v-if="operationResult" class="upload-result artifact-detail-operation-message" role="status">{{ operationResult }}</p>
+      <p v-if="operationError" class="inline-error artifact-detail-operation-message" role="alert">{{ operationError }}</p>
       <section class="artifact-detail-overview" aria-label="原始文件元数据">
         <div class="artifact-detail-identity">
           <div class="artifact-detail-file-mark" aria-hidden="true"><FileText :size="24" /></div>

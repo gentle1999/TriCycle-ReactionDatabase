@@ -10,7 +10,9 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import and_, delete, func, or_
+from sqlalchemy import and_, delete, func, insert, or_
+from sqlalchemy import select as sa_select
+from sqlalchemy.orm import load_only
 from sqlmodel import Session, col, select
 
 from tricycle_reaction_db.application.dtos import MappedReactionThermodynamics
@@ -18,6 +20,7 @@ from tricycle_reaction_db.application.services._persistence import (
     _attach_or_reuse_entity,
     _attach_pending_entities,
     _require_id,
+    _uuid7,
 )
 from tricycle_reaction_db.application.services.geometry_energy import (
     GeometryEnergyComposite,
@@ -116,6 +119,74 @@ class _ProfileSourceReference:
 
     calculation_frame_id: UUID
     allow_partial_ingestion: bool
+
+
+def _index_calculation_source_rows(
+    rows: Sequence[Any],
+) -> tuple[
+    list[tuple[CalculationFrame, CalculationProtocol | None, ThermochemistryResult | None]],
+    dict[UUID, dict[UUID, tuple[int, float | None]]],
+    frozenset[UUID],
+]:
+    """Split one source query into selection rows, runtimes, and frame ids.
+
+    Profile refresh used to issue a second query over the same frame/revision/
+    artifact joins solely to recover file runtimes.  Keeping the small scalar
+    provenance projection in the source query removes that duplicate round
+    trip while preserving the existing per-file/highest-revision aggregation.
+    """
+
+    calculation_rows: list[
+        tuple[CalculationFrame, CalculationProtocol | None, ThermochemistryResult | None]
+    ] = []
+    runtimes_by_geometry: dict[UUID, dict[UUID, tuple[int, float | None]]] = {}
+    eligible_source_frame_ids: set[UUID] = set()
+    for row in rows:
+        frame = cast(CalculationFrame, row[0])
+        protocol = cast(CalculationProtocol | None, row[1])
+        thermochemistry = cast(ThermochemistryResult | None, row[2])
+        artifact_id = cast(UUID | None, row[3])
+        revision_number = cast(int, row[4])
+        running_time = cast(float | None, row[5])
+        calculation_rows.append((frame, protocol, thermochemistry))
+        if isinstance(frame.id, UUID):
+            eligible_source_frame_ids.add(frame.id)
+        geometry_id = frame.geometry_id
+        if not isinstance(geometry_id, UUID) or not isinstance(artifact_id, UUID):
+            continue
+        by_file = runtimes_by_geometry.setdefault(geometry_id, {})
+        candidate = (int(revision_number), running_time)
+        previous = by_file.get(artifact_id)
+        if previous is None or candidate[0] > previous[0]:
+            by_file[artifact_id] = candidate
+    return calculation_rows, runtimes_by_geometry, frozenset(eligible_source_frame_ids)
+
+
+def _insert_profile_source_rows(
+    session: Session,
+    profile_rows: Sequence[MappedReactionThermodynamicProfile],
+    source_references_by_profile: Sequence[tuple[_ProfileSourceReference, ...]],
+) -> None:
+    """Insert normalized profile evidence in one Core executemany operation."""
+
+    created_at = datetime.now(UTC)
+    rows = [
+        {
+            "id": _uuid7(),
+            "created_at": created_at,
+            "profile_id": _require_id(profile_row, label="MappedReactionThermodynamicProfile"),
+            "calculation_frame_id": reference.calculation_frame_id,
+            "allow_partial_ingestion": reference.allow_partial_ingestion,
+        }
+        for profile_row, references in zip(
+            profile_rows,
+            source_references_by_profile,
+            strict=True,
+        )
+        for reference in references
+    ]
+    if rows:
+        session.execute(insert(MappedReactionThermodynamicProfileSource), rows)
 
 
 def _runtime_for_geometry_ids(
@@ -224,7 +295,9 @@ def _endpoint_geometries_by_participant(
         col(CalculationFrame.optimization_status) == OptimizationStatus.CONVERGED,
     )
     geometries = session.exec(
-        select(Geometry).where(
+        select(Geometry)
+        .options(load_only(cast(Any, Geometry.id), cast(Any, Geometry.topology_id)))
+        .where(
             col(Geometry.project_id) == project_id,
             col(Geometry.topology_id).in_(all_topology_ids),
             col(Geometry.id).in_(eligible_geometry_ids),
@@ -294,7 +367,9 @@ def _endpoint_geometries_by_participant(
                 endpoint_compatible_candidate_ids.update(matching_ids)
         if endpoint_compatible_candidate_ids:
             endpoint_compatible_geometries = session.exec(
-                select(Geometry).where(
+                select(Geometry)
+                .options(load_only(cast(Any, Geometry.id), cast(Any, Geometry.topology_id)))
+                .where(
                     col(Geometry.project_id) == project_id,
                     col(Geometry.topology_id).in_(endpoint_compatible_candidate_ids),
                     col(Geometry.id).in_(eligible_geometry_ids),
@@ -374,6 +449,7 @@ def _load_mapped_reaction_thermodynamics_input(
     ).all()
     binding_rows = session.exec(
         select(MappedReactionNode, MappedReactionNodeGeometry, Geometry)
+        .options(load_only(cast(Any, Geometry.id), cast(Any, Geometry.topology_id)))
         .join(
             MappedReactionNodeGeometry,
             col(MappedReactionNodeGeometry.mapped_reaction_node_id) == col(MappedReactionNode.id),
@@ -411,10 +487,24 @@ def _load_mapped_reaction_thermodynamics_input(
         for geometry in endpoint_geometries:
             geometries[_require_id(geometry, label="Geometry")] = geometry
     geometry_ids = list(geometries)
-    calculation_rows: Sequence[Any] = ()
+    calculation_rows: list[
+        tuple[CalculationFrame, CalculationProtocol | None, ThermochemistryResult | None]
+    ] = []
+    runtimes_by_geometry: dict[UUID, dict[UUID, tuple[int, float | None]]] = {}
+    eligible_source_frame_ids: frozenset[UUID] = frozenset()
     if geometry_ids:
-        calculation_rows = session.exec(
-            select(CalculationFrame, CalculationProtocol, ThermochemistryResult)
+        source_rows = session.exec(
+            cast(
+                Any,
+                sa_select(
+                    CalculationFrame,
+                    CalculationProtocol,
+                    ThermochemistryResult,
+                    col(ArtifactFile.id),
+                    col(ParseRevision.revision_number),
+                    col(ParseRevision.running_time_seconds),
+                ),
+            )
             .join(
                 CalculationSegment,
                 col(CalculationFrame.segment_id) == col(CalculationSegment.id),
@@ -446,49 +536,11 @@ def _load_mapped_reaction_thermodynamics_input(
                 col(ArtifactFile.storage_status) != StorageStatus.RETIRED,
             )
         ).all()
-
-    eligible_source_frame_ids = frozenset(
-        frame.id
-        for frame, _protocol, _thermochemistry in calculation_rows
-        if isinstance(frame.id, UUID)
-    )
-
-    runtimes_by_geometry: dict[UUID, dict[UUID, tuple[int, float | None]]] = {}
-    if geometry_ids:
-        runtime_rows = session.exec(
-            select(
-                col(CalculationFrame.geometry_id),
-                col(ArtifactFile.id),
-                col(ParseRevision.revision_number),
-                col(ParseRevision.running_time_seconds),
-            )
-            .join(
-                ParseRevision,
-                col(CalculationFrame.parse_revision_id) == col(ParseRevision.id),
-            )
-            .join(
-                ArtifactFile,
-                col(ParseRevision.artifact_file_id) == col(ArtifactFile.id),
-            )
-            .join(
-                ArtifactIngestion,
-                col(ArtifactIngestion.artifact_file_id) == col(ArtifactFile.id),
-            )
-            .where(
-                col(CalculationFrame.geometry_id).in_(geometry_ids),
-                col(ParseRevision.status) == ParseStatus.SUCCEEDED,
-                _thermodynamic_source_ingestion_predicate(transition_state_geometry_ids),
-                col(ArtifactFile.storage_status) != StorageStatus.RETIRED,
-            )
-        ).all()
-        for geometry_id, artifact_id, revision_number, running_time in runtime_rows:
-            if geometry_id is None or artifact_id is None:
-                continue
-            by_file = runtimes_by_geometry.setdefault(geometry_id, {})
-            previous = by_file.get(artifact_id)
-            candidate = (int(revision_number), running_time)
-            if previous is None or candidate[0] > previous[0]:
-                by_file[artifact_id] = candidate
+        (
+            calculation_rows,
+            runtimes_by_geometry,
+            eligible_source_frame_ids,
+        ) = _index_calculation_source_rows(source_rows)
 
     return _MappedReactionThermodynamicsInput(
         mapped_reaction=mapped_reaction,
@@ -730,6 +782,7 @@ def _materialize_profile_rows(
         ).hexdigest()
         profile_rows.append(
             cast(Any, MappedReactionThermodynamicProfile)(
+                id=_uuid7(),
                 mapped_reaction_id=profile.mapped_reaction_id,
                 policy_version=profile.policy_version,
                 source_key_hash=source_key_hash,
@@ -893,20 +946,7 @@ def refresh_mapped_reaction_thermodynamics(
     )
     session.add(mapped_reaction)
     session.flush()
-    session.add_all(
-        MappedReactionThermodynamicProfileSource(
-            profile_id=_require_id(profile_row, label="MappedReactionThermodynamicProfile"),
-            calculation_frame_id=reference.calculation_frame_id,
-            allow_partial_ingestion=reference.allow_partial_ingestion,
-        )
-        for profile_row, references in zip(
-            profile_rows,
-            source_references_by_profile,
-            strict=True,
-        )
-        for reference in references
-    )
-    session.flush()
+    _insert_profile_source_rows(session, profile_rows, source_references_by_profile)
     bounds = session.exec(
         select(
             func.min(MappedReactionThermodynamicProfile.activation_gibbs_free_energy_kcal_mol),
@@ -1116,6 +1156,7 @@ def refresh_mapped_reactions_thermodynamics(
 
     binding_rows = session.exec(
         select(MappedReactionNode, MappedReactionNodeGeometry, Geometry)
+        .options(load_only(cast(Any, Geometry.id), cast(Any, Geometry.topology_id)))
         .join(
             MappedReactionNodeGeometry,
             col(MappedReactionNodeGeometry.mapped_reaction_node_id) == col(MappedReactionNode.id),
@@ -1174,10 +1215,24 @@ def refresh_mapped_reactions_thermodynamics(
         if node.role is MappedReactionNodeRole.TRANSITION_STATE
     }
     geometry_ids = list(geometries)
-    calculation_rows: Sequence[Any] = ()
+    calculation_rows: list[
+        tuple[CalculationFrame, CalculationProtocol | None, ThermochemistryResult | None]
+    ] = []
+    runtimes_by_geometry: dict[UUID, dict[UUID, tuple[int, float | None]]] = {}
+    eligible_source_frame_ids: frozenset[UUID] = frozenset()
     if geometry_ids:
-        calculation_rows = session.exec(
-            select(CalculationFrame, CalculationProtocol, ThermochemistryResult)
+        source_rows = session.exec(
+            cast(
+                Any,
+                sa_select(
+                    CalculationFrame,
+                    CalculationProtocol,
+                    ThermochemistryResult,
+                    col(ArtifactFile.id),
+                    col(ParseRevision.revision_number),
+                    col(ParseRevision.running_time_seconds),
+                ),
+            )
             .join(
                 CalculationSegment,
                 col(CalculationFrame.segment_id) == col(CalculationSegment.id),
@@ -1209,49 +1264,11 @@ def refresh_mapped_reactions_thermodynamics(
                 col(ArtifactFile.storage_status) != StorageStatus.RETIRED,
             )
         ).all()
-
-    runtimes_by_geometry: dict[UUID, dict[UUID, tuple[int, float | None]]] = {}
-    if geometry_ids:
-        runtime_rows = session.exec(
-            select(
-                col(CalculationFrame.geometry_id),
-                col(ArtifactFile.id),
-                col(ParseRevision.revision_number),
-                col(ParseRevision.running_time_seconds),
-            )
-            .join(
-                ParseRevision,
-                col(CalculationFrame.parse_revision_id) == col(ParseRevision.id),
-            )
-            .join(
-                ArtifactFile,
-                col(ParseRevision.artifact_file_id) == col(ArtifactFile.id),
-            )
-            .join(
-                ArtifactIngestion,
-                col(ArtifactIngestion.artifact_file_id) == col(ArtifactFile.id),
-            )
-            .where(
-                col(CalculationFrame.geometry_id).in_(geometry_ids),
-                col(ParseRevision.status) == ParseStatus.SUCCEEDED,
-                _thermodynamic_source_ingestion_predicate(transition_state_geometry_ids),
-                col(ArtifactFile.storage_status) != StorageStatus.RETIRED,
-            )
-        ).all()
-        for geometry_id, artifact_id, revision_number, running_time in runtime_rows:
-            if geometry_id is None or artifact_id is None:
-                continue
-            by_file = runtimes_by_geometry.setdefault(geometry_id, {})
-            previous = by_file.get(artifact_id)
-            candidate = (int(revision_number), running_time)
-            if previous is None or candidate[0] > previous[0]:
-                by_file[artifact_id] = candidate
-
-    eligible_source_frame_ids = frozenset(
-        frame.id
-        for frame, _protocol, _thermochemistry in calculation_rows
-        if isinstance(frame.id, UUID)
-    )
+        (
+            calculation_rows,
+            runtimes_by_geometry,
+            eligible_source_frame_ids,
+        ) = _index_calculation_source_rows(source_rows)
     composites = geometry_energy_composites(
         geometry_ids,
         calculation_rows,
@@ -1296,21 +1313,7 @@ def refresh_mapped_reactions_thermodynamics(
         )
     session.add_all(mapped_reaction_values)
     session.flush()
-    source_rows = [
-        MappedReactionThermodynamicProfileSource(
-            profile_id=_require_id(profile_row, label="MappedReactionThermodynamicProfile"),
-            calculation_frame_id=reference.calculation_frame_id,
-            allow_partial_ingestion=reference.allow_partial_ingestion,
-        )
-        for profile_row, references in zip(
-            profile_rows,
-            source_references_by_profile,
-            strict=True,
-        )
-        for reference in references
-    ]
-    session.add_all(source_rows)
-    session.flush()
+    _insert_profile_source_rows(session, profile_rows, source_references_by_profile)
 
     bounds_by_reaction_id = _persist_profile_bounds(session, mapped_reaction_ids)
     for mapped_reaction in mapped_reaction_values:

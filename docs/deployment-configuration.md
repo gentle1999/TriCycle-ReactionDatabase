@@ -429,7 +429,7 @@ OpenMP/BLAS 线程，不能用增大 native thread 数代替文件级并发。�
 
 该模型要求生产环境只运行一个 `upload-worker` 实例：它是共享 MolOP 进程池和单一活动持久化消费者的边界。API 节点可以横向扩展，但不要横向扩展 upload-worker；多个 worker 副本会各自创建解析池和持久化消费者，从而改变本节描述的串行组和资源上限语义。
 
-持久化微批不会在 upload-worker 内重建 thermodynamic profile；受影响的 mapped reaction 只会递增 generation 并写入持久化刷新队列。upload-worker 不执行 profile 计算，因此大型 profile 刷新不会阻塞 MolOP 解析、数据库微批提交或租约心跳。需要启用刷新时，单独启动可选的 `profile-refresh` Compose service（`docker compose --profile profile-refresh up -d profile-refresh-worker`），或运行 `tricycle-profile-refresh-worker`；该进程按最多 256 个 reaction 的微批独立消费队列，失败任务会按租约和退避策略恢复。生产环境默认不启动该 service，可通过 REST/MCP 的主动刷新入口将指定项目或 reaction 加入队列。
+持久化微批不会在 upload-worker 内重建 thermodynamic profile；受影响的 mapped reaction 只会递增 generation 并写入持久化刷新队列。upload-worker 不执行 profile 计算，因此大型 profile 刷新不会阻塞 MolOP 解析、数据库微批提交或租约心跳。标准 Compose 部署会同时运行独立的 `profile-refresh-worker`，按最多 256 个 reaction 的微批消费队列，失败任务会按租约和退避策略恢复；它不是可省略的服务，否则新入库的 source evidence 只会停留在待刷新队列。单独启动或恢复该服务可执行 `docker compose up -d profile-refresh-worker`，或运行 `tricycle-profile-refresh-worker`。
 
 Voyager 使用 NexusX 6.3 及以上版本的 `ComposedErManager` member cluster/color。当前所有数据库实体
 属于同一个 PostgreSQL 逻辑 engine，因此配置中只有一个数据库 cluster；即使
