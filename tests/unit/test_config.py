@@ -43,7 +43,7 @@ def test_settings_accept_psycopg_database_url() -> None:
     assert settings.database_max_overflow == 10
     assert settings.database_pool_timeout_seconds == 30.0
     assert settings.api_port == 8000
-    assert settings.molop_capture_source_evidence is False
+    assert settings.molop_capture_source_evidence is True
     assert settings.molop_parallel_frame_persistence is True
     assert settings.molop_file_parse_timeout_seconds == 60.0
 
@@ -61,12 +61,16 @@ def test_database_pool_settings_can_match_worker_concurrency() -> None:
     assert settings.database_pool_timeout_seconds == 60.0
 
 
-def test_molop_source_evidence_can_be_enabled_for_audit_ingestion(
+def test_molop_source_evidence_is_required(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE", "true")
 
     assert Settings(_env_file=None).molop_capture_source_evidence is True
+
+    monkeypatch.setenv("TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE", "false")
+    with pytest.raises(ValidationError, match="must remain enabled"):
+        Settings(_env_file=None)
 
 
 def test_molop_parallel_frame_persistence_can_be_disabled(
@@ -159,7 +163,7 @@ def test_oidc_authentication_requires_complete_provider_configuration() -> None:
         ({"debug": True}, "TRICYCLE_DEBUG=false"),
         ({"session_secret": "development-session-secret-change-me"}, "non-default"),
         ({"session_cookie_secure": False}, "Secure session cookie"),
-        ({"molop_batch_n_jobs": -1}, "positive limit"),
+        ({"molop_batch_n_jobs": 0}, "positive integer"),
         ({"oidc_issuer": "http://identity.example.test"}, "HTTPS oidc_issuer"),
         (
             {"oidc_redirect_uri": "http://app.example.test/api/auth/callback"},

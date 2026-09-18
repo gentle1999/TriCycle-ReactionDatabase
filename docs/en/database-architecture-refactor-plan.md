@@ -142,118 +142,94 @@ Fixed rules:
    accessed through the same ArtifactFile project ownership; equal content, graph, or reaction
    hashes must never reuse one derived row across projects.
 
-### 2.1 Raw-file staging and the single reparse path (fixed design)
+### 2.1 Raw-file staging and the unified streaming parse path (fixed design)
 
 RustFS is the staging and integrity boundary for raw files, not a second parsing entry point.
-Once a file has been written to RustFS and PostgreSQL contains its `ArtifactFile`,
-`ArtifactIngestion`, and `staged` queue item, calculation-output processing must use the
-single `reparse_batch` worker path. It is the grouping wrapper around the existing
-`upload_batch` pipeline:
+Once PostgreSQL contains the `ArtifactFile`, `ArtifactIngestion`, and `staged` queue item,
+all calculation-output processing enters one upload-worker streaming dispatcher:
 
 ```text
-manifest/API staging
+manifest/API/local/MCP staging
     -> RustFS object + ArtifactFile/ArtifactIngestion(staged)
     -> upload-worker lease
-    -> ArtifactUploadService.reparse_batch
-       -> RustFS bytes/hash verification (read existing objects only)
-       -> ArtifactUploadService.upload_batch
-          -> _run_molop_file_pipeline / shared MolOP process pool
-          -> single persistence consumer
-       -> ParseRevision/Frame/Inference persistence
+    -> continuous claim page / shared parser dispatcher
+       -> parse_staged_artifact (RustFS read/hash verification)
+       -> one reusable MolOP process pool
+       -> one project-serialized persistence consumer
+          -> persist_parsed_microbatch
+             -> upload_batch bulk persistence core
     -> UploadBatchItem terminal state
 ```
 
 The fixed boundaries are:
 
-- `UploadBatchWorker._process_jobs` and `_process_pending_jobs` may only hand leased windows to
-  `reparse_batch`; pending-ingestion recovery must also be grouped by project/user and must not
-  return to single-file `reparse`. Do not add a remote
-  parser, a second MolOP invocation, a second frame-materializing path, or a second persistence
-  transaction for RustFS objects. An already-staged object must not be uploaded again.
-- `reparse_batch` is the only durable worker file-level parse/reparse service. It reads/verifies
-  existing objects and delegates MolOP, MolGR, failed-ingestion finalization, and scientific-fact
-  persistence to `upload_batch`. The old synchronous `upload()`, `reparse()`, and `stage()` entry
-  points are removed. The worker only claims/renews leases, invokes the service, and commits
-  terminal queue state.
-- The local CLI, explicit single-file reparse, and durable worker may differ in source reads and
-  result queues, but they must share `_run_molop_file_pipeline` and the `upload_batch` boundary.
-  A local path versus a RustFS object must not change scientific parsing semantics.
-- `IMPORT_PIPELINE_WINDOW_FILES=64` is a local candidate window. The remote worker claims
-  `TRICYCLE_MAX_BATCH_FILES=64` staged jobs and aggregates them by project/user before calling
-  `reparse_batch`. A client `UploadBatch` is a queue/progress boundary, not a persistence
-  boundary; multiple one-file batches for the same project/user must enter one persistence
-  microbatch. Different project/user microbatches must run sequentially rather than competing
-  for project-scoped identity locks. `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` is retained for
-  pending-ingestion recovery, not as a second staged-parser queue.
-- `TRICYCLE_MOLOP_BATCH_N_JOBS=16` is the `_file_worker_submission_slots` admission limit for
-  one reusable `spawn` MolOP process pool. Sixteen file tasks share hot processes; a new pool is
-  not created for each file. Keep `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, and
-  `MKL_NUM_THREADS` at `1` unless a measured design change says otherwise.
-- The worker must not add its own database scheduler, second consumer, or alternate persistence
-  implementation around `reparse_batch`. It only aggregates a claim window into project/user
-  microbatches and invokes them sequentially. The wrapper only reads/verifies RustFS objects and
-  splits the batch; `upload_batch` owns the shared parser pool, failed-ingestion cleanup, and
-  scientific-fact transaction. The worker records terminal state separately for each original
-  queue item.
+- API, MCP, local CLI, remote import, and explicit reparse only create the durable batch/item and
+  write/verify RustFS. The local CLI does not run MolOP. A staged object is never uploaded again,
+  and parsing is not owned by an HTTP request or browser lifecycle.
+- `UploadBatchWorker._run_streaming_cycle` continuously claims small pages and creates parser
+  tasks immediately. `TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES` is only a bounded prefetch/backpressure
+  limit; `0` derives it from the effective MolOP process count. It is not a client batch or
+  persistence transaction size.
+- `parse_staged_artifact` reads/verifies an existing object and returns MolOP/MolGR results to the
+  shared result queue without writing parse rows. All parser tasks use one reusable `spawn`
+  MolOP pool. `TRICYCLE_MOLOP_BATCH_N_JOBS=-1` uses all CPU cores visible to the worker; a
+  positive value is an explicit cap.
+- One persistence consumer keeps project/user authorization groups isolated. Project write locks
+  coordinate old-parse cleanup, materialization, and UploadBatch finalization. It commits eight
+  completed files or 128 frames per microbatch; an empty result queue only triggers preload
+  persistence, while the idle parser pool triggers the tail commit. Different project/user groups
+  write serially, so client-side one-file UploadBatch boundaries cannot bypass microbatching.
+- `persist_parsed_microbatch` reuses the legacy bulk persistence core in `upload_batch`; it does
+  not duplicate frame/reaction/geometry materialization. A failed file is finalized independently
+  and does not roll back unrelated files.
+- `TRICYCLE_UPLOAD_MAX_CONCURRENCY` controls only RustFS reads and
+  `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` only legacy pending-ingestion recovery. Production should
+  run one upload-worker replica; multiple replicas create independent parser pools and persistence
+  consumers.
 
 ### 2.2 Bulk-import throughput invariants (regression guard)
 
-The previous high-throughput importer is the performance baseline for bulk ingestion. Project
-isolation, source authorization, and idempotency constraints may continue to improve, but the
-execution shape below must not change silently. Any change must measure byte throughput, CPU,
-database-stage timings, and failures on the same real file set and pass an architecture regression
-check before merge.
+The unified stream is the performance boundary for bulk ingestion. Project isolation, source authorization,
+and idempotency constraints may continue to improve, but the execution shape must not silently return to
+client-batch barriers or one persistence session per file. Any change must measure byte throughput, CPU,
+queue depth, database-stage timings, and failures on the same real file set and pass an architecture
+regression check before merge.
 
-| Boundary | Local CLI | RustFS durable reparse | What it must not be confused with |
+| Boundary | Local CLI | RustFS durable worker | What it must not be confused with |
 | --- | --- | --- | --- |
-| Parser admission | `TRICYCLE_MOLOP_BATCH_N_JOBS`, normally `16` on a dedicated host | The same shared pool and the same `16`-file admission limit | Not `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` or RustFS read concurrency |
-| Candidate/claim window | `IMPORT_PIPELINE_WINDOW_FILES=64` | Up to `TRICYCLE_MAX_BATCH_FILES=64` | Keeps the queue supplied; it is not the parser-process count |
-| Persistence hand-off | Internal `PERSISTENCE_PRELOAD_BATCH_SIZE=8` files, with a 128-frame ceiling | The same eight-file/128-frame boundary, or when the result queue is temporarily empty | Must not wait for the whole claim before writing |
-| Commit/checkpoint | `IMPORT_COMMIT_BATCH_FILES`, default `16` | One `upload_batch` call per project/user microbatch; it commits at the eight-file/128-frame boundary, and one claim may produce several sequential calls | The commit boundary does not control parser concurrency |
+| Parser admission | CLI does not run MolOP | `TRICYCLE_MOLOP_BATCH_N_JOBS`; `-1` uses all CPU cores visible to the worker | Not RustFS read concurrency |
+| Staging/claim prefetch | `IMPORT_PIPELINE_WINDOW_FILES` | `TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES`; `0` derives automatically | Backpressure only, not a parser batch |
+| Persistence hand-off | The worker consumes staged results | Eight files or 128 frames; an empty queue only preloads, and an idle MolOP pool commits the tail | Must not wait for a client batch |
+| Commit/checkpoint | `IMPORT_COMMIT_BATCH_FILES` is compatibility-only | Worker microbatch and lease finalization | Does not control parser or DB concurrency |
 
 The implementation invariants are:
 
-- `_run_molop_file_pipeline` must submit file work to one reusable, `spawn`-based
-  `ProcessPoolExecutor`; `_file_worker_submission_slots` is the only file-level parser admission
-  point. Do not restore a per-file process pool/executor or use native OpenMP/BLAS thread counts
-  as a substitute for file concurrency.
-- `upload_batch` has one bounded parser-result queue and one persistence consumer. Every eight
-  completed files (or when the queue is temporarily empty) are handed to `persist_parsed_files`, so parser
-  work and database writes overlap. Only the persistence-window boundary commits. Moving all
-  persistence until a 64-file claim completes reintroduces the fixed throughput regression.
-  Each commit window is additionally capped at 128 parsed frames so a handful of large files
-  cannot hold identity locks for an entire claim window.
-- The worker first aggregates the claim window by project/user; the original `UploadBatch`
-  boundary cannot prevent microbatching across one-file submissions. Each project/user
-  microbatch only reads and verifies existing RustFS objects, then calls `reparse_batch`; its
-  `upload_batch` call commits at the fixed eight-file/128-frame persistence boundary. Different
-  microbatches run sequentially. Thus `64` on the remote path is a claim window, not a second parser queue,
-  64 serial parses, or 64 concurrent persistence transactions.
-- `TRICYCLE_UPLOAD_MAX_CONCURRENCY` controls only RustFS reads;
-  `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` is only for pending-ingestion recovery. Neither may
-  replace or be multiplied with MolOP file-level concurrency.
-- Durable reparse enables the `legacy bulk import` hot-path flag in the persistence session. It
-  applies only to the bulk-import transaction: topology-participant caches are reused by inferred
-  reaction SMILES, Geometry equivalence matching is one set-based query per persistence window,
-  and later per-file concrete-identity, logical-stereo/membership, and reverse mapped-reaction
-  reconciliation extensions are skipped. Required project ownership, project scope, and
-  scientific-fact constraints still apply; ordinary single-file/interactive reaction creation
-  must not use this shortcut.
-- A new derived check or enrichment must not insert per-file queries or reconciliation into this
-  bulk hot path. Make it a bounded batch/rebuildable refresh, or first prove that throughput and
-  failure isolation do not regress on the same fixture, and add an architecture regression test.
+- `_run_molop_file_pipeline` submits file work to one reusable, `spawn`-based
+  `ProcessPoolExecutor`; `_file_worker_submission_slots` is the file-level parser admission point.
+  Do not restore a per-file process pool/executor or use native OpenMP/BLAS thread counts as a
+  substitute for file concurrency.
+- `_run_streaming_cycle` refills parser tasks as they finish. One bounded result queue feeds one
+  persistence consumer, which commits eight completed files or 128 parsed frames at a time. Parser
+  work and database writes overlap; an empty queue only triggers preload persistence.
+- Project write locks coordinate old-parse cleanup, microbatch materialization, and UploadBatch
+  finalization. Multiple client one-file batches may affect progress and leases, but cannot create
+  competing persistence sessions for the same project.
+- `persist_parsed_microbatch` reuses the legacy bulk hot path in `upload_batch`; reaction-SMILES
+  topology caches and set-based Geometry matching remain enabled. Per-file concrete/logical/reverse
+  reconciliation must not be inserted directly. Failed files are finalized independently.
+- Production should run one upload-worker replica. API nodes may scale horizontally, but multiple
+  worker replicas create independent MolOP pools and persistence consumers and change these limits.
 
-The fixed relationship is therefore: 16 shared parser slots continuously take work, results are
-continuously handed to one persistence consumer in bounded eight-file/128-frame groups, local
-imports commit configured microbatches, and the RustFS worker normally aggregates a 64-file claim into project/user
-microbatches and commits them sequentially. A client one-file batch cannot bypass server-side
-microbatching. Changing any number or using one layer to control another requires updating this
-section, the development/deployment guides, and the corresponding tests first.
+The fixed relationship is therefore: after RustFS staging, every source enters one continuous dispatcher;
+the effective MolOP process pool remains supplied, results are handed to one persistence consumer in
+eight-file/128-frame microbatches, and project/user groups write serially. A client one-file batch cannot
+bypass server-side microbatching. Changing any boundary requires updating this section, the
+development/deployment guides, and the corresponding tests.
 
-Every change to the import path must answer whether it still goes through `reparse_batch` and
-`_run_molop_file_pipeline`, and whether it only adds scheduling, lease, or resource control.
-If not, update this design and the corresponding architecture tests before introducing a
-parallel implementation.
+Every change to the import path must answer whether it still goes through `parse_staged_artifact`,
+`_run_molop_file_pipeline`, and `persist_parsed_microbatch`, and whether it only adds scheduling,
+lease, or resource control. If not, update this design and the corresponding architecture tests before
+introducing a parallel implementation.
 
 ## 3. Work Items and Acceptance
 

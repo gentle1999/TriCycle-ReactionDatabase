@@ -37,9 +37,10 @@ from tricycle_reaction_db.ingestion.manifest import (
 
 HASH_CHUNK_BYTES = 1024 * 1024
 MAX_FINGERPRINT_WORKERS = 32
-# The local importer only controls discovery/fingerprinting and queue chunking.
-# MolOP concurrency is owned by the durable upload worker, not this process.
-IMPORT_COMMIT_BATCH_FILES = 16  # retained as a CLI compatibility option
+# The local importer only controls discovery/fingerprinting and RustFS staging
+# windows. MolOP concurrency and database commit microbatches are owned by the
+# durable upload worker, not this process.
+IMPORT_COMMIT_BATCH_FILES = 16  # retained as a deprecated CLI compatibility option
 IMPORT_PIPELINE_WINDOW_FILES = 64
 IMPORT_STREAM_QUEUE_SIZE = 64
 IMPORT_MAX_TRANSIENT_RETRIES = 3
@@ -713,7 +714,7 @@ async def import_files(
     state: ImportState,
     dry_run: bool,
     fingerprint_workers: int | None = None,
-    commit_batch_files: int = IMPORT_COMMIT_BATCH_FILES,
+    commit_batch_files: int | None = IMPORT_COMMIT_BATCH_FILES,
     pipeline_window_files: int = IMPORT_PIPELINE_WINDOW_FILES,
     stream_queue_size: int = IMPORT_STREAM_QUEUE_SIZE,
     max_transient_retries: int = IMPORT_MAX_TRANSIENT_RETRIES,
@@ -721,7 +722,10 @@ async def import_files(
     metrics: ImportMetrics | None = None,
 ) -> ImportSummary:
     metrics = metrics or ImportMetrics()
-    if commit_batch_files < 1:
+    # Kept so older automation does not fail at argument parsing. It no longer
+    # controls persistence: every local file is staged first and the worker
+    # decides when to parse and commit its shared microbatch.
+    if commit_batch_files is not None and commit_batch_files < 1:
         raise ValueError("commit_batch_files must be positive")
     if pipeline_window_files < 1:
         raise ValueError("pipeline_window_files must be positive")
@@ -732,7 +736,7 @@ async def import_files(
     if transient_retry_backoff_seconds < 0:
         raise ValueError("transient_retry_backoff_seconds must be non-negative")
     settings = get_settings()
-    batch_limit_files = min(pipeline_window_files, settings.max_batch_files)
+    stage_window_files = min(pipeline_window_files, settings.max_batch_files)
     summary = ImportSummary(scanned=len(candidates))
     workers = fingerprint_workers or min(MAX_FINGERPRINT_WORKERS, max(4, os.cpu_count() or 4))
     if workers < 1:
@@ -917,7 +921,7 @@ async def import_files(
     producer_error: BaseException | None = None
 
     async def produce_candidates() -> None:
-        """Fingerprint only a bounded in-flight window and feed the parser queue."""
+        """Fingerprint only a bounded in-flight window and feed staging."""
 
         nonlocal producer_error, skipped_count
         loop = asyncio.get_running_loop()
@@ -991,7 +995,7 @@ async def import_files(
 
             batch_with_fingerprints = [first]
             batch_bytes = first[0].size_bytes
-            while len(batch_with_fingerprints) < batch_limit_files:
+            while len(batch_with_fingerprints) < stage_window_files:
                 next_item = await candidate_queue.get()
                 if next_item is None:
                     producer_finished = True
@@ -1093,7 +1097,10 @@ def _parser() -> argparse.ArgumentParser:
         "--commit-batch-files",
         type=int,
         default=IMPORT_COMMIT_BATCH_FILES,
-        help=(f"legacy queue-window compatibility value (default: {IMPORT_COMMIT_BATCH_FILES})"),
+        help=(
+            "deprecated compatibility option; worker owns persistence microbatches "
+            f"(default: {IMPORT_COMMIT_BATCH_FILES})"
+        ),
     )
     parser.add_argument(
         "--pipeline-window-files",

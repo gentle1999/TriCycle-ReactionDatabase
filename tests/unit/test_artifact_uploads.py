@@ -15,8 +15,10 @@ from sqlmodel import Session
 
 from tricycle_reaction_db.application.services import artifact_uploads as upload_module
 from tricycle_reaction_db.application.services._persistence import (
+    _fast_pending_entity_count,
     _queue_fast_pending_entity,
     _session_entity_for_identity,
+    _truncate_fast_pending_entities,
 )
 from tricycle_reaction_db.application.services.artifact_upload_types import (
     _FailedInference,
@@ -37,6 +39,7 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
     _parser_payload,
     _pipeline_task_lifecycle,
     _prepare_calculation_parser_path,
+    _process_frame_chunk_worker,
     _require_batch_upload_budget,
     _restore_inference_context,
     _run_molop_file_pipeline,
@@ -128,6 +131,39 @@ def test_fast_pending_identity_lookup_reuses_the_first_entity() -> None:
     _queue_fast_pending_entity(session, first)
 
     assert _session_entity_for_identity(session, duplicate) is first
+
+
+def test_fast_pending_checkpoint_discards_only_rows_after_the_checkpoint() -> None:
+    session = Session()
+    first_id = UUID("00000000-0000-7000-8000-000000000011")
+    second_id = UUID("00000000-0000-7000-8000-000000000012")
+    first = MappedReactionNodeGeometry(
+        id=first_id,
+        mapped_reaction_node_id=first_id,
+        geometry_id=first_id,
+        component_key="transition-state",
+        component_index=0,
+        coordinate_index=0,
+        is_primary=False,
+    )
+    second = MappedReactionNodeGeometry(
+        id=second_id,
+        mapped_reaction_node_id=second_id,
+        geometry_id=second_id,
+        component_key="transition-state",
+        component_index=0,
+        coordinate_index=0,
+        is_primary=False,
+    )
+
+    _queue_fast_pending_entity(session, first)
+    checkpoint = _fast_pending_entity_count(session)
+    _queue_fast_pending_entity(session, second)
+    _truncate_fast_pending_entities(session, checkpoint)
+
+    assert _fast_pending_entity_count(session) == 1
+    assert _session_entity_for_identity(session, first) is first
+    assert _session_entity_for_identity(session, second) is second
 
 
 def test_inference_cache_key_keeps_strict_stereo_variants_distinct() -> None:
@@ -264,6 +300,37 @@ def test_frame_conversion_failure_keeps_other_frames(monkeypatch: pytest.MonkeyP
             "message": "malformed frame",
         },
     )
+
+
+def test_unexpected_chunk_frame_failure_does_not_discard_neighbours(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeFrame:
+        def __init__(self, index: int) -> None:
+            self.file_frame_index = index
+
+    def process(frame: FakeFrame, fallback_index: int, _: str) -> object:
+        if frame.file_frame_index == 1:
+            raise RuntimeError("unexpected frame failure")
+        return SimpleNamespace(
+            file_frame_index=frame.file_frame_index,
+            record=object(),
+            inference=None,
+            topology_reconstruction_status="succeeded",
+            error_code=None,
+        )
+
+    monkeypatch.setattr(upload_module, "_process_frame_without_configuration", process)
+    result = _process_frame_chunk_worker(
+        tuple((FakeFrame(index), index) for index in range(3)),
+        "test-schema",
+    )
+
+    assert [item.file_frame_index for item in result] == [0, 1, 2]
+    assert result[0].record is not None
+    assert result[2].record is not None
+    assert result[1].record is None
+    assert result[1].error_code == "frame_conversion_failed"
 
 
 def test_frame_failure_diagnostic_keeps_specific_error_code_and_evidence() -> None:
@@ -436,7 +503,7 @@ async def test_batch_startup_failure_recovers_committed_reservations(
         cls: object,
         **_: object,
     ) -> tuple[dict[int, object], dict[int, object]]:
-        return {0: object()}, {}
+        return {0: SimpleNamespace(needs_storage=True)}, {}
 
     monkeypatch.setattr(
         ArtifactUploadService,
@@ -537,7 +604,7 @@ def test_fast_molop_parse_defers_topology_reconstruction_until_materialization(
     # The parser runs in a spawned process, so configure the child through the
     # environment rather than only replacing the parent module's settings
     # accessor. This keeps the test independent of the repository .env file.
-    monkeypatch.setenv("TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE", "false")
+    monkeypatch.setenv("TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE", "true")
     parsed = asyncio.run(
         upload_module._run_molop_source_parser(TS_FIXTURE.read_bytes(), TS_FIXTURE.name)
     )
@@ -545,19 +612,19 @@ def test_fast_molop_parse_defers_topology_reconstruction_until_materialization(
     assert parsed.source_frame_count == 23
     assert parsed.frame_records == ()
     assert parsed.inferences == ()
-    # The throughput profile deliberately leaves source spans/block hashes out
-    # of the parsed DTO. Audit imports opt into source evidence explicitly.
-    assert parsed.chem_file.source_segments == []
-    assert parsed.chem_file[0].frame_role is None
-    assert parsed.chem_file[9].frame_role is None
+    assert len(parsed.chem_file.source_segments) == 3
+    assert parsed.chem_file[0].frame_role is not None
+    assert parsed.chem_file[9].frame_role is not None
     assert all(frame.topology_reconstruction_status is None for frame in parsed.chem_file)
 
     materialized = _materialize_parsed_artifacts([parsed])[0]
     assert len(materialized.frame_records) == 23
     assert len(materialized.inferences) == 1
-    assert materialized.frame_records[0].frame.frame_role.value == "single_point"
-    assert materialized.frame_records[9].frame.frame_role.value == "single_point"
-    assert materialized.frame_records[22].frame.frame_role.value == "single_point"
+    assert materialized.frame_records[0].frame.frame_role.value == "initial"
+    assert materialized.frame_records[9].frame.frame_role.value == "terminal"
+    assert materialized.frame_records[10].frame.frame_role.value == "initial"
+    assert materialized.frame_records[21].frame.frame_role.value == "terminal"
+    assert materialized.frame_records[22].frame.frame_role.value == "terminal"
     assert all(
         frame.topology_reconstruction_status in {"succeeded", "suspicious_fallback"}
         for frame in materialized.chem_file

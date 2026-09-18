@@ -13,6 +13,7 @@ from sqlalchemy.orm import undefer
 from sqlmodel import Session, col, select
 
 from tricycle_reaction_db.application.dtos import ArtifactFileRecord, CreateReactionCommand
+from tricycle_reaction_db.application.services import _persistence
 from tricycle_reaction_db.application.services.artifact_upload_types import _FailedInference
 from tricycle_reaction_db.application.services.artifact_uploads import (
     _create_pending_ingestion,
@@ -556,6 +557,91 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
             ).one()
             assert reparse_inference.calculation_frame_id != first_inference_frame_id
             assert reparse_inference.mapped_reaction_id == first_mapped_reaction_id
+    finally:
+        transaction.rollback()
+        connection.close()
+        engine.dispose()
+
+
+def test_partial_frame_parse_persists_valid_sibling_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A frame conversion diagnostic must not make the whole file disappear."""
+
+    payload = gzip.decompress(FIXTURE.read_bytes()) + b"\n"
+    digest = sha256(payload).hexdigest()
+    parsed = _parse_calculation_output(payload, FIXTURE.name.removesuffix(".gz"))
+    failed_file_frame_index = 5
+    partial = replace(
+        parsed,
+        frame_records=tuple(
+            record
+            for record in parsed.frame_records
+            if record.frame.file_frame_index != failed_file_frame_index
+        ),
+        parse_diagnostics=(
+            *parsed.parse_diagnostics,
+            {
+                "code": "frame_conversion_failed",
+                "stage": "conversion",
+                "segment_index": 0,
+                "file_frame_index": failed_file_frame_index,
+                "error_type": "ValueError",
+                "message": "fixture frame conversion failed",
+            },
+        ),
+    )
+    now = datetime.now(UTC)
+    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    connection = engine.connect()
+    transaction = connection.begin()
+
+    def fail_fast_bulk_insert(_session: Session) -> None:
+        raise AssertionError("partial files must use isolated frame persistence")
+
+    monkeypatch.setattr(_persistence, "_bulk_insert_pending_entities", fail_fast_bulk_insert)
+    try:
+        with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
+            artifact = persist_artifact_file(
+                session,
+                record=ArtifactFileRecord(
+                    project_id=SYSTEM_PROJECT_ID,
+                    created_by_user_id=DEVELOPMENT_USER_ID,
+                    visibility=ArtifactVisibility.PROJECT,
+                    bucket="integration-test",
+                    object_key=f"uploads/partial-frame/{digest[:2]}/{digest}",
+                    content_sha256=digest,
+                    size_bytes=len(payload),
+                    original_filename=FIXTURE.name.removesuffix(".gz"),
+                    media_type="text/plain",
+                    artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+                    storage_status=StorageStatus.AVAILABLE,
+                    storage_verified_at=now,
+                ),
+            )
+            ingestion, _ = _create_pending_ingestion(session, artifact=artifact, started_at=now)
+            assert ingestion.id is not None
+            revision_id, _ = _persist_parsed_artifact(
+                session,
+                ingestion_id=ingestion.id,
+                parsed=partial,
+                started_at=now,
+                completed_at=now,
+            )
+            session.flush()
+
+            frame_ids = session.exec(
+                select(CalculationFrame.file_frame_index).where(
+                    CalculationFrame.parse_revision_id == revision_id
+                )
+            ).all()
+            revision = session.get(ParseRevision, revision_id)
+            assert revision is not None
+            assert len(frame_ids) == 22
+            assert failed_file_frame_index not in frame_ids
+            assert 22 in frame_ids
+            assert ingestion.status is ArtifactIngestionStatus.PARTIAL
+            assert revision.parse_completeness.value == "partial"
     finally:
         transaction.rollback()
         connection.close()

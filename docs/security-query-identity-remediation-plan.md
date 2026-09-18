@@ -165,12 +165,14 @@
 - 新增 `TRICYCLE_MAX_BATCH_FILES` 和 `TRICYCLE_MAX_BATCH_BYTES`，同时检查文件数、单文件
   字节和批次累计字节；超限返回稳定的 413 错误码，不进入 RustFS 或解析阶段。
 - 初始默认值固定为 32 个文件、256 MiB 总请求载荷；若代理层使用更小上限，以更小值为准。
-- 生产默认 `TRICYCLE_MOLOP_BATCH_N_JOBS=2`；禁止生产配置使用 `-1`。开发环境可以显式
-  选择 `-1`，但不得写入生产示例。
-- 增加进程级 MolOP 解析 semaphore，默认同时只运行一个解析请求。每个 Uvicorn worker
-  维护一个可复用的 MolOP 进程池；多 worker 部署必须按
-  `Uvicorn worker 数 x TRICYCLE_MOLOP_BATCH_N_JOBS` 计算全机进程和内存上限。
-MolOP 解析并发只由显式解析进程池的 worker 数控制，不再设置请求级 slot 闸门。
+- 生产默认 `TRICYCLE_MOLOP_BATCH_N_JOBS=-1`，使用 upload-worker 进程可见的全部 CPU
+  核；只有需要为数据库、API 或其他任务预留 CPU 时才设置正整数。该设置是共享 MolOP
+  进程池的文件级准入上限，不是每个上传请求的并发数。
+- 每个 upload-worker 进程维护一个可复用的 MolOP 进程池；worker 持续从 RustFS 小页领取
+  pending 文件，解析结果进入单一持久化消费者的微批。生产推荐只运行一个 upload-worker
+  副本；如扩展副本，必须按 `worker 副本数 x TRICYCLE_MOLOP_BATCH_N_JOBS` 计算全机进程
+  和内存上限。
+MolOP 解析并发由共享进程池控制，不再按客户端请求创建解析池或以请求级 batch 作为闸门。
 - gzip 等压缩输入在解压前后都检查大小；禁止仅按上传压缩包大小判断资源预算。
 - 中期把批量接口从“全部读取为 `bytes` 后再写临时文件”改为受控 spool/path 流程；
   immediate fix 不能等待该重构完成。

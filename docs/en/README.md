@@ -14,6 +14,7 @@ snapshot is not mistaken for a current deployment instruction.
 | --- | --- | --- |
 | [Development environment](development.md) | [开发环境](../development.md) | Host development, testing, and local imports |
 | [Deployment and configuration](deployment-configuration.md) | [部署与配置指南](../deployment-configuration.md) | Development, single-host, and multi-host deployment |
+| [High-performance import configuration](performance-tuning.md) | [高性能导入配置指南](../performance-tuning.md) | MolOP, worker, PostgreSQL, and RustFS throughput tuning |
 | [Data model and storage boundaries](data-model.md) | [数据模型与存储边界](../data-model.md) | Chemistry, artifact, reaction, and query contracts |
 | [Business model](business-model.md) | [业务模型](../business-model.md) | User-facing objects, workflows, and non-goals |
 | [Production operations and recovery runbook](operations-runbook.md) | [生产运维与恢复 Runbook](../operations-runbook.md) | Backup, recovery, monitoring, and scheduled work |

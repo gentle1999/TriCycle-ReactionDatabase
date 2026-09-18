@@ -159,10 +159,11 @@ abstraction policy、匹配 schema、原子对应和被抽象的 feature，便�
 浏览器上传、批量上传、显式 reparse 和本地 `tricycle-import-artifacts` CLI 共用同一个
 application upload service；CLI 只把本地路径作为字节来源。所有入口都先建立 durable
 batch/item，并把核验后的原始对象暂存到 RustFS；计算 ingestion 保持 `pending`，条目进入
-`staged`。独立的 `tricycle-upload-worker` 每轮领取最多 64 个 staged 项，读取/校验已有对象，
-再调用共享 MolOP 进程池和统一持久化路径。它不会再次上传对象，也不会为每个请求/会话新增
-解析器。MolOP 不在 HTTP 请求或浏览器生命周期内运行，因此刷新页面、切换路由、API 重启或
-worker 重启都不会丢失已经 staged 的文件。对象和内容哈希不可原地覆盖。成功 reparse 会在
+`staged`。独立的 `tricycle-upload-worker` 连续小页领取 staged 项，使用由
+`TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES` 控制的有界预取，并调用共享 MolOP 进程池和统一持久化
+路径。它不会再次上传对象，也不会为每个请求/会话新增解析器。MolOP 不在 HTTP 请求或浏览器
+生命周期内运行，因此刷新页面、切换路由、API 重启或 worker 重启都不会丢失已经 staged 的文件。
+对象和内容哈希不可原地覆盖。成功 reparse 会在
 解析前删除该 Artifact 的全部旧 ParseRevision、segment、frame、推断及相关派生绑定，再从
 空白状态建立新的物化结果；失败时保留 RustFS 原始对象并将 ingestion 标记为 `failed`，不
 恢复旧解析结果。
@@ -202,7 +203,8 @@ worker 的 `recover_stale` 会按项目、文件大小、artifact kind 和该哈
 求和替代。
 
 本地导入是 RustFS 暂存候选队列：`IMPORT_PIPELINE_WINDOW_FILES` 决定暂存预取窗口；CLI
-不运行 MolOP。worker 内的 `TRICYCLE_MOLOP_BATCH_N_JOBS` 决定共享进程池的文件准入，
+不运行 MolOP。worker 内的 `TRICYCLE_MOLOP_BATCH_N_JOBS` 决定共享进程池的进程数，`-1` 使用
+worker 可见的全部 CPU 核；
 `IMPORT_COMMIT_BATCH_FILES` 仅作为旧 CLI 参数保留，最终解析提交由 worker 管理。保持
 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS` 和 `MKL_NUM_THREADS` 有界，避免共享池中的
 native thread 过量。计算输出导入会在暂存前排除明确的 JSON/CSV/结构等旁车文件；身份预约

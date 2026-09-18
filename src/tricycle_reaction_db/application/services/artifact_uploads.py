@@ -36,8 +36,12 @@ from molop import AutoFileParser
 from molop.config import molopconfig
 from molop.io.base_models.ChemFileFrame import BaseCalcFrame
 from rdkit import Chem
+from sqlalchemy import case, text, update
+from sqlalchemy import cast as sa_cast
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session as SQLAlchemySession
 from sqlalchemy.orm import joinedload
+from sqlalchemy.orm.attributes import set_committed_value
 from sqlmodel import Session, col, select
 
 from tricycle_reaction_db.application.dtos import (
@@ -57,11 +61,13 @@ from tricycle_reaction_db.application.services._persistence import (
     _attach_or_reuse_entity,
     _attach_pending_entities,
     _fast_insert_enabled,
+    _fast_pending_entity_count,
     _flush_new_entity,
     _new_entity,
     _prepare_new_entity,
     _require_id,
     _set_fast_pending_entities,
+    _truncate_fast_pending_entities,
 )
 from tricycle_reaction_db.application.services.artifact_content import (
     detect_artifact_media_type,
@@ -89,6 +95,7 @@ from tricycle_reaction_db.application.services.artifact_upload_types import (
     ArtifactUploadPayload,
     MolOPFileParseTimeoutError,
     NoCalculationFramesError,
+    ParsedArtifactTask,
     _DeferredArtifactInferences,
     _FailedInference,
     _Inference,
@@ -192,8 +199,11 @@ logger = logging.getLogger(__name__)
 # hold hundreds of identity locks for tens of seconds. Eight files is the
 # normal hand-off/commit stack; the frame ceiling below prevents eight large
 # multi-frame files from recreating the same long transaction.
-PERSISTENCE_PRELOAD_BATCH_SIZE = 8
-PERSISTENCE_BATCH_FRAME_LIMIT = 128
+# Defaults for callers that do not supply worker settings.  The durable
+# worker resolves the same limits from Settings so deployments can tune the
+# commit boundary without changing parser admission.
+PERSISTENCE_PRELOAD_BATCH_SIZE = 16
+PERSISTENCE_BATCH_FRAME_LIMIT = 256
 # MolGR reconstruction is CPU-heavy and each frame crosses a process boundary.
 # Larger chunks amortize pickle/future overhead while retaining enough tasks to
 # keep all configured workers busy across a multi-file batch.
@@ -241,6 +251,7 @@ _storage_process_pool_workers: int | None = None
 _storage_process_pool_pid: int | None = None
 _storage_process_pool_lock = threading.Lock()
 _file_worker_slots: tuple[asyncio.AbstractEventLoop, int, asyncio.Semaphore] | None = None
+_frame_worker_slots: tuple[asyncio.AbstractEventLoop, int, asyncio.Semaphore] | None = None
 _rustfs_download_slots: tuple[asyncio.AbstractEventLoop, int, asyncio.Semaphore] | None = None
 
 # A storage-pool child handles many files over its lifetime. Recreating a
@@ -382,6 +393,12 @@ def _resolve_molop_process_workers(n_jobs: int) -> int:
     return max(1, (os.cpu_count() or 1) if n_jobs == -1 else n_jobs)
 
 
+def molop_process_worker_count() -> int:
+    """Return the effective shared MolOP process count for this service."""
+
+    return _resolve_molop_process_workers(get_settings().molop_batch_n_jobs)
+
+
 def _frame_submission_limit() -> int:
     workers = _resolve_molop_process_workers(get_settings().molop_batch_n_jobs)
     return max(1, workers * 2)
@@ -400,6 +417,21 @@ def _file_worker_submission_slots() -> asyncio.Semaphore:
     ):
         _file_worker_slots = (loop, workers, asyncio.Semaphore(workers))
     return _file_worker_slots[2]
+
+
+def _frame_worker_submission_slots() -> asyncio.Semaphore:
+    """Share frame-conversion submissions across all upload requests."""
+
+    global _frame_worker_slots
+    loop = asyncio.get_running_loop()
+    workers = _frame_submission_limit()
+    if (
+        _frame_worker_slots is None
+        or _frame_worker_slots[0] is not loop
+        or _frame_worker_slots[1] != workers
+    ):
+        _frame_worker_slots = (loop, workers, asyncio.Semaphore(workers))
+    return _frame_worker_slots[2]
 
 
 def _rustfs_download_submission_slots() -> asyncio.Semaphore:
@@ -428,6 +460,28 @@ def _fast_molop_ingestion_enabled() -> bool:
 
     settings = get_settings()
     return settings.molop_parallel_frame_persistence
+
+
+def _parsed_artifact_requires_isolated_frame_persistence(
+    parsed: _ParsedArtifact,
+) -> bool:
+    """Use per-frame savepoints for parser results already known to be partial.
+
+    The deferred writer batches revision-local rows by table.  That is fast for
+    a clean result, but a database constraint discovered only at the final
+    batch flush can otherwise roll back every frame in the file.  A parser
+    diagnostic or a partial frame record is already a reliable signal that
+    this file needs the regular per-frame boundary, which preserves all valid
+    sibling frames while keeping clean files on the bulk path.
+    """
+
+    if parsed.parse_diagnostics:
+        return True
+    return any(
+        record.frame.parse_completeness is ParseCompleteness.PARTIAL
+        or bool(record.frame.parse_diagnostics)
+        for record in parsed.frame_records
+    )
 
 
 def _get_molop_process_pool(n_jobs: int) -> ProcessPoolExecutor:
@@ -589,7 +643,11 @@ async def _run_molop_file_pipeline(
             )
             return await _process_parsed_artifact_frames(
                 parsed,
-                submission_slots=(submission_slots or asyncio.Semaphore(_frame_submission_limit())),
+                submission_slots=(
+                    submission_slots
+                    if submission_slots is not None
+                    else _frame_worker_submission_slots()
+                ),
             )
 
     except TimeoutError as error:
@@ -909,6 +967,50 @@ def _process_frame_without_configuration(
     )
 
 
+def _frame_processing_failure(
+    frame: BaseCalcFrame[Any],
+    fallback_index: int,
+    error: Exception,
+) -> _ProcessedFrame:
+    """Convert an unexpected frame boundary error into one frame diagnostic."""
+
+    try:
+        file_frame_index = _frame_file_index(frame, fallback_index)
+    except Exception:
+        file_frame_index = fallback_index
+    return _ProcessedFrame(
+        file_frame_index=file_frame_index,
+        record=None,
+        inference=None,
+        topology_reconstruction_status=None,
+        error_code=getattr(error, "error_code", "frame_conversion_failed"),
+        error_message=str(error) or type(error).__name__,
+        error_type=type(error).__name__,
+        error_metadata=(error.evidence() if isinstance(error, StereoProjectionError) else None),
+    )
+
+
+def _process_frame_chunk_item(
+    frame: BaseCalcFrame[Any],
+    fallback_index: int,
+    schema_version: str,
+) -> _ProcessedFrame:
+    """Keep an unexpected frame exception local to its chunk item.
+
+    The normal conversion and inference boundaries already return a diagnostic
+    for one bad frame.  This outer guard covers failures before those
+    boundaries (for example a malformed MolOP object or a reconstruction
+    status property that raises).  Without it, the chunk worker raises and the
+    async collector has no source-level way to tell one failed frame from all
+    of its otherwise valid neighbours.
+    """
+
+    try:
+        return _process_frame_without_configuration(frame, fallback_index, schema_version)
+    except Exception as error:
+        return _frame_processing_failure(frame, fallback_index, error)
+
+
 def _process_frame_worker(
     frame: BaseCalcFrame[Any],
     fallback_index: int,
@@ -926,7 +1028,7 @@ def _process_frame_chunk_worker(
     """Process a frame chunk after one-time worker initialization."""
 
     return tuple(
-        _process_frame_without_configuration(frame, fallback_index, schema_version)
+        _process_frame_chunk_item(frame, fallback_index, schema_version)
         for frame, fallback_index in frames
     )
 
@@ -1062,24 +1164,10 @@ def _materialize_parsed_artifacts(
         ]
         processed: list[_ProcessedFrame] = []
         for fallback_index, frame, job in jobs:
-            file_frame_index = _frame_file_index(frame, fallback_index)
             try:
                 processed.append(job.result())
             except Exception as error:
-                processed.append(
-                    _ProcessedFrame(
-                        file_frame_index=file_frame_index,
-                        record=None,
-                        inference=None,
-                        topology_reconstruction_status=None,
-                        error_code=getattr(error, "error_code", "frame_conversion_failed"),
-                        error_message=str(error) or type(error).__name__,
-                        error_type=type(error).__name__,
-                        error_metadata=(
-                            error.evidence() if isinstance(error, StereoProjectionError) else None
-                        ),
-                    )
-                )
+                processed.append(_frame_processing_failure(frame, fallback_index, error))
         status_by_index = {
             item.file_frame_index: item.topology_reconstruction_status for item in processed
         }
@@ -1175,6 +1263,33 @@ async def _process_parsed_artifact_frames(
                 str(chem_file.schema_version),
             )
 
+    async def recover_frame_chunk(
+        chunk: tuple[tuple[BaseCalcFrame[Any], int], ...],
+    ) -> tuple[_ProcessedFrame, ...]:
+        """Retry a failed chunk item-by-item so valid neighbours survive."""
+
+        async def recover_frame(
+            frame: BaseCalcFrame[Any],
+            fallback_index: int,
+        ) -> _ProcessedFrame:
+            async with submission_slots:
+                try:
+                    return await loop.run_in_executor(
+                        pool,
+                        _process_frame_worker,
+                        _detach_frame_for_process(frame),
+                        fallback_index,
+                        str(chem_file.schema_version),
+                    )
+                except Exception as error:
+                    return _frame_processing_failure(frame, fallback_index, error)
+
+        return tuple(
+            await asyncio.gather(
+                *(recover_frame(frame, fallback_index) for frame, fallback_index in chunk)
+            )
+        )
+
     gathered_chunks = await asyncio.gather(
         *(process_frame_chunk(chunk) for chunk in frame_chunks),
         return_exceptions=True,
@@ -1184,21 +1299,7 @@ async def _process_parsed_artifact_frames(
         if isinstance(result, tuple):
             processed.extend(result)
             continue
-        processed.extend(
-            _ProcessedFrame(
-                file_frame_index=_frame_file_index(frame, fallback_index),
-                record=None,
-                inference=None,
-                topology_reconstruction_status=None,
-                error_code=getattr(result, "error_code", "frame_conversion_failed"),
-                error_message=str(result) or type(result).__name__,
-                error_type=type(result).__name__,
-                error_metadata=(
-                    result.evidence() if isinstance(result, StereoProjectionError) else None
-                ),
-            )
-            for frame, fallback_index in chunk
-        )
+        processed.extend(await recover_frame_chunk(chunk))
     status_by_index = {
         item.file_frame_index: item.topology_reconstruction_status for item in processed
     }
@@ -1262,7 +1363,10 @@ def _parse_calculation_path_worker(
         chem_file = AutoFileParser(
             path,
             parser_detection="auto",
-            capture_source_evidence=get_settings().molop_capture_source_evidence,
+            # Segment boundaries and frame locators are part of the durable
+            # calculation identity.  Every ingestion route uses the same
+            # evidence-complete parser contract.
+            capture_source_evidence=True,
             release_file_content=True,
         )
         return (
@@ -2837,6 +2941,7 @@ def _persist_parsed_artifact(
     # ``persist_parsed_files`` before calling us.
     if not parsed.frame_records and parsed.source_frame_count:
         parsed = _materialize_parsed_artifacts([parsed])[0]
+    isolated_frame_persistence = _parsed_artifact_requires_isolated_frame_persistence(parsed)
     artifact = ingestion.artifact_file
     if existing_revision_ids is None:
         existing_revision_ids = {
@@ -2890,10 +2995,14 @@ def _persist_parsed_artifact(
         # path for retries silently changed the durable worker to one-frame-at-
         # a-time ORM writes.
         fast_insert=(
-            _fast_molop_ingestion_enabled() and (not existing_revision_ids or force_new_revision)
+            _fast_molop_ingestion_enabled()
+            and (not existing_revision_ids or force_new_revision)
+            and not isolated_frame_persistence
         ),
         parallel_frame_persistence=(
-            _fast_molop_ingestion_enabled() and (not existing_revision_ids or force_new_revision)
+            _fast_molop_ingestion_enabled()
+            and (not existing_revision_ids or force_new_revision)
+            and not isolated_frame_persistence
         ),
         geometry_context=active_geometry_context,
         preload_geometry_context=preload_geometry_context,
@@ -3279,24 +3388,22 @@ def _finalize_batch_ingestions(
         if inference.status is TransitionStateInferenceStatus.FAILED
     }
 
+    statuses_by_id: dict[UUID, ArtifactIngestionStatus] = {}
+    source_counts_by_id: dict[UUID, int] = {}
+    transition_counts_by_id: dict[UUID, int] = {}
+    completed_at_by_id: dict[UUID, datetime] = {}
+    parser_metadata_by_id: dict[UUID, dict[str, object]] = {}
     for ingestion_id, (parse_revision_id, completion) in completed.items():
         ingestion = ingestions_by_id.get(ingestion_id)
         if ingestion is None:
             raise RuntimeError("artifact ingestion disappeared during batch finalization")
         has_failed_inference = (ingestion_id, parse_revision_id) in failed_revision_pairs
-        ingestion.status = (
+        status = (
             ArtifactIngestionStatus.PARTIAL
             if has_failed_inference or completion.parse_completeness is ParseCompleteness.PARTIAL
             else ArtifactIngestionStatus.SUCCEEDED
         )
-        ingestion.source_frame_count = completion.source_frame_count
-        ingestion.transition_state_frame_count = completion.transition_state_frame_count
-        ingestion.completed_at = completion.completed_at
-        ingestion.worker_lease_id = None
-        ingestion.worker_lease_expires_at = None
-        ingestion.error_code = None
-        ingestion.error_message = None
-        ingestion.parser_metadata = {
+        metadata: dict[str, object] = {
             "source_format": completion.source_format,
             "latest_parse_revision_id": str(completion.parse_revision_id),
             "latest_parse_revision_created": completion.parse_revision_created,
@@ -3305,7 +3412,75 @@ def _finalize_batch_ingestions(
             "parse_completeness": completion.parse_completeness.value,
             "parse_diagnostics": list(completion.parse_diagnostics),
         }
-        session.add(ingestion)
+        statuses_by_id[ingestion_id] = status
+        source_counts_by_id[ingestion_id] = completion.source_frame_count
+        transition_counts_by_id[ingestion_id] = completion.transition_state_frame_count
+        completed_at_by_id[ingestion_id] = completion.completed_at
+        parser_metadata_by_id[ingestion_id] = metadata
+
+    if completed:
+        ingestion_id_column = col(ArtifactIngestion.id)
+        session.exec(
+            update(ArtifactIngestion)
+            .where(ingestion_id_column.in_(completed))
+            .values(
+                status=case(
+                    statuses_by_id,
+                    value=ingestion_id_column,
+                    else_=col(ArtifactIngestion.status),
+                ),
+                source_frame_count=case(
+                    source_counts_by_id,
+                    value=ingestion_id_column,
+                    else_=col(ArtifactIngestion.source_frame_count),
+                ),
+                transition_state_frame_count=case(
+                    transition_counts_by_id,
+                    value=ingestion_id_column,
+                    else_=col(ArtifactIngestion.transition_state_frame_count),
+                ),
+                completed_at=case(
+                    completed_at_by_id,
+                    value=ingestion_id_column,
+                    else_=col(ArtifactIngestion.completed_at),
+                ),
+                worker_lease_id=None,
+                worker_lease_expires_at=None,
+                error_code=None,
+                error_message=None,
+                parser_metadata=case(
+                    {
+                        ingestion_id: sa_cast(metadata, JSONB)
+                        for ingestion_id, metadata in parser_metadata_by_id.items()
+                    },
+                    value=ingestion_id_column,
+                    else_=col(ArtifactIngestion.parser_metadata),
+                ),
+            )
+        )
+        # The result builder reuses the preloaded ORM instances.  Mark the
+        # values as committed so the set-based UPDATE does not get overwritten
+        # by a stale unit-of-work flush and no refresh SELECT is needed.
+        for ingestion_id, ingestion in ingestions_by_id.items():
+            if ingestion_id not in statuses_by_id:
+                continue
+            set_committed_value(ingestion, "status", statuses_by_id[ingestion_id])
+            set_committed_value(
+                ingestion,
+                "source_frame_count",
+                source_counts_by_id[ingestion_id],
+            )
+            set_committed_value(
+                ingestion,
+                "transition_state_frame_count",
+                transition_counts_by_id[ingestion_id],
+            )
+            set_committed_value(ingestion, "completed_at", completed_at_by_id[ingestion_id])
+            set_committed_value(ingestion, "worker_lease_id", None)
+            set_committed_value(ingestion, "worker_lease_expires_at", None)
+            set_committed_value(ingestion, "error_code", None)
+            set_committed_value(ingestion, "error_message", None)
+            set_committed_value(ingestion, "parser_metadata", parser_metadata_by_id[ingestion_id])
     return inferences_by_ingestion_id
 
 
@@ -3470,16 +3645,30 @@ def _run_persist_parsed_artifact_savepoint(
     # mode by deferring reconciliation, so inspect the configured fast-path
     # switch here as well; otherwise ``begin_nested`` would still flush the
     # deferred queue at every file boundary.
-    fast_mode = typed_session.info.get("tricycle_fast_insert", False) or (
-        kwargs.get("defer_reconciliation", False) and _fast_molop_ingestion_enabled()
+    parsed = kwargs.get("parsed")
+    requires_isolated_frame_persistence = isinstance(
+        parsed, _ParsedArtifact
+    ) and _parsed_artifact_requires_isolated_frame_persistence(parsed)
+    fast_mode = not requires_isolated_frame_persistence and (
+        typed_session.info.get("tricycle_fast_insert", False)
+        or (kwargs.get("defer_reconciliation", False) and _fast_molop_ingestion_enabled())
     )
+    if fast_mode:
+        pending_checkpoint = _fast_pending_entity_count(typed_session)
+        try:
+            return _persist_parsed_artifact(typed_session, **kwargs)
+        except Exception:
+            # Fast rows are appended to a Python queue until the persistence
+            # microbatch flush.  A file-level failure must remove its queued
+            # revision-local rows or a later file can flush them as if they
+            # were valid.  This is the deferred equivalent of the regular
+            # path's database savepoint.
+            _truncate_fast_pending_entities(typed_session, pending_checkpoint)
+            raise
     # Keep the previous high-throughput path allocation-free at the file
     # boundary.  The snapshots are only needed when a real savepoint is used;
     # taking them in fast mode copies the growing geometry/inference context
     # for every parsed file and reintroduces the regression this helper avoids.
-    if fast_mode:
-        return _persist_parsed_artifact(typed_session, **kwargs)
-
     context = kwargs.get("geometry_context")
     context_snapshot = _snapshot_inference_context(context)
     pending_snapshot = list(typed_session.info.get("_fast_pending_entities", ()))
@@ -3488,8 +3677,11 @@ def _run_persist_parsed_artifact_savepoint(
             return _persist_parsed_artifact(typed_session, **kwargs)
     except Exception:
         _restore_inference_context(context, context_snapshot)
-        if typed_session.info.get("tricycle_fast_insert", False):
-            _set_fast_pending_entities(typed_session, pending_snapshot)
+        # A regular partial-file boundary can follow clean files whose rows
+        # are still in the deferred queue.  Restore that queue regardless of
+        # the current mode; the nested transaction rolls back any rows that
+        # were attached from it before the failure.
+        _set_fast_pending_entities(typed_session, pending_snapshot)
         raise
 
 
@@ -3866,8 +4058,19 @@ def _run_preload_batch_persistence_state(
     # importer.  Newer correctness/reconciliation features remain available
     # to single-file and explicitly non-bulk calls, while the durable worker
     # reparse uses the proven shared batch semantics.
-    cast(Session, session).info[LEGACY_BULK_IMPORT_SESSION_INFO_KEY] = True
-    return _preload_batch_persistence_state(cast(Session, session), ingestion_ids=ingestion_ids)
+    typed_session = cast(Session, session)
+    typed_session.info[LEGACY_BULK_IMPORT_SESSION_INFO_KEY] = True
+    # Source visibility is materialized by the same batch's reconciliation or
+    # by the worker's queue-drain profile refresh.  The row-level PostgreSQL
+    # triggers otherwise recompute the profile graph once for every frame,
+    # ingestion, and profile-source row while the transaction is still
+    # building the graph.  The LOCAL setting is scoped to this one database
+    # transaction and the trigger functions fail back to their old behavior
+    # for every other write path.
+    typed_session.connection().execute(
+        text("SET LOCAL tricycle.defer_profile_source_visibility = 'on'")
+    )
+    return _preload_batch_persistence_state(typed_session, ingestion_ids=ingestion_ids)
 
 
 def _stored_result(artifact: ArtifactFile) -> ArtifactUploadResult:
@@ -4093,6 +4296,216 @@ class ArtifactUploadService:
             )
 
     @classmethod
+    async def parse_staged_artifact(cls, artifact_id: UUID) -> ParsedArtifactTask:
+        """Download and parse one claimed RustFS object without touching SQL rows."""
+
+        started_at = datetime.now(UTC)
+        try:
+            async with session_factory() as session:
+                artifact = await session.get(ArtifactFile, artifact_id)
+            if artifact is None:
+                raise ArtifactUploadError("artifact not found")
+            if artifact.artifact_kind is not ArtifactKind.CALCULATION_OUTPUT:
+                raise ArtifactUploadError("only calculation output artifacts can be parsed")
+            if artifact.storage_status is not StorageStatus.AVAILABLE:
+                raise ArtifactUploadError("artifact bytes are not available for parsing")
+            async with _rustfs_download_submission_slots():
+                payload = await asyncio.to_thread(
+                    cls._load_payload,
+                    RustFSSettings().model_copy(update={"bucket": artifact.bucket}),
+                    artifact.object_key,
+                )
+            if len(payload) != artifact.size_bytes or sha256(payload).hexdigest() != (
+                artifact.content_sha256
+            ):
+                raise ArtifactUploadError("stored artifact bytes do not match database identity")
+            _require_upload_size(payload)
+            parsed = await _run_molop_file_pipeline(
+                payload,
+                artifact.original_filename,
+                artifact_sha256=artifact.content_sha256,
+            )
+            return ParsedArtifactTask(artifact_id=artifact_id, started_at=started_at, parsed=parsed)
+        except Exception as error:
+            return ParsedArtifactTask(artifact_id=artifact_id, started_at=started_at, parsed=error)
+
+    @classmethod
+    async def _prepare_preparsed_batch(
+        cls,
+        *,
+        parsed_tasks: Sequence[ParsedArtifactTask],
+        project_id: UUID,
+        worker_lease_by_artifact_id: Mapping[UUID, UUID] | None,
+    ) -> tuple[
+        list[ArtifactUploadPayload],
+        dict[int, _PreparedCalculationUpload],
+        dict[int, ParsedArtifactTask],
+        dict[UUID, Exception],
+    ]:
+        """Build upload reservations around parser results already in memory."""
+
+        ordered_tasks = list({task.artifact_id: task for task in parsed_tasks}.values())
+        if not ordered_tasks:
+            return [], {}, {}, {}
+        artifact_ids = tuple(task.artifact_id for task in ordered_tasks)
+        async with session_factory() as session:
+            artifacts = (
+                await session.exec(
+                    select(ArtifactFile).where(col(ArtifactFile.id).in_(artifact_ids))
+                )
+            ).all()
+            ingestions = (
+                await session.exec(
+                    select(ArtifactIngestion).where(
+                        col(ArtifactIngestion.artifact_file_id).in_(artifact_ids)
+                    )
+                )
+            ).all()
+        artifacts_by_id = {
+            artifact.id: artifact for artifact in artifacts if artifact.id is not None
+        }
+        ingestions_by_artifact_id = {
+            ingestion.artifact_file_id: ingestion for ingestion in ingestions
+        }
+        files: list[ArtifactUploadPayload] = []
+        prepared: dict[int, _PreparedCalculationUpload] = {}
+        preparsed_by_index: dict[int, ParsedArtifactTask] = {}
+        errors: dict[UUID, Exception] = {}
+        for task in ordered_tasks:
+            artifact = artifacts_by_id.get(task.artifact_id)
+            if artifact is None:
+                errors[task.artifact_id] = ArtifactUploadError("artifact not found")
+                continue
+            if artifact.project_id != project_id:
+                errors[task.artifact_id] = ArtifactUploadError(
+                    "parsed artifact belongs to a different project"
+                )
+                continue
+            if artifact.artifact_kind is not ArtifactKind.CALCULATION_OUTPUT:
+                errors[task.artifact_id] = ArtifactUploadError(
+                    "only calculation output artifacts can be persisted"
+                )
+                continue
+            ingestion = ingestions_by_artifact_id.get(task.artifact_id)
+            if ingestion is None or ingestion.id is None:
+                errors[task.artifact_id] = ArtifactUploadError("artifact ingestion not found")
+                continue
+            expected_lease = (
+                worker_lease_by_artifact_id.get(task.artifact_id)
+                if worker_lease_by_artifact_id is not None
+                else None
+            )
+            if expected_lease is not None and (
+                ingestion.status is not ArtifactIngestionStatus.PROCESSING
+                or ingestion.worker_lease_id != expected_lease
+            ):
+                errors[task.artifact_id] = ArtifactUploadError(
+                    "artifact processing lease is no longer current"
+                )
+                continue
+            index = len(files)
+            files.append(
+                ArtifactUploadPayload(
+                    filename=artifact.original_filename,
+                    media_type=artifact.media_type,
+                    payload=None,
+                )
+            )
+            prepared[index] = _PreparedCalculationUpload(
+                settings=RustFSSettings().model_copy(update={"bucket": artifact.bucket}),
+                artifact_id=task.artifact_id,
+                object_key=artifact.object_key,
+                ingestion_id=ingestion.id,
+                started_at=task.started_at,
+                source=b"",
+                size_bytes=artifact.size_bytes,
+                media_type=artifact.media_type,
+                content_sha256=artifact.content_sha256,
+                needs_storage=False,
+                check_existing_object=False,
+                force_new_revision=True,
+                ingestion_status=ingestion.status,
+            )
+            preparsed_by_index[index] = task
+        return files, prepared, preparsed_by_index, errors
+
+    @classmethod
+    async def persist_parsed_microbatch(
+        cls,
+        parsed_tasks: Sequence[ParsedArtifactTask],
+        *,
+        project_id: UUID,
+        user_id: UUID,
+        worker_lease_by_artifact_id: Mapping[UUID, UUID] | None = None,
+        persistence_batch_files: int | None = None,
+        persistence_frame_limit: int | None = None,
+        defer_thermodynamic_refresh: bool = True,
+    ) -> dict[UUID, ArtifactUploadResult | Exception]:
+        """Persist parser results through one bounded SQLAlchemy consumer."""
+
+        (
+            files,
+            prepared,
+            preparsed_by_index,
+            preparation_errors,
+        ) = await cls._prepare_preparsed_batch(
+            parsed_tasks=parsed_tasks,
+            project_id=project_id,
+            worker_lease_by_artifact_id=worker_lease_by_artifact_id,
+        )
+        results: dict[UUID, ArtifactUploadResult | Exception] = dict(preparation_errors)
+        if not files:
+            return results
+        resolved_batch_files = (
+            persistence_batch_files or get_settings().upload_worker_persistence_batch_files
+        )
+        batch_result = await cls.upload_batch(
+            files=files,
+            artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+            project_id=project_id,
+            user_id=user_id,
+            persistence_batch_files=min(resolved_batch_files, len(files)),
+            persistence_frame_limit=(
+                persistence_frame_limit or get_settings().upload_worker_persistence_frame_limit
+            ),
+            defer_thermodynamic_refresh=defer_thermodynamic_refresh,
+            _preparsed_tasks=preparsed_by_index,
+            _prepared_uploads=prepared,
+        )
+        timings = batch_result.timings_ms
+        logger.info(
+            "upload worker persistence microbatch project=%s user=%s files=%d bytes=%d "
+            "frames=%d succeeded=%d failed=%d total_ms=%.1f persist_wall_ms=%.1f "
+            "persist_db_ms=%.1f preload_ms=%.1f write_ms=%.1f flush_ms=%.1f "
+            "inference_ms=%.1f reconcile_ms=%.1f result_ms=%.1f commit_ms=%.1f",
+            project_id,
+            user_id,
+            batch_result.total_count,
+            sum(item.size_bytes for item in prepared.values()),
+            batch_result.source_frame_count or 0,
+            batch_result.succeeded_count,
+            batch_result.failed_count,
+            timings.get("total_ms", 0.0),
+            timings.get("persist_pipeline_wall_ms", 0.0),
+            timings.get("persist_db_ms", 0.0),
+            timings.get("persist_preload_db_ms", 0.0),
+            timings.get("persist_write_db_ms", 0.0),
+            timings.get("persist_flush_initial_ms", 0.0),
+            timings.get("persist_deferred_inferences_ms", 0.0),
+            timings.get("persist_reconcile_geometry_ms", 0.0),
+            timings.get("persist_result_db_ms", 0.0),
+            timings.get("persist_commit_db_ms", 0.0),
+        )
+        for item, prepared_item in zip(batch_result.items, prepared.values(), strict=True):
+            if item.result is not None:
+                results[prepared_item.artifact_id] = item.result
+            else:
+                results[prepared_item.artifact_id] = ArtifactUploadError(
+                    item.error_message or item.error_code or "artifact persistence failed"
+                )
+        return results
+
+    @classmethod
     async def clear_previous_parse_results(
         cls,
         *,
@@ -4208,18 +4621,17 @@ class ArtifactUploadService:
         refresh_statistics: bool = False,
         defer_thermodynamic_refresh: bool = False,
     ) -> dict[UUID, ArtifactUploadResult | Exception]:
-        """Reparse staged objects through the existing bounded batch pipeline.
+        """Reparse staged objects through the compatibility batch pipeline.
 
-        The durable worker has already completed the RustFS hand-off. This
-        method only downloads and verifies those objects, then delegates all
-        MolOP, MolGR, and database work to ``upload_batch``. The parser claim
-        window remains 64 files, while database commits stay bounded to the
-        shared eight-file/128-frame persistence microbatch. In particular, it does not
-        create a second parser or a second persistence consumer; the shared
-        process pool and batched writer are the same path used by the local
-        importer. ``defer_thermodynamic_refresh`` is used by the durable worker
-        so the queue-level profile refresher, rather than each persistence
-        microbatch, owns the expensive derived-profile rebuild.
+        The normal durable worker uses ``parse_staged_artifact`` for continuous
+        dispatch and ``persist_parsed_microbatch`` for the shared persistence
+        consumer. This method remains for explicit administrative callers and
+        older tests/scripts: it only downloads and verifies existing RustFS
+        objects, then delegates MolOP, MolGR, and database work to
+        ``upload_batch``. It does not create a parser process per file or
+        upload session. ``defer_thermodynamic_refresh`` is used by the durable
+        worker so the queue-level profile refresher, rather than each
+        persistence microbatch, owns the expensive derived-profile rebuild.
         """
 
         ordered_ids = tuple(dict.fromkeys(artifact_ids))
@@ -4392,11 +4804,10 @@ class ArtifactUploadService:
                     artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
                     project_id=project_id,
                     user_id=user_id,
-                    # The worker's project/user group can contain up to the
-                    # 64-file claim window, but commits must happen at the
-                    # bounded persistence microbatch boundary. This keeps
-                    # the single consumer and shared parser pool while
-                    # releasing project-scoped identity locks regularly.
+                    # Keep the compatibility path on the same bounded
+                    # persistence boundary as the streaming worker. The
+                    # production worker itself already hands this method one
+                    # parsed microbatch at a time.
                     persistence_batch_files=PERSISTENCE_PRELOAD_BATCH_SIZE,
                     reparse_failed_ingestions=True,
                     force_reparse=force_reparse,
@@ -4844,11 +5255,14 @@ class ArtifactUploadService:
         on_file_committed: Callable[[int, ArtifactBatchUploadItem], Awaitable[None]] | None = None,
         streaming: bool = False,
         persistence_batch_files: int = PERSISTENCE_PRELOAD_BATCH_SIZE,
+        persistence_frame_limit: int = PERSISTENCE_BATCH_FRAME_LIMIT,
         enforce_batch_file_limit: bool = True,
         reparse_failed_ingestions: bool = False,
         force_reparse: bool = False,
         previous_results_cleared: bool = False,
         defer_thermodynamic_refresh: bool = False,
+        _preparsed_tasks: Mapping[int, ParsedArtifactTask] | None = None,
+        _prepared_uploads: Mapping[int, _PreparedCalculationUpload] | None = None,
     ) -> ArtifactBatchUploadResult:
         """Prepare once, then advance files through an asynchronous pipeline.
 
@@ -4867,20 +5281,27 @@ class ArtifactUploadService:
 
         if persistence_batch_files < 1:
             raise ValueError("persistence_batch_files must be positive")
+        if persistence_frame_limit < 1:
+            raise ValueError("persistence_frame_limit must be positive")
         timings: dict[str, float] = {}
         started = perf_counter()
         if streaming and any(file.payload is not None for file in files):
             raise ArtifactUploadError(
                 "streaming upload mode requires on-disk spool paths, not in-memory payloads"
             )
-        # Local CLI imports pass on-disk paths and use the bounded pipeline as
-        # the resource limit. Their files must not be split merely because the
-        # aggregate source size crosses the HTTP request budget.
-        source_inspections = _require_batch_upload_budget(
-            files,
-            enforce_batch_files=enforce_batch_file_limit,
-            enforce_batch_bytes=not streaming,
-        )
+        if (_preparsed_tasks is None) != (_prepared_uploads is None):
+            raise ValueError("preparsed tasks and prepared uploads must be supplied together")
+        if _preparsed_tasks is not None:
+            source_inspections: Mapping[int, _InspectedUploadSource] = {}
+        else:
+            # Local CLI imports pass on-disk paths and use the bounded pipeline
+            # as the resource limit. Their files must not be split merely
+            # because the aggregate source size crosses the HTTP request budget.
+            source_inspections = _require_batch_upload_budget(
+                files,
+                enforce_batch_files=enforce_batch_file_limit,
+                enforce_batch_bytes=not streaming,
+            )
         timings["validate_budget_ms"] = (perf_counter() - started) * 1000
         phase_started = perf_counter()
         await AuthorizationService.require_project_permission(
@@ -4891,17 +5312,21 @@ class ArtifactUploadService:
         timings["authorize_ms"] = (perf_counter() - phase_started) * 1000
 
         phase_started = perf_counter()
-        prepared, item_by_index = await cls._prepare_upload_batch(
-            files=files,
-            artifact_kind=artifact_kind,
-            project_id=project_id,
-            user_id=user_id,
-            source_inspections=source_inspections,
-            reparse_failed_ingestions=reparse_failed_ingestions,
-            force_reparse=force_reparse,
-            previous_results_cleared=previous_results_cleared,
-            defer_thermodynamic_refresh=defer_thermodynamic_refresh,
-        )
+        if _prepared_uploads is not None:
+            prepared = dict(_prepared_uploads)
+            item_by_index: dict[int, ArtifactBatchUploadItem] = {}
+        else:
+            prepared, item_by_index = await cls._prepare_upload_batch(
+                files=files,
+                artifact_kind=artifact_kind,
+                project_id=project_id,
+                user_id=user_id,
+                source_inspections=source_inspections,
+                reparse_failed_ingestions=reparse_failed_ingestions,
+                force_reparse=force_reparse,
+                previous_results_cleared=previous_results_cleared,
+                defer_thermodynamic_refresh=defer_thermodynamic_refresh,
+            )
         timings["prepare_db_ms"] = (perf_counter() - phase_started) * 1000
 
         stored: dict[int, Any] = {}
@@ -4919,11 +5344,17 @@ class ArtifactUploadService:
             # Preparation commits the pending reservations before this stage.
             # Keep pool startup inside the recovery boundary so an executor
             # initialization failure cannot strand those rows indefinitely.
-            storage_pool = _get_storage_process_pool(get_settings().upload_max_concurrency)
+            # A worker microbatch supplies already staged/parser-owned files;
+            # it must not start an unused RustFS process pool.
+            storage_pool = (
+                _get_storage_process_pool(get_settings().upload_max_concurrency)
+                if any(reservation.needs_storage for reservation in prepared.values())
+                else None
+            )
         except BaseException as error:
             await _await_cancellation_safe(recover_aborted_batch(error))
             raise
-        frame_submission_slots = asyncio.Semaphore(_frame_submission_limit())
+        frame_submission_slots = _frame_worker_submission_slots()
         storage_phase_finished_at: float | None = None
         storage_completed_count = 0
         storage_total_count = sum(
@@ -4983,6 +5414,8 @@ class ArtifactUploadService:
                                 )
                             )
                     else:
+                        if storage_pool is None:
+                            raise RuntimeError("storage pool is unavailable for a storage task")
                         value = await _await_cancellation_safe(
                             loop.run_in_executor(
                                 storage_pool,
@@ -5020,6 +5453,9 @@ class ArtifactUploadService:
                 or reservation.skip_parse
             ):
                 return index, storage_error, None
+            preparsed_task = (_preparsed_tasks or {}).get(index)
+            if preparsed_task is not None:
+                return index, None, preparsed_task.parsed
             parse_started_at = perf_counter()
             parsed: _ParsedArtifact | Exception
             molop_started_at = perf_counter()
@@ -5593,7 +6029,9 @@ class ArtifactUploadService:
                 pending_persistence_frame_count = 0
 
             persistence_preload_limit = min(
-                PERSISTENCE_PRELOAD_BATCH_SIZE,
+                persistence_batch_files
+                if _preparsed_tasks is not None
+                else PERSISTENCE_PRELOAD_BATCH_SIZE,
                 persistence_batch_files,
             )
 
@@ -5616,14 +6054,14 @@ class ArtifactUploadService:
                     # old 32-file write set in the same SQLAlchemy Session.
                     if pending_preload and (
                         len(pending_preload) >= persistence_preload_limit
-                        or pipeline_result_queue.empty()
+                        or (pipeline_result_queue.empty() and _preparsed_tasks is None)
                     ):
                         parsed_batch = pending_preload.copy()
                         pending_preload.clear()
                         await persist_parsed_files(parsed_batch)
                 if (
                     len(pending_completed_indices) >= persistence_batch_files
-                    or pending_persistence_frame_count >= PERSISTENCE_BATCH_FRAME_LIMIT
+                    or pending_persistence_frame_count >= persistence_frame_limit
                 ):
                     completed_batch = pending_completed_indices.copy()
                     pending_completed_indices.clear()
@@ -5799,4 +6237,5 @@ __all__ = [
     "ArtifactUploadPayload",
     "ArtifactUploadService",
     "MolOPFileParseTimeoutError",
+    "molop_process_worker_count",
 ]

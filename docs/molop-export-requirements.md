@@ -12,12 +12,12 @@
 
 MolOP 通过现有 `ChemFile` 与 `ChemFileFrame` 模型提供稳定、版本化、可验证的计算结果
 序列化视图。数据库导入 Gaussian、ORCA 等计算结果时，不得依赖 MolOP 私有 parser 类型、
-缓存、完整原文或格式专用 semantic model。普通大规模导入默认采用上一版高吞吐模式；
-需要 source evidence 的审计/可复现导入必须显式开启证据采集。
+缓存、完整原文或格式专用 semantic model。所有导入统一开启 source evidence，以保证 segment、
+frame 和重解析替换都有可追溯的原文证据。
 
 正式导入必须保留 artifact、segment、frame、几何、拓扑、能量、数组和热化学之间的物理
-关系；开启 source evidence 的导入还必须把每条 evidence 追溯到原始 artifact 的确定字节
-区间。普通大批量导入未开启证据时，相关 source span/block hash 字段按契约保留为 `NULL`。
+关系；每条 evidence 都必须追溯到原始 artifact 的确定字节区间。关闭 source evidence 的
+配置不符合契约，应用启动时会拒绝该配置。
 
 本文使用以下约束词：
 
@@ -142,8 +142,8 @@ end_line
 | `MOLREQ-013` | `frame_id` 只表示当前 `ChemFile` 的追加序号 | 数据库不得用 `frame_id` 恢复原文件顺序 |
 | `MOLREQ-014` | status 必须按真实证据作用域输出 | segment termination 不伪装成逐 frame termination 事实 |
 | `MOLREQ-015` | span 必须在 locator 拆分原文时产生 | 不得通过重复 frame 文本反向搜索位置 |
-| `MOLREQ-016` | 普通大规模导入默认设置 `capture_source_evidence=False`；审计/可复现导入必须显式设置为 `True` | 开启时必须保留 artifact identity、segment evidence、frame span 和 MolOP frame role；关闭时保留 artifact SHA-256、解析器 provenance/configuration、帧顺序与诊断，源跨度/块哈希为 `NULL` |
-| `MOLREQ-017` | 证据收集、角色判定与图重建彼此独立 | MolOP `0.2.18` 的 evidence collection 不再隐式重建分子图；普通吞吐导入可以关闭 evidence，由 MolGR 在归一化阶段重建图；审计/重解析路径显式开启 evidence。文件级 worker、候选窗口与完成结果持久化微批独立控制。 |
+| `MOLREQ-016` | 所有导入统一设置 `capture_source_evidence=True`，不得关闭 | 必须保留 artifact identity、segment evidence、frame span、MolOP frame role 和 block hash；关闭 source evidence 的配置必须被拒绝 |
+| `MOLREQ-017` | 证据收集、角色判定与图重建彼此独立 | MolOP `0.2.18` 的 evidence collection 不再隐式重建分子图；所有导入都开启 evidence，由 MolGR 在归一化阶段重建图。文件级 worker、候选窗口与完成结果持久化微批独立控制。 |
 
 segment 的 `protocol` 必须是通用 `model_chemistry` 的纯 mapping 投影，
 `task_requests` 必须是通用 `QMTaskRequest` 的纯 mapping 列表。不得泄漏

@@ -21,6 +21,9 @@ would create a competing local PostgreSQL/RustFS pair. Use `compose.data.yaml`
 for the data host and the `compose.compute.yaml` overlay for a compute/API host,
 or equivalent separate production stacks.
 
+For MolOP, upload-worker, PostgreSQL, and RustFS throughput settings on a dedicated
+compute host, see [High-performance import configuration](performance-tuning.md).
+
 Expose only a same-origin HTTPS edge. Do not publish PostgreSQL, RustFS Console,
 Keycloak administration, or internal API ports. HTTP only redirects to HTTPS;
 Caddy proxies API, health, OpenAPI, GraphQL, MCP, and NexusX routes.
@@ -106,32 +109,34 @@ Bound OpenMP/BLAS pools separately with `OMP_NUM_THREADS`,
 `OPENBLAS_NUM_THREADS`, and `MKL_NUM_THREADS`. The local import candidate
 window only bounds RustFS staging and fingerprint buffering. The parse timeout
 is 60 seconds for a 10 MiB input and scales proportionally; timeout advances
-only that worker to the next queued file. Never use
-`TRICYCLE_MOLOP_BATCH_N_JOBS=-1` in production.
+only that worker to the next queued file. `-1` uses all CPU cores visible to the
+single upload-worker; use a positive value only when CPU must be reserved for
+another workload.
 
 After RustFS staging, browser, remote, and legacy pending-ingestion imports use
-the single `ArtifactUploadService.reparse_batch` path. The worker claims a
-64-file window and `reparse_batch` only reads/verifies existing RustFS objects before
-delegating to the shared MolOP process pool and single persistence consumer. It
-does not upload the object again or add a parser per request. `TRICYCLE_UPLOAD_MAX_CONCURRENCY` limits RustFS reads,
+the same continuous worker path. The worker claims small pages and feeds a
+shared dispatcher; `TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES=0` derives a bounded
+prefetch limit from the MolOP process count. It only reads/verifies existing
+RustFS objects before delegating to the shared MolOP process pool and single
+persistence consumer. It does not upload the object again or add a parser per
+request. `TRICYCLE_UPLOAD_MAX_CONCURRENCY` limits RustFS reads,
 `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` is retained for pending-ingestion
-recovery, and `TRICYCLE_MOLOP_BATCH_N_JOBS` is the shared parser-pool admission
-limit. Inside `upload_batch`, every eight completed files (or a temporarily
-empty result queue) are handed to the single persistence consumer. The
-persistence transaction is also capped at eight completed files or 128 parsed
-frames, whichever limit is reached first. The client
-`UploadBatch` is only a queue/progress boundary, not a persistence boundary:
-one-file submissions for the same project/user are merged into one persistence
-microbatch, while different project/user microbatches are committed
-sequentially, with each persistence microbatch committed at the bounded
-eight-file/128-frame boundary.
-Neither boundary changes the configured parser-pool admission target, and these
-controls must not be multiplied.
+recovery, and `TRICYCLE_MOLOP_BATCH_N_JOBS` is the shared parser-pool process
+count. The client `UploadBatch` is only a queue/progress boundary, not a
+persistence boundary: one-file submissions for the same project/user enter the
+same persistence microbatch. The consumer commits 16 completed files or 256
+parsed frames per microbatch by default; tune the file and frame boundaries with
+`TRICYCLE_UPLOAD_WORKER_PERSISTENCE_BATCH_FILES` and
+`TRICYCLE_UPLOAD_WORKER_PERSISTENCE_FRAME_LIMIT`. A temporarily empty result queue only triggers
+preload persistence, while an idle MolOP pool causes the tail microbatch to be
+committed. Project write groups are serialized, and these boundaries do not
+change the parser-pool target or open one persistence session per upload.
+These controls must not be multiplied.
 The bulk path keeps the previous legacy hot-path behavior; per-file
 concrete/logical/reverse reconciliation must not be inserted there without a
 same-fixture throughput regression check.
 
-This model requires exactly one `upload-worker` instance in production: it is
+This model recommends exactly one `upload-worker` instance in production: it is
 the boundary for the shared MolOP process pool and the single active persistence
 consumer. API nodes may scale horizontally, but upload-worker should not be
 scaled horizontally. Multiple worker replicas create independent parser pools

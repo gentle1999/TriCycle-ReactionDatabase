@@ -16,14 +16,15 @@ from uuid import UUID
 from sqlmodel import Session
 
 from tricycle_reaction_db.application.dtos import (
-    CalculationSegmentRecord,
     ParseRevisionCompletionRecord,
 )
 from tricycle_reaction_db.application.services._persistence import (
     LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
     _attach_or_reuse_entity,
     _attach_pending_entities,
+    _fast_pending_entity_count,
     _set_fast_pending_entities,
+    _truncate_fast_pending_entities,
 )
 from tricycle_reaction_db.application.services.calculations import (
     finalize_parse_revision,
@@ -537,19 +538,14 @@ def persist_molop_calculation_artifact(
         records_by_segment: dict[int, list[MolOPFrameRecords]] = {}
         for record in frame_records:
             records_by_segment.setdefault(record.segment_index, []).append(record)
-        source_segments = tuple(chem_file.source_segments)
-        if not source_segments and frame_records:
-            # MolOP omits source segments when evidence capture is disabled.
-            # Keep the relational segment required by the schema, but leave all
-            # source-location fields NULL rather than manufacturing offsets.
-            source_segments = (None,)
+        source_segments = tuple(getattr(chem_file, "source_segments", ()) or ())
+        if frame_records and not source_segments:
+            raise ValueError("MolOP source evidence is required: no source segments were captured")
         persisted_segments = []
         for source_segment in source_segments:
-            protocol_record = (
-                protocol_record_from_molop_segment(source_segment)
-                if source_segment is not None
-                else None
-            )
+            segment_index = source_segment.segment_index
+            segment_record = segment_record_from_molop(source_segment)
+            protocol_record = protocol_record_from_molop_segment(source_segment)
             protocol = (
                 persist_calculation_protocol(
                     session,
@@ -559,21 +555,6 @@ def persist_molop_calculation_artifact(
                 if protocol_record is not None
                 else None
             )
-            segment_record = (
-                segment_record_from_molop(source_segment)
-                if source_segment is not None
-                else CalculationSegmentRecord(
-                    segment_index=0,
-                    source_frame_count=len(chem_file),
-                    parse_completeness=(
-                        ParseCompleteness.PARTIAL
-                        if diagnostics or len(frame_records) != len(chem_file)
-                        else ParseCompleteness.NOT_ASSESSED
-                    ),
-                    parse_diagnostics=list(diagnostics),
-                    program_metadata={"source_evidence_captured": False},
-                )
-            )
             segment = persist_calculation_segment(
                 session,
                 revision,
@@ -581,10 +562,7 @@ def persist_molop_calculation_artifact(
                 segment_record,
             )
             persisted_segments.append(segment)
-            segment_frames = records_by_segment.get(
-                source_segment.segment_index if source_segment is not None else 0,
-                [],
-            )
+            segment_frames = records_by_segment.get(segment_index, [])
             segment_diagnostics = list(segment_record.parse_diagnostics)
             captured_indices = set(
                 segment_record.program_metadata.get("molop_captured_frame_indices", ())
@@ -592,7 +570,10 @@ def persist_molop_calculation_artifact(
             segment_diagnostics.extend(
                 diagnostic
                 for diagnostic in diagnostics
-                if diagnostic.get("file_frame_index") in captured_indices
+                if (
+                    diagnostic.get("segment_index") == segment_index
+                    or diagnostic.get("file_frame_index") in captured_indices
+                )
                 and diagnostic not in segment_diagnostics
             )
             segment_failed = any(
@@ -613,7 +594,7 @@ def persist_molop_calculation_artifact(
                 # entire, growing GeometryPersistenceContext for every frame.
                 # In the deferred fast path those copies turn persistence into
                 # O(frames * context-size), which is especially costly for a
-                # long-running 64-file worker window.  The normal/audit path
+                # long-running streaming worker cycle.  The normal/audit path
                 # keeps the per-frame savepoint snapshot; the fast path relies
                 # on the enclosing batch transaction and parser-side frame
                 # diagnostics instead of paying that copy on every success.
@@ -626,6 +607,9 @@ def persist_molop_calculation_artifact(
                     None
                     if effective_fast_insert
                     else list(session.info.get("_fast_pending_entities", ()))
+                )
+                pending_checkpoint = (
+                    _fast_pending_entity_count(session) if effective_fast_insert else None
                 )
                 array_counts_snapshot = None if effective_fast_insert else dict(array_counts)
                 persisted_frame: CalculationFrame | None = None
@@ -722,6 +706,8 @@ def persist_molop_calculation_artifact(
                         _restore_geometry_context(active_geometry_context, frame_snapshot)
                     if pending_snapshot is not None:
                         _set_fast_pending_entities(session, pending_snapshot)
+                    elif pending_checkpoint is not None:
+                        _truncate_fast_pending_entities(session, pending_checkpoint)
                     if array_counts_snapshot is not None:
                         array_counts.clear()
                         array_counts.update(array_counts_snapshot)
@@ -802,6 +788,13 @@ def persist_molop_calculation_artifact(
             revision.parse_completeness = ParseCompleteness.PARTIAL
             revision.parse_diagnostics = [*revision.parse_diagnostics, *diagnostics]
             _attach_or_reuse_entity(session, revision)
+            if not defer_batch_flush:
+                # The regular partial-file path must publish the revision
+                # completeness before finalize_parse_revision refreshes it;
+                # otherwise that refresh restores COMPLETE from PostgreSQL
+                # and the source/frame-count guard rejects the valid sibling
+                # frames that were already written.
+                session.flush()
 
         finalize_parse_revision(
             session,

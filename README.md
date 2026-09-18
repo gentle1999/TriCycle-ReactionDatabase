@@ -196,27 +196,37 @@ size, mtime, and SHA-256. Start `tricycle-upload-worker` alongside the CLI (the
 staged files. Final parse status is available from the UploadBatch API; a
 failure in one file does not discard unrelated files.
 
+The local importer is a staging client, not a parser client. It writes verified
+bytes to RustFS and marks each durable queue item `staged`; the single
+`tricycle-upload-worker` continuously claims work, keeps the shared MolOP pool
+full, and sends completed results to one microbatch persistence consumer. The
+client-side window only limits staging/backpressure. A single-file local import
+therefore follows exactly the same backend path as a browser, remote, or MCP
+upload after staging.
+
 The importer deliberately separates four controls:
 
 | Control | Default | Purpose |
 | --- | --- | --- |
-| `TRICYCLE_MOLOP_BATCH_N_JOBS` | `2` | Shared worker-process-pool admission limit |
-| `IMPORT_PIPELINE_WINDOW_FILES` | `64` | Candidate files available to the parser queue |
-| `IMPORT_COMMIT_BATCH_FILES` | `16` | Legacy compatibility setting; staging checkpoints are per queue window |
+| `TRICYCLE_MOLOP_BATCH_N_JOBS` | `-1` | Shared MolOP process count; `-1` uses all CPU cores visible to the worker |
+| `TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES` | `0` | Shared worker claim/prefetch limit; `0` derives a bounded value from the MolOP pool |
+| `IMPORT_PIPELINE_WINDOW_FILES` | `64` | Candidate files available to the RustFS staging queue |
+| `IMPORT_COMMIT_BATCH_FILES` | `16` | Deprecated CLI compatibility option; worker owns persistence microbatches |
 | `IMPORT_STREAM_QUEUE_SIZE` | `64` | Bounded discovery/fingerprinting buffer |
 
 Set the pipeline window to bound RustFS staging and keep memory predictable. The
 worker owns parser concurrency and persistence; do not use the staging window to
-create parser processes. Keep `OMP_NUM_THREADS`,
+create parser processes. `TRICYCLE_MOLOP_BATCH_N_JOBS=-1` uses every CPU core
+visible inside the worker container; set a positive value only when CPU must be
+reserved for another workload. Keep `OMP_NUM_THREADS`,
 `OPENBLAS_NUM_THREADS`, and `MKL_NUM_THREADS` bounded (the supplied development
 configuration uses `1`) to avoid nested native-thread oversubscription.
 
-For a dedicated compute host, use `TRICYCLE_MOLOP_BATCH_N_JOBS=16`, native
-thread limits of `1 / 1 / 1`, and a `64 / 64` staging/fingerprint window as the
-throughput-oriented starting point. The worker owns parse and persistence
-batching.
-Keep the conservative `2` worker setting on a low-resource development host;
-the full tuning table and the separate browser/upload-worker settings are in
+For a dedicated compute host, keep `TRICYCLE_MOLOP_BATCH_N_JOBS=-1` and use
+native thread limits of `1 / 1 / 1`; set a positive value if the host has other
+CPU consumers. The worker continuously refills the parser pool and commits
+eight completed files or 128 parsed frames per persistence microbatch. The full
+tuning table and the separate browser/upload-worker settings are in
 [Development: recommended import settings](docs/en/development.md#recommended-import-settings).
 
 The worker's baseline file timeout is `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS`
@@ -241,8 +251,9 @@ Frequently changed settings include:
 | `TRICYCLE_RUSTFS_ENDPOINT_URL` | Host-process S3/RustFS endpoint |
 | `TRICYCLE_AUTH_MODE` | `development` locally, `oidc` in production |
 | `TRICYCLE_OIDC_*` | OIDC issuer, audience, JWKS, and browser client settings |
-| `TRICYCLE_MOLOP_BATCH_N_JOBS` | Bounded file parser worker count |
-| `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` | Maximum files per durable queue claim |
+| `TRICYCLE_MOLOP_BATCH_N_JOBS` | Shared MolOP process count; `-1` uses all CPU cores visible to the worker |
+| `TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES` | Continuous worker prefetch limit; `0` derives a bounded value from the MolOP pool |
+| `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` | Legacy pending-ingestion recovery concurrency |
 | `TRICYCLE_UPLOAD_WORKER_PROFILE_REFRESH_MAX_DELAY_SECONDS` | Maximum delay before deferred thermodynamic profiles are refreshed |
 | `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS` | Per-file parsing baseline timeout |
 | `TRICYCLE_QUERY_STATEMENT_TIMEOUT_MS` | PostgreSQL statement timeout for query traffic |
@@ -327,6 +338,7 @@ separates current operating contracts from dated planning and acceptance records
 - [Documentation index / 文档索引](docs/README.md)
 - [Development environment and local importer](docs/en/development.md) / [开发环境与本地导入](docs/development.md)
 - [Deployment and configuration](docs/en/deployment-configuration.md) / [部署与配置指南](docs/deployment-configuration.md)
+- [High-performance import configuration](docs/en/performance-tuning.md) / [高性能导入配置指南](docs/performance-tuning.md)
 - [Data model and storage boundaries](docs/en/data-model.md) / [数据模型与存储边界](docs/data-model.md)
 - [Business model](docs/en/business-model.md) / [业务模型](docs/business-model.md)
 - [Operations and recovery runbook](docs/en/operations-runbook.md) / [生产运维与恢复 Runbook](docs/operations-runbook.md)

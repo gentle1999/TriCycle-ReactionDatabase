@@ -226,6 +226,19 @@ async def test_mixed_raw_batch_persists_independently_and_failed_reparse_starts_
                 assert gaussian_item.result.source_frame_count == 23
                 assert gaussian_item.result.transition_state_frame_count == 1
                 assert gaussian_item.result.inferred_reaction_count == 1
+                assert gaussian_item.result.parse_revision_id is not None
+                async with isolated_factory() as session:
+                    gaussian_frame_count = len(
+                        (
+                            await session.exec(
+                                select(CalculationFrame.id).where(
+                                    CalculationFrame.parse_revision_id
+                                    == gaussian_item.result.parse_revision_id
+                                )
+                            )
+                        ).all()
+                    )
+                assert gaussian_frame_count == 23
                 assert invalid_item.succeeded is False
                 assert invalid_item.result is not None
                 assert invalid_item.result.ingestion_status is ArtifactIngestionStatus.FAILED

@@ -23,12 +23,13 @@ than private object internals or a source checkout commit.
   parser-status facts where present.
 - TS role evidence and positive/negative imaginary-mode endpoint candidates.
 
-MolOP `0.2.18` may collect frame-role/source-locator evidence without implicitly
-reconstructing graphs. The previous high-throughput mode keeps evidence
-collection disabled for ordinary bulk imports; audit/reproducibility imports
-must enable it explicitly. MolGR is responsible for graph reconstruction; the
-database treats a trusted MolGR graph as authoritative and does not apply extra
-chemical repair, atom canonicalization, or implicit-H inference.
+MolOP `0.2.18` collects frame-role/source-locator evidence for every import
+without implicitly reconstructing graphs. Source evidence is mandatory because
+segment boundaries, frame locators, and parse replacement require an auditable
+source mapping; disabling it is a configuration error. MolGR is responsible for
+graph reconstruction; the database treats a trusted MolGR graph as authoritative
+and does not apply extra chemical repair, atom canonicalization, or implicit-H
+inference.
 
 ## Atomic and Electronic-State Contract
 

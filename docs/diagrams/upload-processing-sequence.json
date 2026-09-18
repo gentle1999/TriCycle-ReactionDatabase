@@ -38,7 +38,7 @@
     { "from": "ingress", "to": "remote", "y": 474, "label": "202 + batch/item 标识", "variant": "return" },
     { "from": "ingress", "to": "local", "y": 516, "label": "返回暂存结果", "variant": "return" },
     { "from": "worker", "to": "postgres", "y": 558, "label": "领取 STAGED 项并加处理租约", "variant": "emphasis" },
-    { "from": "postgres", "to": "worker", "y": 600, "label": "PROCESSING 任务窗口（最多 64）", "variant": "return" },
+    { "from": "postgres", "to": "worker", "y": 600, "label": "PROCESSING 小页（连续补充，预取上限）", "variant": "return" },
     { "from": "worker", "to": "rustfs", "y": 642, "label": "读取已暂存原始文件", "variant": "default" },
     { "from": "rustfs", "to": "worker", "y": 684, "label": "返回文件字节", "variant": "return" },
     { "from": "worker", "to": "molop", "y": 726, "label": "提交解析任务", "variant": "emphasis" },
@@ -46,7 +46,7 @@
     { "from": "worker", "to": "committer", "y": 810, "label": "结果进入有界持久化队列", "variant": "emphasis" },
     { "from": "committer", "to": "postgres", "y": 852, "label": "队列为空：仅写入预加载结果，不提交", "variant": "default" },
     { "from": "committer", "to": "postgres", "y": 894, "label": "累计 8 个结果或 128 帧：提交一次微批事务", "variant": "emphasis" },
-    { "from": "committer", "to": "postgres", "y": 936, "label": "当前领取窗口结束：提交剩余结果", "variant": "emphasis" },
+    { "from": "committer", "to": "postgres", "y": 936, "label": "MolOP 无待处理任务：提交剩余结果", "variant": "emphasis" },
     { "from": "committer", "to": "worker", "y": 978, "label": "项目 / 用户组完成，串行处理下一组", "variant": "return" },
     { "from": "worker", "to": "postgres", "y": 1020, "label": "逐项完成 UploadBatchItem 状态", "variant": "default" },
     { "from": "remote", "to": "ingress", "y": 1062, "label": "GET 状态 / 结果", "variant": "default" },
@@ -88,7 +88,7 @@
       "items": [
         "有界队列达到 8 个结果或 128 帧时提交一次",
         "队列为空只刷新预加载结果，不触发提交",
-        "领取窗口结束时提交剩余结果"
+        "MolOP 无待处理任务时提交尾批"
       ]
     }
   ]

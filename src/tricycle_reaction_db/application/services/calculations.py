@@ -1225,10 +1225,50 @@ def finalize_parse_revision(
         raise ValueError("only pending ParseRevision rows can be finalized as succeeded")
     if revision.started_at is not None and completion.completed_at < revision.started_at:
         raise ValueError("ParseRevision completion cannot precede its start time")
-    if not revision.segments:
+
+    # Fast batch persistence intentionally does not maintain reverse ORM
+    # collections: the new segment/frame objects are deferred to Core bulk
+    # INSERT and are not attached to the Session.  Resolve the validation set
+    # from that deferred queue, falling back to the database when a caller has
+    # already flushed it.  The regular path keeps the relationship-backed
+    # validation semantics.
+    if _fast_insert_enabled(session):
+        revision_id = _require_id(revision, label="ParseRevision")
+        pending_entities = tuple(session.info.get("_fast_pending_entities", ()))
+        segments = [
+            candidate
+            for candidate in pending_entities
+            if isinstance(candidate, CalculationSegment)
+            and candidate.parse_revision_id == revision_id
+        ]
+        if not segments:
+            segments = list(
+                session.exec(
+                    select(CalculationSegment).where(
+                        CalculationSegment.parse_revision_id == revision_id
+                    )
+                ).all()
+            )
+    else:
+        segments = list(revision.segments)
+    if not segments:
         raise ValueError("a succeeded ParseRevision requires at least one CalculationSegment")
-    for segment in revision.segments:
-        frame_count = len(segment.frames)
+
+    for segment in segments:
+        if _fast_insert_enabled(session):
+            segment_id = _require_id(segment, label="CalculationSegment")
+            pending_frame_count = sum(
+                isinstance(candidate, CalculationFrame) and candidate.segment_id == segment_id
+                for candidate in pending_entities
+            )
+            persisted_frame_count = len(
+                session.exec(
+                    select(CalculationFrame.id).where(CalculationFrame.segment_id == segment_id)
+                ).all()
+            )
+            frame_count = pending_frame_count + persisted_frame_count
+        else:
+            frame_count = len(segment.frames)
         if segment.source_frame_count is None and frame_count == 0:
             raise ValueError("a segment without source frame evidence requires a frame")
         if (

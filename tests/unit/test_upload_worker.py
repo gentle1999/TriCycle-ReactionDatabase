@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from hashlib import sha256
 from types import SimpleNamespace
 from uuid import UUID
@@ -7,9 +8,9 @@ from uuid import UUID
 import pytest
 
 from tricycle_reaction_db.application.services import artifact_uploads as upload_module
+from tricycle_reaction_db.application.services.artifact_upload_types import ParsedArtifactTask
 from tricycle_reaction_db.application.services.artifact_uploads import ArtifactUploadService
 from tricycle_reaction_db.application.services.upload_batches import (
-    PendingIngestionJob,
     UploadBatchService,
     UploadProcessingJob,
 )
@@ -39,155 +40,6 @@ def _job(
         user_id=USER_ID,
         lease_id=UUID(f"00000000-0000-7000-0004-{item_id:012d}"),
     )
-
-
-def _pending_job(*, project_id: UUID, ingestion_id: int, artifact_id: int) -> PendingIngestionJob:
-    return PendingIngestionJob(
-        project_id=project_id,
-        ingestion_id=UUID(f"00000000-0000-7000-0000-{ingestion_id:012d}"),
-        artifact_file_id=UUID(f"00000000-0000-7000-0003-{artifact_id:012d}"),
-        user_id=USER_ID,
-        lease_id=UUID(f"00000000-0000-7000-0004-{ingestion_id:012d}"),
-    )
-
-
-@pytest.mark.asyncio
-async def test_worker_merges_compatibility_ingestions_into_one_project_microbatch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    jobs = [
-        _pending_job(project_id=PROJECT_A, ingestion_id=1, artifact_id=11),
-        _pending_job(project_id=PROJECT_A, ingestion_id=2, artifact_id=12),
-    ]
-    reparse_calls: list[tuple[tuple[UUID, ...], UUID, bool]] = []
-    failed: list[tuple[UUID, UUID, Exception]] = []
-
-    async def reparse_batch(
-        *,
-        artifact_ids: list[UUID],
-        user_id: UUID,
-        force_reparse: bool,
-        refresh_statistics: bool,
-        defer_thermodynamic_refresh: bool,
-    ) -> dict[UUID, object]:
-        reparse_calls.append((tuple(artifact_ids), user_id, force_reparse))
-        assert refresh_statistics is False
-        assert defer_thermodynamic_refresh is True
-        return {artifact_id: object() for artifact_id in artifact_ids}
-
-    async def fail_pending_ingestion(
-        *,
-        ingestion_id: UUID,
-        lease_id: UUID,
-        error: Exception,
-    ) -> None:
-        failed.append((ingestion_id, lease_id, error))
-
-    monkeypatch.setattr(ArtifactUploadService, "reparse_batch", reparse_batch)
-    monkeypatch.setattr(
-        ArtifactUploadService,
-        "fail_pending_ingestion",
-        fail_pending_ingestion,
-    )
-
-    await UploadBatchWorker()._process_pending_jobs(jobs)
-
-    assert reparse_calls == [((jobs[0].artifact_file_id, jobs[1].artifact_file_id), USER_ID, True)]
-    assert failed == []
-
-
-@pytest.mark.asyncio
-async def test_worker_merges_single_file_batches_into_one_project_microbatch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    jobs = [
-        _job(project_id=PROJECT_A, batch_id=1, item_id=1, artifact_id=11),
-        _job(project_id=PROJECT_A, batch_id=2, item_id=2, artifact_id=12),
-    ]
-    reparse_calls: list[tuple[tuple[UUID, ...], UUID, bool]] = []
-    finished: list[tuple[UUID, object | None, Exception | None]] = []
-
-    async def reparse_batch(
-        *,
-        artifact_ids: list[UUID],
-        user_id: UUID,
-        force_reparse: bool,
-        refresh_statistics: bool,
-        defer_thermodynamic_refresh: bool,
-    ) -> dict[UUID, object]:
-        reparse_calls.append((tuple(artifact_ids), user_id, force_reparse))
-        assert refresh_statistics is False
-        assert defer_thermodynamic_refresh is True
-        return {artifact_id: object() for artifact_id in artifact_ids}
-
-    async def finish_processing_batch(
-        jobs: list[UploadProcessingJob],
-        results: dict[UUID, object],
-    ) -> int:
-        for job in jobs:
-            result = results.get(job.artifact_file_id)
-            finished.append((job.artifact_file_id, result, None))
-        return len(jobs)
-
-    monkeypatch.setattr(ArtifactUploadService, "reparse_batch", reparse_batch)
-    monkeypatch.setattr(UploadBatchService, "finish_processing_batch", finish_processing_batch)
-
-    await UploadBatchWorker()._process_jobs(jobs)
-
-    assert reparse_calls == [((jobs[0].artifact_file_id, jobs[1].artifact_file_id), USER_ID, True)]
-    assert [artifact_id for artifact_id, _result, _error in finished] == [
-        jobs[0].artifact_file_id,
-        jobs[1].artifact_file_id,
-    ]
-    assert all(error is None for _artifact_id, _result, error in finished)
-
-
-@pytest.mark.asyncio
-async def test_worker_processes_project_microbatches_sequentially(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    jobs = [
-        _job(project_id=PROJECT_A, batch_id=3, item_id=3, artifact_id=13),
-        _job(project_id=PROJECT_B, batch_id=4, item_id=4, artifact_id=14),
-    ]
-    active_calls = 0
-    maximum_active_calls = 0
-    call_projects: list[UUID] = []
-
-    async def reparse_batch(
-        *,
-        artifact_ids: list[UUID],
-        user_id: UUID,
-        force_reparse: bool,
-        refresh_statistics: bool,
-        defer_thermodynamic_refresh: bool,
-    ) -> dict[UUID, object]:
-        nonlocal active_calls, maximum_active_calls
-        assert user_id == USER_ID
-        assert force_reparse is True
-        assert refresh_statistics is False
-        assert defer_thermodynamic_refresh is True
-        active_calls += 1
-        maximum_active_calls = max(maximum_active_calls, active_calls)
-        call_projects.append(PROJECT_A if artifact_ids == [jobs[0].artifact_file_id] else PROJECT_B)
-        await asyncio.sleep(0)
-        active_calls -= 1
-        return {artifact_ids[0]: object()}
-
-    async def finish_processing_batch(
-        jobs: list[UploadProcessingJob],
-        results: dict[UUID, object],
-    ) -> int:
-        assert all(results.get(job.artifact_file_id) is not None for job in jobs)
-        return len(jobs)
-
-    monkeypatch.setattr(ArtifactUploadService, "reparse_batch", reparse_batch)
-    monkeypatch.setattr(UploadBatchService, "finish_processing_batch", finish_processing_batch)
-
-    await UploadBatchWorker()._process_jobs(jobs)
-
-    assert call_projects == [PROJECT_A, PROJECT_B]
-    assert maximum_active_calls == 1
 
 
 @pytest.mark.asyncio
@@ -278,6 +130,104 @@ async def test_worker_refreshes_profiles_after_the_max_delay(
     await worker._flush_profiles()
 
     assert calls == [((PROJECT_A,), "upload-worker-profile-refresh-max-delay")]
+
+
+@pytest.mark.asyncio
+async def test_streaming_worker_refills_parser_dispatcher_and_flushes_one_tail_microbatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    jobs = [
+        _job(project_id=PROJECT_A, batch_id=10, item_id=10, artifact_id=101),
+        _job(project_id=PROJECT_A, batch_id=11, item_id=11, artifact_id=102),
+        _job(project_id=PROJECT_A, batch_id=12, item_id=12, artifact_id=103),
+        _job(project_id=PROJECT_A, batch_id=13, item_id=13, artifact_id=104),
+    ]
+    claim_limits: list[int] = []
+    clear_calls: list[list[UUID]] = []
+    parsed_calls: list[UUID] = []
+    persistence_calls: list[list[UUID]] = []
+    finalized_calls: list[list[UUID]] = []
+    claim_offset = 0
+
+    async def claim_stream_jobs(*, limit: int, prefer_processing: bool) -> list[object]:
+        del prefer_processing
+        nonlocal claim_offset
+        claim_limits.append(limit)
+        if claim_offset >= len(jobs):
+            return []
+        claimed = jobs[claim_offset : claim_offset + min(limit, 2)]
+        claim_offset += len(claimed)
+        return claimed
+
+    async def clear_claimed_parse_state(
+        claimed: list[object],
+        *,
+        project_write_locks: dict[UUID, asyncio.Lock],
+    ) -> dict[UUID, Exception]:
+        del project_write_locks
+        clear_calls.append([job.artifact_file_id for job in claimed])  # type: ignore[attr-defined]
+        return {}
+
+    async def parse_staged_artifact(artifact_id: UUID) -> ParsedArtifactTask:
+        parsed_calls.append(artifact_id)
+        return ParsedArtifactTask(
+            artifact_id=artifact_id,
+            started_at=datetime.now(UTC),
+            parsed=SimpleNamespace(frame_records=(), source_frame_count=1),  # type: ignore[arg-type]
+        )
+
+    async def persist_parsed_microbatch(
+        tasks: list[ParsedArtifactTask],
+        *,
+        project_id: UUID,
+        user_id: UUID,
+        worker_lease_by_artifact_id: object,
+        defer_thermodynamic_refresh: bool,
+    ) -> dict[UUID, object]:
+        assert project_id == PROJECT_A
+        assert user_id == USER_ID
+        assert worker_lease_by_artifact_id
+        assert defer_thermodynamic_refresh is True
+        artifact_ids = [task.artifact_id for task in tasks]
+        persistence_calls.append(artifact_ids)
+        return {artifact_id: object() for artifact_id in artifact_ids}
+
+    async def finish_processing_batch(
+        claimed: list[UploadProcessingJob],
+        results: dict[UUID, object],
+    ) -> int:
+        finalized_calls.append([job.artifact_file_id for job in claimed])
+        assert all(job.artifact_file_id in results for job in claimed)
+        return len(claimed)
+
+    monkeypatch.setattr(worker_module, "molop_process_worker_count", lambda: 2)
+    monkeypatch.setattr(UploadBatchWorker, "_stream_prefetch_limit", staticmethod(lambda: 4))
+    monkeypatch.setattr(
+        UploadBatchWorker,
+        "_claim_stream_jobs",
+        staticmethod(claim_stream_jobs),
+    )
+    monkeypatch.setattr(
+        UploadBatchWorker,
+        "_clear_claimed_parse_state",
+        staticmethod(clear_claimed_parse_state),
+    )
+    monkeypatch.setattr(ArtifactUploadService, "parse_staged_artifact", parse_staged_artifact)
+    monkeypatch.setattr(
+        ArtifactUploadService,
+        "persist_parsed_microbatch",
+        persist_parsed_microbatch,
+    )
+    monkeypatch.setattr(UploadBatchService, "finish_processing_batch", finish_processing_batch)
+
+    had_work = await UploadBatchWorker()._run_streaming_cycle()
+
+    assert had_work is True
+    assert claim_limits == [2, 2, 2]
+    assert len(clear_calls) == 2
+    assert parsed_calls == [job.artifact_file_id for job in jobs]
+    assert persistence_calls == [[job.artifact_file_id for job in jobs]]
+    assert finalized_calls == [[job.artifact_file_id for job in jobs]]
 
 
 @pytest.mark.asyncio

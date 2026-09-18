@@ -233,7 +233,10 @@ def parse_revision_record_from_molop(
     if provenance_value is None:
         raise ValueError("MolOP source capture did not provide parser provenance")
     provenance = dict(_model_dump(provenance_value))
-    source_evidence_captured = bool(chem_file.source_segments)
+    source_segments = tuple(getattr(chem_file, "source_segments", ()) or ())
+    if not source_segments:
+        raise ValueError("MolOP source evidence is required: no source segments were captured")
+    source_evidence_captured = True
     provenance["source_evidence_captured"] = source_evidence_captured
     source_format = {
         "g16log": SourceFormat.GAUSSIAN_LOG,

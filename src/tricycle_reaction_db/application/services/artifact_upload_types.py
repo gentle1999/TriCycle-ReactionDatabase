@@ -97,6 +97,15 @@ class _ParsedArtifact:
 
 
 @dataclass(frozen=True, slots=True)
+class ParsedArtifactTask:
+    """One durable queue item after RustFS verification and MolOP parsing."""
+
+    artifact_id: UUID
+    started_at: datetime
+    parsed: _ParsedArtifact | Exception
+
+
+@dataclass(frozen=True, slots=True)
 class _ProcessedFrame:
     """One frame after MolGR reconstruction and ingestion-level validation."""
 
@@ -205,6 +214,7 @@ __all__ = [
     "_IngestionCompletion",
     "_InspectedUploadSource",
     "_ParsedArtifact",
+    "ParsedArtifactTask",
     "_PreparedCalculationUpload",
     "_ProcessedFrame",
     "_RetiredArtifactReservation",

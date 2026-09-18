@@ -177,6 +177,32 @@ def _set_fast_pending_entities(session: Session, entities: Iterable[object]) -> 
     }
 
 
+def _fast_pending_entity_count(session: Session) -> int:
+    """Return the current deferred-row queue length without copying it."""
+
+    pending = session.info.get(_FAST_PENDING_ENTITIES_KEY)
+    return len(pending) if isinstance(pending, list) else 0
+
+
+def _truncate_fast_pending_entities(session: Session, count: int) -> None:
+    """Discard deferred rows appended after a file/frame checkpoint.
+
+    Fast persistence normally keeps rows out of SQLAlchemy's unit of work
+    until the microbatch flush.  A failed frame or file therefore cannot rely
+    on a database savepoint alone: its rows are still Python objects in the
+    deferred queue.  Truncating the append-only queue is the cheap rollback
+    operation for the success path and rebuilding the identity index keeps
+    subsequent files from reusing a failed row.
+    """
+
+    if count < 0:
+        raise ValueError("fast pending entity checkpoint must be non-negative")
+    pending = session.info.get(_FAST_PENDING_ENTITIES_KEY)
+    if not isinstance(pending, list) or len(pending) <= count:
+        return
+    _set_fast_pending_entities(session, pending[:count])
+
+
 def _pop_fast_pending_entities(session: Session) -> list[object] | None:
     """Remove and return the deferred-row queue plus its lookup index."""
 
@@ -359,24 +385,11 @@ def _new_entity[EntityT](
         # Assigning a related persistent object through the normal instrumented
         # descriptor triggers ``save-update`` cascade and silently attaches
         # this new row to the Session.  Keep it transient until the table-level
-        # Core executemany below while retaining the object graph for callers.
+        # Core executemany below.  The scalar foreign key is copied by
+        # ``_prepare_new_entity``; maintaining a parent-side collection here
+        # only creates an ORM graph that is never flushed and can emit
+        # ``CalculationSegment not in session`` warnings.
         set_committed_value(entity, key, value)
-        relationship = relationships[key]
-        inverse_key = relationship.back_populates
-        if (
-            inverse_key
-            and inverse_key in {"segments", "frames"}
-            and relationship.mapper.class_ is type(value)
-        ):
-            inverse = relationship.mapper.relationships.get(inverse_key)
-            if inverse is not None and inverse.uselist:
-                # Do not access the descriptor here: an unloaded collection
-                # would issue a SELECT for every child row.
-                current = value.__dict__.get(inverse_key)
-                if current is None:
-                    set_committed_value(value, inverse_key, [entity])
-                else:
-                    current.append(entity)
     return entity
 
 
@@ -741,6 +754,7 @@ __all__ = [
     "_attach_or_reuse_entity",
     "_bulk_insert_pending_entities",
     "_assert_record_matches",
+    "_fast_pending_entity_count",
     "_fast_insert_enabled",
     "_new_entity",
     "_project_owner_predicate",
@@ -749,6 +763,7 @@ __all__ = [
     "_pop_fast_pending_entities",
     "_queue_fast_pending_entity",
     "_set_fast_pending_entities",
+    "_truncate_fast_pending_entities",
     "_identity_lock_id",
     "_require_id",
     "_uuid7",

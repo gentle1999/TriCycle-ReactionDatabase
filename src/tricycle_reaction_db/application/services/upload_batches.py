@@ -11,7 +11,8 @@ from hashlib import sha256
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, func, or_, update
+from sqlalchemy import and_, case, cast, func, or_, update
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -123,6 +124,7 @@ class UploadProcessingJob:
     artifact_file_id: UUID
     user_id: UUID
     lease_id: UUID
+    lease_expires_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +136,7 @@ class PendingIngestionJob:
     artifact_file_id: UUID
     user_id: UUID
     lease_id: UUID
+    lease_expires_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1740,18 +1743,13 @@ class UploadBatchService:
         jobs: list[PendingIngestionJob] = []
         async with session_factory() as session:
             rows = (await session.exec(statement)).all()
+            lease_by_ingestion_id: dict[UUID, UUID] = {}
             for ingestion, artifact in rows:
                 ingestion_id = _required_uuid(ingestion.id, "ArtifactIngestion")
                 artifact_id = _required_uuid(artifact.id, "ArtifactFile")
                 lease_id = uuid4()
                 lease_expires_at = now + timedelta(seconds=settings.upload_worker_lease_seconds)
-                _mark_ingestion_processing(
-                    ingestion,
-                    started_at=now,
-                    lease_id=lease_id,
-                    lease_expires_at=lease_expires_at,
-                )
-                session.add(ingestion)
+                lease_by_ingestion_id[ingestion_id] = lease_id
                 jobs.append(
                     PendingIngestionJob(
                         project_id=artifact.project_id,
@@ -1759,9 +1757,30 @@ class UploadBatchService:
                         artifact_file_id=artifact_id,
                         user_id=artifact.created_by_user_id,
                         lease_id=lease_id,
+                        lease_expires_at=lease_expires_at,
                     )
                 )
             if jobs:
+                await session.exec(
+                    update(ArtifactIngestion)
+                    .where(col(ArtifactIngestion.id).in_(lease_by_ingestion_id))
+                    .values(
+                        status=ArtifactIngestionStatus.PROCESSING,
+                        started_at=now,
+                        completed_at=None,
+                        processing_attempt_count=(
+                            col(ArtifactIngestion.processing_attempt_count) + 1
+                        ),
+                        worker_lease_id=case(
+                            lease_by_ingestion_id,
+                            value=col(ArtifactIngestion.id),
+                            else_=col(ArtifactIngestion.worker_lease_id),
+                        ),
+                        worker_lease_expires_at=lease_expires_at,
+                        error_code=None,
+                        error_message=None,
+                    )
+                )
                 await session.commit()
         return jobs
 
@@ -1936,68 +1955,61 @@ class UploadBatchService:
             artifact_ids = {
                 item.artifact_file_id for item, _batch in rows if item.artifact_file_id is not None
             }
-            ingestions_by_artifact_id = {
-                ingestion.artifact_file_id: ingestion
-                for ingestion in (
-                    await session.exec(
-                        select(ArtifactIngestion)
-                        .where(col(ArtifactIngestion.artifact_file_id).in_(artifact_ids))
-                        .with_for_update()
-                    )
-                ).all()
-            }
+            await session.exec(
+                select(ArtifactIngestion)
+                .where(col(ArtifactIngestion.artifact_file_id).in_(artifact_ids))
+                .with_for_update()
+            )
+            item_ids: list[UUID] = []
+            item_statuses: dict[UUID, UploadBatchItemStatus] = {}
+            item_parse_statuses: dict[UUID, str] = {}
+            item_materialization_statuses: dict[UUID, str] = {}
+            item_error_codes: dict[UUID, str | None] = {}
+            item_error_messages: dict[UUID, str | None] = {}
+            item_metadata: dict[UUID, dict[str, object]] = {}
+            item_processing_attempts: set[UUID] = set()
+            lease_by_item_id: dict[UUID, UUID] = {}
+            lease_by_artifact_id: dict[UUID, UUID] = {}
+            batch_deltas: dict[UUID, list[int]] = {}
             for item, batch in rows:
                 batch_id = _required_uuid(batch.id, "UploadBatch")
                 item_id = _required_uuid(item.id, "UploadBatchItem")
+                item_ids.append(item_id)
+                delta = batch_deltas.setdefault(batch_id, [0, 0, 0])
+                delta[0] -= 1  # staged_count
                 if item.artifact_file_id is None:
-                    item.status = UploadBatchItemStatus.FAILED
-                    item.parse_status = ImportParseStatus.FAILED.value
-                    item.materialization_status = ImportMaterializationStatus.FAILED.value
-                    item.error_code = "staged_artifact_missing"
-                    item.error_message = "staged queue item has no artifact reference"
-                    item.metadata_json = _with_upload_progress(
+                    item_statuses[item_id] = UploadBatchItemStatus.FAILED
+                    item_parse_statuses[item_id] = ImportParseStatus.FAILED.value
+                    item_materialization_statuses[item_id] = (
+                        ImportMaterializationStatus.FAILED.value
+                    )
+                    item_error_codes[item_id] = "staged_artifact_missing"
+                    item_error_messages[item_id] = "staged queue item has no artifact reference"
+                    item_metadata[item_id] = _with_upload_progress(
                         item.metadata_json,
                         phase="failed",
                         completed=1,
                         total=1,
                     )
-                    item.updated_at = now
-                    batch.staged_count = max(0, batch.staged_count - 1)
-                    batch.failed_count += 1
-                    session.add(item)
-                    session.add(batch)
-                    _finish_batch_if_terminal(batch)
+                    delta[2] += 1  # failed_count
                     continue
                 lease_id = uuid4()
                 lease_expires_at = now + timedelta(seconds=settings.upload_worker_lease_seconds)
-                item.status = UploadBatchItemStatus.PROCESSING
-                item.parse_status = ImportParseStatus.PENDING.value
-                item.processing_attempt_count += 1
-                item.worker_lease_id = lease_id
-                item.worker_lease_expires_at = lease_expires_at
-                item.error_code = None
-                item.error_message = None
-                item.metadata_json = _with_upload_progress(
+                item_statuses[item_id] = UploadBatchItemStatus.PROCESSING
+                item_parse_statuses[item_id] = ImportParseStatus.PENDING.value
+                item_materialization_statuses[item_id] = ImportMaterializationStatus.PENDING.value
+                item_processing_attempts.add(item_id)
+                lease_by_item_id[item_id] = lease_id
+                lease_by_artifact_id[item.artifact_file_id] = lease_id
+                item_error_codes[item_id] = None
+                item_error_messages[item_id] = None
+                item_metadata[item_id] = _with_upload_progress(
                     item.metadata_json,
                     phase="processing",
                     completed=0,
                     total=1,
                 )
-                item.updated_at = now
-                batch.staged_count = max(0, batch.staged_count - 1)
-                batch.processing_count += 1
-                batch.updated_at = now
-                ingestion = ingestions_by_artifact_id.get(item.artifact_file_id)
-                if ingestion is not None:
-                    _mark_ingestion_processing(
-                        ingestion,
-                        started_at=now,
-                        lease_id=lease_id,
-                        lease_expires_at=lease_expires_at,
-                    )
-                    session.add(ingestion)
-                session.add(item)
-                session.add(batch)
+                delta[1] += 1  # processing_count
                 jobs.append(
                     UploadProcessingJob(
                         project_id=batch.project_id,
@@ -2007,6 +2019,182 @@ class UploadBatchService:
                         artifact_file_id=item.artifact_file_id,
                         user_id=batch.created_by_user_id,
                         lease_id=lease_id,
+                        lease_expires_at=lease_expires_at,
+                    )
+                )
+
+            def keyed_case(
+                column: object,
+                values: Mapping[UUID, object],
+                *,
+                key_column: object,
+            ) -> object:
+                if not values:
+                    return column
+                return case(values, value=key_column, else_=column)
+
+            def jsonb_case(
+                column: object,
+                values: Mapping[UUID, object],
+                *,
+                key_column: object,
+            ) -> object:
+                if not values:
+                    return column
+                return case(
+                    {key: cast(value, JSONB) for key, value in values.items()},
+                    value=key_column,
+                    else_=column,
+                )
+
+            if item_ids:
+                await session.exec(
+                    update(UploadBatchItem)
+                    .where(col(UploadBatchItem.id).in_(item_ids))
+                    .values(
+                        status=keyed_case(
+                            col(UploadBatchItem.status),
+                            item_statuses,
+                            key_column=col(UploadBatchItem.id),
+                        ),
+                        parse_status=keyed_case(
+                            col(UploadBatchItem.parse_status),
+                            item_parse_statuses,
+                            key_column=col(UploadBatchItem.id),
+                        ),
+                        materialization_status=keyed_case(
+                            col(UploadBatchItem.materialization_status),
+                            item_materialization_statuses,
+                            key_column=col(UploadBatchItem.id),
+                        ),
+                        processing_attempt_count=case(
+                            (
+                                col(UploadBatchItem.id).in_(item_processing_attempts),
+                                col(UploadBatchItem.processing_attempt_count) + 1,
+                            ),
+                            else_=col(UploadBatchItem.processing_attempt_count),
+                        ),
+                        worker_lease_id=keyed_case(
+                            col(UploadBatchItem.worker_lease_id),
+                            lease_by_item_id,
+                            key_column=col(UploadBatchItem.id),
+                        ),
+                        worker_lease_expires_at=case(
+                            (col(UploadBatchItem.id).in_(lease_by_item_id), lease_expires_at),
+                            else_=col(UploadBatchItem.worker_lease_expires_at),
+                        ),
+                        error_code=keyed_case(
+                            col(UploadBatchItem.error_code),
+                            item_error_codes,
+                            key_column=col(UploadBatchItem.id),
+                        ),
+                        error_message=keyed_case(
+                            col(UploadBatchItem.error_message),
+                            item_error_messages,
+                            key_column=col(UploadBatchItem.id),
+                        ),
+                        metadata_json=jsonb_case(
+                            col(UploadBatchItem.metadata_json),
+                            item_metadata,
+                            key_column=col(UploadBatchItem.id),
+                        ),
+                        updated_at=now,
+                    )
+                )
+
+            ingestion_artifact_ids = list(lease_by_artifact_id)
+            if ingestion_artifact_ids:
+                await session.exec(
+                    update(ArtifactIngestion)
+                    .where(col(ArtifactIngestion.artifact_file_id).in_(ingestion_artifact_ids))
+                    .values(
+                        status=ArtifactIngestionStatus.PROCESSING,
+                        started_at=now,
+                        completed_at=None,
+                        processing_attempt_count=(
+                            col(ArtifactIngestion.processing_attempt_count) + 1
+                        ),
+                        worker_lease_id=keyed_case(
+                            col(ArtifactIngestion.worker_lease_id),
+                            lease_by_artifact_id,
+                            key_column=col(ArtifactIngestion.artifact_file_id),
+                        ),
+                        worker_lease_expires_at=lease_expires_at,
+                        error_code=None,
+                        error_message=None,
+                    )
+                )
+
+            batch_ids = list(batch_deltas)
+            batch_statuses: dict[UUID, UploadBatchStatus] = {}
+            for batch_id in batch_ids:
+                batch = next(batch for _item, batch in rows if batch.id == batch_id)
+                staged_delta, processing_delta, failed_delta = batch_deltas[batch_id]
+                new_staged = max(0, batch.staged_count + staged_delta)
+                new_processing = max(0, batch.processing_count + processing_delta)
+                new_failed = batch.failed_count + failed_delta
+                terminal = batch.succeeded_count + new_failed + batch.cancelled_count
+                batch_statuses[batch_id] = (
+                    UploadBatchStatus.COMPLETED
+                    if (
+                        batch.status is not UploadBatchStatus.CANCELLED
+                        and batch.uploading_count == 0
+                        and new_staged == 0
+                        and new_processing == 0
+                        and terminal == batch.total_count
+                    )
+                    else batch.status
+                )
+            if batch_ids:
+                await session.exec(
+                    update(UploadBatch)
+                    .where(col(UploadBatch.id).in_(batch_ids))
+                    .values(
+                        staged_count=case(
+                            {
+                                batch_id: max(
+                                    0,
+                                    next(
+                                        batch for _item, batch in rows if batch.id == batch_id
+                                    ).staged_count
+                                    + batch_deltas[batch_id][0],
+                                )
+                                for batch_id in batch_ids
+                            },
+                            value=col(UploadBatch.id),
+                            else_=col(UploadBatch.staged_count),
+                        ),
+                        processing_count=case(
+                            {
+                                batch_id: max(
+                                    0,
+                                    next(
+                                        batch for _item, batch in rows if batch.id == batch_id
+                                    ).processing_count
+                                    + batch_deltas[batch_id][1],
+                                )
+                                for batch_id in batch_ids
+                            },
+                            value=col(UploadBatch.id),
+                            else_=col(UploadBatch.processing_count),
+                        ),
+                        failed_count=case(
+                            {
+                                batch_id: next(
+                                    batch for _item, batch in rows if batch.id == batch_id
+                                ).failed_count
+                                + batch_deltas[batch_id][2]
+                                for batch_id in batch_ids
+                            },
+                            value=col(UploadBatch.id),
+                            else_=col(UploadBatch.failed_count),
+                        ),
+                        status=keyed_case(
+                            col(UploadBatch.status),
+                            batch_statuses,
+                            key_column=col(UploadBatch.id),
+                        ),
+                        updated_at=now,
                     )
                 )
             await session.commit()
@@ -2057,7 +2245,7 @@ class UploadBatchService:
     async def renew_processing_leases(jobs: list[UploadProcessingJob]) -> int:
         """Renew one upload-batch claim group using set-based updates.
 
-        ``reparse_batch`` owns the only persistence consumer for a
+        The streaming worker owns the only persistence consumer for a
         project/user group.  Heartbeats must therefore share that same
         coarse-grained shape; a per-file locking query otherwise creates a
         connection and a lock waiter for every claimed item.
@@ -2258,8 +2446,8 @@ class UploadBatchService:
     ) -> int:
         """Publish one worker group with one set of locks and one commit.
 
-        ``reparse_batch`` already persists a project/user group in one
-        transaction. Finalizing every one-file upload batch through
+        The streaming worker already persists a project/user group in one
+        microbatch. Finalizing every one-file upload batch through
         ``finish_processing`` immediately afterwards used to reopen one
         transaction per file, which made a large reparse look stalled after
         its actual parse/write work had completed. Lock all involved rows in
@@ -2303,12 +2491,15 @@ class UploadBatchService:
             ).all()
             ingestions = (
                 await session.exec(
-                    select(ArtifactIngestion).where(
+                    select(ArtifactIngestion)
+                    .where(
                         or_(
                             col(ArtifactIngestion.artifact_file_id).in_(artifact_ids),
                             col(ArtifactIngestion.id).in_(result_ingestion_ids),
                         )
                     )
+                    .order_by(col(ArtifactIngestion.id))
+                    .with_for_update()
                 )
             ).all()
             batches_by_id = {batch.id: batch for batch in batches}
@@ -2325,6 +2516,18 @@ class UploadBatchService:
             }
             now = datetime.now(UTC)
             finalized = 0
+            item_ids_to_update: list[UUID] = []
+            item_statuses: dict[UUID, UploadBatchItemStatus] = {}
+            item_parse_statuses: dict[UUID, str] = {}
+            item_materialization_statuses: dict[UUID, str] = {}
+            item_artifact_ids: dict[UUID, UUID] = {}
+            item_revision_ids: dict[UUID, UUID | None] = {}
+            item_error_codes: dict[UUID, str | None] = {}
+            item_error_messages: dict[UUID, str | None] = {}
+            item_metadata: dict[UUID, dict[str, object]] = {}
+            ingestion_error_codes: dict[UUID, str] = {}
+            ingestion_error_messages: dict[UUID, str] = {}
+            batch_deltas: dict[UUID, list[int]] = {}
             for job in jobs:
                 batch = batches_by_id.get(job.batch_id)
                 item = items_by_id.get(job.item_id)
@@ -2335,6 +2538,9 @@ class UploadBatchService:
                     or item.worker_lease_id != job.lease_id
                 ):
                     continue
+                batch_id = _required_uuid(batch.id, "UploadBatch")
+                item_id = _required_uuid(item.id, "UploadBatchItem")
+                item_ids_to_update.append(item_id)
 
                 raw_result = results.get(job.artifact_file_id)
                 upload_result = raw_result if isinstance(raw_result, ArtifactUploadResult) else None
@@ -2351,51 +2557,48 @@ class UploadBatchService:
                     or upload_result is None
                     or upload_result.ingestion_status in failure_statuses
                 )
-                batch.processing_count = max(0, batch.processing_count - 1)
-                item.worker_lease_id = None
-                item.worker_lease_expires_at = None
+                delta = batch_deltas.setdefault(batch_id, [0, 0, 0])
+                delta[0] -= 1  # processing_count
                 if (
                     failed
                     and ingestion is not None
                     and ingestion.status
                     in {ArtifactIngestionStatus.PENDING, ArtifactIngestionStatus.PROCESSING}
                 ):
-                    ingestion.status = ArtifactIngestionStatus.FAILED
-                    ingestion.completed_at = now
-                    ingestion.worker_lease_id = None
-                    ingestion.worker_lease_expires_at = None
-                    ingestion.error_code = (
+                    ingestion_id = _required_uuid(ingestion.id, "ArtifactIngestion")
+                    ingestion_error_codes[ingestion_id] = (
                         getattr(error, "error_code", None)
                         if error is not None
                         else "ingestion_failed"
                     ) or "ingestion_failed"
-                    ingestion.error_message = (
+                    ingestion_error_messages[ingestion_id] = (
                         str(error) or type(error).__name__
                         if error is not None
                         else "artifact processing failed"
                     )
-                    session.add(ingestion)
                 if upload_result is not None:
-                    item.artifact_file_id = upload_result.artifact_id
-                    item.parse_revision_id = upload_result.parse_revision_id
-                    item.materialization_status = ImportMaterializationStatus.SUCCEEDED.value
+                    item_artifact_ids[item_id] = upload_result.artifact_id
+                    item_revision_ids[item_id] = upload_result.parse_revision_id
+                    item_materialization_statuses[item_id] = (
+                        ImportMaterializationStatus.SUCCEEDED.value
+                    )
                 if failed:
-                    item.status = UploadBatchItemStatus.FAILED
-                    item.parse_status = (
+                    item_statuses[item_id] = UploadBatchItemStatus.FAILED
+                    item_parse_statuses[item_id] = (
                         ImportParseStatus.FILTERED.value
                         if upload_result is not None
                         and upload_result.ingestion_status is ArtifactIngestionStatus.FILTERED
                         else ImportParseStatus.FAILED.value
                     )
-                    batch.failed_count += 1
-                    item.error_code = (
+                    delta[2] += 1  # failed_count
+                    item_error_codes[item_id] = (
                         getattr(error, "error_code", None)
                         if error is not None
                         else ingestion.error_code
                         if ingestion is not None
                         else "ingestion_failed"
                     ) or "ingestion_failed"
-                    item.error_message = (
+                    item_error_messages[item_id] = (
                         str(error) or type(error).__name__
                         if error is not None
                         else ingestion.error_message
@@ -2404,32 +2607,157 @@ class UploadBatchService:
                     )
                     phase = "failed"
                 else:
-                    item.status = UploadBatchItemStatus.SUCCEEDED
-                    item.parse_status = (
+                    item_statuses[item_id] = UploadBatchItemStatus.SUCCEEDED
+                    item_parse_statuses[item_id] = (
                         ImportParseStatus.PARTIAL.value
                         if upload_result is not None
                         and upload_result.ingestion_status is ArtifactIngestionStatus.PARTIAL
                         else ImportParseStatus.SUCCEEDED.value
                     )
-                    batch.succeeded_count += 1
-                    item.error_code = None
-                    item.error_message = None
+                    delta[1] += 1  # succeeded_count
+                    item_error_codes[item_id] = None
+                    item_error_messages[item_id] = None
                     phase = "completed"
-                item.metadata_json = _with_upload_progress(
+                item_metadata[item_id] = _with_upload_progress(
                     item.metadata_json,
                     phase=phase,
                     completed=1,
                     total=1,
                 )
-                item.updated_at = now
-                batch.updated_at = now
-                session.add(item)
                 finalized += 1
 
             if finalized:
-                for batch in batches:
-                    _finish_batch_if_terminal(batch)
-                    session.add(batch)
+
+                def item_case(column: object, values: Mapping[UUID, object]) -> object:
+                    return case(values, value=col(UploadBatchItem.id), else_=column)
+
+                def item_jsonb_case(
+                    column: object,
+                    values: Mapping[UUID, object],
+                ) -> object:
+                    return case(
+                        {key: cast(value, JSONB) for key, value in values.items()},
+                        value=col(UploadBatchItem.id),
+                        else_=column,
+                    )
+
+                await session.exec(
+                    update(UploadBatchItem)
+                    .where(col(UploadBatchItem.id).in_(item_ids_to_update))
+                    .values(
+                        status=item_case(col(UploadBatchItem.status), item_statuses),
+                        parse_status=item_case(
+                            col(UploadBatchItem.parse_status), item_parse_statuses
+                        ),
+                        materialization_status=item_case(
+                            col(UploadBatchItem.materialization_status),
+                            item_materialization_statuses,
+                        ),
+                        artifact_file_id=item_case(
+                            col(UploadBatchItem.artifact_file_id), item_artifact_ids
+                        ),
+                        parse_revision_id=item_case(
+                            col(UploadBatchItem.parse_revision_id), item_revision_ids
+                        ),
+                        worker_lease_id=None,
+                        worker_lease_expires_at=None,
+                        error_code=item_case(col(UploadBatchItem.error_code), item_error_codes),
+                        error_message=item_case(
+                            col(UploadBatchItem.error_message), item_error_messages
+                        ),
+                        metadata_json=item_jsonb_case(
+                            col(UploadBatchItem.metadata_json),
+                            item_metadata,
+                        ),
+                        updated_at=now,
+                    )
+                )
+
+                if ingestion_error_codes:
+
+                    def ingestion_case(column: object, values: Mapping[UUID, object]) -> object:
+                        return case(values, value=col(ArtifactIngestion.id), else_=column)
+
+                    await session.exec(
+                        update(ArtifactIngestion)
+                        .where(col(ArtifactIngestion.id).in_(ingestion_error_codes))
+                        .values(
+                            status=ArtifactIngestionStatus.FAILED,
+                            completed_at=now,
+                            worker_lease_id=None,
+                            worker_lease_expires_at=None,
+                            error_code=ingestion_case(
+                                col(ArtifactIngestion.error_code), ingestion_error_codes
+                            ),
+                            error_message=ingestion_case(
+                                col(ArtifactIngestion.error_message), ingestion_error_messages
+                            ),
+                        )
+                    )
+
+                batch_by_id = {_required_uuid(batch.id, "UploadBatch"): batch for batch in batches}
+                final_batch_ids = list(batch_deltas)
+                batch_statuses: dict[UUID, UploadBatchStatus] = {}
+                for batch_id in final_batch_ids:
+                    batch = batch_by_id[batch_id]
+                    processing_delta, succeeded_delta, failed_delta = batch_deltas[batch_id]
+                    new_processing = max(0, batch.processing_count + processing_delta)
+                    new_succeeded = batch.succeeded_count + succeeded_delta
+                    new_failed = batch.failed_count + failed_delta
+                    terminal = new_succeeded + new_failed + batch.cancelled_count
+                    batch_statuses[batch_id] = (
+                        UploadBatchStatus.COMPLETED
+                        if (
+                            batch.status is not UploadBatchStatus.CANCELLED
+                            and batch.uploading_count == 0
+                            and batch.staged_count == 0
+                            and new_processing == 0
+                            and terminal == batch.total_count
+                        )
+                        else batch.status
+                    )
+                await session.exec(
+                    update(UploadBatch)
+                    .where(col(UploadBatch.id).in_(final_batch_ids))
+                    .values(
+                        processing_count=case(
+                            {
+                                batch_id: max(
+                                    0,
+                                    batch_by_id[batch_id].processing_count
+                                    + batch_deltas[batch_id][0],
+                                )
+                                for batch_id in final_batch_ids
+                            },
+                            value=col(UploadBatch.id),
+                            else_=col(UploadBatch.processing_count),
+                        ),
+                        succeeded_count=case(
+                            {
+                                batch_id: batch_by_id[batch_id].succeeded_count
+                                + batch_deltas[batch_id][1]
+                                for batch_id in final_batch_ids
+                            },
+                            value=col(UploadBatch.id),
+                            else_=col(UploadBatch.succeeded_count),
+                        ),
+                        failed_count=case(
+                            {
+                                batch_id: batch_by_id[batch_id].failed_count
+                                + batch_deltas[batch_id][2]
+                                for batch_id in final_batch_ids
+                            },
+                            value=col(UploadBatch.id),
+                            else_=col(UploadBatch.failed_count),
+                        ),
+                        status=case(
+                            batch_statuses,
+                            value=col(UploadBatch.id),
+                            else_=col(UploadBatch.status),
+                        ),
+                        updated_at=now,
+                    )
+                )
                 await session.commit()
             return finalized
 

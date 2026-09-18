@@ -201,9 +201,10 @@ Browser uploads, batch uploads, explicit reparse, and the local
 CLI differs only by using local paths as its byte source. Every ingress path
 first creates the durable batch/item and stages a verified object in RustFS;
 calculation ingestion remains `pending` while the item is `staged`. An
-independent `tricycle-upload-worker` claims at most 64 staged items per window,
-reads/verifies the existing objects, and calls the shared MolOP process pool
-and persistence path. It does not upload objects again or add a parser per
+independent `tricycle-upload-worker` continuously claims small pages with a
+bounded prefetch controlled by `TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES`, reads/
+verifies the existing objects, and calls the shared MolOP process pool and
+persistence path. It does not upload objects again or add a parser per
 request/session. MolOP is not owned by the HTTP request or browser lifecycle,
 so a page reload, route change, API restart, or worker restart cannot discard a
 staged file. Object identity and content hashes are never overwritten in
@@ -255,7 +256,9 @@ by a sum of frame runtimes.
 
 Local import is a streaming RustFS staging queue. `IMPORT_PIPELINE_WINDOW_FILES`
 sets the prefetched staging window; the CLI does not run MolOP. The worker's
-`TRICYCLE_MOLOP_BATCH_N_JOBS` sets shared parser-pool admission, while
+`TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES` bounds continuous staged-item prefetch,
+and `TRICYCLE_MOLOP_BATCH_N_JOBS` sets the shared parser-pool process count;
+`-1` uses all CPU cores visible to the worker. Meanwhile
 `IMPORT_COMMIT_BATCH_FILES` is retained only for CLI compatibility. Bound
 `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, and `MKL_NUM_THREADS` inside the
 shared parser workers. Calculation-output imports reject unambiguous

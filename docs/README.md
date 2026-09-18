@@ -18,6 +18,7 @@ current operating instructions.
 | --- | --- | --- |
 | [开发环境](development.md) | [Development environment](en/development.md) | 宿主机开发、测试与本地导入 / host development, testing, and local import |
 | [部署与配置指南](deployment-configuration.md) | [Deployment and configuration](en/deployment-configuration.md) | 开发、单机和多主机部署 / development, single-host, and multi-host deployment |
+| [高性能导入配置指南](performance-tuning.md) | [High-performance import configuration](en/performance-tuning.md) | MolOP、worker、PostgreSQL 和 RustFS 吞吐调优 / ingestion throughput tuning |
 | [数据模型与存储边界](data-model.md) | [Data model and storage boundaries](en/data-model.md) | 当前化学、文件、反应和查询契约 / chemistry, artifact, reaction, and query contracts |
 | [业务模型](business-model.md) | [Business model](en/business-model.md) | 面向用户的对象、流程和非目标 / user-facing objects, workflows, and non-goals |
 | [生产运维与恢复 Runbook](operations-runbook.md) | [Production operations and recovery runbook](en/operations-runbook.md) | 备份、恢复、监控与定时任务 / backup, recovery, monitoring, and scheduled work |

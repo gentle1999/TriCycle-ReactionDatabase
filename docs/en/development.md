@@ -181,20 +181,24 @@ The default limits are documented in `.env.example`. In particular:
 | `TRICYCLE_QUERY_STATEMENT_TIMEOUT_MS` | `15000` | PostgreSQL statement budget per connection |
 | `TRICYCLE_SLOW_QUERY_THRESHOLD_MS` | `500` | Slow-query log threshold; parameters are redacted |
 | `TRICYCLE_UPLOAD_MAX_CONCURRENCY` | `8` | Concurrent HTTP upload requests per API process |
-| `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` | `2` | Maximum files in one durable queue claim |
+| `TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES` | `0` | Continuous worker prefetch limit; `0` derives a bounded value from the shared MolOP pool |
+| `TRICYCLE_UPLOAD_WORKER_PERSISTENCE_BATCH_FILES` | `16` | Maximum completed files in one project/user persistence microbatch |
+| `TRICYCLE_UPLOAD_WORKER_PERSISTENCE_FRAME_LIMIT` | `256` | Maximum parsed frames in one project/user persistence microbatch |
+| `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` | `2` | Concurrency reserved for legacy pending-ingestion recovery |
 | `TRICYCLE_UPLOAD_WORKER_LEASE_SECONDS` | `3600` | Worker processing lease; heartbeats extend it and expiry permits recovery |
 | `TRICYCLE_UPLOAD_WORKER_PROFILE_REFRESH_MAX_DELAY_SECONDS` | `60` | Maximum delay for deferred thermodynamic profile refresh during a continuously busy queue; queue drain refreshes immediately |
 | `TRICYCLE_UPLOAD_CLIENT_LEASE_SECONDS` | `900` | Recovery threshold for an interrupted HTTP staging request |
 | `TRICYCLE_UPLOAD_WORKER_POLL_INTERVAL_SECONDS` | `1` | Worker polling interval for staged items and expired leases |
 | `TRICYCLE_UPLOAD_WORKER_STATEMENT_TIMEOUT_MS` | `120000` | Independent PostgreSQL statement budget for background parse/persistence; interactive API queries keep `TRICYCLE_QUERY_STATEMENT_TIMEOUT_MS` |
-| `TRICYCLE_MOLOP_BATCH_N_JOBS` | `2` | Concurrent file-level MolOP workers |
+| `TRICYCLE_MOLOP_BATCH_N_JOBS` | `-1` | Shared MolOP process count; `-1` uses all CPU cores visible to the worker |
 | `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS` | `60` | Baseline parse budget for 10 MiB; larger files scale linearly |
 | `TRICYCLE_STRUCTURE_CANDIDATE_LIMIT` | `50000` | Limit for paths requiring per-candidate post-processing |
 
 Set `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, and `MKL_NUM_THREADS` to bound
 native pools within each file worker. Do not reduce file-worker concurrency just
-to control nested native threads. Production must give
-`TRICYCLE_MOLOP_BATCH_N_JOBS` an explicit positive bound.
+to control nested native threads. `TRICYCLE_MOLOP_BATCH_N_JOBS=-1` uses all CPU
+cores visible to the worker; choose a positive bound only when CPU must be
+reserved for another workload.
 
 Geometry lists narrow candidates through project catalog and elemental filters
 before expensive structure conditions. REST returns `413 query_budget_exceeded`
@@ -250,7 +254,7 @@ batch item in PostgreSQL, then writes and verifies RustFS. Only an available
 object whose item is marked `staged` enters the parse queue. When the worker
 claims that object and starts MolOP/frame processing, the file-level ingestion
 becomes `processing`; an expired lease returns it to `pending`. A
-[standalone zoomable version](diagrams/upload-processing-sequence.html) is also
+[standalone zoomable version](../diagrams/upload-processing-sequence.html) is also
 available.
 
 ```mermaid
@@ -280,7 +284,7 @@ sequenceDiagram
     S-->>L: Return staging result
 
     W->>D: Claim staged items and acquire leases
-    D-->>W: PROCESSING claim window (up to 64 files)
+    D-->>W: PROCESSING small page, continuously refilled up to prefetch limit
     loop Each project/user persistence group (groups are serial)
         loop Each file in the group
             W->>O: Read and verify staged raw object
@@ -290,12 +294,12 @@ sequenceDiagram
             W->>P: Enqueue result in bounded persistence queue
             alt Result queue is temporarily empty
                 P->>D: Persist preload results only; do not commit
-            else 8 files or 128 frames accumulated
+            else 16 files or 256 frames accumulated
                 P->>D: Commit one bounded persistence microbatch
             end
         end
     end
-    P->>D: Claim window ends; commit remaining results
+    P->>D: MolOP pool has no remaining work; commit remaining results
     W->>D: Finalize each UploadBatchItem state
     W->>D: Queue drains; refresh durable dirty thermodynamic profiles
     W->>D: Refresh affected project statistics once both queues are empty
@@ -329,11 +333,11 @@ Read the boundaries in the diagram as follows:
 - `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, and `MKL_NUM_THREADS` bound native
   threads inside the child and should normally all be `1`. The candidate
   window and native-thread counts do not replace file-level slots.
-- The staging window provides RustFS backpressure; the worker's claim window
-  and bounded persistence batches provide database backpressure. The staging
-  checkpoint records batch/item IDs, while final parse status comes from the
-  UploadBatch API. One file failure does not roll back other staged or completed
-  files.
+- The staging window provides RustFS backpressure; the worker's bounded
+  prefetch and persistence batches provide database backpressure. There is no
+  client-sized parser claim window. The staging checkpoint records batch/item
+  IDs, while final parse status comes from the UploadBatch API. One file failure
+  does not roll back other staged or completed files.
 - The single `upload-worker` instance is the boundary for the shared MolOP pool
   and the single active persistence consumer. API nodes may scale horizontally;
   do not scale upload-worker horizontally unless multiple parser pools and
@@ -374,48 +378,48 @@ best effort and does not roll back an already successful business transaction.
 
 Browser, MCP, and remote API uploads skip the CLI fingerprint pool and local
 candidate queue: the entry point stores bytes in RustFS and marks the item
-`staged`, then the independent `upload-worker` claims a
-`TRICYCLE_MAX_BATCH_FILES` (64) window and groups it by project/user for
-`ArtifactUploadService.reparse_batch`. That wrapper only reads/verifies
-existing objects and delegates to the shared MolOP pool and single persistence
-consumer; it does not upload objects again or introduce a second parser.
-`TRICYCLE_UPLOAD_MAX_CONCURRENCY` limits RustFS reads,
+`staged`, then the single `upload-worker` continuously claims small pages and
+feeds a shared parsing dispatcher. `TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES=0`
+derives a bounded prefetch limit from the MolOP process count. This is a
+backpressure limit, not a client batch or parser barrier. The worker only
+reads/verifies existing RustFS objects and does not upload them again or create
+a parser per request. `TRICYCLE_UPLOAD_MAX_CONCURRENCY` limits RustFS reads,
 `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` is retained for legacy pending-ingestion
-recovery, and `TRICYCLE_MOLOP_BATCH_N_JOBS` limits shared-pool admission; these
-controls must not simply be multiplied.
+recovery, and `TRICYCLE_MOLOP_BATCH_N_JOBS` controls the shared process count;
+`-1` uses all CPU cores visible to the worker. These controls must not simply
+be multiplied.
 
-Keep the remote reparse boundaries separate from parser concurrency: the worker
-claims at most 64 staged files, aggregates each project/user microbatch, and
-passes the microbatch through `reparse_batch` to `upload_batch`. The client
-`UploadBatch` is only a queue/progress boundary, not a persistence boundary:
-one-file submissions for the same project/user are merged into one microbatch,
-and different project/user microbatches are committed sequentially. Within a
-microbatch, the same result queue and single consumer call `persist_parsed_files`
-for every eight completed files (or when the queue is temporarily empty), and commit
-at that bounded persistence boundary. A second ceiling of 128 parsed frames prevents
-multi-frame files from creating an oversized transaction. Persistence must not wait until
-all 64 claimed files have parsed. Thus `64` is the claim window and the
-eight-file/128-frame limit is the commit microbatch, while actual parser concurrency is controlled only by the shared MolOP pool's
-`TRICYCLE_MOLOP_BATCH_N_JOBS` (normally `16` on a dedicated host). The durable
-bulk/reparse transaction also uses the previous legacy bulk hot path: reaction-SMILES
-topology caching and one set-based Geometry match remain enabled, while later
-per-file concrete/logical/reverse reconciliation must not be inserted directly.
-Project scope and ownership constraints still apply. Update the architecture guide
-and remeasure byte throughput and failure isolation on the same real file set before
+Keep parser and persistence boundaries separate: the client `UploadBatch` is
+only a queue/progress boundary, not a persistence boundary. Even one-file
+submissions for the same project/user enter the shared persistence consumer.
+Parser tasks are refilled continuously; the consumer commits 16 completed
+files or 256 parsed frames per microbatch by default. A temporarily empty result queue
+only triggers preload persistence, without committing an undersized microbatch.
+When the MolOP pool has no remaining work, the consumer commits the tail. Project/user
+groups are serialized, and project write locks coordinate old-parse cleanup,
+materialization, and UploadBatch finalization. This keeps multiple upload
+sessions from opening competing persistence sessions. The durable path keeps the
+previous legacy bulk hot path: reaction-SMILES topology caching and one
+set-based Geometry match remain enabled, while later per-file
+concrete/logical/reverse reconciliation must not be inserted directly. Project
+scope and ownership constraints still apply. Update the architecture guide and
+remeasure byte throughput and failure isolation on the same real file set before
 changing these boundaries.
 
 ### Recommended import settings
+
+For the dedicated-compute profile, 256-file benchmark procedure, and symptom-based tuning table, see [High-performance import configuration](performance-tuning.md).
 
 Choose a starting profile based on the host. The current deployment benchmark
 uses 16 file-level MolOP workers and one native thread per worker. Treat that
 as a validated starting point for a compute host, not as a universal optimum:
 available CPU cores, memory, storage, and PostgreSQL latency all matter.
 
-| Profile | `TRICYCLE_MOLOP_BATCH_N_JOBS` | `OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `MKL_NUM_THREADS` | `IMPORT_PIPELINE_WINDOW_FILES` | `IMPORT_STREAM_QUEUE_SIZE` | `IMPORT_COMMIT_BATCH_FILES` |
-| --- | ---: | --- | ---: | ---: | ---: |
-| Local development or low-resource host | `2` | `1 / 1 / 1` | `16` | `16` | `8–16` |
-| Dedicated compute host, throughput first | `16` | `1 / 1 / 1` | `64` | `64` | `16` |
-| Memory- or database-constrained host | `4–8` | `1 / 1 / 1` | `32` | `32` | `8` |
+| Profile | `TRICYCLE_MOLOP_BATCH_N_JOBS` | `TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES` | `OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `MKL_NUM_THREADS` | `IMPORT_PIPELINE_WINDOW_FILES` | `IMPORT_STREAM_QUEUE_SIZE` | `IMPORT_COMMIT_BATCH_FILES` |
+| --- | ---: | ---: | --- | ---: | ---: | --- |
+| Local development or low-resource host | `-1` or positive | `0` (automatic) | `1 / 1 / 1` | `16` | `16` | compatibility only |
+| Dedicated compute host, throughput first | `-1` | `0` (automatic) | `1 / 1 / 1` | `64` | `64` | compatibility only |
+| Memory- or database-constrained host | positive | manually lower | `1 / 1 / 1` | `32` | `32` | compatibility only |
 
 For a dedicated compute host, the following is a useful first run:
 
@@ -424,7 +428,8 @@ IMPORT_MODE=deployment \
 OMP_NUM_THREADS=1 \
 OPENBLAS_NUM_THREADS=1 \
 MKL_NUM_THREADS=1 \
-TRICYCLE_MOLOP_BATCH_N_JOBS=16 \
+TRICYCLE_MOLOP_BATCH_N_JOBS=-1 \
+TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES=0 \
 IMPORT_PIPELINE_WINDOW_FILES=64 \
 IMPORT_STREAM_QUEUE_SIZE=64 \
 IMPORT_COMMIT_BATCH_FILES=16 \
@@ -438,24 +443,26 @@ make import-artifacts
 
 Tune in this order:
 
-- Increase `TRICYCLE_MOLOP_BATCH_N_JOBS` in steps such as `2 → 4 → 8 → 16`,
-  measuring the same real file set after each change. Approximate CPU pressure
-  is file-worker count multiplied by native threads per worker. Keep all three
-  OpenMP/BLAS variables at `1`; do not use nested native pools as a substitute
-  for file-level concurrency. Production must use a positive bound, never `-1`.
-- Set `IMPORT_PIPELINE_WINDOW_FILES` to roughly four times the parser-worker
-  count, and keep it above that count. Use the same value for
-  `IMPORT_STREAM_QUEUE_SIZE` as a starting point. These values control
-  buffering and prefetch, not parser concurrency; lower them for large files
-  or memory pressure.
+- Start with `TRICYCLE_MOLOP_BATCH_N_JOBS=-1`, which uses all CPU cores visible
+  to the worker. Set a positive value when CPU must be reserved for PostgreSQL,
+  the API, or another workload, and measure steps such as `2 → 4 → 8 → 16`.
+  Keep all three OpenMP/BLAS variables at `1`; do not use nested native pools
+  as a substitute for file-level concurrency.
+- `TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES` bounds continuous dispatcher
+  prefetching; `0` derives it from the parser-pool size. The local
+  `IMPORT_PIPELINE_WINDOW_FILES` only bounds RustFS staging, and
+  `IMPORT_STREAM_QUEUE_SIZE` bounds discovery/fingerprint buffering. None of
+  these values increases parser concurrency; lower them for large files or
+  memory pressure.
 - Fingerprinting uses a separate thread pool with an internal cap of `32`;
   there is currently no environment variable or CLI flag for it. If the
   fingerprint phase dominates the timings, inspect storage and SHA-256 read
   cost before increasing MolOP parser concurrency.
-- `IMPORT_COMMIT_BATCH_FILES` controls persistence transaction/checkpoint
-  frequency only. Keep `16` initially, reduce to `8` for lock contention,
-  statement timeouts, or database memory pressure, and try `32` only when the
-  database has clear headroom.
+- `IMPORT_COMMIT_BATCH_FILES` is retained only as a deprecated CLI compatibility
+  option. It no longer controls local transactions, worker claims, or
+  persistence microbatches; the worker defaults to 16 files or 256 frames, which
+  can be tuned with `TRICYCLE_UPLOAD_WORKER_PERSISTENCE_BATCH_FILES` and
+  `TRICYCLE_UPLOAD_WORKER_PERSISTENCE_FRAME_LIMIT`.
 - Keep `IMPORT_MAX_TRANSIENT_RETRIES=3`. It covers transient deadlocks,
   serialization conflicts, and connection interruptions; raising it does not
   fix a persistent failure.
@@ -463,23 +470,27 @@ Tune in this order:
   scales with source size. It isolates outliers rather than increasing speed;
   raise it for slow storage or many large files, and lower it only after
   checking the resulting failure rate.
-- Keep `TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE=false` for the previous
-  high-throughput bulk-import behavior. Set it to `true` for audit imports that
-  require frame-role/source-locator, source-span, or block-hash evidence and
-  accept the extra cost. Keep `TRICYCLE_MOLOP_PARALLEL_FRAME_PERSISTENCE=true`.
+- `TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE=true` is mandatory. Segment
+  boundaries, frame roles, source locators, source spans, and block hashes are
+  required for lossless persistence and parse replacement; setting it to
+  `false` rejects application startup. Keep
+  `TRICYCLE_MOLOP_PARALLEL_FRAME_PERSISTENCE=true`.
 
 Browser and remote API uploads use the independent durable `upload-worker`, so
 do not confuse its controls with the local `IMPORT_*` variables.
 `TRICYCLE_UPLOAD_MAX_CONCURRENCY=8` limits RustFS reads and
-`TRICYCLE_MAX_BATCH_FILES=64` is the worker claim window; persistence commits
-are bounded to eight completed files or 128 parsed frames per microbatch;
+`TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES=0` enables automatic continuous
+prefetching; persistence commits default to 16 completed files or 256 parsed
+frames per microbatch and can be tuned with
+`TRICYCLE_UPLOAD_WORKER_PERSISTENCE_BATCH_FILES` and
+`TRICYCLE_UPLOAD_WORKER_PERSISTENCE_FRAME_LIMIT`;
 `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` is only for pending-ingestion recovery.
-A dedicated compute host may use `TRICYCLE_MOLOP_BATCH_N_JOBS=16` for the
+A dedicated compute host may use `TRICYCLE_MOLOP_BATCH_N_JOBS=-1` for the
 shared parser pool, subject to CPU, memory, and database write-latency checks.
 
-The worker claim window does not define a database transaction: it does not
-serialize 64 files or change the internal eight-file/128-frame hand-off.
-Persistence commits are bounded to that microbatch. Local CLI
+The worker prefetch limit does not define a database transaction or change the
+internal 16-file/256-frame hand-off. Persistence commits are bounded to that
+microbatch. Local CLI
 `IMPORT_COMMIT_BATCH_FILES` is retained for compatibility and does not control
 worker parsing or persistence. These controls belong to staging backpressure,
 parser admission, and worker commit boundaries respectively and must not

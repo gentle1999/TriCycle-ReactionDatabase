@@ -12,20 +12,20 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 
-def _parse_only(path: str, capture_source_evidence: bool) -> tuple[float, int]:
+def _parse_only(path: str) -> tuple[float, int]:
     from molop import AutoFileParser
 
     started = time.perf_counter()
     chem_file = AutoFileParser(
         path,
         parser_detection="auto",
-        capture_source_evidence=capture_source_evidence,
+        capture_source_evidence=True,
         release_file_content=True,
     )
     return time.perf_counter() - started, len(chem_file)
 
 
-def _parse_and_convert(path: str, capture_source_evidence: bool) -> tuple[float, int]:
+def _parse_and_convert(path: str) -> tuple[float, int]:
     from tricycle_reaction_db.application.services.artifact_uploads import (
         _parse_calculation_path_worker,
     )
@@ -72,7 +72,6 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--count", type=int, default=128)
     parser.add_argument("--workers", type=int, default=16)
-    parser.add_argument("--capture-source-evidence", action="store_true")
     parser.add_argument("--stage", choices=("parse", "convert"), default="parse")
     args = parser.parse_args()
     paths = asyncio.run(_selected_paths(args.root.resolve(), args.count))
@@ -82,7 +81,7 @@ def main() -> None:
     results: list[tuple[float, int]] = []
     context = multiprocessing.get_context("spawn")
     with ProcessPoolExecutor(max_workers=args.workers, mp_context=context) as pool:
-        futures = [pool.submit(function, str(path), args.capture_source_evidence) for path in paths]
+        futures = [pool.submit(function, str(path)) for path in paths]
         for future in as_completed(futures):
             results.append(future.result())
     elapsed = time.perf_counter() - started
@@ -90,7 +89,7 @@ def main() -> None:
         json.dumps(
             {
                 "stage": args.stage,
-                "capture_source_evidence": args.capture_source_evidence,
+                "capture_source_evidence": True,
                 "workers": args.workers,
                 "files": len(results),
                 "source_names_sha256": digest,

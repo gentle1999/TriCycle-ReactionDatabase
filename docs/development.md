@@ -538,7 +538,10 @@ writer endpoint 对应用呈现为同一个逻辑 engine，节点数量不会变
 | `TRICYCLE_READ_RATE_LIMIT_REQUESTS` | `10000` | 登录态、目录、详情、GraphQL 等只读请求数 |
 | `TRICYCLE_UPLOAD_RATE_LIMIT_REQUESTS` | `1000` | Artifact 上传、批量上传、验证和重解析请求数 |
 | `TRICYCLE_UPLOAD_MAX_CONCURRENCY` | `8` | 单个 API 进程内同时处理的上传请求数 |
-| `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` | `2` | durable upload-worker 单次数据库领取的最大文件数 |
+| `TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES` | `0` | durable upload-worker 连续 dispatcher 的预取上限；`0` 按共享 MolOP 进程数自动计算 |
+| `TRICYCLE_UPLOAD_WORKER_PERSISTENCE_BATCH_FILES` | `16` | 同一 project/user 持久化消费者的文件微批上限 |
+| `TRICYCLE_UPLOAD_WORKER_PERSISTENCE_FRAME_LIMIT` | `256` | 同一 project/user 持久化消费者的帧微批上限 |
+| `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` | `2` | 仅用于旧 pending-ingestion 恢复的并发数 |
 | `TRICYCLE_UPLOAD_WORKER_LEASE_SECONDS` | `3600` | worker 处理 lease 的有效期；worker 用心跳续租，过期后可被重新领取 |
 | `TRICYCLE_UPLOAD_WORKER_PROFILE_REFRESH_MAX_DELAY_SECONDS` | `60` | 解析队列持续繁忙时，延迟 thermodynamic profile 刷新的最长时间；队列排空时立即刷新 |
 | `TRICYCLE_UPLOAD_CLIENT_LEASE_SECONDS` | `900` | HTTP 上传 lease 的恢复阈值；请求中断后超过此时间可回到队列 |
@@ -549,7 +552,7 @@ writer endpoint 对应用呈现为同一个逻辑 engine，节点数量不会变
 | `TRICYCLE_QUERY_RATE_LIMIT_WINDOW_SECONDS` | `60` | 限流窗口秒数 |
 | `TRICYCLE_STRUCTURE_QUERY_MAX_CHARACTERS` | `16384` | SMILES/SMARTS/reaction 输入长度上限 |
 | `TRICYCLE_STRUCTURE_CANDIDATE_LIMIT` | `50000` | 需要逐候选后处理的最大关系行数 |
-| `TRICYCLE_MOLOP_BATCH_N_JOBS` | `2` | 同时处理的文件级 MolOP worker 数；使用可复用的 `spawn` 进程池，`-1` 在开发环境使用全部可用 CPU，生产环境必须显式限界 |
+| `TRICYCLE_MOLOP_BATCH_N_JOBS` | `-1` | 共享 MolOP 进程数；`-1` 使用 worker 可见的全部 CPU 核，正整数用于主动限界 |
 | `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS` | `60` | 10 MiB 文件的 MolOP 解析与 MolGR 帧重建基准时长；更大文件按体积等比例放大，较小文件至少使用该基准；超时文件单独失败，批次继续处理 |
 
 描述符、Murcko scaffold、手性和匹配次数等逐候选计算必须先通过 Formula、
@@ -663,7 +666,7 @@ sequenceDiagram
     S-->>L: 返回暂存结果
 
     W->>D: 领取 staged 项并加处理租约
-    D-->>W: PROCESSING 领取窗口（最多 64 个文件）
+    D-->>W: PROCESSING 小页（连续补充，预取上限由 worker 配置决定）
     loop 每个 project/user 持久化组（组间串行）
         loop 组内文件
             W->>O: 读取并校验已暂存原始文件
@@ -673,12 +676,12 @@ sequenceDiagram
             W->>P: 结果进入有界持久化队列
             alt 结果队列暂时为空
                 P->>D: 仅持久化预加载结果，不提交事务
-            else 累计 8 个完成结果或达到 128 帧
-                P->>D: 提交 8 个结果的微批事务
+            else 累计 16 个完成结果或达到 256 帧
+                P->>D: 提交一个有界微批事务
             end
         end
     end
-    P->>D: 当前领取窗口结束，提交剩余结果
+    P->>D: MolOP 无待处理任务时，提交剩余微批结果
     W->>D: 逐项完成 UploadBatchItem 状态
     W->>D: 队列排空；在独立短事务中刷新 dirty thermodynamic profiles
     W->>D: 两个待处理队列均为空后刷新受影响项目统计
@@ -697,9 +700,10 @@ sequenceDiagram
 - `pending` 只是写入过程中的可恢复预约和等待队列状态；RustFS 写入和摘要校验成功后才转为
   `staged`，worker 领取后文件级 ingestion 才显示为 `processing`。上传请求不会在 RustFS
   之前或之后直接调用 MolOP。
-- worker 领取后把 parser/frame 任务提交到同一个可复用的 `spawn` 进程池。因此 `n_jobs=16`
-  表示该服务进程最多同时执行 16 个文件任务，不会为每个 artifact 或上传会话重复创建进程池；
-  文件完成或失败后，队列继续补位。取消或超时只结束该文件的任务，已提交的共享池工作由池自行排空。
+- worker 领取后把 parser/frame 任务提交到同一个可复用的 `spawn` 进程池。因此
+  `n_jobs=-1` 表示使用该 worker 进程可见的全部 CPU 核，正整数才是主动设置的上限；不会为每个
+  artifact 或上传会话重复创建进程池。文件完成或失败后，领取器立即连续补位；取消或超时只结束
+  该文件的任务，已提交的共享池工作由池自行排空。
 - 子进程内部的 OpenMP/BLAS native thread 由 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS` 和 `MKL_NUM_THREADS` 控制；推荐都设为 `1`。候选窗口和 native thread 数都不会替代文件级槽位。
 - RustFS 暂存批次只负责上传背压；解析 worker 以领取窗口和有界持久化批次形成数据库写入背压。
   暂存检查点记录 batch/item ID，最终解析状态以 UploadBatch 查询结果为准；单文件失败不会回滚
@@ -708,26 +712,25 @@ sequenceDiagram
   不要横向扩展 upload-worker，否则每个进程都会拥有自己的 MolOP 池和持久化消费者。
 
 浏览器、MCP 或远程 API 路径不经过 Import CLI 的指纹线程池和本地候选队列：入口先把字节写入
-RustFS 并将 item 标记为 `staged`，独立 `upload-worker` 每轮领取 `TRICYCLE_MAX_BATCH_FILES`
-（当前为 64）个文件，按项目/用户交给 `ArtifactUploadService.reparse_batch`。该方法只读取
-并校验已有对象，然后委托共享 MolOP 进程池和单一持久化消费者；不会再次上传，也不会建立
-第二套解析路径。`TRICYCLE_UPLOAD_MAX_CONCURRENCY` 限制 RustFS 读取槽位，
-`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 只用于旧 pending-ingestion 恢复，
-`TRICYCLE_MOLOP_BATCH_N_JOBS` 限制共享解析池准入，三者不能简单相乘。
+RustFS 并将 item 标记为 `staged`，独立 `upload-worker` 按小页连续领取 staged 文件，并按
+项目/用户交给共享解析 dispatcher。`TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES=0` 时，预取上限
+自动按 MolOP 进程数计算；它是背压上限，不是客户端 batch，也不会切断解析流。该路径只读取并
+校验已有对象，不会再次上传，也不会建立第二套解析路径。`TRICYCLE_UPLOAD_MAX_CONCURRENCY`
+限制 RustFS 读取槽位，`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 只用于旧 pending-ingestion 恢复，
+`TRICYCLE_MOLOP_BATCH_N_JOBS` 限制共享解析池进程数，三者不能简单相乘。
 
-远程 reparse 的批次边界必须与解析并发分开理解：worker 每轮最多领取 64 个 staged
-文件。客户端 `UploadBatch` 只是队列/进度边界，不是持久化边界；即使原始上传是单文件
-批次，同一项目/用户的任务也必须在 worker 中合并为一个持久化微批。不同项目/用户的
-微批顺序执行，不能并发打开多个项目持久化事务。每个 project/user 微批通过
-`reparse_batch` 交给 `upload_batch`，再使用同一个结果队列和单一消费者；其中每 8
-个解析结果、累计达到 128 帧（或队列暂时为空）调用一次 `persist_parsed_files`，并在持久化
-微批边界提交事务，不能等到整个领取窗口全部解析完成后才写数据库。因此 `64` 只表示领取窗口，
-`8` 个文件/`128` 帧是固定的持久化提交微批，实际解析并发仍只由共享 MolOP 池的
-`TRICYCLE_MOLOP_BATCH_N_JOBS`（专用主机通常为 `16`）决定。该 durable bulk/reparse
-事务还使用上一版的 legacy bulk 热路径：reaction SMILES topology 缓存和单次 set-based
-Geometry 匹配保持开启，后来增加的逐文件 concrete/logical/reverse reconciliation 不得
-直接插入；项目范围和所有权约束仍然必须执行。修改这些边界前必须同步更新架构说明并用同一
-批真实文件复测字节吞吐和失败隔离。
+客户端 `UploadBatch` 只是队列/进度边界，不是解析或持久化边界；即使原始上传是单文件批次，
+同一项目/用户的结果也会进入统一持久化消费者。解析任务连续补充，消费者默认按每 16 个完成文件或
+累计 256 帧提交一次微批（可通过 `TRICYCLE_UPLOAD_WORKER_PERSISTENCE_BATCH_FILES` 和
+`TRICYCLE_UPLOAD_WORKER_PERSISTENCE_FRAME_LIMIT` 调整）；结果队列暂时为空时只执行预加载结果持久化，不把尚未凑够微批的结果
+单独提交。MolOP 进程池没有待处理任务时，消费者提交尾部微批。不同项目/用户的数据库写入组
+串行执行，同一项目的旧 parse 清理、结果写入和 UploadBatch 状态完成也由项目写锁协调；因此
+不会因为多个用户或多个单文件上传会话而并发打开一批数据库持久化会话。实际解析并发只由
+`TRICYCLE_MOLOP_BATCH_N_JOBS` 决定，`-1` 使用 worker 可见的全部 CPU 核。
+
+持久化仍使用 legacy bulk 热路径：reaction SMILES topology 缓存和单次 set-based Geometry
+匹配保持开启，逐文件 concrete/logical/reverse reconciliation 不得直接插入；项目范围和所有权
+约束仍然必须执行。修改这些边界前必须同步更新架构说明并用同一批真实文件复测字节吞吐和失败隔离。
 
 #### 项目级批量变更后的统计刷新
 
@@ -753,13 +756,15 @@ project geometry catalogue 以及反应 profile 读路径所需的列级统计�
 
 #### 推荐的导入超参数
 
+完整的专用算力部署配置、256 文件基准方法和按症状调参表见[高性能导入配置指南](performance-tuning.md)。
+
 先按运行场景选择起始组合。当前部署算力主机的吞吐基准以 16 个文件级 MolOP worker、每个 worker 使用 1 个 native thread 为起点；这不是所有机器的固定最优值，CPU 核数、可用内存、磁盘和 PostgreSQL 延迟不同都需要重新验证。
 
-| 场景 | `TRICYCLE_MOLOP_BATCH_N_JOBS` | `OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `MKL_NUM_THREADS` | `IMPORT_PIPELINE_WINDOW_FILES` | `IMPORT_STREAM_QUEUE_SIZE` | `IMPORT_COMMIT_BATCH_FILES` |
-| --- | ---: | --- | ---: | ---: | ---: |
-| 本地开发或低资源主机 | `2` | `1 / 1 / 1` | `16` | `16` | `8–16` |
-| 有足够 CPU/内存的部署算力主机（吞吐优先） | `16` | `1 / 1 / 1` | `64` | `64` | `16` |
-| 内存或数据库压力较大 | `4–8` | `1 / 1 / 1` | `32` | `32` | `8` |
+| 场景 | `TRICYCLE_MOLOP_BATCH_N_JOBS` | `TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES` | `OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `MKL_NUM_THREADS` | `IMPORT_PIPELINE_WINDOW_FILES` | `IMPORT_STREAM_QUEUE_SIZE` | `IMPORT_COMMIT_BATCH_FILES` |
+| --- | ---: | ---: | --- | ---: | ---: | --- |
+| 本地开发或低资源主机 | `-1` 或正整数 | `0`（自动） | `1 / 1 / 1` | `16` | `16` | 兼容参数 |
+| 有足够 CPU/内存的部署算力主机（吞吐优先） | `-1` | `0`（自动） | `1 / 1 / 1` | `64` | `64` | 兼容参数 |
+| 内存或数据库压力较大 | 正整数 | 手动减小 | `1 / 1 / 1` | `32` | `32` | 兼容参数 |
 
 部署算力主机可以从下面的组合开始；`IMPORT_*` 是 `make import-artifacts` 的命令行变量，`TRICYCLE_*` 和 native thread 变量则应同时放入运行环境或 shell 环境：
 
@@ -768,7 +773,8 @@ IMPORT_MODE=deployment \
 OMP_NUM_THREADS=1 \
 OPENBLAS_NUM_THREADS=1 \
 MKL_NUM_THREADS=1 \
-TRICYCLE_MOLOP_BATCH_N_JOBS=16 \
+TRICYCLE_MOLOP_BATCH_N_JOBS=-1 \
+TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES=0 \
 IMPORT_PIPELINE_WINDOW_FILES=64 \
 IMPORT_STREAM_QUEUE_SIZE=64 \
 IMPORT_COMMIT_BATCH_FILES=16 \
@@ -782,20 +788,21 @@ make import-artifacts
 
 调参时按以下顺序处理：
 
-- 首先调 `TRICYCLE_MOLOP_BATCH_N_JOBS`，建议按 `2 → 4 → 8 → 16` 递增，每次使用同一批真实文件重新测量。它是 worker 共享解析进程池的文件级准入上限；三个 OpenMP/BLAS 变量应保持为 `1`，不要通过把它们设大来代替文件级并发。生产环境必须使用正整数，不能使用 `-1`。
-- `IMPORT_PIPELINE_WINDOW_FILES` 是 RustFS 暂存候选池，不是 parser worker 数；它只影响预取、背压和内存占用。`IMPORT_STREAM_QUEUE_SIZE` 是发现/指纹阶段的缓冲，通常与候选池取相同值。增大这两个值不会增加解析并发；大文件或内存紧张时应优先减小它们。
+- 首先确认 `TRICYCLE_MOLOP_BATCH_N_JOBS=-1` 是否适合主机；它使用 worker 进程可见的全部 CPU 核。若需要为数据库、API 或其他服务预留 CPU，再按 `2 → 4 → 8 → 16` 设置正整数。三个 OpenMP/BLAS 变量应保持为 `1`，不要通过把它们设大来代替文件级并发。
+- `TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES` 只限制共享 dispatcher 预取的 staged 文件数；`0` 自动按 MolOP 进程数设置。`IMPORT_PIPELINE_WINDOW_FILES` 是本地 RustFS 暂存候选窗口，`IMPORT_STREAM_QUEUE_SIZE` 是发现/指纹阶段缓冲；它们都不增加解析并发，大文件或内存紧张时应优先减小。
 - 指纹阶段使用独立线程池，当前内部上限为 `32` 个 worker，没有对应的环境变量或 CLI 参数。若统计中的瓶颈在 fingerprint 阶段，应先检查磁盘和 SHA-256 读取开销，不要盲目增大 MolOP 解析并发。
-- `IMPORT_COMMIT_BATCH_FILES` 目前仅为旧 CLI 参数保留；worker 的领取窗口和持久化批次由服务端控制，不由本地 CLI 会话创建解析进程。若调整 worker 的提交边界，应同步观察锁竞争、statement timeout 和数据库内存压力。
+- `IMPORT_COMMIT_BATCH_FILES` 目前仅为旧 CLI 参数保留，不再控制本地事务、worker 领取窗口或持久化微批；worker 默认按 16 个文件或 256 帧提交，可通过 `TRICYCLE_UPLOAD_WORKER_PERSISTENCE_BATCH_FILES` 和 `TRICYCLE_UPLOAD_WORKER_PERSISTENCE_FRAME_LIMIT` 调整。若调整该边界，应同步观察锁竞争、statement timeout 和数据库内存压力。
 - `IMPORT_MAX_TRANSIENT_RETRIES=3` 建议保持不变。它只用于死锁、序列化冲突、连接瞬断等瞬态错误；提高它不能修复持续性错误，只会延长失败恢复时间。
 - `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS=60` 是 10 MiB 文件的基准预算，并随源文件大小放大；它是异常文件隔离参数，不是提速参数。慢磁盘或大文件较多时提高，想更快跳过异常文件时降低，但应先确认失败率。
-- `TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE=false` 是上一版高吞吐导入的默认值，适合大规模普通导入；需要 frame role/source locator、source span 和 block hash 等审计证据时显式设为 `true`，并接受额外开销。`TRICYCLE_MOLOP_PARALLEL_FRAME_PERSISTENCE=true` 应保持开启。
+- `TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE=true` 是强制设置。segment 边界、frame role、source locator、source span 和 block hash 是无损入库与重解析替换所需的证据；设为 `false` 会直接拒绝启动。`TRICYCLE_MOLOP_PARALLEL_FRAME_PERSISTENCE=true` 应保持开启。
 
-浏览器和远程 API 上传使用独立的 durable `upload-worker`，参数不要与本地导入的 `IMPORT_*` 混用。`TRICYCLE_UPLOAD_MAX_CONCURRENCY=8` 限制 RustFS 读取；`TRICYCLE_MAX_BATCH_FILES=64` 是 worker 的领取窗口，持久化提交微批固定为 8 个文件或 128 帧；`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 仅用于旧 pending-ingestion 恢复。专用算力主机可以把共享解析池 `TRICYCLE_MOLOP_BATCH_N_JOBS` 调到 `16`，并根据 CPU、内存和数据库写入延迟复测。
+浏览器和远程 API 上传使用统一的 durable `upload-worker`，参数不要与本地导入的 `IMPORT_*` 混用。`TRICYCLE_UPLOAD_MAX_CONCURRENCY=8` 限制 RustFS 读取；`TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES=0` 自动设置连续领取的预取上限，持久化提交微批默认按 16 个文件或 256 帧；`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 仅用于旧 pending-ingestion 恢复。专用算力主机默认使用 `TRICYCLE_MOLOP_BATCH_N_JOBS=-1`，并根据 CPU、内存和数据库写入延迟复测。
 
-worker 的 64 个文件是领取窗口，不代表 64 个文件共用一个事务；每个 project/user 微批
-通过同一个结果队列和单一消费者处理，并按 8 个文件或 128 帧提交一次。它不改变解析准入；本地
-CLI 的 `IMPORT_COMMIT_BATCH_FILES=16` 仍只控制本地事务/检查点频率。三种数字分别属于
-解析准入、结果交接和提交边界，不能互相替代。
+worker 的预取上限不代表同一批文件共用一个事务；每个 project/user 微批通过同一个结果队列和
+单一消费者处理，并按默认 16 个文件或 256 帧提交一次。它不改变解析准入；本地 CLI 的
+`IMPORT_COMMIT_BATCH_FILES=16` 仅作为兼容参数保留。解析进程数、结果预取和数据库提交边界
+分别由 `TRICYCLE_MOLOP_BATCH_N_JOBS`、`TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES` 和服务端
+固定微批控制，不能互相替代。
 
 `TRICYCLE_MAX_UPLOAD_BYTES=64 MiB` 是单文件上限，本地导入也会执行；`TRICYCLE_MAX_BATCH_FILES=64` 和 `TRICYCLE_MAX_BATCH_BYTES=512 MiB` 是 HTTP 批次保护，不是本地导入的吞吐参数。只有在专用内网压测或可信批量客户端中，并且反向代理 body limit、RustFS、PostgreSQL 都已验证有余量时，才临时提高批次上限到例如 `1024` 文件 / `1 GiB`；不要为普通公网 API 修改这些默认值。`TRICYCLE_UPLOAD_WORKER_LEASE_SECONDS=3600`、`TRICYCLE_UPLOAD_CLIENT_LEASE_SECONDS=900` 和轮询间隔 `1` 秒属于故障恢复参数，保持默认值即可。
 

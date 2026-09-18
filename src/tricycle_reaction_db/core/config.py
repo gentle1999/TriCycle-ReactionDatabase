@@ -103,11 +103,20 @@ class Settings(BaseSettings):
     # Only unowned pending ingestions older than this grace period are treated
     # as legacy orphans.
     upload_pending_recovery_seconds: int = Field(default=900, ge=60, le=86_400)
+    # Zero derives a bounded claim window from the shared MolOP process pool;
+    # it is a prefetch limit, not a parser or database concurrency setting.
+    upload_worker_prefetch_files: int = Field(default=0, ge=0, le=100_000)
+    # The worker keeps parsing ahead of the database but commits one
+    # project/user microbatch at these limits.  They are deliberately
+    # configurable because database latency and frame density vary by host.
+    upload_worker_persistence_batch_files: int = Field(default=16, ge=1, le=64)
+    upload_worker_persistence_frame_limit: int = Field(default=256, ge=1, le=10_000)
     upload_worker_concurrency: int = Field(default=2, ge=1, le=32)
-    # Source spans and block hashes are expensive for large calculation logs.
-    # Keep them opt-in for normal/high-throughput ingestion; audit and
-    # reproducibility imports can enable them explicitly.
-    molop_capture_source_evidence: bool = False
+    # Source spans, block hashes, segment boundaries, and frame roles are
+    # required for lossless calculation ingestion.  Keep the setting for
+    # backwards-compatible deployment configuration, but reject attempts to
+    # disable it rather than silently losing source evidence.
+    molop_capture_source_evidence: bool = True
     # Fast ingestion batches revision-local frame rows in one transaction.
     # Evidence capture no longer disables deferred topology reconstruction.
     molop_parallel_frame_persistence: bool = True
@@ -127,7 +136,10 @@ class Settings(BaseSettings):
     )
     structure_query_max_characters: int = Field(default=16_384, ge=100, le=1_000_000)
     structure_candidate_limit: int = Field(default=50_000, ge=1, le=10_000_000)
-    molop_batch_n_jobs: int = Field(default=2, ge=-1)
+    # -1 means all CPU cores visible to this service process.  Set a positive
+    # value only when an operator deliberately wants to reserve CPU for other
+    # workloads.
+    molop_batch_n_jobs: int = Field(default=-1, ge=-1)
     auth_mode: Literal["development", "oidc"] = "development"
     development_user_id: UUID = DEVELOPMENT_USER_ID
     oidc_issuer: str | None = None
@@ -258,6 +270,13 @@ class Settings(BaseSettings):
             raise ValueError("molop_batch_n_jobs must be -1 or a positive integer")
         return value
 
+    @field_validator("molop_capture_source_evidence")
+    @classmethod
+    def require_molop_source_evidence(cls, value: bool) -> bool:
+        if not value:
+            raise ValueError("molop_capture_source_evidence must remain enabled")
+        return value
+
     @model_validator(mode="after")
     def validate_authentication(self) -> "Settings":
         if self.environment == "production" and self.auth_mode != "oidc":
@@ -323,8 +342,6 @@ class Settings(BaseSettings):
             redis_url = urlsplit(self.rate_limit_redis_url)
             if redis_url.scheme != "rediss" or not redis_url.hostname:
                 raise ValueError("production rate limiting requires a rediss:// URL")
-        if self.environment == "production" and self.molop_batch_n_jobs == -1:
-            raise ValueError("production must set molop_batch_n_jobs to a positive limit")
         if len(self.session_secret) < 32:
             raise ValueError("session_secret must contain at least 32 characters")
         if self.email_delivery_mode == "smtp" and not self.smtp_host:

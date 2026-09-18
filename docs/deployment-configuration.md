@@ -7,6 +7,8 @@
 [.env.example](../.env.example)，前端变量见
 [frontend/.env.example](../frontend/.env.example)。
 
+专用算力主机的 MolOP、upload-worker、PostgreSQL 和 RustFS 吞吐配置见[高性能导入配置指南](performance-tuning.md)。
+
 ## 1. 部署边界
 
 单机和多机生产拓扑都受支持。应用不要求 PostgreSQL、RustFS 或中间件与 API 同机，也不要求
@@ -395,18 +397,35 @@ TRICYCLE_RATE_LIMIT_KEY_PREFIX=reaction-database
 OMP_NUM_THREADS=1
 OPENBLAS_NUM_THREADS=1
 MKL_NUM_THREADS=1
-# Conservative generic deployment default; raise this only after measuring
-# the actual compute host and PostgreSQL/RustFS capacity.
-TRICYCLE_MOLOP_BATCH_N_JOBS=2
+# Use every CPU core visible to the single upload-worker by default. Set a
+# positive value only when CPU must be reserved for another workload.
+TRICYCLE_MOLOP_BATCH_N_JOBS=-1
+# 0 derives a bounded continuous-dispatcher prefetch limit from the MolOP pool.
+TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES=0
 # Baseline budget for a 10 MiB file; larger files scale proportionally.
 TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS=60
 ~~~
 
 #### 文件导入参数推荐
 
-上面的 `2` 是 upload-worker 共享解析进程池在低资源主机上的保守起点。专用算力主机上，吞吐优先的第一组实验可以把 `TRICYCLE_MOLOP_BATCH_N_JOBS` 提高到 `16`，同时保持 `OMP_NUM_THREADS=1`、`OPENBLAS_NUM_THREADS=1` 和 `MKL_NUM_THREADS=1`；本地 `make import-artifacts` 再配合 `IMPORT_PIPELINE_WINDOW_FILES=64`、`IMPORT_STREAM_QUEUE_SIZE=64` 和 `IMPORT_MAX_TRANSIENT_RETRIES=3`。`IMPORT_COMMIT_BATCH_FILES` 仅为旧 CLI 参数保留，不控制 worker 解析。内存或数据库压力较大时从 `4–8 / 32 / 32` 开始。每次只调整一组参数，并用同一批真实文件观察总耗时、内存峰值、数据库写入延迟和失败重试次数。
+默认的 `-1` 会让单个 upload-worker 使用其进程可见的全部 CPU 核；只有需要为 PostgreSQL、API 或其他
+负载预留 CPU 时才设置正整数。保持 `OMP_NUM_THREADS=1`、`OPENBLAS_NUM_THREADS=1` 和
+`MKL_NUM_THREADS=1`；本地 `make import-artifacts` 的 `IMPORT_PIPELINE_WINDOW_FILES` 与
+`IMPORT_STREAM_QUEUE_SIZE` 只控制 RustFS 暂存和指纹缓冲。`IMPORT_COMMIT_BATCH_FILES` 仅为旧
+CLI 参数保留，不控制 worker 解析或数据库提交。每次只调整一组参数，并用同一批真实文件观察总耗时、
+内存峰值、数据库写入延迟和失败重试次数。
 
-`TRICYCLE_MOLOP_BATCH_N_JOBS` 是共享进程池的文件解析准入上限；三个 native thread 变量控制每个槽位内部的 OpenMP/BLAS 线程，不能用增大 native thread 数代替文件级并发。生产路径使用可复用的 `spawn` MolOP 进程池，文件完成或超时后释放准入槽位，后续任务继续从同一个池排队执行。`IMPORT_*` 只属于宿主机直接导入命令，不会自动成为 Compose 服务环境变量。RustFS 暂存完成后，浏览器/远程上传和兼容 pending-ingestion 恢复都由 worker 按最多 64 个文件领取窗口、按项目/用户分组调用唯一的 `ArtifactUploadService.reparse_batch`；它只读取并校验已有 RustFS 对象，再委托共享 MolOP 进程池和单一持久化消费者，不重复上传或新增解析器。客户端 `UploadBatch` 只是队列/进度边界，不是持久化边界；同一项目/用户的多个单文件批次会在 worker 中合并成一个持久化微批，不同项目/用户微批顺序提交，避免并发争抢项目范围身份锁。`upload_batch` 内部每 8 个解析结果、累计达到 128 帧（或结果队列暂时为空）就交给持久化消费者，并以 8 个文件或 128 帧作为事务提交边界；这两个数字都不改变当前配置的 MolOP 解析准入上限。批量路径保持上一版的 legacy bulk 热路径，不能把逐文件 concrete/logical/reverse reconciliation 直接加回。`TRICYCLE_UPLOAD_MAX_CONCURRENCY` 只限制 RustFS 读取槽位，`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 只用于兼容 pending-ingestion 恢复，`TRICYCLE_MOLOP_BATCH_N_JOBS` 限制解析准入。完整的场景表、HTTP 请求上限和调参边界见[开发环境：推荐的导入超参数](development.md#推荐的导入超参数)。
++`TRICYCLE_MOLOP_BATCH_N_JOBS` 是共享进程池的文件解析进程数；三个 native thread 变量控制每个槽位内部的
+OpenMP/BLAS 线程，不能用增大 native thread 数代替文件级并发。生产路径使用可复用的 `spawn` MolOP
+进程池，文件完成或超时后释放槽位，连续 dispatcher 立即补充下一个 staged 文件。`IMPORT_*` 只属于
+宿主机直接导入命令，不会自动成为 Compose 服务环境变量。RustFS 暂存完成后，浏览器、远程上传、MCP
+和兼容 pending-ingestion 恢复都进入同一个 worker 流；它只读取并校验已有 RustFS 对象，不重复上传。
+`TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES=0` 按 MolOP 进程数自动设置预取上限。客户端 `UploadBatch`
+只是队列/进度边界，不是持久化边界；同一项目/用户的多个单文件批次会进入同一个持久化消费者，默认按 16
+个完成文件或 256 帧提交一次微批（可通过 `TRICYCLE_UPLOAD_WORKER_PERSISTENCE_BATCH_FILES` 和
+`TRICYCLE_UPLOAD_WORKER_PERSISTENCE_FRAME_LIMIT` 调整），结果队列暂时为空只做预加载，MolOP 没有待处理任务时再提交尾批。
+不同项目/用户微批顺序执行，项目写锁协调旧 parse 清理、结果写入和状态完成。完整边界见[开发环境：
+推荐的导入超参数](development.md#推荐的导入超参数)。
 
 该模型要求生产环境只运行一个 `upload-worker` 实例：它是共享 MolOP 进程池和单一活动持久化消费者的边界。API 节点可以横向扩展，但不要横向扩展 upload-worker；多个 worker 副本会各自创建解析池和持久化消费者，从而改变本节描述的串行组和资源上限语义。
 
@@ -425,8 +444,9 @@ federation `page_by_*_in` 根的默认排序；本项目没有启用跨数据库
 检查默认排序与跨 member 结果一致性。
 
 应用启动时会拒绝以下生产配置：非 OIDC 认证、默认 Session secret、非 Secure Cookie、
-非 HTTPS 的 issuer/redirect/JWKS URL、SMTP 465/无 STARTTLS/非法发件域名，以及
-TRICYCLE_MOLOP_BATCH_N_JOBS=-1。
+非 HTTPS 的 issuer/redirect/JWKS URL、SMTP 465/无 STARTTLS/非法发件域名。`-1` 的 MolOP
+配置表示使用 worker 进程可见的全部 CPU 核；多副本 upload-worker 仍不推荐，因为每个副本都会
+拥有自己的解析池和持久化消费者。
 
 数据库 URL 中的特殊字符必须进行 URL 编码。`verify-full` 校验连接主机名，因此 URL 应使用
 证书 SAN 中的 DNS 名，不能临时改成裸 IP。不要把数据库、RustFS S3 API 或 Console 暴露公网。
@@ -748,10 +768,9 @@ API 默认只监听 127.0.0.1:8000，由反向代理对外提供 HTTPS。`infra/
 指标是进程内状态，不应在同一个监听端口启动 Uvicorn 多 worker，否则抓取请求只会随机命中
 其中一个 worker。若未来引入 Prometheus multiprocess 聚合，同机多 worker 仍必须按
 先用 `OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS` 和 `MKL_NUM_THREADS` 限制每个 MolOP
-进程内部的原生线程池，再用“Uvicorn worker 数 × `TRICYCLE_MOLOP_BATCH_N_JOBS`”评估
-MolOP 解析进程的 CPU 和内存。`TRICYCLE_MOLOP_BATCH_N_JOBS` 是唯一的文件级解析准入
-上限；请求/worker 的 `reparse` 任务窗口和数据库连接准入不能替代或复制这条解析路径。
-生产不得设置 `TRICYCLE_MOLOP_BATCH_N_JOBS=-1`。
+进程内部的原生线程池，再用“upload-worker 副本数 × 有效 MolOP 进程数”评估解析进程的 CPU
+和内存。生产推荐只运行一个 upload-worker；API 节点可横向扩展，但请求/worker 的 `reparse`
+任务窗口和数据库连接准入不能替代或复制这条共享解析路径。
 
 ## 12. 定时任务、备份与验收
 
