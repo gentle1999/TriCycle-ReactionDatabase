@@ -351,6 +351,7 @@ async def _benchmark(
     parallel_files: int,
 ) -> tuple[list[SampleReport], float, float]:
     file_slots = asyncio.Semaphore(parallel_files)
+    worker_slots = asyncio.Semaphore(workers)
     frame_slots = asyncio.Semaphore(workers * 2)
 
     async def parse_one(
@@ -358,21 +359,27 @@ async def _benchmark(
     ) -> tuple[Path, _ParsedArtifact | Exception, float, float]:
         queued_at = perf_counter()
         await file_slots.acquire()
-        queue_wait = perf_counter() - queued_at
-        started = perf_counter()
         try:
-            parsed = await artifact_uploads._run_molop_file_pipeline(
-                parser_paths[path],
-                parser_paths[path].name,
-                submission_slots=frame_slots,
-                # The benchmark's outer semaphore already times and bounds the
-                # file queue. This local permit preserves the production helper
-                # path without counting its second acquire as parse latency.
-                file_slots=asyncio.Semaphore(1),
-            )
-            return path, parsed, perf_counter() - started, queue_wait
-        except Exception as error:
-            return path, error, perf_counter() - started, queue_wait
+            # Match the production file-submission limit before starting the
+            # parser deadline. Otherwise executor queue time consumes a file's
+            # parse budget when parallel_files exceeds the process-pool size.
+            await worker_slots.acquire()
+            queue_wait = perf_counter() - queued_at
+            started = perf_counter()
+            try:
+                parsed = await artifact_uploads._run_molop_file_pipeline(
+                    parser_paths[path],
+                    parser_paths[path].name,
+                    submission_slots=frame_slots,
+                    # worker_slots above owns the shared file admission permit;
+                    # keep the helper's own acquire non-blocking and local.
+                    file_slots=asyncio.Semaphore(1),
+                )
+                return path, parsed, perf_counter() - started, queue_wait
+            except Exception as error:
+                return path, error, perf_counter() - started, queue_wait
+            finally:
+                worker_slots.release()
         finally:
             file_slots.release()
 
