@@ -175,13 +175,14 @@ The fixed boundaries are:
   MolOP pool. `TRICYCLE_MOLOP_BATCH_N_JOBS=-1` uses all CPU cores visible to the worker; a
   positive value is an explicit cap.
 - One persistence consumer keeps project/user authorization groups isolated. Project write locks
-  coordinate old-parse cleanup, materialization, and UploadBatch finalization. It commits eight
-  completed files or 128 frames per microbatch; an empty result queue only triggers preload
+  coordinate old-parse cleanup, materialization, and UploadBatch finalization. It commits 16
+  completed files or 256 frames per microbatch; an empty result queue only triggers preload
   persistence, while the idle parser pool triggers the tail commit. Different project/user groups
   write serially, so client-side one-file UploadBatch boundaries cannot bypass microbatching.
-- `persist_parsed_microbatch` reuses the legacy bulk persistence core in `upload_batch`; it does
-  not duplicate frame/reaction/geometry materialization. A failed file is finalized independently
-  and does not roll back unrelated files.
+- `persist_parsed_microbatch` reuses the unified persistence core in `upload_batch`; it does not
+  duplicate frame/reaction/geometry materialization. Each microbatch completes topology-DAG
+  construction, membership, and reverse reconciliation before it enqueues profile refresh work.
+  A failed file is finalized independently and does not roll back unrelated files.
 - `TRICYCLE_UPLOAD_MAX_CONCURRENCY` controls only RustFS reads and
   `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` only legacy pending-ingestion recovery. Production should
   run one upload-worker replica; multiple replicas create independent parser pools and persistence
@@ -199,7 +200,7 @@ regression check before merge.
 | --- | --- | --- | --- |
 | Parser admission | CLI does not run MolOP | `TRICYCLE_MOLOP_BATCH_N_JOBS`; `-1` uses all CPU cores visible to the worker | Not RustFS read concurrency |
 | Staging/claim prefetch | `IMPORT_PIPELINE_WINDOW_FILES` | `TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES`; `0` derives automatically | Backpressure only, not a parser batch |
-| Persistence hand-off | The worker consumes staged results | Eight files or 128 frames; an empty queue only preloads, and an idle MolOP pool commits the tail | Must not wait for a client batch |
+| Persistence hand-off | The worker consumes staged results | 16 files or 256 frames; an empty queue only preloads, and an idle MolOP pool commits the tail | Must not wait for a client batch |
 | Commit/checkpoint | `IMPORT_COMMIT_BATCH_FILES` is compatibility-only | Worker microbatch and lease finalization | Does not control parser or DB concurrency |
 
 The implementation invariants are:
@@ -209,20 +210,21 @@ The implementation invariants are:
   Do not restore a per-file process pool/executor or use native OpenMP/BLAS thread counts as a
   substitute for file concurrency.
 - `_run_streaming_cycle` refills parser tasks as they finish. One bounded result queue feeds one
-  persistence consumer, which commits eight completed files or 128 parsed frames at a time. Parser
+  persistence consumer, which commits 16 completed files or 256 parsed frames at a time. Parser
   work and database writes overlap; an empty queue only triggers preload persistence.
 - Project write locks coordinate old-parse cleanup, microbatch materialization, and UploadBatch
   finalization. Multiple client one-file batches may affect progress and leases, but cannot create
   competing persistence sessions for the same project.
-- `persist_parsed_microbatch` reuses the legacy bulk hot path in `upload_batch`; reaction-SMILES
-  topology caches and set-based Geometry matching remain enabled. Per-file concrete/logical/reverse
-  reconciliation must not be inserted directly. Failed files are finalized independently.
+- `persist_parsed_microbatch` reuses the unified persistence path in `upload_batch`; reaction-SMILES
+  topology caches and set-based Geometry matching remain enabled. Each microbatch completes
+  topology-DAG construction, concrete/logical membership, and reverse reconciliation before it
+  enqueues profile refresh work. Failed files are finalized independently.
 - Production should run one upload-worker replica. API nodes may scale horizontally, but multiple
   worker replicas create independent MolOP pools and persistence consumers and change these limits.
 
 The fixed relationship is therefore: after RustFS staging, every source enters one continuous dispatcher;
 the effective MolOP process pool remains supplied, results are handed to one persistence consumer in
-eight-file/128-frame microbatches, and project/user groups write serially. A client one-file batch cannot
+16-file/256-frame microbatches, and project/user groups write serially. A client one-file batch cannot
 bypass server-side microbatching. Changing any boundary requires updating this section, the
 development/deployment guides, and the corresponding tests.
 

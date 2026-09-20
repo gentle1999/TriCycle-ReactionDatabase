@@ -398,7 +398,11 @@ def test_derived_mapping_shares_source_ts_and_unchanged_endpoint_evidence() -> N
                 ts_binding,
                 MappedReactionNodeGeometryMappingRecord(
                     geometry_atom_map_numbers=atom_maps,
-                    mapped_smiles=mapped_smiles_for_topology(ts_geometry.topology, atom_maps),
+                    mapped_smiles=mapped_smiles_for_topology(
+                        ts_geometry.topology,
+                        atom_maps,
+                        include_stereochemistry=False,
+                    ),
                     mapping_method="tests/shared-evidence",
                     mapping_version="1",
                     verified=True,

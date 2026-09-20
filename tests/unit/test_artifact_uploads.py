@@ -69,6 +69,41 @@ NON_TS_FIXTURE = (
 )
 
 
+def test_unified_batch_preload_keeps_dag_hooks_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared upload transaction must not opt into the legacy bypass."""
+
+    executed: list[str] = []
+
+    class FakeConnection:
+        def execute(self, statement: object) -> None:
+            executed.append(str(statement))
+
+    class FakeSession:
+        info: dict[str, object] = {}
+
+        def connection(self) -> FakeConnection:
+            return FakeConnection()
+
+    expected = ({}, {})
+
+    def fake_preload(
+        _session: object,
+        *,
+        ingestion_ids: list[UUID],
+    ) -> tuple[dict[UUID, object], dict[UUID, set[UUID]]]:
+        assert ingestion_ids == []
+        return expected
+
+    monkeypatch.setattr(upload_module, "_preload_batch_persistence_state", fake_preload)
+
+    session = FakeSession()
+    assert upload_module._run_preload_batch_persistence_state(session, ingestion_ids=[]) == expected
+    assert "tricycle_legacy_bulk_import" not in session.info
+    assert executed == ["SET LOCAL tricycle.defer_profile_source_visibility = 'on'"]
+
+
 def test_inference_context_snapshot_restores_nested_reconciliation_cache_lists() -> None:
     context = GeometryPersistenceContext()
     cache = ReconciliationBatchCache()
@@ -104,6 +139,24 @@ def test_inference_context_snapshot_restores_nested_reconciliation_cache_lists()
     assert cache.node_geometries_by_node[node_id] == [original_binding]
     assert node_id in cache.loaded_node_geometries
     assert node_id in cache.new_mapped_reaction_ids
+
+
+def test_inference_context_snapshot_does_not_copy_pure_topology_preparation_cache() -> None:
+    context = GeometryPersistenceContext()
+    snapshot = _snapshot_inference_context(context)
+    inferred = object()
+    prepared_records = object()
+    context.inference_topology_records_by_object_id[id(inferred)] = (
+        inferred,
+        prepared_records,
+    )
+
+    _restore_inference_context(context, snapshot)
+
+    assert context.inference_topology_records_by_object_id[id(inferred)] == (
+        inferred,
+        prepared_records,
+    )
 
 
 def test_fast_pending_identity_lookup_reuses_the_first_entity() -> None:
@@ -401,7 +454,8 @@ async def test_file_pipeline_timeout_isolated_to_one_file(monkeypatch: pytest.Mo
     [
         (5 * 1024 * 1024, 60.0),
         (10 * 1024 * 1024, 60.0),
-        (20 * 1024 * 1024, 120.0),
+        (20 * 1024 * 1024, 150.0),
+        (30 * 1024 * 1024, 240.0),
     ],
 )
 def test_file_parse_timeout_scales_with_source_size(
@@ -424,7 +478,34 @@ def test_file_parse_timeout_scales_path_sources(
     source = tmp_path / "large.log"
     source.write_bytes(b"0" * (30 * 1024 * 1024))
 
-    assert _molop_file_parse_timeout_seconds(source) == 180.0
+    assert _molop_file_parse_timeout_seconds(source) == 240.0
+
+
+def test_file_parse_timeout_has_headroom_for_previous_large_file_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(_env_file=None, molop_file_parse_timeout_seconds=60.0)
+    monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
+    source = tmp_path / "previously-timed-out.log"
+    with source.open("wb") as stream:
+        stream.truncate(19_620_917)
+
+    assert _molop_file_parse_timeout_seconds(source) == pytest.approx(138.4, abs=0.1)
+
+
+def test_file_parse_timeout_uses_uncompressed_gzip_size() -> None:
+    compressed = gzip.compress(b"0" * (20 * 1024 * 1024))
+
+    assert _molop_file_parse_timeout_seconds(compressed) == 150.0
+
+
+def test_file_parse_timeout_uses_uncompressed_gzip_path_size(tmp_path: Path) -> None:
+    compressed = gzip.compress(b"0" * (30 * 1024 * 1024))
+    source = tmp_path / "compressed.upload"
+    source.write_bytes(compressed)
+
+    assert _molop_file_parse_timeout_seconds(source) == 240.0
 
 
 @pytest.mark.asyncio
@@ -739,18 +820,14 @@ def test_inferred_endpoint_repairs_stereo_before_fragment_extraction(
     assert "/" not in incomplete_smiles and "\\" not in incomplete_smiles
     assert endpoint.GetNumConformers() == 1
 
-    repair_inputs: list[tuple[int, int]] = []
-    repair_stereo = upload_module.ensure_serializable_double_bond_stereochemistry
+    normalization_inputs: list[tuple[int, int]] = []
+    normalize_fragment = upload_module.normalize_topology
 
-    def record_repair_input(molecule: Chem.Mol, **kwargs: object) -> Chem.Mol:
-        repair_inputs.append((len(Chem.GetMolFrags(molecule)), molecule.GetNumConformers()))
-        return repair_stereo(molecule, **kwargs)
+    def record_normalization_input(molecule: Chem.Mol, **kwargs: object) -> object:
+        normalization_inputs.append((len(Chem.GetMolFrags(molecule)), molecule.GetNumConformers()))
+        return normalize_fragment(molecule, **kwargs)
 
-    monkeypatch.setattr(
-        upload_module,
-        "ensure_serializable_double_bond_stereochemistry",
-        record_repair_input,
-    )
+    monkeypatch.setattr(upload_module, "normalize_topology", record_normalization_input)
 
     inferred = _SuccessfulInference(
         file_frame_index=0,
@@ -764,13 +841,12 @@ def test_inferred_endpoint_repairs_stereo_before_fragment_extraction(
         charge=1,
         multiplicity=1,
     )
-    records = upload_module._inference_topology_records(inferred)
+    records = upload_module._prepare_inference_topology_records(inferred).all_records
 
-    # Fragments are split while the endpoint's conformer is still available;
-    # the conformer is removed only after each fragment's stereo is repaired.
-    # Complete endpoint projection is performed once by the reaction-side
-    # serializer; topology normalization consumes the frozen endpoint state.
-    assert repair_inputs == [(1, 1)] * 4
+    # Fragments are split while the endpoint's conformer is still available.
+    # The unified serializer runs at the topology/reaction write boundary;
+    # ordering the fragments here uses source atom maps and does no SMILES IO.
+    assert normalization_inputs == [(1, 1)] * 4
     endpoint_smiles = [record.topology.canonical_isomeric_smiles for record in records[:2]]
     participant_smiles = [
         record.topology.canonical_isomeric_smiles
@@ -839,7 +915,7 @@ def test_fragment_stereo_uses_endpoint_coordinates_before_conformer_removal(
         charge=1,
         multiplicity=1,
     )
-    records = upload_module._inference_topology_records(inferred)
+    records = upload_module._prepare_inference_topology_records(inferred).all_records
     participant_smiles = [
         record.topology.canonical_isomeric_smiles
         for record in records[2:]
@@ -898,6 +974,213 @@ def test_ts_endpoint_stereo_is_inferred_from_endpoint_3d_coordinates() -> None:
         Chem.BondStereo.STEREOZ,
     }
     assert "/" in serialized or "\\" in serialized
+
+
+def test_reactant_and_product_ez_are_independent_of_ts_stereo() -> None:
+    # A TS may have E geometry while one displaced endpoint has Z geometry.
+    # Each endpoint's own coordinates determine its persisted stereo; the
+    # reaction projection must not force both sides to inherit TS stereo.
+    transition_state = Chem.AddHs(Chem.MolFromSmiles("C/C=C/C"))
+    reactant = Chem.AddHs(Chem.MolFromSmiles("C/C=C/C"))
+    product = Chem.AddHs(Chem.MolFromSmiles("C/C=C\\C"))
+    assert transition_state is not None
+    assert reactant is not None
+    assert product is not None
+    assert AllChem.EmbedMolecule(transition_state, randomSeed=29) == 0
+    assert AllChem.EmbedMolecule(reactant, randomSeed=31) == 0
+    assert AllChem.EmbedMolecule(product, randomSeed=37) == 0
+
+    def infer_from_coordinates(molecule: Chem.Mol) -> Chem.Mol:
+        for bond in molecule.GetBonds():
+            bond.SetStereo(Chem.BondStereo.STEREONONE)
+            bond.SetBondDir(Chem.BondDir.NONE)
+        return upload_module._infer_endpoint_stereochemistry_from_3d(molecule)
+
+    inferred_ts = infer_from_coordinates(transition_state)
+    inferred_reactant = infer_from_coordinates(reactant)
+    inferred_product = infer_from_coordinates(product)
+
+    def double_bond_stereo(molecule: Chem.Mol) -> Chem.BondStereo:
+        return next(
+            bond.GetStereo()
+            for bond in molecule.GetBonds()
+            if bond.GetBondType() == Chem.BondType.DOUBLE
+        )
+
+    assert double_bond_stereo(inferred_ts) is Chem.BondStereo.STEREOE
+    assert double_bond_stereo(inferred_reactant) is Chem.BondStereo.STEREOE
+    assert double_bond_stereo(inferred_product) is Chem.BondStereo.STEREOZ
+
+    reaction_smiles = upload_module._mapped_reaction_smiles(
+        inferred_reactant,
+        inferred_product,
+    )
+    parsed_reactant, parsed_product = (
+        Chem.MolFromSmiles(side) for side in reaction_smiles.split(">>")
+    )
+    assert parsed_reactant is not None
+    assert parsed_product is not None
+    assert double_bond_stereo(parsed_reactant) is Chem.BondStereo.STEREOE
+    assert double_bond_stereo(parsed_product) is Chem.BondStereo.STEREOZ
+
+    inferred = _SuccessfulInference(
+        file_frame_index=0,
+        imaginary_mode_index=0,
+        imaginary_frequency_cm1=-100.0,
+        reaction_smiles=reaction_smiles,
+        negative_endpoint=inferred_reactant,
+        positive_endpoint=inferred_product,
+        negative_displacement_ratio=1.0,
+        positive_displacement_ratio=1.0,
+        charge=0,
+        multiplicity=1,
+    )
+    topology_records = upload_module._prepare_inference_topology_records(inferred).all_records
+    endpoint_stereo = {
+        record.topology_derivation.reconstruction_metadata["direction"]: double_bond_stereo(
+            record.topology.mol
+        )
+        for record in topology_records[:2]
+    }
+    assert endpoint_stereo == {
+        "negative": Chem.BondStereo.STEREOE,
+        "positive": Chem.BondStereo.STEREOZ,
+    }
+    side_stereo = {
+        record.topology_derivation.reconstruction_metadata["side"]: double_bond_stereo(
+            record.topology.mol
+        )
+        for record in topology_records[2:]
+    }
+    assert side_stereo == {
+        "reactant": Chem.BondStereo.STEREOE,
+        "product": Chem.BondStereo.STEREOZ,
+    }
+
+
+def test_inference_topology_records_are_normalized_once_per_microbatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    negative = Chem.MolFromSmiles("C/C=C/C")
+    positive = Chem.MolFromSmiles("C/C=C\\C")
+    assert negative is not None
+    assert positive is not None
+    inferred = _SuccessfulInference(
+        file_frame_index=0,
+        imaginary_mode_index=0,
+        imaginary_frequency_cm1=-100.0,
+        reaction_smiles="C/C=C/C>>C/C=C\\C",
+        negative_endpoint=negative,
+        positive_endpoint=positive,
+        negative_displacement_ratio=1.0,
+        positive_displacement_ratio=1.0,
+        charge=0,
+        multiplicity=1,
+    )
+    endpoint_normalizations = 0
+    participant_normalizations = 0
+    original_endpoint_normalizer = upload_module._normalize_transition_state_endpoint_topology
+    original_participant_normalizer = upload_module.normalize_topology
+
+    def count_endpoint_normalization(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        nonlocal endpoint_normalizations
+        endpoint_normalizations += 1
+        return original_endpoint_normalizer(*args, **kwargs)
+
+    def count_participant_normalization(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        nonlocal participant_normalizations
+        participant_normalizations += 1
+        return original_participant_normalizer(*args, **kwargs)
+
+    monkeypatch.setattr(
+        upload_module,
+        "_normalize_transition_state_endpoint_topology",
+        count_endpoint_normalization,
+    )
+    monkeypatch.setattr(upload_module, "normalize_topology", count_participant_normalization)
+
+    context = GeometryPersistenceContext(project_id=SYSTEM_PROJECT_ID)
+    first = upload_module._inference_topology_records_for_context(inferred, context)
+    second = upload_module._inference_topology_records_for_context(inferred, context)
+
+    assert second is first
+    assert endpoint_normalizations == 2
+    assert participant_normalizations == 2
+
+
+def test_endpoint_persistence_reuses_independent_prepared_topologies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    negative = Chem.AddHs(Chem.MolFromSmiles("C/C=C/C"))
+    positive = Chem.AddHs(Chem.MolFromSmiles("C/C=C\\C"))
+    assert negative is not None
+    assert positive is not None
+    assert AllChem.EmbedMolecule(negative, randomSeed=41) == 0
+    assert AllChem.EmbedMolecule(positive, randomSeed=43) == 0
+    inferred = _SuccessfulInference(
+        file_frame_index=0,
+        imaginary_mode_index=0,
+        imaginary_frequency_cm1=-100.0,
+        reaction_smiles="independently-stereospecified-endpoints",
+        negative_endpoint=negative,
+        positive_endpoint=positive,
+        negative_displacement_ratio=1.0,
+        positive_displacement_ratio=1.0,
+        charge=0,
+        multiplicity=1,
+    )
+    prepared = upload_module._prepare_inference_topology_records(inferred)
+    persisted_records = []
+    persisted_values = []
+
+    def fail_if_normalized_again(*args: object, **kwargs: object) -> None:
+        raise AssertionError("endpoint topology was normalized more than once")
+
+    def record_topology(_session: object, record: object, *, context: object = None) -> object:
+        persisted_records.append(record)
+        return SimpleNamespace(topology=SimpleNamespace(id=UUID(int=len(persisted_records))))
+
+    def build_endpoint(_session: object, _entity_type: object, **values: object) -> object:
+        persisted_values.append(values)
+        return SimpleNamespace(**values)
+
+    monkeypatch.setattr(
+        upload_module,
+        "_normalize_transition_state_endpoint_topology",
+        fail_if_normalized_again,
+    )
+    monkeypatch.setattr(upload_module, "persist_molecular_topology", record_topology)
+    monkeypatch.setattr(upload_module, "_fast_insert_enabled", lambda _session: True)
+    monkeypatch.setattr(upload_module, "_new_entity", build_endpoint)
+    monkeypatch.setattr(upload_module, "_flush_new_entity", lambda *_args, **_kwargs: None)
+
+    frame = SimpleNamespace(
+        id=UUID(int=100),
+        charge=0,
+        multiplicity=1,
+        observed_to_geometry_atom_indices=list(range(negative.GetNumAtoms())),
+    )
+    upload_module._persist_transition_state_endpoints(
+        SimpleNamespace(info={}),
+        calculation_frame=frame,
+        inferred=inferred,
+        prepared_topology_records=prepared,
+        identity_is_new=True,
+        defer_flush=True,
+    )
+
+    assert persisted_records == [
+        prepared.negative_endpoint.record,
+        prepared.positive_endpoint.record,
+    ]
+    assert [row["direction"] for row in persisted_values] == [
+        upload_module.TransitionStateEndpointDirection.NEGATIVE,
+        upload_module.TransitionStateEndpointDirection.POSITIVE,
+    ]
+    assert [row["source_to_topology_atom_indices"] for row in persisted_values] == [
+        list(prepared.negative_endpoint.source_to_topology_atom_indices),
+        list(prepared.positive_endpoint.source_to_topology_atom_indices),
+    ]
 
 
 def test_gzip_parser_payload_keeps_logical_source_identity_separate() -> None:

@@ -18,6 +18,7 @@ from tricycle_reaction_db.application.services.artifact_upload_types import (
 from tricycle_reaction_db.application.services.artifact_uploads import (
     _parse_calculation_output,
     _persist_transition_state_endpoints,
+    _prepare_inference_topology_records,
     _resolve_and_bind_transition_state_reaction,
     infer_transition_states_from_calculation_output,
 )
@@ -234,15 +235,18 @@ def _mark_reinference_succeeded(
             )
         )
         session.flush()
+    prepared_topology_records = _prepare_inference_topology_records(inferred)
     logical_reaction_id, mapped_reaction_id = _resolve_and_bind_transition_state_reaction(
         session,
         inferred=inferred,
         calculation_frame=frame,
+        prepared_topology_records=prepared_topology_records,
     )
     _persist_transition_state_endpoints(
         session,
         calculation_frame=frame,
         inferred=inferred,
+        prepared_topology_records=prepared_topology_records,
     )
     inference.imaginary_mode_index = inferred.imaginary_mode_index
     inference.imaginary_frequency_cm1 = inferred.imaginary_frequency_cm1
@@ -470,10 +474,12 @@ def _backfill(
                                 )
                             )
                             session.flush()
+                        prepared_topology_records = _prepare_inference_topology_records(inferred)
                         _persist_transition_state_endpoints(
                             session,
                             calculation_frame=frame,
                             inferred=inferred,
+                            prepared_topology_records=prepared_topology_records,
                         )
                         old_logical_reaction_id = inference.logical_reaction_id
                         old_mapped_reaction_id = inference.mapped_reaction_id
@@ -482,6 +488,7 @@ def _backfill(
                                 session,
                                 inferred=inferred,
                                 calculation_frame=frame,
+                                prepared_topology_records=prepared_topology_records,
                             )
                         )
                         inference.logical_reaction_id = logical_reaction_id

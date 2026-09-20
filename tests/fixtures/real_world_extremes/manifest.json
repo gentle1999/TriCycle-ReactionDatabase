@@ -1,0 +1,68 @@
+{
+  "schema_version": "real-world-ingestion-fixtures-v1",
+  "samples": [
+    {
+      "file": "1-s2.0-S2451929422005617-mmc2__23.log.gz",
+      "source_sha256": "acd78c7d9ac27f08a17547c0373cf6fcd144ca6222331a35d2baa8b96b216d43",
+      "source_size_bytes": 2886805,
+      "source_frame_count": 31,
+      "segment_frame_counts": [30, 1],
+      "inference_count": 1,
+      "failed_inference_count": 0
+    },
+    {
+      "file": "1-s2.0-S2451929422005617-mmc2__24.log.gz",
+      "source_sha256": "f2c30cf0e1e69ae5b533ac82a7e0032ba736b8e45a90e6205a14961680c43c97",
+      "source_size_bytes": 6422978,
+      "source_frame_count": 77,
+      "segment_frame_counts": [76, 1],
+      "inference_count": 1,
+      "failed_inference_count": 0
+    },
+    {
+      "file": "1-s2.0-S2451929422005617-mmc2__25.log.gz",
+      "source_sha256": "fcda355e5ce1177f9a70dee8f0f1f67a015249f29f71a92e5117713d602c800d",
+      "source_size_bytes": 14037619,
+      "source_frame_count": 156,
+      "segment_frame_counts": [155, 1],
+      "inference_count": 1,
+      "failed_inference_count": 0
+    },
+    {
+      "file": "1-s2.0-S2451929422005617-mmc2__26.log.gz",
+      "source_sha256": "6fbab2f871041d6cd27508995718c61261bd6e3f20f6487807062752c9c26401",
+      "source_size_bytes": 19620917,
+      "source_frame_count": 219,
+      "segment_frame_counts": [218, 1],
+      "inference_count": 1,
+      "failed_inference_count": 0
+    },
+    {
+      "file": "ajoc_201402070_sm_miscellaneous_information__44.log.gz",
+      "source_sha256": "3112ba908f9ecc0f1997ec23cd12df6ead03dbe0987268c4c35dedd60bda648f",
+      "source_size_bytes": 3628849,
+      "source_frame_count": 104,
+      "segment_frame_counts": [103, 1],
+      "inference_count": 1,
+      "failed_inference_count": 0
+    },
+    {
+      "file": "anie202216373-sup-0001-misc_information__6.log.gz",
+      "source_sha256": "a5cc887251af02328139e36b315374456ccc2673c0231a59035f9096b1bd0fc7",
+      "source_size_bytes": 10352290,
+      "source_frame_count": 128,
+      "segment_frame_counts": [127, 1],
+      "inference_count": 1,
+      "failed_inference_count": 0
+    },
+    {
+      "file": "anie202217654-sup-0001-misc_information__15_modts.log.gz",
+      "source_sha256": "e704d6a077f1f6162d307301de3dae0a749ea04f114894ba00f074ca5d0ec4c7",
+      "source_size_bytes": 521713,
+      "source_frame_count": 13,
+      "segment_frame_counts": [5, 1, 6, 1],
+      "inference_count": 2,
+      "failed_inference_count": 0
+    }
+  ]
+}

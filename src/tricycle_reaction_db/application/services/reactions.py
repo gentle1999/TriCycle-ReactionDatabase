@@ -39,6 +39,10 @@ from tricycle_reaction_db.application.services.reaction_geometry_policy import (
     require_geometry_reaction_endpoint_eligibility,
     require_geometry_thermodynamic_property,
 )
+from tricycle_reaction_db.core.chemistry_config import (
+    REACTION_TS_GEOMETRY_LINK_METHOD,
+    REACTION_TS_GEOMETRY_LINK_POLICY_VERSION,
+)
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
     Geometry,
@@ -63,9 +67,7 @@ from tricycle_reaction_db.domain.enums import (
     StorageStatus,
     WorkflowManifestStatus,
 )
-from tricycle_reaction_db.ingestion.normalization import (
-    ensure_serializable_double_bond_stereochemistry,
-)
+from tricycle_reaction_db.ingestion.normalization import serialize_molecule_smiles
 
 ParticipantIdentity = tuple[LogicalReactionParticipantSide, MolecularTopology, int]
 MappedReactionConcreteIdentity = tuple[
@@ -130,82 +132,51 @@ def _reaction_from_representation(
 def _canonical_mapped_reaction_smiles(
     definition: rdChemReactions.ChemicalReaction,
 ) -> str:
-    """Canonicalize mapped reactions while avoiding unstable metal stereo tags."""
+    """Serialize reaction templates without changing source stereo evidence."""
 
     all_templates = (
         definition.GetReactants(),
         definition.GetAgents(),
         definition.GetProducts(),
     )
-    # RDKit's ChemicalReaction template copy can segfault for some
-    # multicoordinate metal graphs. Individual template serialization is both
-    # deterministic and sufficient for the mapped reaction identity there.
-    if any(
-        _is_metal_atomic_number(atom.GetAtomicNum())
-        for templates in all_templates
-        for template in templates
-        for atom in template.GetAtoms()
-    ):
-        serialized_sides = []
-        for templates in all_templates:
-            serialized_templates = []
-            for template in templates:
-                template_maps = [atom.GetAtomMapNum() for atom in template.GetAtoms()]
-                normalized = ensure_serializable_double_bond_stereochemistry(
-                    template,
-                    preserve_atom_maps=bool(
-                        template_maps
-                        and all(number > 0 for number in template_maps)
-                        and len(set(template_maps)) == len(template_maps)
-                    ),
+    serialized_sides: list[str] = []
+    for templates in all_templates:
+        serialized_components: list[str] = []
+        for template in templates:
+            fragments = Chem.GetMolFrags(template, asMols=True, sanitizeFrags=False)
+            for fragment in fragments:
+                normalized = Chem.Mol(fragment)
+                fragment_maps = [
+                    atom.GetAtomMapNum()
+                    for atom in normalized.GetAtoms()  # type: ignore[no-untyped-call]
+                ]
+                has_valid_maps = bool(
+                    fragment_maps
+                    and all(number > 0 for number in fragment_maps)
+                    and len(set(fragment_maps)) == len(fragment_maps)
                 )
-                # RDKit's ChemicalReaction template copy can segfault for some
-                # multicoordinate metal graphs.  Preserve every supported
-                # non-metal/ bond stereo annotation, while retaining the
-                # existing policy of omitting unstable metal-center tags from
-                # the reaction-level identity.
+                has_metal = any(
+                    _is_metal_atomic_number(atom.GetAtomicNum())
+                    for atom in normalized.GetAtoms()  # type: ignore[no-untyped-call]
+                )
+                # RDKit's unsupported metal-center tags are not stable across
+                # a parse/serialize round trip. Keep the existing policy of
+                # omitting only those atom tags; supported bond stereo still
+                # goes through exact-text validation.
                 for atom in normalized.GetAtoms():  # type: ignore[no-untyped-call]
                     if _is_metal_atomic_number(atom.GetAtomicNum()):
                         atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
-                serialized_templates.append(
-                    Chem.MolToSmiles(
+                serialized_components.append(
+                    serialize_molecule_smiles(
                         normalized,
-                        canonical=True,
-                        isomericSmiles=True,
-                        allHsExplicit=True,
+                        preserve_atom_maps=has_valid_maps,
+                        retain_atom_maps=True,
+                        all_hs_explicit=has_metal,
                     )
                 )
-            serialized_sides.append(".".join(sorted(serialized_templates)))
-        reactants, agents, products = serialized_sides
-        return f"{reactants}>{agents}>{products}" if agents else f"{reactants}>>{products}"
-
-    stable = rdChemReactions.ChemicalReaction()
-    for templates, add_template in (
-        (definition.GetReactants(), stable.AddReactantTemplate),
-        (definition.GetAgents(), stable.AddAgentTemplate),
-        (definition.GetProducts(), stable.AddProductTemplate),
-    ):
-        for template in templates:
-            normalized = Chem.Mol(template)
-            template_maps = [
-                atom.GetAtomMapNum()
-                for atom in normalized.GetAtoms()  # type: ignore[no-untyped-call]
-            ]
-            normalized = ensure_serializable_double_bond_stereochemistry(
-                normalized,
-                preserve_atom_maps=bool(
-                    template_maps
-                    and all(number > 0 for number in template_maps)
-                    and len(set(template_maps)) == len(template_maps)
-                ),
-            )
-            # RDKit's unsupported metal stereo annotations are not stable across
-            # a parse/serialize round trip. Supported non-metal stereo stays.
-            for atom in normalized.GetAtoms():  # type: ignore[no-untyped-call]
-                if _is_metal_atomic_number(atom.GetAtomicNum()):
-                    atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
-            add_template(normalized)
-    return rdChemReactions.ReactionToSmiles(stable, True)
+        serialized_sides.append(".".join(sorted(serialized_components)))
+    reactants, agents, products = serialized_sides
+    return f"{reactants}>{agents}>{products}" if agents else f"{reactants}>>{products}"
 
 
 _METAL_ATOMIC_NUMBERS = frozenset(
@@ -339,8 +310,15 @@ def atom_maps_from_source_order(
 def mapped_smiles_for_topology(
     topology: MolecularTopology,
     atom_map_numbers: Iterable[int],
+    *,
+    include_stereochemistry: bool = True,
 ) -> str:
-    """Render the exact explicit-H topology with business atom-map numbers."""
+    """Render a topology with business atom-map numbers.
+
+    Transition-state coordinate mappings use this same representation with
+    ``include_stereochemistry=False``: their map vector is source-order
+    evidence, while TS geometry stereo is independent of endpoint stereo.
+    """
 
     atom_maps = list(atom_map_numbers)
     if len(atom_maps) != topology.atom_count:
@@ -362,17 +340,14 @@ def mapped_smiles_for_topology(
     # not expose the status field; their graph itself is the only available
     # stereo evidence. Persisted MolecularTopology rows always carry an
     # explicit status and therefore require ASSIGNED before isomeric output.
-    isomeric_smiles = stereo_status is None or stereo_status is StereoStatus.ASSIGNED
-    if isomeric_smiles:
-        mapped = ensure_serializable_double_bond_stereochemistry(
-            mapped,
-            preserve_atom_maps=True,
-        )
-    return Chem.MolToSmiles(
+    isomeric_smiles = include_stereochemistry and (
+        stereo_status is None or stereo_status is StereoStatus.ASSIGNED
+    )
+    return serialize_molecule_smiles(
         mapped,
-        canonical=True,
-        isomericSmiles=isomeric_smiles,
-        allHsExplicit=True,
+        preserve_atom_maps=True,
+        isomeric_smiles=isomeric_smiles,
+        all_hs_explicit=True,
     )
 
 
@@ -926,6 +901,7 @@ def _register_mapped_reaction_concrete_identity(
 
 
 def _transferred_atom_maps(
+    session: Session,
     *,
     logical_participant: LogicalReactionParticipant,
     source_topology: MolecularTopology,
@@ -946,11 +922,36 @@ def _transferred_atom_maps(
 
     from tricycle_reaction_db.application.services.topology_abstraction import (
         find_topology_matches,
+        topology_abstraction_mapping_witness,
     )
 
     abstract_topology = logical_participant.topology
-    source_matches = find_topology_matches(source_topology.mol, abstract_topology.mol)
-    target_matches = find_topology_matches(target_topology.mol, abstract_topology.mol)
+    source_witness = topology_abstraction_mapping_witness(
+        session,
+        source_topology,
+        abstract_topology,
+        require_projection_provenance=True,
+        require_unique=True,
+    )
+    source_matches: tuple[tuple[int, ...], ...]
+    target_matches: tuple[tuple[int, ...], ...]
+    target_witness = topology_abstraction_mapping_witness(
+        session,
+        target_topology,
+        abstract_topology,
+        require_projection_provenance=True,
+        require_unique=True,
+    )
+    if source_witness is not None and target_witness is not None:
+        # These mappings were preserved from the original endpoint atom order
+        # during normalization. They are stronger than a rediscovered graph
+        # isomorphism for map transfer and avoid enumerating large symmetric
+        # molecular graphs on the upload/reconciliation path.
+        source_matches = (source_witness,)
+        target_matches = (target_witness,)
+    else:
+        source_matches = find_topology_matches(source_topology.mol, abstract_topology.mol)
+        target_matches = find_topology_matches(target_topology.mol, abstract_topology.mol)
     if not source_matches or not target_matches:
         raise ValueError(
             "source or target concrete topology is not a stereo-aware match for its "
@@ -1053,6 +1054,7 @@ def transfer_mapped_reaction_to_concrete_topologies(
             atom_maps = list(source_participant.atom_map_numbers)
         else:
             atom_maps = _transferred_atom_maps(
+                session,
                 logical_participant=logical_participant,
                 source_topology=source_topology,
                 source_atom_maps=source_participant.atom_map_numbers,
@@ -2157,11 +2159,13 @@ def persist_mapped_reaction_node_geometry_mapping(
     node_geometry_id = _require_id(node_geometry, label="MappedReactionNodeGeometry")
     node = node_geometry.mapped_reaction_node
     mapped_reaction = node.mapped_reaction
+    transition_state_mapping = node.role is MappedReactionNodeRole.TRANSITION_STATE
     if len(record.geometry_atom_map_numbers) != node_geometry.geometry.atom_count:
         raise ValueError("Geometry atom-map count must match the bound Geometry")
     expected_smiles = mapped_smiles_for_topology(
         node_geometry.geometry.topology,
         record.geometry_atom_map_numbers,
+        include_stereochemistry=not transition_state_mapping,
     )
     if record.mapped_smiles != expected_smiles:
         raise ValueError("mapped_smiles does not match the converted coordinate mapping")
@@ -2193,13 +2197,31 @@ def persist_mapped_reaction_node_geometry_mapping(
             )
         ).first()
     if binding is not None:
+        existing_smiles = (
+            mapped_smiles_for_topology(
+                node_geometry.geometry.topology,
+                binding.geometry_atom_map_numbers,
+                include_stereochemistry=False,
+            )
+            if transition_state_mapping
+            else binding.mapped_smiles
+        )
         if not _reaction_mapping_isomorphic(
             expected_atom_map_numbers=binding.geometry_atom_map_numbers,
-            expected_mapped_smiles=binding.mapped_smiles,
+            expected_mapped_smiles=existing_smiles,
             observed_atom_map_numbers=record.geometry_atom_map_numbers,
             observed_mapped_smiles=record.mapped_smiles,
         ):
             raise ValueError("node Geometry has an incompatible reaction mapping")
+        if transition_state_mapping:
+            # A legacy TS binding may have serialized endpoint-irrelevant
+            # E/Z markers into its mapped SMILES. Preserve its trusted map
+            # vector, but normalize the derived string to the connectivity-only
+            # TS identity contract.
+            binding.mapped_smiles = existing_smiles
+            binding.mapping_method = REACTION_TS_GEOMETRY_LINK_METHOD
+            binding.mapping_version = REACTION_TS_GEOMETRY_LINK_POLICY_VERSION
+            session.add(binding)
         # A Geometry mapping is expressed in canonical Geometry/Topology
         # order.  Source atom order and its permutation belong to each Frame,
         # so an equivalent mapping is reusable across QM programs and files.

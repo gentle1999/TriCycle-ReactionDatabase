@@ -36,6 +36,7 @@ from tricycle_reaction_db.ingestion.normalization import (
     normalize_topology,
     normalize_topology_with_mapping,
     project_serializable_double_bond_stereochemistry,
+    serialize_molecule_smiles,
     validate_serializable_double_bond_stereochemistry,
 )
 
@@ -59,6 +60,7 @@ __all__ = [
     "normalize_topology",
     "normalize_topology_with_mapping",
     "normalize_molop_frame",
+    "serialize_molecule_smiles",
     "validate_serializable_double_bond_stereochemistry",
     "parse_revision_record_from_molop",
     "protocol_record_from_molop_segment",

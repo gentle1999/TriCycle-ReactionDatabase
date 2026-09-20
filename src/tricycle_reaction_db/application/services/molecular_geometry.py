@@ -175,6 +175,15 @@ class GeometryPersistenceContext:
     inferred_reaction_topology_records_by_key: dict[str, tuple[Any, ...]] = field(
         default_factory=dict
     )
+    # Keep normalized TS endpoint and participant records for the lifetime of
+    # their source inference. The upload path preloads these identities before
+    # persistence; reusing them avoids normalizing the same MolGR graphs again
+    # during reaction creation and endpoint-row persistence. This is pure
+    # input-derived data, so savepoint rollback does not invalidate it and it
+    # is intentionally excluded from context snapshots.
+    inference_topology_records_by_object_id: dict[int, tuple[Any, Any]] = field(
+        default_factory=dict
+    )
     inferred_reaction_cache_hits: int = 0
     # Created lazily by batch reconciliation to avoid a module import cycle.
     reconciliation_cache: Any = None
@@ -581,6 +590,17 @@ def _validate_cached_topology(
         or topology.graph_hash != record.topology.graph_hash
     ):
         raise ValueError("cached molecular topology identity is inconsistent")
+    if (
+        getattr(topology, "stereo_agnostic_graph_hash", None) is not None
+        and record.topology.stereo_agnostic_graph_hash is not None
+        and topology.stereo_agnostic_graph_hash != record.topology.stereo_agnostic_graph_hash
+    ):
+        raise ValueError("cached molecular topology DAG hash is inconsistent")
+    if (
+        getattr(topology, "stereo_agnostic_graph_hash", None) is None
+        and record.topology.stereo_agnostic_graph_hash is not None
+    ):
+        topology.stereo_agnostic_graph_hash = record.topology.stereo_agnostic_graph_hash
     _assert_record_matches(
         persisted.topology_derivation,
         record.topology_derivation,

@@ -8,6 +8,9 @@ from functools import lru_cache
 from rdkit import Chem
 from sqlmodel import Session
 
+from tricycle_reaction_db.application.services.rdkit_graph_matching import (
+    get_substruct_matches,
+)
 from tricycle_reaction_db.application.services.topology_abstraction import (
     StereoFeature,
     assigned_stereo_features,
@@ -39,7 +42,11 @@ def inversion_labile_atom_indices(
     matches: list[tuple[str, int]] = []
     for rule in rules:
         query = _rule_query(rule.atom_smarts)
-        for match in molecule.GetSubstructMatches(query, useChirality=False, uniquify=True):
+        for match in get_substruct_matches(
+            molecule,
+            query,
+            hard_timeout_for_large_molecules=True,
+        ):
             if len(match) != 1:
                 raise ValueError(
                     f"inversion-labile rule {rule.rule_id} must match one atom per result"

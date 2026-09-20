@@ -1,7 +1,9 @@
 """Canonicalize parsed molecular frames into immutable business records."""
 
+import ast
 import json
 from collections import Counter
+from contextlib import suppress
 from functools import lru_cache
 from hashlib import sha256
 from typing import Any
@@ -30,6 +32,7 @@ from tricycle_reaction_db.core.chemistry_config import (
     TOPOLOGY_DERIVATION_VERSION,
     TOPOLOGY_IDENTITY_VERSION,
     TOPOLOGY_SOURCE_ORDER_STEREO_IDENTITY_VERSION,
+    TOPOLOGY_STEREO_AGNOSTIC_GRAPH_HASH_VERSION,
 )
 from tricycle_reaction_db.domain.enums import StereoStatus, TopologySanitizationStatus
 from tricycle_reaction_db.domain.formulas import element_count_vector_from_composition
@@ -193,12 +196,17 @@ def clear_inversion_labile_atom_chirality(mol: Chem.Mol) -> Chem.Mol:
     labile_atom_indices: set[int] = set()
     for rule in INVERSION_LABILE_RULES:
         query = _inversion_labile_rule_query(rule.atom_smarts)
-        for match in cleaned.GetSubstructMatches(query, useChirality=False, uniquify=True):
-            if len(match) != 1:
-                raise ValueError(
-                    f"inversion-labile rule {rule.rule_id} must match one atom per result"
-                )
-            labile_atom_indices.add(int(match[0]))
+        query_atom = query.GetAtomWithIdx(0)
+        # These rules are explicitly constrained to one SMARTS atom. Running
+        # a whole-molecule substructure search here needlessly launched an
+        # isolated RDKit process for every rule and every large calculation
+        # frame. Atom.Match applies the same compiled SMARTS predicate in
+        # linear time without constructing graph matchings.
+        labile_atom_indices.update(
+            atom.GetIdx()
+            for atom in cleaned.GetAtoms()  # type: ignore[no-untyped-call]
+            if query_atom.Match(atom)
+        )
 
     for atom_index in labile_atom_indices:
         atom = cleaned.GetAtomWithIdx(atom_index)
@@ -234,9 +242,20 @@ def _copy_bond_directions(source: Chem.Mol, target: Chem.Mol) -> None:
 
 
 def _canonical_smiles_atom_order(mol: Chem.Mol) -> list[int] | None:
-    """Read the atom traversal emitted by the preceding canonical SMILES write."""
+    """Return the canonical writer traversal without mutating its source graph."""
 
-    value = mol.GetPropsAsDict(includePrivate=True, includeComputed=True).get(
+    candidate = Chem.Mol(mol)
+    _clear_smiles_output_order(candidate)
+    try:
+        Chem.MolToSmiles(
+            candidate,
+            canonical=True,
+            isomericSmiles=True,
+            allHsExplicit=True,
+        )
+    except (RuntimeError, ValueError):
+        return None
+    value = candidate.GetPropsAsDict(includePrivate=True, includeComputed=True).get(
         "_smilesAtomOutputOrder"
     )
     if value is None:
@@ -420,21 +439,79 @@ def _canonical_topology(
     return canonical, source_to_topology, sanitization_status, sanitization_error
 
 
-def _graph_smiles(
-    mol: Chem.Mol,
-    *,
-    all_hydrogens_explicit: bool,
-    canonical: bool = True,
-) -> str | None:
+def stereo_agnostic_graph_hash(mol: Chem.Mol) -> str:
+    """Hash canonical connectivity while deliberately ignoring all stereo.
+
+    The projection retains the graph facts needed to identify a DAG node:
+    element and isotope identity, formal charge, explicit hydrogen count,
+    radical state, aromaticity, bond connectivity, and bond order. Atom maps,
+    atom chirality, bond stereo, and directional writer flags are excluded.
+    """
+
+    projected = Chem.Mol(mol)
+    for atom in projected.GetAtoms():  # type: ignore[no-untyped-call]
+        atom.SetAtomMapNum(0)
+    Chem.RemoveStereochemistry(projected)
     try:
-        return Chem.MolToSmiles(
-            mol,
-            canonical=canonical,
+        smiles = Chem.MolToSmiles(
+            projected,
+            canonical=True,
             isomericSmiles=True,
-            allHsExplicit=all_hydrogens_explicit,
+            allHsExplicit=True,
         )
     except Exception:
-        return None
+        # Unsanitized trusted MolGR fallbacks may not be serializable by the
+        # canonical SMILES writer. Canonical ranks still remove source atom
+        # ordering when RDKit can compute them; source ordering is the final
+        # deterministic fallback for a graph that RDKit cannot rank.
+        try:
+            ranks = tuple(int(rank) for rank in Chem.CanonicalRankAtoms(projected, breakTies=True))
+        except Exception:
+            ranks = tuple(range(projected.GetNumAtoms()))
+        atoms = [
+            {
+                "rank": ranks[index],
+                "atomic_number": atom.GetAtomicNum(),
+                "isotope": atom.GetIsotope(),
+                "formal_charge": atom.GetFormalCharge(),
+                "radical_electrons": atom.GetNumRadicalElectrons(),
+                "aromatic": atom.GetIsAromatic(),
+                "no_implicit": atom.GetNoImplicit(),
+                "explicit_hydrogens": atom.GetNumExplicitHs(),
+            }
+            for index, atom in enumerate(projected.GetAtoms())  # type: ignore[no-untyped-call]
+        ]
+        bonds = [
+            {
+                "begin_rank": min(ranks[bond.GetBeginAtomIdx()], ranks[bond.GetEndAtomIdx()]),
+                "end_rank": max(ranks[bond.GetBeginAtomIdx()], ranks[bond.GetEndAtomIdx()]),
+                "bond_type": str(bond.GetBondType()),
+                "aromatic": bond.GetIsAromatic(),
+            }
+            for bond in projected.GetBonds()  # type: ignore[no-untyped-call]
+        ]
+        return _digest(
+            {
+                "schema_version": TOPOLOGY_STEREO_AGNOSTIC_GRAPH_HASH_VERSION,
+                "graph": {
+                    "atoms": sorted(atoms, key=lambda atom: int(atom["rank"])),
+                    "bonds": sorted(
+                        bonds,
+                        key=lambda bond: (
+                            int(bond["begin_rank"]),
+                            int(bond["end_rank"]),
+                            str(bond["bond_type"]),
+                        ),
+                    ),
+                },
+            }
+        )
+    return _digest(
+        {
+            "schema_version": TOPOLOGY_STEREO_AGNOSTIC_GRAPH_HASH_VERSION,
+            "explicit_graph_smiles": smiles,
+        }
+    )
 
 
 def _source_order_graph_signature(
@@ -592,6 +669,7 @@ _SERIALIZED_DOUBLE_BOND_STEREO = frozenset(
         Chem.BondStereo.STEREOZ,
     }
 )
+_MAX_STEREO_SMILES_ROOT_CANDIDATES = 32
 
 
 def _has_single_3d_conformer(mol: Chem.Mol) -> bool:
@@ -713,10 +791,6 @@ def normalize_molgr_stereochemistry(mol: Chem.Mol) -> Chem.Mol:
     return normalized
 
 
-def _has_serialized_e_z_marker(smiles: str | None) -> bool:
-    return smiles is not None and ("/" in smiles or "\\" in smiles)
-
-
 DoubleBondStereoSignature = tuple[
     Chem.BondStereo,
     tuple[int, int],
@@ -783,39 +857,527 @@ def _e_z_stereo_signature(
     return result
 
 
-def _serialized_e_z_stereo_signature(
+def _smiles_output_atom_order(mol: Chem.Mol) -> list[int] | None:
+    """Return source atom indices in the exact order emitted by RDKit."""
+
+    if not mol.HasProp("_smilesAtomOutputOrder"):
+        return None
+    try:
+        value = ast.literal_eval(mol.GetProp("_smilesAtomOutputOrder"))
+    except (SyntaxError, ValueError):
+        return None
+    if not isinstance(value, list) or any(not isinstance(index, int) for index in value):
+        return None
+    order = [int(index) for index in value]
+    if sorted(order) != list(range(mol.GetNumAtoms())):
+        return None
+    return order
+
+
+def _atom_graph_signature(
+    atom: Chem.Atom,
+    *,
+    include_radical_electrons: bool = True,
+) -> tuple[int, int, int, int, bool, int]:
+    """Return the atom facts that an isomeric SMILES must preserve."""
+
+    try:
+        hydrogen_count = int(atom.GetTotalNumHs(includeNeighbors=True))
+    except (RuntimeError, ValueError):
+        hydrogen_count = int(atom.GetNumExplicitHs())
+    return (
+        int(atom.GetAtomicNum()),
+        int(atom.GetIsotope()),
+        int(atom.GetFormalCharge()),
+        int(atom.GetNumRadicalElectrons()) if include_radical_electrons else 0,
+        bool(atom.GetIsAromatic()),
+        hydrogen_count,
+    )
+
+
+def _molecular_graph_signature(
+    mol: Chem.Mol,
+    atom_identities: list[int],
+    *,
+    include_radical_electrons: bool = True,
+) -> tuple[
+    tuple[tuple[int, tuple[int, int, int, int, bool, int]], ...],
+    tuple[tuple[tuple[int, int], str, bool], ...],
+]:
+    """Describe connectivity and chemistry independently of atom ordering."""
+
+    graph = Chem.Mol(mol)
+    with suppress(RuntimeError, ValueError):
+        # MolOP may provide a trusted unsanitized graph with an uninitialized
+        # RDKit valence cache. Match the hydrogen count used by MolToSmiles
+        # without running chemical sanitization or mutating the source graph.
+        graph.UpdatePropertyCache(strict=False)
+    if len(atom_identities) != graph.GetNumAtoms():
+        raise ValueError("SMILES round trip changed the atom count")
+    atom_signature = tuple(
+        sorted(
+            (
+                identity,
+                _atom_graph_signature(
+                    atom,
+                    include_radical_electrons=include_radical_electrons,
+                ),
+            )
+            for identity, atom in zip(
+                atom_identities,
+                graph.GetAtoms(),  # type: ignore[no-untyped-call]
+                strict=True,
+            )
+        )
+    )
+    bond_signature: list[tuple[tuple[int, int], str, bool]] = []
+    for bond in graph.GetBonds():  # type: ignore[no-untyped-call]
+        begin = atom_identities[bond.GetBeginAtomIdx()]
+        end = atom_identities[bond.GetEndAtomIdx()]
+        # Dative bonds are directed: donor and acceptor order is part of the
+        # graph. All other supported bond types are undirected.
+        edge = (
+            (begin, end)
+            if bond.GetBondType() is Chem.BondType.DATIVE
+            else tuple(sorted((begin, end)))
+        )
+        bond_signature.append((edge, str(bond.GetBondType()), bool(bond.GetIsAromatic())))
+    return atom_signature, tuple(sorted(bond_signature))
+
+
+def _validate_smiles_round_trip(
+    source: Chem.Mol,
+    smiles: str,
+    output_order: list[int] | None,
+    *,
+    preserve_atom_maps: bool,
+    retain_atom_maps: bool,
+    isomeric_smiles: bool,
+) -> dict[frozenset[int], DoubleBondStereoSignature]:
+    """Validate the exact output text against its source graph and E/Z state."""
+
+    parser: Any = Chem.SmilesParserParams()
+    parser.removeHs = False
+    # Unsanitized MolGR graphs can be valid serialization inputs even when
+    # RDKit cannot assign valence. Bond directions still encode SMILES E/Z;
+    # materialize those annotations explicitly after parsing.
+    parser.sanitize = False
+    parsed = Chem.MolFromSmiles(smiles, parser)
+    if parsed is None:
+        raise ValueError("RDKit could not parse the generated SMILES")
+    try:
+        Chem.SetBondStereoFromDirections(parsed)
+    except (RuntimeError, ValueError) as error:
+        raise ValueError("RDKit could not recover E/Z from the generated SMILES") from error
+
+    if parsed.GetNumAtoms() != source.GetNumAtoms():
+        raise ValueError("SMILES round trip changed the atom count")
+    if preserve_atom_maps:
+        source_identities = _stereo_identity_numbers(source, preserve_atom_maps=True)
+        parsed_identities = _stereo_identity_numbers(parsed, preserve_atom_maps=True)
+    else:
+        if output_order is None or len(output_order) != parsed.GetNumAtoms():
+            raise ValueError("RDKit did not report the generated SMILES atom order")
+        source_identities = list(range(1, source.GetNumAtoms() + 1))
+        parsed_identities = [source_index + 1 for source_index in output_order]
+        if retain_atom_maps:
+            expected_maps = [
+                source.GetAtomWithIdx(source_index).GetAtomMapNum() for source_index in output_order
+            ]
+            observed_maps = [
+                atom.GetAtomMapNum()
+                for atom in parsed.GetAtoms()  # type: ignore[no-untyped-call]
+            ]
+            if observed_maps != expected_maps:
+                raise ValueError("SMILES round trip changed atom-map labels")
+
+    if _molecular_graph_signature(
+        source,
+        source_identities,
+        include_radical_electrons=False,
+    ) != _molecular_graph_signature(
+        parsed,
+        parsed_identities,
+        include_radical_electrons=False,
+    ):
+        raise ValueError("SMILES round trip changed the source molecular graph")
+
+    source_radicals = {
+        identity: int(atom.GetNumRadicalElectrons())
+        for identity, atom in zip(
+            source_identities,
+            source.GetAtoms(),  # type: ignore[no-untyped-call]
+            strict=True,
+        )
+    }
+    parsed_radicals = {
+        identity: int(atom.GetNumRadicalElectrons())
+        for identity, atom in zip(
+            parsed_identities,
+            parsed.GetAtoms(),  # type: ignore[no-untyped-call]
+            strict=True,
+        )
+    }
+    if source_radicals != parsed_radicals:
+        # RDKit's sanitize=False parser deliberately does not infer radical
+        # electrons from bracket-atom valence. Check the serialized notation
+        # with its normal parser on a new molecule, leaving the trusted source
+        # and the unsanitized round-trip graph untouched. Some MolGR fallback
+        # graphs are not chemically sanitizable; in that case the exact graph
+        # and stereo checks above remain authoritative, and the binary source
+        # molecule retains MolGR's radical assignments.
+        sanitized_parser: Any = Chem.SmilesParserParams()
+        sanitized_parser.removeHs = False
+        try:
+            sanitized = Chem.MolFromSmiles(smiles, sanitized_parser)
+        except (RuntimeError, ValueError):
+            sanitized = None
+        if sanitized is not None and sanitized.GetNumAtoms() == len(parsed_identities):
+            sanitized_radicals = {
+                identity: int(atom.GetNumRadicalElectrons())
+                for identity, atom in zip(
+                    parsed_identities,
+                    sanitized.GetAtoms(),  # type: ignore[no-untyped-call]
+                    strict=True,
+                )
+            }
+            if source_radicals != sanitized_radicals:
+                raise ValueError("SMILES round trip changed radical-electron assignments")
+
+    expected_stereo_mol = Chem.Mol(source)
+    serialized_stereo_mol = Chem.Mol(parsed)
+    for atom, identity in zip(
+        expected_stereo_mol.GetAtoms(),  # type: ignore[no-untyped-call]
+        source_identities,
+        strict=True,
+    ):
+        atom.SetAtomMapNum(identity)
+    for atom, identity in zip(
+        serialized_stereo_mol.GetAtoms(),  # type: ignore[no-untyped-call]
+        parsed_identities,
+        strict=True,
+    ):
+        atom.SetAtomMapNum(identity)
+    expected_stereo = (
+        _e_z_stereo_signature(expected_stereo_mol, preserve_atom_maps=True)
+        if isomeric_smiles
+        else {}
+    )
+    serialized_stereo = (
+        _e_z_stereo_signature(serialized_stereo_mol, preserve_atom_maps=True)
+        if isomeric_smiles
+        else {}
+    )
+    if not _stereo_signatures_match(serialized_stereo, expected_stereo):
+        raise ValueError("SMILES round trip changed a source E/Z control-atom relationship")
+    return serialized_stereo
+
+
+def _stereo_root_candidates(
+    mol: Chem.Mol,
+    *,
+    preserve_atom_maps: bool,
+) -> list[int]:
+    """Return a bounded, deterministic set of roots near assigned E/Z bonds."""
+
+    candidates: set[int] = set()
+    for bond in mol.GetBonds():  # type: ignore[no-untyped-call]
+        if bond.GetStereo() not in _DOUBLE_BOND_E_Z_STEREO:
+            continue
+        candidates.update((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()))
+        candidates.update(int(index) for index in bond.GetStereoAtoms())
+    if not candidates:
+        return []
+
+    if preserve_atom_maps:
+
+        def order_key(index: int) -> tuple[int, int]:
+            return mol.GetAtomWithIdx(index).GetAtomMapNum(), index
+    else:
+        try:
+            ranks = tuple(
+                int(rank)
+                for rank in Chem.CanonicalRankAtoms(
+                    mol,
+                    breakTies=True,
+                    includeChirality=False,
+                    includeIsotopes=True,
+                )
+            )
+        except (RuntimeError, ValueError):
+            ranks = tuple(range(mol.GetNumAtoms()))
+
+        def order_key(index: int) -> tuple[int, int]:
+            return ranks[index], index
+
+    return sorted(candidates, key=order_key)[:_MAX_STEREO_SMILES_ROOT_CANDIDATES]
+
+
+def _deterministic_smiles_traversal(
+    mol: Chem.Mol,
+    *,
+    preserve_atom_maps: bool,
+) -> Chem.Mol:
+    """Renumber a fallback traversal so re-parsing yields the same writer order."""
+
+    atom_count = mol.GetNumAtoms()
+    if preserve_atom_maps:
+        _stereo_identity_numbers(mol, preserve_atom_maps=True)
+        order = sorted(
+            range(atom_count),
+            key=lambda index: mol.GetAtomWithIdx(index).GetAtomMapNum(),
+        )
+    else:
+        try:
+            ranks = tuple(
+                int(rank)
+                for rank in Chem.CanonicalRankAtoms(
+                    mol,
+                    breakTies=True,
+                    includeChirality=False,
+                    includeIsotopes=True,
+                )
+            )
+            order = sorted(range(atom_count), key=lambda index: (ranks[index], index))
+        except (RuntimeError, ValueError):
+            order = list(range(atom_count))
+    traversal = _renumber_atoms_preserving_stereochemistry(mol, order)
+    _clear_smiles_output_order(traversal)
+    if any(
+        bond.GetStereo() in _SERIALIZED_DOUBLE_BOND_STEREO
+        for bond in traversal.GetBonds()  # type: ignore[no-untyped-call]
+    ):
+        traversal = project_serializable_double_bond_stereochemistry(
+            traversal,
+            preserve_atom_maps=preserve_atom_maps,
+        )
+    return traversal
+
+
+def _serialize_molecule_smiles_once(
     mol: Chem.Mol,
     *,
     preserve_atom_maps: bool = False,
-) -> dict[frozenset[int], DoubleBondStereoSignature]:
-    """Return the complete stereo signature after an explicit-H SMILES round trip."""
+    retain_atom_maps: bool = False,
+    isomeric_smiles: bool = True,
+    all_hs_explicit: bool = True,
+) -> str:
+    """Write and validate one exact SMILES candidate.
+
+    Canonical output remains the fast path and preserves existing identities
+    for ordinary molecules. If canonical traversal changes trusted E/Z, try a
+    bounded set of rooted traversals around stereo bonds and their control
+    atoms. A candidate is returned only after its graph and complete mapped
+    E/Z control-atom signature survive parsing.
+    """
 
     projected = Chem.Mol(mol)
-    _stereo_identity_numbers(
+    _clear_smiles_output_order(projected)
+    retain_atom_maps = retain_atom_maps or preserve_atom_maps
+    if preserve_atom_maps:
+        _stereo_identity_numbers(projected, preserve_atom_maps=True)
+    elif not retain_atom_maps:
+        for atom in projected.GetAtoms():  # type: ignore[no-untyped-call]
+            atom.SetAtomMapNum(0)
+
+    if not isomeric_smiles:
+        # RDKit's isomericSmiles=False suppresses isotope labels as well as
+        # stereochemistry. This option controls stereo only; isotopes remain
+        # part of molecular identity.
+        Chem.RemoveStereochemistry(projected)
+    elif any(
+        bond.GetStereo() in _SERIALIZED_DOUBLE_BOND_STEREO
+        for bond in projected.GetBonds()  # type: ignore[no-untyped-call]
+    ):
+        projected = project_serializable_double_bond_stereochemistry(
+            projected,
+            preserve_atom_maps=preserve_atom_maps,
+        )
+    else:
+        _clear_bond_directions(projected)
+
+    def write_candidate(
+        molecule: Chem.Mol,
+        *,
+        canonical: bool,
+        root: int | None = None,
+    ) -> tuple[str, list[int] | None]:
+        candidate = Chem.Mol(molecule)
+        _clear_smiles_output_order(candidate)
+        smiles = Chem.MolToSmiles(
+            candidate,
+            canonical=canonical,
+            rootedAtAtom=-1 if root is None else root,
+            isomericSmiles=True,
+            allHsExplicit=all_hs_explicit,
+        )
+        return smiles, _smiles_output_atom_order(candidate)
+
+    try:
+        canonical_smiles, canonical_order = write_candidate(projected, canonical=True)
+    except (RuntimeError, ValueError) as error:
+        canonical_smiles = ""
+        canonical_order = None
+        canonical_error = f"{type(error).__name__}: {error}"
+    else:
+        canonical_error = ""
+        try:
+            _validate_smiles_round_trip(
+                projected,
+                canonical_smiles,
+                canonical_order,
+                preserve_atom_maps=preserve_atom_maps,
+                retain_atom_maps=retain_atom_maps,
+                isomeric_smiles=isomeric_smiles,
+            )
+            return canonical_smiles
+        except (RuntimeError, ValueError) as error:
+            canonical_error = f"{type(error).__name__}: {error}"
+
+    attempted_roots: list[int] = []
+    last_serialized: dict[frozenset[int], DoubleBondStereoSignature] = {}
+    traversal = _deterministic_smiles_traversal(
         projected,
         preserve_atom_maps=preserve_atom_maps,
     )
-    if not preserve_atom_maps:
-        for atom_index, atom in enumerate(
-            projected.GetAtoms(),  # type: ignore[no-untyped-call]
-            start=1,
-        ):
-            # Temporary labels let us compare the same graph edges after
-            # canonical SMILES changes the atom and bond ordering.
-            atom.SetAtomMapNum(atom_index)
-    smiles = _graph_smiles(projected, all_hydrogens_explicit=True)
-    if not _has_serialized_e_z_marker(smiles):
-        return {}
-    try:
+    for root in _stereo_root_candidates(
+        traversal,
+        preserve_atom_maps=preserve_atom_maps,
+    ):
+        attempted_roots.append(
+            traversal.GetAtomWithIdx(root).GetAtomMapNum() if preserve_atom_maps else root
+        )
+        try:
+            smiles, output_order = write_candidate(traversal, canonical=False, root=root)
+            last_serialized = _validate_smiles_round_trip(
+                traversal,
+                smiles,
+                output_order,
+                preserve_atom_maps=preserve_atom_maps,
+                retain_atom_maps=retain_atom_maps,
+                isomeric_smiles=isomeric_smiles,
+            )
+            return smiles
+        except (RuntimeError, ValueError):
+            continue
+
+    expected_stereo = _e_z_stereo_signature(
+        projected,
+        preserve_atom_maps=preserve_atom_maps,
+    )
+    projection_error = _stereo_projection_failure(
+        projected,
+        "no SMILES traversal preserves the source molecular graph and E/Z control atoms",
+        reason="no_lossless_smiles_traversal",
+        expected={edge: signature[0] for edge, signature in expected_stereo.items()},
+        serialized={edge: signature[0] for edge, signature in last_serialized.items()},
+    )
+    evidence = projection_error.evidence()
+    evidence["canonical_attempt_error"] = canonical_error
+    evidence["attempted_root_identities"] = attempted_roots
+    evidence["root_candidate_limit"] = _MAX_STEREO_SMILES_ROOT_CANDIDATES
+    raise StereoProjectionError(str(projection_error), evidence=evidence)
+
+
+def serialize_molecule_smiles(
+    mol: Chem.Mol,
+    *,
+    preserve_atom_maps: bool = False,
+    retain_atom_maps: bool = False,
+    isomeric_smiles: bool = True,
+    all_hs_explicit: bool = True,
+) -> str:
+    """Return a round-trip-validated, stable SMILES serialization.
+
+    A safe rooted fallback can parse into a different but physically
+    equivalent ``BondStereo`` control-atom pair. RDKit may then accept its
+    canonical traversal even though it rejected the original molecule's. Run
+    the exact writer/round-trip check to a fixed point (bounded to four passes).
+    If equivalent valid strings form a cycle, select its lexicographically
+    first member so subsequent calls return the same text.
+    """
+
+    has_source_e_z = isomeric_smiles and any(
+        bond.GetStereo() in _SERIALIZED_DOUBLE_BOND_STEREO
+        for bond in mol.GetBonds()  # type: ignore[no-untyped-call]
+    )
+    expected_stereo = {
+        edge: signature[0]
+        for edge, signature in _e_z_stereo_signature(
+            mol,
+            preserve_atom_maps=preserve_atom_maps,
+        ).items()
+    }
+    current = _serialize_molecule_smiles_once(
+        mol,
+        preserve_atom_maps=preserve_atom_maps,
+        retain_atom_maps=retain_atom_maps,
+        isomeric_smiles=isomeric_smiles,
+        all_hs_explicit=all_hs_explicit,
+    )
+    if not has_source_e_z:
+        return current
+
+    path = [current]
+    path_positions = {current: 0}
+    for _ in range(4):
         parser: Any = Chem.SmilesParserParams()
         parser.removeHs = False
-        parser.sanitize = True
-        serialized = Chem.MolFromSmiles(smiles, parser)
-        if serialized is None:
-            return {}
-        return _e_z_stereo_signature(serialized, preserve_atom_maps=True)
-    except Exception:
-        return {}
+        parser.sanitize = False
+        parsed = Chem.MolFromSmiles(current, parser)
+        if parsed is None:
+            raise _stereo_projection_failure(
+                mol,
+                "generated SMILES could not be parsed during stability validation",
+                reason="smiles_stability_parse_failed",
+                expected=expected_stereo,
+            )
+        try:
+            Chem.SetBondStereoFromDirections(parsed)
+        except (RuntimeError, ValueError) as error:
+            raise _stereo_projection_failure(
+                mol,
+                "generated SMILES directions could not restore E/Z during stability validation",
+                reason="smiles_stability_stereo_recovery_failed",
+                expected=expected_stereo,
+            ) from error
+        if not any(
+            bond.GetStereo() in _SERIALIZED_DOUBLE_BOND_STEREO
+            for bond in parsed.GetBonds()  # type: ignore[no-untyped-call]
+        ):
+            raise _stereo_projection_failure(
+                mol,
+                "generated SMILES did not recover its assigned E/Z state",
+                reason="smiles_stability_lost_e_z",
+                expected=expected_stereo,
+            )
+
+        rewritten = _serialize_molecule_smiles_once(
+            parsed,
+            preserve_atom_maps=preserve_atom_maps,
+            retain_atom_maps=retain_atom_maps,
+            isomeric_smiles=isomeric_smiles,
+            all_hs_explicit=all_hs_explicit,
+        )
+        if rewritten == current:
+            return current
+        cycle_start = path_positions.get(rewritten)
+        if cycle_start is not None:
+            # Every string in this cycle has already passed the exact graph
+            # and physical E/Z round-trip checks in _serialize_molecule_smiles_once.
+            # Pick one deterministic representative instead of rejecting a
+            # valid molecule because RDKit alternates equivalent traversals.
+            return min(path[cycle_start:])
+        path_positions[rewritten] = len(path)
+        path.append(rewritten)
+        current = rewritten
+
+    raise _stereo_projection_failure(
+        mol,
+        "SMILES serialization did not reach a stable round-trip representation",
+        reason="smiles_stability_pass_limit",
+        expected=expected_stereo,
+    )
 
 
 def _flip_e_z_stereo(stereo: Chem.BondStereo) -> Chem.BondStereo:
@@ -876,12 +1438,7 @@ def _canonical_isomeric_smiles_signature(smiles: str | None) -> str | None:
             for atom in molecule.GetAtoms():  # type: ignore[no-untyped-call]
                 # Atom maps identify source atoms, not molecular identity.
                 atom.SetAtomMapNum(0)
-            return Chem.MolToSmiles(
-                molecule,
-                canonical=True,
-                isomericSmiles=True,
-                allHsExplicit=True,
-            )
+            return serialize_molecule_smiles(molecule, all_hs_explicit=True)
         except Exception:
             continue
     return None
@@ -971,12 +1528,11 @@ def validate_serializable_double_bond_stereochemistry(
 
     The expected state is the source molecule's assigned ``BondStereo`` plus
     ``Bond.GetStereoAtoms()``—ultimately the marker recovered from its 3D
-    conformer. The observed state is parsed from the projected explicit-H
-    SMILES. Acceptance means that every double-bond edge has the same relative
-    geometry for its two endpoint sides. RDKit may choose another valid
-    substituent pair or the opposite E/Z spelling after a canonical traversal,
-    so raw E/Z enums, slash directions, and string/traversal identity are not
-    validated here.
+    conformer. The projection must carry that physical state, and a shared
+    safe serialization must preserve the complete graph and E/Z identity in
+    the exact output text. RDKit may choose another valid substituent pair or
+    the opposite E/Z spelling after a traversal change, so raw E/Z enums,
+    slash directions, and string/traversal identity are not compared.
 
     This check does not infer, canonicalize, repair, or otherwise mutate either
     molecule. It also does not validate reaction chemistry, atom-map
@@ -994,21 +1550,64 @@ def validate_serializable_double_bond_stereochemistry(
         normalized_source,
         preserve_atom_maps=preserve_atom_maps,
     )
-    serialized_signature = _serialized_e_z_stereo_signature(
-        projected,
-        preserve_atom_maps=preserve_atom_maps,
-    )
-    if _stereo_signatures_match(serialized_signature, expected_signature):
-        return
-    expected = {edge: signature[0] for edge, signature in expected_signature.items()}
-    serialized = {edge: signature[0] for edge, signature in serialized_signature.items()}
-    raise _stereo_projection_failure(
-        source,
-        "SMILES projection changed the source E/Z control-atom relationship",
-        reason="serialized_stereo_does_not_match_source",
-        expected=expected,
-        serialized=serialized,
-    )
+    projected_signature = _e_z_stereo_signature(projected, preserve_atom_maps=preserve_atom_maps)
+    if not _stereo_signatures_match(projected_signature, expected_signature):
+        expected = {edge: signature[0] for edge, signature in expected_signature.items()}
+        serialized = {edge: signature[0] for edge, signature in projected_signature.items()}
+        failure = _stereo_projection_failure(
+            source,
+            "SMILES projection changed the source E/Z control-atom relationship",
+            reason="serialized_stereo_does_not_match_source",
+            expected=expected,
+            serialized=serialized,
+        )
+        evidence = failure.evidence()
+
+        def signature_evidence(
+            signatures: dict[frozenset[int], DoubleBondStereoSignature],
+        ) -> list[dict[str, Any]]:
+            return [
+                {
+                    "bond_atom_identities": sorted(int(identity) for identity in edge),
+                    "stereo": str(stereo),
+                    "control_atom_identities": [int(identity) for identity in control_atoms],
+                    "ordered_bond_atom_identities": [int(identity) for identity in bond_order],
+                }
+                for edge, (stereo, control_atoms, bond_order) in sorted(
+                    signatures.items(),
+                    key=lambda item: tuple(sorted(item[0])),
+                )
+            ]
+
+        evidence["expected_stereo_signatures"] = signature_evidence(expected_signature)
+        evidence["projected_stereo_signatures"] = signature_evidence(projected_signature)
+        raise StereoProjectionError(str(failure), evidence=evidence) from failure
+
+    # Validate a complete exact string through the shared safe writer. Keep a
+    # serializer's own diagnostic (for example, a graph round-trip failure)
+    # instead of misreporting it as an E/Z control-atom mismatch.
+    try:
+        serialize_molecule_smiles(
+            projected,
+            preserve_atom_maps=preserve_atom_maps,
+            retain_atom_maps=preserve_atom_maps,
+            all_hs_explicit=True,
+        )
+    except StereoProjectionError:
+        raise
+    except (RuntimeError, ValueError) as error:
+        expected = {edge: signature[0] for edge, signature in expected_signature.items()}
+        serialized = {edge: signature[0] for edge, signature in projected_signature.items()}
+        failure = _stereo_projection_failure(
+            source,
+            "SMILES serialization failed while validating E/Z preservation",
+            reason="smiles_serialization_failed",
+            expected=expected,
+            serialized=serialized,
+        )
+        evidence = failure.evidence()
+        evidence["serialization_error"] = f"{type(error).__name__}: {error}"
+        raise StereoProjectionError(str(failure), evidence=evidence) from error
 
 
 def ensure_serializable_double_bond_stereochemistry(
@@ -1110,13 +1709,7 @@ def _normalized_topology_records(
                 topology_mol,
             )
             _copy_bond_directions(topology_projection, topology_mol)
-            if _graph_smiles(topology_projection, all_hydrogens_explicit=True) is None:
-                raise _stereo_projection_failure(
-                    topology_projection,
-                    "MolGR topology has no explicit-H SMILES projection",
-                    reason="topology_explicit_h_smiles_missing",
-                    expected={},
-                )
+            serialize_molecule_smiles(topology_projection, all_hs_explicit=True)
         except StereoProjectionError as error:
             evidence = error.evidence()
             evidence["failure_boundary"] = "topology_source_order_projection"
@@ -1138,9 +1731,27 @@ def _normalized_topology_records(
     # not switch to an implicit-H "skeleton" projection: coordinate-bearing
     # hydrogen atoms and MolGR's radical annotations are part of the trusted
     # molecular graph identity.
-    explicit_graph_smiles = (
-        None if suspicious_fallback else _graph_smiles(topology_mol, all_hydrogens_explicit=True)
-    )
+    explicit_graph_smiles: str | None = None
+    if not suspicious_fallback:
+        try:
+            explicit_graph_smiles = serialize_molecule_smiles(
+                topology_mol,
+                isomeric_smiles=stereo_projection_error is None,
+                all_hs_explicit=True,
+            )
+        except (RuntimeError, ValueError) as error:
+            evidence = (
+                error.evidence()
+                if isinstance(error, StereoProjectionError)
+                else {"reason": "topology_smiles_round_trip_failed"}
+            )
+            evidence["failure_boundary"] = "topology_serialization"
+            stereo_projection_error = StereoProjectionError(str(error), evidence=evidence)
+            explicit_graph_smiles = serialize_molecule_smiles(
+                topology_mol,
+                isomeric_smiles=False,
+                all_hs_explicit=True,
+            )
     stable_topology_projection = False
     source_order_topology = topology_mol
     source_order_mapping = list(source_to_topology)
@@ -1159,17 +1770,10 @@ def _normalized_topology_records(
                         topology_mol,
                     )
                     _copy_bond_directions(topology_projection, topology_mol)
-                    explicit_graph_smiles = _graph_smiles(
+                    explicit_graph_smiles = serialize_molecule_smiles(
                         topology_projection,
-                        all_hydrogens_explicit=True,
+                        all_hs_explicit=True,
                     )
-                    if explicit_graph_smiles is None:
-                        raise _stereo_projection_failure(
-                            topology_mol,
-                            "projected MolGR topology lost its explicit-H SMILES serialization",
-                            reason="projected_explicit_h_smiles_missing",
-                            expected={},
-                        )
                 except StereoProjectionError as error:
                     # ``RenumberAtoms`` can leave a valid source graph with a
                     # stale molecule-level stereo cache. Keep the pre-projection
@@ -1184,42 +1788,35 @@ def _normalized_topology_records(
                     )
                     topology_mol = source_order_topology
                     source_to_topology = source_order_mapping
-                    explicit_graph_smiles = (
-                        _graph_smiles(
-                            topology_mol,
-                            all_hydrogens_explicit=True,
-                            canonical=False,
-                        )
-                        or source_order_smiles
-                    )
+                    # Reuse the already validated source-order text. A new
+                    # canonical write here could repeat the same stereo flip
+                    # that caused the projection rollback.
+                    explicit_graph_smiles = source_order_smiles
                     _clear_smiles_output_order(topology_mol)
             if stereo_projection_error is None:
                 stable_topology_projection = True
         else:
-            explicit_graph_smiles = _graph_smiles(
+            explicit_graph_smiles = serialize_molecule_smiles(
                 topology_mol,
-                all_hydrogens_explicit=True,
-                canonical=False,
+                isomeric_smiles=stereo_projection_error is None,
+                all_hs_explicit=True,
             )
             _clear_smiles_output_order(topology_mol)
     elif explicit_graph_smiles is not None:
-        explicit_graph_smiles = (
-            _graph_smiles(
-                topology_mol,
-                all_hydrogens_explicit=True,
-                canonical=False,
-            )
-            or explicit_graph_smiles
+        explicit_graph_smiles = serialize_molecule_smiles(
+            topology_mol,
+            isomeric_smiles=stereo_projection_error is None,
+            all_hs_explicit=True,
         )
         _clear_smiles_output_order(topology_mol)
     if explicit_graph_smiles is None and trusted_molgr_graph:
         # Canonical ranking can fail for unusual but trusted MolGR valence
         # states.  A source-order explicit-H SMILES still preserves the graph
         # and its electronic annotations without attempting chemical repair.
-        explicit_graph_smiles = _graph_smiles(
+        explicit_graph_smiles = serialize_molecule_smiles(
             topology_mol,
-            all_hydrogens_explicit=True,
-            canonical=False,
+            isomeric_smiles=stereo_projection_error is None,
+            all_hs_explicit=True,
         )
         _clear_smiles_output_order(topology_mol)
     standardized_graph_smiles: str | None = None
@@ -1236,10 +1833,10 @@ def _normalized_topology_records(
             stable_topology_projection = False
             topology_mol = source_order_topology
             source_to_topology = source_order_mapping
-            explicit_graph_smiles = _graph_smiles(
+            explicit_graph_smiles = serialize_molecule_smiles(
                 topology_mol,
-                all_hydrogens_explicit=True,
-                canonical=False,
+                isomeric_smiles=stereo_projection_error is None,
+                all_hs_explicit=True,
             )
             _clear_smiles_output_order(topology_mol)
     # ``canonical_isomeric_smiles`` is retained as the public field name for
@@ -1251,6 +1848,7 @@ def _normalized_topology_records(
         if stable_topology_projection and standardized_graph_smiles is not None
         else explicit_graph_smiles
     )
+    stereo_agnostic_graph_hash_value = stereo_agnostic_graph_hash(topology_mol)
     identity_schema_version = (
         TOPOLOGY_IDENTITY_VERSION
         if standardized_graph_smiles is not None and stable_topology_projection
@@ -1282,6 +1880,7 @@ def _normalized_topology_records(
         mol=topology_mol,
         canonical_isomeric_smiles=canonical_isomeric_smiles,
         graph_hash=graph_hash,
+        stereo_agnostic_graph_hash=stereo_agnostic_graph_hash_value,
         identity_schema_version=identity_schema_version,
         atom_count=topology_mol.GetNumAtoms(),
         heavy_atom_count=sum(
@@ -1564,5 +2163,7 @@ __all__ = [
     "normalize_topology",
     "normalize_topology_with_mapping",
     "project_serializable_double_bond_stereochemistry",
+    "serialize_molecule_smiles",
+    "stereo_agnostic_graph_hash",
     "validate_serializable_double_bond_stereochemistry",
 ]

@@ -46,6 +46,8 @@ from tricycle_reaction_db.application.services.topology_compatibility import (
 from tricycle_reaction_db.core.chemistry_config import (
     REACTION_GEOMETRY_LINK_METHOD,
     REACTION_GEOMETRY_LINK_POLICY_VERSION,
+    REACTION_TS_GEOMETRY_LINK_METHOD,
+    REACTION_TS_GEOMETRY_LINK_POLICY_VERSION,
 )
 from tricycle_reaction_db.db.models import (
     CalculationFrame,
@@ -434,19 +436,55 @@ def _ensure_mapping(
     cache: ReconciliationBatchCache | None = None,
 ) -> MappedReactionNodeGeometryMapping:
     node_geometry_id = _require_id(node_geometry, label="MappedReactionNodeGeometry")
+    transition_state_mapping = (
+        node_geometry.mapped_reaction_node.role is MappedReactionNodeRole.TRANSITION_STATE
+    )
+    if transition_state_mapping:
+        # The Geometry/Topology retains its own stereo evidence. This mapping
+        # record binds source atom identity to TS coordinates; TS E/Z must not
+        # constrain endpoint mappings and metal-controlled E/Z may not have a
+        # lossless SMILES representation.
+        mapped_smiles = mapped_smiles_for_topology(
+            node_geometry.geometry.topology,
+            topology_atom_maps,
+            include_stereochemistry=False,
+        )
+        mapping_method = REACTION_TS_GEOMETRY_LINK_METHOD
+        mapping_version = REACTION_TS_GEOMETRY_LINK_POLICY_VERSION
+    else:
+        mapping_method = REACTION_GEOMETRY_LINK_METHOD
+        mapping_version = REACTION_GEOMETRY_LINK_POLICY_VERSION
     existing = (
         cache.mappings_by_node_geometry_id.get(node_geometry_id)
         if cache is not None and node_geometry_id in cache.loaded_mappings
         else None
     )
     if existing is not None:
+        existing_mapped_smiles = (
+            mapped_smiles_for_topology(
+                node_geometry.geometry.topology,
+                existing.geometry_atom_map_numbers,
+                include_stereochemistry=False,
+            )
+            if transition_state_mapping
+            else existing.mapped_smiles
+        )
         if not _reaction_mapping_isomorphic(
             expected_atom_map_numbers=existing.geometry_atom_map_numbers,
-            expected_mapped_smiles=existing.mapped_smiles,
+            expected_mapped_smiles=existing_mapped_smiles,
             observed_atom_map_numbers=topology_atom_maps,
             observed_mapped_smiles=mapped_smiles,
         ):
             raise ValueError("existing node Geometry has an incompatible reaction mapping")
+        if transition_state_mapping and (
+            existing.mapped_smiles != existing_mapped_smiles
+            or existing.mapping_method != mapping_method
+            or existing.mapping_version != mapping_version
+        ):
+            existing.mapped_smiles = existing_mapped_smiles
+            existing.mapping_method = mapping_method
+            existing.mapping_version = mapping_version
+            session.add(existing)
         # Source atom order belongs to each CalculationFrame.  A Geometry-level
         # reaction mapping is reusable when its Geometry-order map is equivalent,
         # even if another software/frame reports a different source permutation.
@@ -457,8 +495,8 @@ def _ensure_mapping(
         MappedReactionNodeGeometryMappingRecord(
             geometry_atom_map_numbers=topology_atom_maps,
             mapped_smiles=mapped_smiles,
-            mapping_method=REACTION_GEOMETRY_LINK_METHOD,
-            mapping_version=REACTION_GEOMETRY_LINK_POLICY_VERSION,
+            mapping_method=mapping_method,
+            mapping_version=mapping_version,
             verified=True,
         ),
         identity_is_new=(cache is not None and node_geometry_id in cache.new_node_geometry_ids),
@@ -871,6 +909,24 @@ def _endpoint_compatible_mapped_reactions(
     source_topology = session.get(MolecularTopology, geometry.topology_id)
     if source_topology is None:
         return ()
+    source_topology_id = _require_id(source_topology, label="MolecularTopology")
+    # A source-compatible endpoint is meaningful only inside the persisted
+    # stereo-abstraction component of the endpoint topology.  The old query
+    # searched every same-formula topology in the project and then paid for a
+    # graph match on each row.  Resolve the bounded DAG component first; the
+    # following SQL query and the final graph predicate now operate on that
+    # small, indexed candidate set only.
+    from tricycle_reaction_db.application.services.topology_abstraction import (
+        topology_dag_component_ids,
+    )
+
+    dag_topology_ids = topology_dag_component_ids(
+        session,
+        (source_topology_id,),
+        project_id=project_id,
+    )
+    if len(dag_topology_ids) <= 1:
+        return ()
     strict_topology = aliased(MolecularTopology)
     rows = session.exec(
         select(MappedReaction, strict_topology)
@@ -898,7 +954,8 @@ def _endpoint_compatible_mapped_reactions(
             col(strict_topology.atom_count) == source_topology.atom_count,
             col(strict_topology.formal_charge) == source_topology.formal_charge,
             col(strict_topology.fragment_count) == source_topology.fragment_count,
-            col(strict_topology.id) != geometry.topology_id,
+            col(strict_topology.id).in_(dag_topology_ids),
+            col(strict_topology.id) != source_topology_id,
         )
     ).all()
     reaction_ids: set[UUID] = set()
@@ -1606,7 +1663,11 @@ def bind_transition_state_frame(
         session,
         node_geometry=node_geometry,
         topology_atom_maps=topology_atom_maps,
-        mapped_smiles=mapped_smiles_for_topology(geometry.topology, topology_atom_maps),
+        mapped_smiles=mapped_smiles_for_topology(
+            geometry.topology,
+            topology_atom_maps,
+            include_stereochemistry=False,
+        ),
         cache=cache,
     )
     mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")

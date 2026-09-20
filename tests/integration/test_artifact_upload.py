@@ -294,6 +294,7 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
             assert mapping.mapped_smiles == mapped_smiles_for_topology(
                 ts_frame.geometry.topology,
                 mapping.geometry_atom_map_numbers,
+                include_stereochemistry=False,
             )
             visible_frames = session.exec(
                 select(CalculationFrame).where(

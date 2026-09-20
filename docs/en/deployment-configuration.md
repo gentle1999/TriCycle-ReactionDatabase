@@ -108,10 +108,12 @@ one.
 Bound OpenMP/BLAS pools separately with `OMP_NUM_THREADS`,
 `OPENBLAS_NUM_THREADS`, and `MKL_NUM_THREADS`. The local import candidate
 window only bounds RustFS staging and fingerprint buffering. The parse timeout
-is 60 seconds for a 10 MiB input and scales proportionally; timeout advances
-only that worker to the next queued file. `-1` uses all CPU cores visible to the
-single upload-worker; use a positive value only when CPU must be reserved for
-another workload.
+has a 60-second base for the first 10 MiB; each additional 10 MiB adds 1.5 times
+that base by default (so a 20 MiB file gets 150 seconds). Gzip inputs use their
+uncompressed-size trailer when available. A timeout advances only that worker
+to the next queued file. `-1` uses all CPU cores visible to the single
+upload-worker; use a positive value only when CPU must be reserved for another
+workload.
 
 After RustFS staging, browser, remote, and legacy pending-ingestion imports use
 the same continuous worker path. The worker claims small pages and feeds a
@@ -131,10 +133,10 @@ parsed frames per microbatch by default; tune the file and frame boundaries with
 preload persistence, while an idle MolOP pool causes the tail microbatch to be
 committed. Project write groups are serialized, and these boundaries do not
 change the parser-pool target or open one persistence session per upload.
-These controls must not be multiplied.
-The bulk path keeps the previous legacy hot-path behavior; per-file
-concrete/logical/reverse reconciliation must not be inserted there without a
-same-fixture throughput regression check.
+These controls must not be multiplied. The unified persistence path completes
+topology-DAG construction, concrete/logical membership, and reverse
+reconciliation before it enqueues profile refresh work; it no longer enters
+the previous legacy bulk bypass.
 
 This model recommends exactly one `upload-worker` instance in production: it is
 the boundary for the shared MolOP process pool and the single active persistence

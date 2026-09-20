@@ -402,8 +402,13 @@ MKL_NUM_THREADS=1
 TRICYCLE_MOLOP_BATCH_N_JOBS=-1
 # 0 derives a bounded continuous-dispatcher prefetch limit from the MolOP pool.
 TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES=0
-# Baseline budget for a 10 MiB file; larger files scale proportionally.
+# Base budget for the first 10 MiB; each extra 10 MiB adds 1.5x this value.
 TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS=60
+TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SIZE_MULTIPLIER=1.5
+# Hard wall-clock budget for one large RDKit full-graph match.
+TRICYCLE_MOLECULAR_GRAPH_MATCH_TIMEOUT_SECONDS=5
+TRICYCLE_MOLECULAR_GRAPH_MATCH_ISOLATION_ATOM_COUNT=48
+TRICYCLE_MOLECULAR_GRAPH_MATCH_MAX_RESULTS=1000
 ~~~
 
 #### 文件导入参数推荐
@@ -429,7 +434,7 @@ OpenMP/BLAS 线程，不能用增大 native thread 数代替文件级并发。�
 
 该模型要求生产环境只运行一个 `upload-worker` 实例：它是共享 MolOP 进程池和单一活动持久化消费者的边界。API 节点可以横向扩展，但不要横向扩展 upload-worker；多个 worker 副本会各自创建解析池和持久化消费者，从而改变本节描述的串行组和资源上限语义。
 
-持久化微批不会在 upload-worker 内重建 thermodynamic profile；受影响的 mapped reaction 只会递增 generation 并写入持久化刷新队列。upload-worker 不执行 profile 计算，因此大型 profile 刷新不会阻塞 MolOP 解析、数据库微批提交或租约心跳。标准 Compose 部署会同时运行独立的 `profile-refresh-worker`，按最多 256 个 reaction 的微批消费队列，失败任务会按租约和退避策略恢复；它不是可省略的服务，否则新入库的 source evidence 只会停留在待刷新队列。单独启动或恢复该服务可执行 `docker compose up -d profile-refresh-worker`，或运行 `tricycle-profile-refresh-worker`。
+持久化微批不会在 upload-worker 内重建 thermodynamic profile；受影响的 mapped reaction 只会递增 generation 并写入持久化刷新队列。upload-worker 不执行 profile 计算，因此大型 profile 刷新不会阻塞 MolOP 解析、数据库微批提交或租约心跳。标准 Compose 部署会同时运行独立的 `profile-refresh-worker`，默认按 32 个 reaction 的独立微批消费队列，失败任务会按租约和退避策略恢复；该值可通过 `TRICYCLE_UPLOAD_WORKER_PROFILE_REFRESH_BATCH_SIZE` 调整，建议保持在 16–32。它不是可省略的服务，否则新入库的 source evidence 只会停留在待刷新队列。单独启动或恢复该服务可执行 `docker compose up -d profile-refresh-worker`，或运行 `tricycle-profile-refresh-worker`。
 
 Voyager 使用 NexusX 6.3 及以上版本的 `ComposedErManager` member cluster/color。当前所有数据库实体
 属于同一个 PostgreSQL 逻辑 engine，因此配置中只有一个数据库 cluster；即使

@@ -65,6 +65,42 @@ jobs:
       - run: uv sync --frozen --python 3.12
       - run: uv run --frozen pytest
 
+  real-world-ingestion-performance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.5"
+          enable-cache: true
+      - run: uv sync --frozen --python 3.12
+      - name: Extract the raw 256-file corpus
+        run: |
+          mkdir -p "$RUNNER_TEMP/real-world-batch-256"
+          for archive in tests/fixtures/real_world_batch_256/corpus-*.tar.gz; do
+            tar -xzf "$archive" -C "$RUNNER_TEMP/real-world-batch-256"
+          done
+      - name: Parse 263 real-world files with the full worker process pool
+        run: >-
+          uv run --frozen python scripts/benchmark_real_world_ingestion.py
+          --fixture-dir "$RUNNER_TEMP/real-world-batch-256"
+          --fixture-dir tests/fixtures/real_world_extremes
+          --n-jobs -1
+          --output "$RUNNER_TEMP/real-world-ingestion-performance.json"
+          --markdown-output "$RUNNER_TEMP/real-world-ingestion-performance.md"
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: real-world-ingestion-performance
+          path: |
+            ${{ runner.temp }}/real-world-ingestion-performance.json
+            ${{ runner.temp }}/real-world-ingestion-performance.md
+          if-no-files-found: ignore
+
   evidence-contract:
     runs-on: ubuntu-24.04
     timeout-minutes: 15

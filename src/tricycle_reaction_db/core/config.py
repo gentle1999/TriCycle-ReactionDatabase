@@ -102,7 +102,10 @@ class Settings(BaseSettings):
         gt=0.0,
         le=86_400.0,
     )
-    upload_worker_profile_refresh_batch_size: int = Field(default=256, ge=1, le=2_048)
+    # Keep profile source selection and replacement in short independent
+    # transactions.  This is deliberately smaller than upload persistence
+    # batches because the profile path may still inspect many source rows.
+    upload_worker_profile_refresh_batch_size: int = Field(default=32, ge=1, le=2_048)
     upload_worker_profile_refresh_lease_seconds: int = Field(
         default=1_800,
         ge=60,
@@ -139,9 +142,17 @@ class Settings(BaseSettings):
     # Fast ingestion batches revision-local frame rows in one transaction.
     # Evidence capture no longer disables deferred topology reconstruction.
     molop_parallel_frame_persistence: bool = True
-    # Baseline end-to-end budget for a 10 MiB source; larger files scale this
-    # budget proportionally while smaller files retain the baseline.
+    # Baseline end-to-end budget for a 10 MiB source; larger files receive an
+    # additional size-derived allowance while smaller files retain the baseline.
     molop_file_parse_timeout_seconds: float = Field(default=60.0, gt=0.0, le=86400.0)
+    # Extra allowance applied per reference-size unit above 10 MiB. At 1.5,
+    # each additional 10 MiB adds 90 seconds to the configured baseline.
+    molop_file_parse_timeout_size_multiplier: float = Field(default=1.5, ge=1.0, le=10.0)
+    # RDKit does not expose a native wall-clock timeout. Large full-graph
+    # matches are therefore isolated in a terminable child process.
+    molecular_graph_match_timeout_seconds: float = Field(default=5.0, gt=0.0, le=300.0)
+    molecular_graph_match_isolation_atom_count: int = Field(default=48, ge=1, le=100_000)
+    molecular_graph_match_max_results: int = Field(default=1_000, ge=1, le=100_000)
     molecule_query_rate_limit_requests: int = Field(default=10_000, ge=1, le=1_000_000)
     depiction_rate_limit_requests: int = Field(default=10_000, ge=1, le=1_000_000)
     query_rate_limit_window_seconds: int = Field(default=60, ge=1, le=86_400)

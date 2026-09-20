@@ -252,6 +252,10 @@ class MolecularTopologyRecord(BaseModel):
     mol: Chem.Mol
     canonical_isomeric_smiles: str | None = None
     graph_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    stereo_agnostic_graph_hash: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     identity_schema_version: str
     atom_count: int = Field(gt=0)
     heavy_atom_count: int = Field(ge=0)

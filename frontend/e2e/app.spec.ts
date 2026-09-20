@@ -1855,6 +1855,8 @@ test("selected artifact files download as one archive", async ({ page }) => {
     preview_available: true,
   }));
   let requestedIds: string[] = [];
+  let releaseArchive: () => void = () => undefined;
+  const archiveReady = new Promise<void>((resolve) => { releaseArchive = resolve; });
 
   await page.route("**/api/auth/me", async (route) => {
     await route.fulfill({
@@ -1889,6 +1891,7 @@ test("selected artifact files download as one archive", async ({ page }) => {
     expect(route.request().method()).toBe("POST");
     const body = new URLSearchParams(route.request().postData() ?? "");
     requestedIds = body.getAll("artifact_ids");
+    await archiveReady;
     await route.fulfill({
       contentType: "application/zip",
       headers: { "content-disposition": 'attachment; filename="artifacts.zip"' },
@@ -1902,6 +1905,8 @@ test("selected artifact files download as one archive", async ({ page }) => {
   }
   const download = page.waitForEvent("download");
   await page.getByRole("button", { name: "批量下载 2 个" }).click();
+  await expect(page.locator(".artifact-batch-download-progress")).toContainText("正在生成压缩包");
+  releaseArchive();
   expect((await download).suggestedFilename()).toBe("artifacts.zip");
   expect(requestedIds).toEqual(artifacts.map((artifact) => artifact.id));
   await expect(page.getByRole("status")).toContainText("已开始下载：2 个文件");

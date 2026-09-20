@@ -46,7 +46,6 @@ import {
   type ReactionSort,
 } from "./reactionQuery";
 import type { ArtifactSort } from "./artifactQuery";
-import { randomUUID } from "./uuid";
 
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
 const csrfCookieName = import.meta.env.VITE_CSRF_COOKIE_NAME?.trim() || "example_csrf";
@@ -82,59 +81,111 @@ function csrfHeaders(): Record<string, string> {
   return token ? { [csrfHeaderName]: decodeURIComponent(token) } : {};
 }
 
-export function submitArtifactBatchDownload(ids: string[], projectId: string): void {
-  const targetName = `artifact-download-${randomUUID()}`;
-  const frame = document.createElement("iframe");
-  frame.name = targetName;
-  frame.title = "";
-  frame.setAttribute("aria-hidden", "true");
-  Object.assign(frame.style, {
-    position: "fixed",
-    width: "1px",
-    height: "1px",
-    border: "0",
-    opacity: "0",
-    pointerEvents: "none",
-  });
+export type ArtifactBatchDownloadPhase = "preparing" | "downloading" | "complete";
 
-  const form = document.createElement("form");
-  form.method = "post";
-  form.action = apiUrl(
-    `/api/artifacts/batch-download/form?project_id=${encodeURIComponent(projectId)}`,
+export interface ArtifactBatchDownloadProgress {
+  phase: ArtifactBatchDownloadPhase;
+  receivedBytes: number;
+  totalBytes: number | null;
+}
+
+function archiveFilename(response: Response): string {
+  const disposition = response.headers.get("content-disposition") ?? "";
+  const encodedFilename = disposition.match(/filename\*=(?:UTF-8'')?([^;]+)/i)?.[1];
+  if (encodedFilename) {
+    try {
+      return decodeURIComponent(encodedFilename.trim().replace(/^"|"$/g, ""));
+    } catch {
+      // Fall through to the plain filename when the header is malformed.
+    }
+  }
+  const plainFilename = disposition.match(/filename="([^"]+)"|filename=([^;]+)/i);
+  return plainFilename?.[1] ?? plainFilename?.[2]?.trim() ?? "artifacts.zip";
+}
+
+function triggerBlobDownload(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.rel = "noopener";
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+export async function submitArtifactBatchDownload(
+  ids: string[],
+  projectId: string,
+  onProgress?: (progress: ArtifactBatchDownloadProgress) => void,
+): Promise<void> {
+  onProgress?.({ phase: "preparing", receivedBytes: 0, totalBytes: null });
+
+  const body = new URLSearchParams();
+  for (const id of ids) body.append("artifact_ids", id);
+  const response = await fetch(
+    apiUrl(
+      `/api/artifacts/batch-download/form?project_id=${encodeURIComponent(projectId)}`,
+    ),
+    {
+      method: "POST",
+      headers: {
+        accept: "application/zip",
+        "content-type": "application/x-www-form-urlencoded",
+        ...csrfHeaders(),
+      },
+      body,
+      credentials: "include",
+    },
   );
-  form.target = targetName;
-  form.enctype = "application/x-www-form-urlencoded";
-  form.style.display = "none";
-  for (const id of ids) {
-    const input = document.createElement("input");
-    input.type = "hidden";
-    input.name = "artifact_ids";
-    input.value = id;
-    form.appendChild(input);
-  }
-  for (const [name, value] of Object.entries(csrfHeaders())) {
-    const input = document.createElement("input");
-    input.type = "hidden";
-    input.name = name;
-    input.value = value;
-    form.appendChild(input);
+
+  if (!response.ok) {
+    let detail = response.statusText;
+    try {
+      const payload = (await response.json()) as { detail?: string };
+      detail = payload.detail ?? detail;
+    } catch {
+      // Preserve the HTTP status when the server did not return JSON.
+    }
+    throw new ApiError(response.status, detail);
   }
 
-  let cleanupTimer: number | null = null;
-  const cleanup = (): void => {
-    if (cleanupTimer !== null) window.clearTimeout(cleanupTimer);
-    frame.remove();
-  };
-  cleanupTimer = window.setTimeout(cleanup, 30 * 60 * 1000);
-  document.body.append(frame, form);
-  try {
-    HTMLFormElement.prototype.submit.call(form);
-  } catch (error) {
-    cleanup();
-    throw error;
-  } finally {
-    form.remove();
+  const contentLength = response.headers.get("content-length");
+  const parsedTotalBytes = contentLength === null ? Number.NaN : Number(contentLength);
+  const totalBytes = Number.isFinite(parsedTotalBytes) && parsedTotalBytes >= 0
+    ? parsedTotalBytes
+    : null;
+  onProgress?.({ phase: "downloading", receivedBytes: 0, totalBytes });
+
+  const chunks: BlobPart[] = [];
+  let receivedBytes = 0;
+  if (response.body) {
+    const reader = response.body.getReader();
+    while (true) {
+      const result = await reader.read();
+      if (result.done) break;
+      if (!result.value) continue;
+      chunks.push(result.value);
+      receivedBytes += result.value.byteLength;
+      onProgress?.({ phase: "downloading", receivedBytes, totalBytes });
+    }
+  } else {
+    const blob = await response.blob();
+    chunks.push(blob);
+    receivedBytes = blob.size;
+    onProgress?.({ phase: "downloading", receivedBytes, totalBytes: totalBytes ?? blob.size });
   }
+
+  triggerBlobDownload(
+    new Blob(chunks, { type: response.headers.get("content-type") ?? "application/zip" }),
+    archiveFilename(response),
+  );
+  onProgress?.({
+    phase: "complete",
+    receivedBytes,
+    totalBytes: totalBytes ?? receivedBytes,
+  });
 }
 
 export interface ChemistryRepresentation {

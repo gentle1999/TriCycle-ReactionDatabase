@@ -811,6 +811,86 @@ async def test_authenticated_batch_upload_preserves_each_raw_file(
 
 
 @pytest.mark.asyncio
+async def test_oversized_file_does_not_reject_valid_batch_siblings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id = UUID("00000000-0000-7000-8000-000000000201")
+    settings = Settings(
+        _env_file=None,
+        max_upload_bytes=1024,
+        max_batch_files=4,
+        max_batch_bytes=2048,
+    )
+    monkeypatch.setattr(upload_routes, "get_settings", lambda: settings)
+
+    async def create_and_stage(**values: object) -> StagedUploadSubmission:
+        files = values["files"]
+        assert isinstance(files, list)
+        assert len(files) == 2
+        valid, oversized = files
+        assert isinstance(valid, ArtifactUploadPayload)
+        assert valid.spool_path is not None
+        assert valid.spool_path.read_bytes() == b"valid Gaussian payload\n"
+        assert isinstance(oversized, ArtifactUploadPayload)
+        assert oversized.payload is None
+        assert oversized.spool_path is None
+        assert oversized.declared_size_bytes == 1025
+        assert oversized.error_code == "upload_file_too_large"
+        assert values["project_id"] == project_id
+        assert values["user_id"] == DEVELOPMENT_USER_ID
+
+        staged = _staged_submission(
+            files,
+            project_id=project_id,
+            artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+        )
+        accepted_item, rejected_item = staged.items
+        rejected_item = rejected_item.model_copy(
+            update={
+                "size_bytes": oversized.declared_size_bytes,
+                "status": UploadBatchItemStatus.FAILED,
+                "parse_status": ImportParseStatus.FAILED,
+                "materialization_status": ImportMaterializationStatus.FAILED,
+                "artifact_file_id": None,
+                "ingestion_id": None,
+                "ingestion_status": None,
+                "error_code": oversized.error_code,
+                "error_message": oversized.error_message,
+            }
+        )
+        batch = staged.batch.model_copy(
+            update={
+                "total_bytes": accepted_item.size_bytes + rejected_item.size_bytes,
+                "staged_count": 1,
+                "failed_count": 1,
+            }
+        )
+        return StagedUploadSubmission(batch=batch, items=(accepted_item, rejected_item))
+
+    monkeypatch.setattr(UploadBatchService, "create_and_stage", staticmethod(create_and_stage))
+    async with AsyncClient(
+        transport=ASGITransport(app=create_app()),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/artifacts/batch",
+            data={"project_id": str(project_id)},
+            files=[
+                ("files", ("valid.log", b"valid Gaussian payload\n", "text/plain")),
+                ("files", ("oversized.log", b"x" * 1025, "text/plain")),
+            ],
+        )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["batch"]["total_count"] == 2
+    assert body["batch"]["staged_count"] == 1
+    assert body["batch"]["failed_count"] == 1
+    assert [item["status"] for item in body["items"]] == ["staged", "failed"]
+    assert body["items"][1]["error_code"] == "upload_file_too_large"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("files", "max_batch_files", "max_batch_bytes", "expected_detail"),
     [

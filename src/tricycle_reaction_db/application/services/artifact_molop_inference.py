@@ -16,8 +16,8 @@ from rdkit import Chem
 
 from tricycle_reaction_db.core.units import ANGSTROM, CM_INVERSE, magnitude_in
 from tricycle_reaction_db.ingestion import (
-    ensure_serializable_double_bond_stereochemistry,
     infer_molgr_stereochemistry_from_3d,
+    serialize_molecule_smiles,
 )
 
 from .artifact_upload_types import _FailedInference, _Inference, _SuccessfulInference
@@ -61,45 +61,37 @@ def mapped_reaction_smiles(reactant: Chem.Mol, product: Chem.Mol) -> str:
         # longer sufficient to reconstruct the physical E/Z state after a
         # disconnected fragment is isolated.
         fragments = Chem.GetMolFrags(mapped, asMols=True, sanitizeFrags=False)
-        serialized_fragments: list[Chem.Mol] = []
+        serialized_fragments: list[str] = []
         for fragment in fragments:
             # Split while the endpoint conformer is still available, then
             # discard it only after the projection has completed. A failure is
             # propagated as an explicit inference failure; emitting a
             # non-isomeric reaction would silently lose trusted 3D stereo.
-            repaired = ensure_serializable_double_bond_stereochemistry(
-                fragment,
-                preserve_atom_maps=True,
-            )
             # A terminal alkene can carry direction-only flags from MolOP's
             # source traversal even though RDKit correctly reports no E/Z
             # assignment. Those flags are not stereochemical evidence and
             # would make the SMILES writer emit arbitrary slash markers.
-            if not any(
+            has_assigned_e_z = any(
                 bond.GetStereo() in {Chem.BondStereo.STEREOE, Chem.BondStereo.STEREOZ}
-                for bond in repaired.GetBonds()  # type: ignore[no-untyped-call]
-            ):
-                for bond in repaired.GetBonds():  # type: ignore[no-untyped-call]
+                for bond in fragment.GetBonds()
+            )
+            projection = Chem.Mol(fragment)
+            if not has_assigned_e_z:
+                for bond in projection.GetBonds():  # type: ignore[no-untyped-call]
                     bond.SetBondDir(Chem.BondDir.NONE)
-            repaired.RemoveAllConformers()
-            serialized_fragments.append(repaired)
-        sides.append(
-            ".".join(
-                sorted(
-                    Chem.MolToSmiles(
-                        fragment,
-                        canonical=True,
-                        isomericSmiles=True,
-                        allHsExplicit=True,
-                    )
-                    for fragment in serialized_fragments
+            projection.RemoveAllConformers()
+            serialized_fragments.append(
+                serialize_molecule_smiles(
+                    projection,
+                    preserve_atom_maps=True,
+                    all_hs_explicit=True,
                 )
             )
-        )
+        sides.append(".".join(sorted(serialized_fragments)))
     # Fragment order is not stable across MolOP endpoint reconstruction. Each
-    # fragment is canonicalized and sorted above, so the mapped reaction is
-    # stable without round-tripping a metal-rich graph through RDKit reaction
-    # templates before persistence validates it.
+    # fragment is safely serialized and the strings are sorted above, so this
+    # mapped reaction does not need to pass a metal-rich graph through RDKit's
+    # reaction-template canonicalizer before topology persistence.
     return f"{sides[0]}>>{sides[1]}"
 
 

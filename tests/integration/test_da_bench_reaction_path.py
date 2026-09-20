@@ -543,6 +543,9 @@ def test_real_da_subset_round_trips_manifest_reaction_path_and_frame_bindings(
                             mapped_smiles=mapped_smiles_for_topology(
                                 calculation_frame.geometry.topology,
                                 topology_maps,
+                                include_stereochemistry=(
+                                    node.role is not MappedReactionNodeRole.TRANSITION_STATE
+                                ),
                             ),
                             mapping_method="manifest-explicit",
                             mapping_version="coordinate-map-v1",

@@ -63,6 +63,37 @@ S3 API and console default to `http://127.0.0.1:19000` and
 against the running service. The development credentials are local-only values
 from `.env.example`.
 
+### Real-file parser performance report
+
+The CI `real-world-ingestion-performance` job parses 256 real product/TS files
+plus seven extreme-case regressions with every CPU visible to the runner, then
+exports JSON and Markdown artifacts. Generate the same report locally:
+
+```bash
+mkdir -p .tmp/real-world-batch-256
+for archive in tests/fixtures/real_world_batch_256/corpus-*.tar.gz; do
+  tar -xzf "$archive" -C .tmp/real-world-batch-256
+done
+uv run --frozen python scripts/benchmark_real_world_ingestion.py \
+  --fixture-dir .tmp/real-world-batch-256 \
+  --fixture-dir tests/fixtures/real_world_extremes \
+  --n-jobs -1 \
+  --output .tmp/performance-reports/real-world-ingestion.json \
+  --markdown-output .tmp/performance-reports/real-world-ingestion.md
+```
+
+The report records per-file hashes/sizes, frame and segment counts, TS inference
+outcomes, queue wait and parse duration, plus aggregate frames/s and MiB/s. The
+256-file corpus is stored as several tar.gz shards but extracted to raw `.log` files
+before parsing; gzip extreme-case fixtures are also expanded before timing, so
+all timed parser inputs are uncompressed text.
+File admission defaults to four times the process-pool size to keep the pool fed.
+It measures the shared MolOP parse and frame-materialization pipeline only; RustFS,
+archive extraction, database persistence, and profile refresh are excluded. Absolute times are
+hardware-dependent and are not cross-host CI thresholds. See the
+[`real_world_batch_256` corpus](../../tests/fixtures/real_world_batch_256/README.md) and
+[`real_world_extremes`](../../tests/fixtures/real_world_extremes/README.md).
+
 ## Authentication and API
 
 Development defaults to `TRICYCLE_AUTH_MODE=development` and requires
@@ -187,11 +218,16 @@ The default limits are documented in `.env.example`. In particular:
 | `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` | `2` | Concurrency reserved for legacy pending-ingestion recovery |
 | `TRICYCLE_UPLOAD_WORKER_LEASE_SECONDS` | `3600` | Worker processing lease; heartbeats extend it and expiry permits recovery |
 | `TRICYCLE_UPLOAD_WORKER_PROFILE_REFRESH_MAX_DELAY_SECONDS` | `60` | Maximum delay for deferred thermodynamic profile refresh during a continuously busy queue; queue drain refreshes immediately |
+| `TRICYCLE_UPLOAD_WORKER_PROFILE_REFRESH_BATCH_SIZE` | `32` | Independent profile refresh claim/commit microbatch; keep it in the recommended 16–32 range |
 | `TRICYCLE_UPLOAD_CLIENT_LEASE_SECONDS` | `900` | Recovery threshold for an interrupted HTTP staging request |
 | `TRICYCLE_UPLOAD_WORKER_POLL_INTERVAL_SECONDS` | `1` | Worker polling interval for staged items and expired leases |
 | `TRICYCLE_UPLOAD_WORKER_STATEMENT_TIMEOUT_MS` | `120000` | Independent PostgreSQL statement budget for background parse/persistence; interactive API queries keep `TRICYCLE_QUERY_STATEMENT_TIMEOUT_MS` |
 | `TRICYCLE_MOLOP_BATCH_N_JOBS` | `-1` | Shared MolOP process count; `-1` uses all CPU cores visible to the worker |
-| `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS` | `60` | Baseline parse budget for 10 MiB; larger files scale linearly |
+| `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS` | `60` | Base parse budget for the first 10 MiB |
+| `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SIZE_MULTIPLIER` | `1.5` | Extra budget per 10 MiB above the base; defaults to 90 seconds |
+| `TRICYCLE_MOLECULAR_GRAPH_MATCH_TIMEOUT_SECONDS` | `5` | Hard timeout for one large RDKit full-graph match; timed-out child processes are terminated |
+| `TRICYCLE_MOLECULAR_GRAPH_MATCH_ISOLATION_ATOM_COUNT` | `48` | Atom threshold for terminable isolation; small molecules keep the in-process fast path |
+| `TRICYCLE_MOLECULAR_GRAPH_MATCH_MAX_RESULTS` | `1000` | Maximum mappings returned by one RDKit match, preventing unbounded symmetric results |
 | `TRICYCLE_STRUCTURE_CANDIDATE_LIMIT` | `50000` | Limit for paths requiring per-candidate post-processing |
 
 Set `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, and `MKL_NUM_THREADS` to bound
@@ -360,7 +396,7 @@ uploads therefore do not run ANALYZE once per file while the queue remains busy.
 Persistence microbatches write frames, geometries, reaction bindings, and queue
 state, but defer rebuilding the global thermodynamic profile. Affected mapped
 reactions receive a durable dirty marker. When the queue drains, the worker
-refreshes dirty profiles in independent transactions of at most 256 reactions
+refreshes dirty profiles in independent transactions of at most 32 reactions
 and then runs the project-level `ANALYZE`. A continuously busy queue uses
 `TRICYCLE_UPLOAD_WORKER_PROFILE_REFRESH_MAX_DELAY_SECONDS` as the maximum
 refresh delay, and a worker restart can recover dirty markers left by an
@@ -399,12 +435,15 @@ When the MolOP pool has no remaining work, the consumer commits the tail. Projec
 groups are serialized, and project write locks coordinate old-parse cleanup,
 materialization, and UploadBatch finalization. This keeps multiple upload
 sessions from opening competing persistence sessions. The durable path keeps the
-previous legacy bulk hot path: reaction-SMILES topology caching and one
-set-based Geometry match remain enabled, while later per-file
-concrete/logical/reverse reconciliation must not be inserted directly. Project
-scope and ownership constraints still apply. Update the architecture guide and
-remeasure byte throughput and failure isolation on the same real file set before
-changing these boundaries.
+same correctness path for every source: reaction-SMILES topology caching and
+set-based Geometry preloading remain enabled, while the microbatch completes
+topology-DAG construction, concrete/logical membership, and reverse
+reconciliation before it enqueues profile work. The unified upload-worker no
+longer enters the old legacy bulk bypass, so single-file, batch, local, and
+remote uploads follow the same ordering. Project scope and ownership
+constraints still apply. Update the architecture guide and remeasure byte
+throughput and failure isolation on the same real file set before changing
+these boundaries.
 
 ### Recommended import settings
 
@@ -466,10 +505,11 @@ Tune in this order:
 - Keep `IMPORT_MAX_TRANSIENT_RETRIES=3`. It covers transient deadlocks,
   serialization conflicts, and connection interruptions; raising it does not
   fix a persistent failure.
-- `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS=60` is a 10 MiB baseline that
-  scales with source size. It isolates outliers rather than increasing speed;
-  raise it for slow storage or many large files, and lower it only after
-  checking the resulting failure rate.
+- `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS=60` covers the first 10 MiB; each
+  additional 10 MiB adds 90 seconds by default, controlled by
+  `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SIZE_MULTIPLIER=1.5`. Gzip inputs use the
+  uncompressed-size trailer when available. This isolates outliers rather than
+  increasing speed; tune it after observing real parse durations and failures.
 - `TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE=true` is mandatory. Segment
   boundaries, frame roles, source locators, source spans, and block hashes are
   required for lossless persistence and parse replacement; setting it to

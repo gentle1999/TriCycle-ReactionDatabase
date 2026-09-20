@@ -4,6 +4,7 @@ import { computed, ref, watch } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 
 import { api, artifactDownloadUrl } from "@/api";
+import type { ArtifactBatchDownloadProgress } from "@/api";
 import { emptyArtifactFilters, type ArtifactFilterValues, type ArtifactSort, type ArtifactSortBy } from "@/artifactQuery";
 import { formatBytes, formatDurationSeconds, labelFor, shortId, statusTone } from "@/format";
 import { CATALOG_PAGE_SIZE_MAX } from "@/pagination";
@@ -77,6 +78,7 @@ const operationArtifactId = ref<string | null>(null);
 const operationKind = ref<ArtifactOperation | null>(null);
 const batchOperation = ref<ArtifactOperation | null>(null);
 const batchDownloadBusy = ref(false);
+const batchDownloadProgress = ref<ArtifactBatchDownloadProgress | null>(null);
 const batchProgress = ref({ completed: 0, total: 0 });
 const operationError = ref("");
 const operationResult = ref("");
@@ -151,6 +153,23 @@ const selectedArtifacts = computed(() => props.artifacts.filter((artifact) => se
 const selectedDownloadableArtifacts = computed(() => selectedArtifacts.value.filter(canDownloadArtifact));
 const selectedDeletableArtifacts = computed(() => selectedArtifacts.value.filter(canDeleteArtifact));
 const selectedReparseableArtifacts = computed(() => selectedArtifacts.value.filter(canReparseArtifact));
+const batchDownloadPercent = computed(() => {
+  const progress = batchDownloadProgress.value;
+  if (!progress || progress.totalBytes === null || progress.totalBytes <= 0) return null;
+  return Math.min(100, Math.round((progress.receivedBytes / progress.totalBytes) * 100));
+});
+const batchDownloadStatusText = computed(() => {
+  const progress = batchDownloadProgress.value;
+  if (!progress) return "";
+  if (progress.phase === "preparing") {
+    return `正在生成压缩包，准备处理 ${selectedDownloadableArtifacts.value.length} 个文件`;
+  }
+  if (progress.phase === "complete") return "压缩包已生成，正在保存";
+  if (batchDownloadPercent.value !== null) {
+    return `正在下载压缩包：${batchDownloadPercent.value}%`;
+  }
+  return `正在下载压缩包：已接收 ${formatBytes(progress.receivedBytes)}`;
+});
 const allSelectableSelected = computed(() =>
   selectableArtifacts.value.length > 0
   && selectableArtifacts.value.every((artifact) => selectedArtifactIds.value.has(artifact.id)),
@@ -343,12 +362,14 @@ async function downloadSelectedArtifacts(): Promise<void> {
   }
 
   batchDownloadBusy.value = true;
+  batchDownloadProgress.value = { phase: "preparing", receivedBytes: 0, totalBytes: null };
   operationError.value = "";
   operationResult.value = "";
   try {
-    api.submitArtifactBatchDownload(
+    await api.submitArtifactBatchDownload(
       candidates.map((artifact) => artifact.id),
       projectId,
+      (progress) => { batchDownloadProgress.value = progress; },
     );
     clearSelection();
     operationResult.value = `已开始下载：${candidates.length} 个文件`;
@@ -356,6 +377,7 @@ async function downloadSelectedArtifacts(): Promise<void> {
     operationError.value = `批量下载失败：${operationErrorMessage(error)}`;
   } finally {
     batchDownloadBusy.value = false;
+    batchDownloadProgress.value = null;
   }
 }
 
@@ -469,7 +491,7 @@ watch(
       <div v-if="selectedArtifacts.length" class="artifact-bulk-toolbar" aria-live="polite">
         <div class="artifact-bulk-summary">
           <strong>已选 {{ selectedArtifacts.length }} 个当前页文件</strong>
-          <span v-if="batchDownloadBusy">正在打包下载 {{ selectedDownloadableArtifacts.length }} 个</span>
+          <span v-if="batchDownloadBusy">{{ batchDownloadStatusText }}</span>
           <span v-else-if="batchOperation">{{ batchOperation === "delete" ? "正在批量删除" : "正在批量重解析" }} {{ batchProgress.completed }} / {{ batchProgress.total }}</span>
           <span v-else>下载 {{ selectedDownloadableArtifacts.length }} 个 · 删除 {{ selectedDeletableArtifacts.length }} 个 · 重解析 {{ selectedReparseableArtifacts.length }} 个</span>
         </div>
@@ -508,6 +530,33 @@ watch(
             删除 {{ selectedDeletableArtifacts.length }} 个
           </button>
           <button class="command-button command-button-muted" type="button" :disabled="operationBusy" @click="clearSelection">取消选择</button>
+        </div>
+      </div>
+
+      <div
+        v-if="batchDownloadBusy && batchDownloadProgress"
+        class="artifact-batch-download-progress"
+        role="status"
+        aria-live="polite"
+      >
+        <div class="artifact-batch-download-progress-heading">
+          <span><LoaderCircle class="is-spinning" :size="15" aria-hidden="true" />{{ batchDownloadStatusText }}</span>
+          <strong v-if="batchDownloadPercent !== null">{{ batchDownloadPercent }}%</strong>
+        </div>
+        <progress
+          v-if="batchDownloadPercent !== null"
+          class="artifact-batch-download-progress-bar"
+          :value="batchDownloadPercent"
+          max="100"
+          aria-label="批量下载进度"
+        >{{ batchDownloadPercent }}%</progress>
+        <div v-else class="artifact-batch-download-progress-track is-indeterminate" role="progressbar" aria-label="正在生成压缩包">
+          <span></span>
+        </div>
+        <div class="artifact-batch-download-progress-meta">
+          <span v-if="batchDownloadProgress.phase === 'downloading'">已接收 {{ formatBytes(batchDownloadProgress.receivedBytes) }}<template v-if="batchDownloadProgress.totalBytes !== null"> / {{ formatBytes(batchDownloadProgress.totalBytes) }}</template></span>
+          <span v-else>服务端正在准备文件，完成后会自动开始下载</span>
+          <span>不会重复下载单个文件</span>
         </div>
       </div>
 

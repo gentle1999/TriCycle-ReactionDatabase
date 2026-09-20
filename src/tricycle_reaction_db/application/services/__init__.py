@@ -247,6 +247,9 @@ from tricycle_reaction_db.application.services.topology_abstraction import (
     specialized_topologies,
     specialized_topology_ids,
     stereo_abstraction_projection,
+    topology_abstraction_mapping_witness,
+    topology_dag_component_ids,
+    topology_dag_components_by_root,
 )
 from tricycle_reaction_db.application.services.user_management import (
     UserManagementConflictError,
@@ -396,6 +399,9 @@ __all__ = [
     "specialized_topologies",
     "specialized_topology_ids",
     "stereo_abstraction_projection",
+    "topology_abstraction_mapping_witness",
+    "topology_dag_component_ids",
+    "topology_dag_components_by_root",
     "mapped_smiles_for_topology",
     "hourly_partition_prefixes",
     "get_topology_depiction",

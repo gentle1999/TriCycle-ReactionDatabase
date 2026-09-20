@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 from molgr.utils.converter import METAL_UNPAIRED_ELECTRONS_PROP
@@ -6,6 +8,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem, rdDepictor
 from rdkit.Geometry import Point3D
 
+import tricycle_reaction_db.ingestion.normalization as normalization_module
 from tricycle_reaction_db.application.dtos import (
     GeometryRecord,
     MolecularTopologyRecord,
@@ -24,6 +27,7 @@ from tricycle_reaction_db.ingestion.normalization import (
     normalize_molgr_stereochemistry,
     normalize_topology,
     normalize_topology_with_mapping,
+    serialize_molecule_smiles,
     validate_serializable_double_bond_stereochemistry,
 )
 
@@ -832,6 +836,164 @@ def test_stereo_validation_accepts_physical_projection_and_rejects_flip() -> Non
         match="changed the source E/Z control-atom relationship",
     ):
         validate_serializable_double_bond_stereochemistry(source, flipped)
+
+
+def test_safe_smiles_serialization_is_stable_for_ez_with_dative_control_atom() -> None:
+    molecule_builder = Chem.RWMol()
+    for atomic_number in (7, 6, 8, 6, 47):
+        atom = Chem.Atom(atomic_number)
+        atom.SetNoImplicit(True)
+        molecule_builder.AddAtom(atom)
+    molecule_builder.AddBond(0, 1, Chem.BondType.DOUBLE)
+    molecule_builder.AddBond(0, 2, Chem.BondType.SINGLE)
+    molecule_builder.AddBond(1, 3, Chem.BondType.SINGLE)
+    molecule_builder.AddBond(0, 4, Chem.BondType.DATIVE)
+    molecule = molecule_builder.GetMol()
+    for atom_index, atom in enumerate(molecule.GetAtoms(), start=1):
+        atom.SetAtomMapNum(atom_index)
+    alkene = molecule.GetBondBetweenAtoms(0, 1)
+    assert alkene is not None
+    # The N-side control atom is connected through a donor bond to Ag. This
+    # reproduces the metal-rich endpoint shape where RDKit's canonical writer
+    # can otherwise choose a different slash/control-atom projection.
+    alkene.SetStereoAtoms(4, 3)
+    alkene.SetStereo(Chem.BondStereo.STEREOE)
+
+    serialized = serialize_molecule_smiles(molecule, preserve_atom_maps=True)
+    parser = Chem.SmilesParserParams()
+    parser.removeHs = False
+    parser.sanitize = False
+    reparsed = Chem.MolFromSmiles(serialized, parser)
+    assert reparsed is not None
+    Chem.SetBondStereoFromDirections(reparsed)
+
+    assert serialize_molecule_smiles(reparsed, preserve_atom_maps=True) == serialized
+    assert sorted(atom.GetAtomMapNum() for atom in reparsed.GetAtoms()) == [1, 2, 3, 4, 5]
+    assert any(
+        bond.GetStereo()
+        in {
+            Chem.BondStereo.STEREOE,
+            Chem.BondStereo.STEREOZ,
+            Chem.BondStereo.STEREOTRANS,
+            Chem.BondStereo.STEREOCIS,
+        }
+        for bond in reparsed.GetBonds()
+    )
+
+
+def test_safe_smiles_serialization_preserves_radical_ez_graphs() -> None:
+    molecule = Chem.MolFromSmiles("[C:1]/[C:2]=[N:3]/[C:4]")
+    assert molecule is not None
+    source_radicals = {
+        atom.GetAtomMapNum(): atom.GetNumRadicalElectrons() for atom in molecule.GetAtoms()
+    }
+    assert any(source_radicals.values())
+
+    mapped_smiles = serialize_molecule_smiles(molecule, preserve_atom_maps=True)
+    mapped_round_trip = Chem.MolFromSmiles(mapped_smiles)
+    assert mapped_round_trip is not None
+    assert {
+        atom.GetAtomMapNum(): atom.GetNumRadicalElectrons() for atom in mapped_round_trip.GetAtoms()
+    } == source_radicals
+
+    # Topology identity removes reaction maps but must still retain this
+    # coordinate-independent E/Z and radical-bearing graph.
+    normalized = normalize_topology(
+        molecule,
+        add_hydrogens=False,
+        reconstruction_method="tests/radical-ez",
+        reconstruction_version="1",
+    )
+    assert normalized.topology.canonical_isomeric_smiles is not None
+    assert normalized.topology.radical_electron_count == sum(source_radicals.values())
+
+
+@pytest.mark.parametrize("source_smiles", ["[2H][3H]", "[2H]/C=C/[3H]"])
+def test_mapped_connectivity_smiles_preserves_isotopes_when_stereo_is_omitted(
+    source_smiles: str,
+) -> None:
+    molecule = Chem.MolFromSmiles(source_smiles)
+    assert molecule is not None
+    expected_isotopes = {
+        index + 1: atom.GetIsotope()
+        for index, atom in enumerate(molecule.GetAtoms())
+        if atom.GetIsotope()
+    }
+    topology = SimpleNamespace(
+        atom_count=molecule.GetNumAtoms(),
+        mol=molecule,
+        stereo_status=StereoStatus.ASSIGNED,
+    )
+
+    mapped_smiles = mapped_smiles_for_topology(
+        topology,
+        list(range(1, molecule.GetNumAtoms() + 1)),
+        include_stereochemistry=False,
+    )
+    parser = Chem.SmilesParserParams()
+    parser.removeHs = False
+    reparsed = Chem.MolFromSmiles(mapped_smiles, parser)
+    assert reparsed is not None
+    observed_isotopes = {
+        atom.GetAtomMapNum(): atom.GetIsotope() for atom in reparsed.GetAtoms() if atom.GetIsotope()
+    }
+    assert observed_isotopes == expected_isotopes
+    assert all(
+        atom.GetChiralTag() is Chem.ChiralType.CHI_UNSPECIFIED for atom in reparsed.GetAtoms()
+    )
+    assert all(
+        bond.GetStereo() is Chem.BondStereo.STEREONONE and bond.GetBondDir() is Chem.BondDir.NONE
+        for bond in reparsed.GetBonds()
+    )
+
+
+def test_safe_smiles_serialization_selects_deterministic_valid_ez_cycle_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    molecule = Chem.MolFromSmiles("F/C=C/F")
+    assert molecule is not None
+    forward = "F/C=C/F"
+    equivalent = r"F\C=C\F"
+    # The two exact spellings encode the same E geometry. Simulate RDKit's
+    # canonicalizer alternating between them after each validated round trip.
+    candidates = iter((forward, equivalent, forward, forward, equivalent, forward))
+
+    def alternating_writer(*_: object, **__: object) -> str:
+        return next(candidates)
+
+    monkeypatch.setattr(
+        normalization_module,
+        "_serialize_molecule_smiles_once",
+        alternating_writer,
+    )
+
+    serialized = serialize_molecule_smiles(molecule)
+    reparsed = Chem.MolFromSmiles(serialized)
+    assert reparsed is not None
+    double_bond = next(
+        bond for bond in reparsed.GetBonds() if bond.GetBondType() is Chem.BondType.DOUBLE
+    )
+    assert double_bond.GetStereo() is Chem.BondStereo.STEREOE
+    assert serialize_molecule_smiles(reparsed) == serialized
+
+
+def test_stereo_validation_preserves_the_serializer_failure_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    molecule = Chem.MolFromSmiles("C/C=C/C")
+    assert molecule is not None
+
+    def fail_serialization(*_: object, **__: object) -> str:
+        raise StereoProjectionError(
+            "SMILES canonicalization oscillated between valid stereo projections",
+            evidence={"reason": "smiles_stability_cycle"},
+        )
+
+    monkeypatch.setattr(normalization_module, "serialize_molecule_smiles", fail_serialization)
+    with pytest.raises(StereoProjectionError) as error:
+        validate_serializable_double_bond_stereochemistry(molecule, molecule)
+
+    assert error.value.evidence() == {"reason": "smiles_stability_cycle"}
 
 
 def test_trusted_molgr_normalization_preserves_e_z_stereochemistry(

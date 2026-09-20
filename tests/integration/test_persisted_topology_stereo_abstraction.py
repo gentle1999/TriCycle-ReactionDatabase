@@ -16,6 +16,9 @@ from tricycle_reaction_db.application.services.topology_abstraction import (
     persist_stereo_abstraction_projection,
     specialized_topologies,
     specialized_topology_ids,
+    topology_abstraction_mapping_witness,
+    topology_dag_component_ids,
+    topology_dag_components_by_root,
 )
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import MolecularTopologyAbstraction
@@ -66,6 +69,16 @@ def test_persisted_stereo_abstraction_is_a_dag() -> None:
                 persisted.topology,
                 (features[0],),
                 context=project_context,
+            )
+            assert (
+                topology_abstraction_mapping_witness(
+                    session,
+                    persisted.topology,
+                    one_center_a,
+                    require_projection_provenance=True,
+                    require_unique=True,
+                )
+                is not None
             )
             one_center_b, edge_b = persist_stereo_abstraction_projection(
                 session,
@@ -131,6 +144,11 @@ def test_persisted_stereo_abstraction_is_a_dag() -> None:
                 zero_center_id,
                 project_id=SYSTEM_PROJECT_ID,
             )
+            dag_component_ids = topology_dag_component_ids(
+                session,
+                (zero_center_id,),
+                project_id=SYSTEM_PROJECT_ID,
+            )
             loaded = specialized_topologies(
                 session,
                 zero_center_id,
@@ -141,6 +159,37 @@ def test_persisted_stereo_abstraction_is_a_dag() -> None:
             assert len(reachable_ids) == 4
             assert persisted.topology.id in reachable_ids
             assert len(loaded) == 5
+            assert set(dag_component_ids) == {*reachable_ids, zero_center_id}
+
+            isolated_molecule = Chem.MolFromSmiles("[CH3][CH3]")
+            assert isolated_molecule is not None
+            isolated_record = normalize_topology(
+                isolated_molecule,
+                add_hydrogens=False,
+                reconstruction_method="tests/isolated-topology",
+                reconstruction_version="1",
+            )
+            isolated = persist_molecular_topology(
+                session,
+                isolated_record,
+                context=project_context,
+            )
+            isolated_id = isolated.topology.id
+            assert isolated_id is not None
+            dag_component_with_isolated = topology_dag_component_ids(
+                session,
+                (zero_center_id,),
+                project_id=SYSTEM_PROJECT_ID,
+            )
+            assert isolated_id not in dag_component_with_isolated
+            components_by_root = topology_dag_components_by_root(
+                session,
+                (zero_center_id, isolated_id),
+                project_id=SYSTEM_PROJECT_ID,
+            )
+            assert persisted.topology.id in components_by_root[zero_center_id]
+            assert isolated_id not in components_by_root[zero_center_id]
+            assert components_by_root[isolated_id] == (isolated_id,)
 
             repeated_a = persist_stereo_abstraction_projection(
                 session,

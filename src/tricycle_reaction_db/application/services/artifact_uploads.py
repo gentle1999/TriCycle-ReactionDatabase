@@ -21,6 +21,7 @@ from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, MutableMapping, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from hashlib import sha256
@@ -182,10 +183,10 @@ from tricycle_reaction_db.ingestion import (
     MolOPFrameRecords,
     StereoProjectionError,
     configure_molecular_graph_reconstruction,
-    ensure_serializable_double_bond_stereochemistry,
     frame_records_from_molop,
     normalize_topology,
     normalize_topology_with_mapping,
+    serialize_molecule_smiles,
 )
 from tricycle_reaction_db.ingestion.manifest import normalize_relative_path
 from tricycle_reaction_db.storage.rustfs import (
@@ -193,6 +194,28 @@ from tricycle_reaction_db.storage.rustfs import (
     RustFSSettings,
     time_partitioned_content_addressed_key_for_sha256,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedEndpointTopology:
+    record: NormalizedTopologyRecord
+    source_to_topology_atom_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedInferenceTopologyRecords:
+    negative_endpoint: _PreparedEndpointTopology
+    positive_endpoint: _PreparedEndpointTopology
+    participant_records: tuple[NormalizedTopologyRecord, ...]
+
+    @property
+    def all_records(self) -> tuple[NormalizedTopologyRecord, ...]:
+        return (
+            self.negative_endpoint.record,
+            self.positive_endpoint.record,
+            *self.participant_records,
+        )
+
 
 MOLOP_VERSION = version("molop")
 logger = logging.getLogger(__name__)
@@ -211,11 +234,11 @@ PERSISTENCE_BATCH_FRAME_LIMIT = 256
 # keep all configured workers busy across a multi-file batch.
 FRAME_CONVERSION_CHUNK_SIZE = 256
 INFERENCE_PERSIST_BATCH_SIZE = 16
-# The configured timeout is the budget for a 10 MiB source. Larger source
-# files receive a proportionally larger budget; smaller files retain the
-# configured baseline so normal parsing is not cut off by an arbitrarily low
-# byte-scaled timeout.
+# The configured timeout covers the first 10 MiB. Above that, each additional
+# 10 MiB gets a configurable allowance. This gives large files headroom without
+# making a small malformed file hold a parser slot for an unbounded period.
 MOLOP_PARSE_TIMEOUT_REFERENCE_BYTES = 10 * 1024 * 1024
+GZIP_MAGIC = b"\x1f\x8b"
 RUSTFS_PARSE_DOWNLOAD_CHUNK_SIZE = 4 * 1024 * 1024
 
 
@@ -711,8 +734,8 @@ async def _run_molop_file_pipeline(
     acquired_file_slot = False
     effective_file_slots = file_slots or _file_worker_submission_slots()
     try:
-        # Queue wait is intentionally outside the per-file processing budget:
-        # a file must get a worker before its one-minute parser deadline starts.
+        # Queue wait is intentionally outside the size-derived per-file budget:
+        # a file must get a worker before its parser deadline starts.
         await effective_file_slots.acquire()
         acquired_file_slot = True
         async with asyncio.timeout(timeout_seconds):
@@ -740,17 +763,50 @@ async def _run_molop_file_pipeline(
 
 
 def _source_size_bytes(source: bytes | Path) -> int:
-    """Return the source size used to scale the per-file parse budget."""
+    """Return the parser-input size, expanding a gzip trailer hint when available.
 
-    return len(source) if isinstance(source, bytes) else source.stat().st_size
+    Gzip's ISIZE trailer gives the uncompressed size in constant time for the
+    single-member files used by the import pipeline. Clamp that hint to the
+    configured decompressed upload limit so malformed trailers cannot create
+    excessive deadlines.
+    """
+
+    if isinstance(source, bytes):
+        compressed_size = len(source)
+        is_gzip = source.startswith(GZIP_MAGIC)
+        trailer = source[-4:] if is_gzip and compressed_size >= 18 else b""
+    else:
+        compressed_size = source.stat().st_size
+        trailer = b""
+        if compressed_size >= 18:
+            with source.open("rb") as stream:
+                is_gzip = stream.read(2) == GZIP_MAGIC
+                if is_gzip:
+                    stream.seek(-4, 2)
+                    trailer = stream.read(4)
+
+    if len(trailer) != 4:
+        return compressed_size
+    uncompressed_size = int.from_bytes(trailer, byteorder="little", signed=False)
+    if uncompressed_size == 0:
+        return compressed_size
+    return min(max(compressed_size, uncompressed_size), get_settings().max_upload_bytes)
 
 
 def _molop_file_parse_timeout_seconds(source: bytes | Path) -> float:
-    """Scale the configured 10 MiB parse budget for a source file."""
+    """Budget parsing from source size, with extra headroom above 10 MiB.
 
-    baseline = get_settings().molop_file_parse_timeout_seconds
-    size_scale = max(1.0, _source_size_bytes(source) / MOLOP_PARSE_TIMEOUT_REFERENCE_BYTES)
-    return baseline * size_scale
+    The configured baseline covers the first 10 MiB. Each additional 10 MiB
+    adds ``baseline * size_multiplier`` seconds; for the defaults, 20 MiB gets
+    150 seconds and 30 MiB gets 240 seconds.
+    """
+
+    settings = get_settings()
+    size_scale = _source_size_bytes(source) / MOLOP_PARSE_TIMEOUT_REFERENCE_BYTES
+    extra_size_scale = max(0.0, size_scale - 1.0)
+    return settings.molop_file_parse_timeout_seconds * (
+        1.0 + extra_size_scale * settings.molop_file_parse_timeout_size_multiplier
+    )
 
 
 def _recover_aborted_batch_sync(
@@ -2260,6 +2316,7 @@ def _persist_transition_state_endpoint(
     direction: TransitionStateEndpointDirection,
     displacement_ratio: float,
     topology_context: GeometryPersistenceContext | None = None,
+    prepared_topology: _PreparedEndpointTopology | None = None,
     identity_is_new: bool = False,
     defer_flush: bool = False,
 ) -> TransitionStateEndpoint:
@@ -2306,13 +2363,19 @@ def _persist_transition_state_endpoint(
         raise ValueError(
             "TS vibration endpoint atom formal-charge sum differs from its CalculationFrame charge"
         )
-    topology_record, source_to_topology = _normalize_transition_state_endpoint_topology(
-        endpoint,
-        direction,
-    )
+    prepared = prepared_topology
+    if prepared is None:
+        topology_record, source_to_topology = _normalize_transition_state_endpoint_topology(
+            endpoint,
+            direction,
+        )
+        prepared = _PreparedEndpointTopology(
+            record=topology_record,
+            source_to_topology_atom_indices=tuple(source_to_topology),
+        )
     persisted_topology = persist_molecular_topology(
         session,
-        topology_record,
+        prepared.record,
         context=topology_context,
     )
     topology_id = _require_id(persisted_topology.topology, label="MolecularTopology")
@@ -2329,7 +2392,7 @@ def _persist_transition_state_endpoint(
         "displacement_ratio": displacement_ratio,
         "source_coordinates": coordinates,
         "source_coordinate_hash": source_coordinate_hash,
-        "source_to_topology_atom_indices": source_to_topology,
+        "source_to_topology_atom_indices": list(prepared.source_to_topology_atom_indices),
         "provenance": {
             "method": "molop.possible_pre_post_ts",
             "molop_version": MOLOP_VERSION,
@@ -2374,6 +2437,7 @@ def _persist_transition_state_endpoints(
     calculation_frame: CalculationFrame,
     inferred: _SuccessfulInference,
     topology_context: GeometryPersistenceContext | None = None,
+    prepared_topology_records: _PreparedInferenceTopologyRecords | None = None,
     identity_is_new: bool = False,
     defer_flush: bool = False,
 ) -> None:
@@ -2381,6 +2445,10 @@ def _persist_transition_state_endpoints(
         raise ValueError("TS endpoint charge must match its CalculationFrame charge")
     if inferred.multiplicity != calculation_frame.multiplicity:
         raise ValueError("TS endpoint multiplicity must match its CalculationFrame multiplicity")
+    if prepared_topology_records is None and topology_context is not None:
+        cached = topology_context.inference_topology_records_by_object_id.get(id(inferred))
+        if cached is not None and cached[0] is inferred:
+            prepared_topology_records = cast(_PreparedInferenceTopologyRecords, cached[1])
     _persist_transition_state_endpoint(
         session,
         calculation_frame=calculation_frame,
@@ -2388,6 +2456,11 @@ def _persist_transition_state_endpoints(
         direction=TransitionStateEndpointDirection.NEGATIVE,
         displacement_ratio=inferred.negative_displacement_ratio,
         topology_context=topology_context,
+        prepared_topology=(
+            prepared_topology_records.negative_endpoint
+            if prepared_topology_records is not None
+            else None
+        ),
         identity_is_new=identity_is_new,
         defer_flush=defer_flush,
     )
@@ -2398,6 +2471,11 @@ def _persist_transition_state_endpoints(
         direction=TransitionStateEndpointDirection.POSITIVE,
         displacement_ratio=inferred.positive_displacement_ratio,
         topology_context=topology_context,
+        prepared_topology=(
+            prepared_topology_records.positive_endpoint
+            if prepared_topology_records is not None
+            else None
+        ),
         identity_is_new=identity_is_new,
         defer_flush=defer_flush,
     )
@@ -2456,6 +2534,7 @@ def _resolve_and_bind_transition_state_reaction(
     inferred: _SuccessfulInference,
     calculation_frame: CalculationFrame,
     topology_context: GeometryPersistenceContext | None = None,
+    prepared_topology_records: _PreparedInferenceTopologyRecords | None = None,
     refresh_thermodynamics: bool | None = None,
 ) -> tuple[UUID, UUID]:
     """Create the mapped endpoint reaction and bind its TS coordinate evidence."""
@@ -2465,47 +2544,57 @@ def _resolve_and_bind_transition_state_reaction(
     )
 
     legacy_bulk_import = bool(session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False))
+    prepared_records = prepared_topology_records
+    cache_key: str | None
+    cached_reaction_ids: tuple[UUID, UUID] | None
     if topology_context is not None and legacy_bulk_import:
         # The previous importer keyed repeated TS inferences by their mapped
-        # reaction string. Keep that cheap cache on the bulk path; strict
-        # endpoint-aware keys remain enabled for ordinary/single-file writes.
-        strict_records = ()
+        # reaction string. Preserve that cache, while reusing the per-inference
+        # normalized records prepared by batch preload when available.
         cache_key = inferred.reaction_smiles
         cached_reaction_ids = topology_context.inferred_reaction_ids_by_key.get(cache_key)
+        cached_participant_records = topology_context.inferred_reaction_topology_records_by_key.get(
+            cache_key
+        )
+        if prepared_records is None:
+            prepared_records = _inference_topology_records_for_context(
+                inferred,
+                topology_context,
+                reaction_records=cached_participant_records,
+                include_participants=(
+                    cached_reaction_ids is None and cached_participant_records is None
+                ),
+            )
     elif topology_context is not None:
-        # Build the strict records before consulting either cache. A mapped
-        # reaction string is only one part of the identity: different MolGR
-        # endpoint stereochemistry can otherwise reuse the first reaction row.
-        strict_records = tuple(_inference_topology_records(inferred))
+        if prepared_records is None:
+            prepared_records = _inference_topology_records_for_context(
+                inferred,
+                topology_context,
+            )
+        strict_records = prepared_records.all_records
+        # A mapped reaction string alone is insufficient: distinct endpoint
+        # stereochemistry must remain distinct even when the TS frame has a
+        # different E/Z assignment.
         cache_key = _inference_reaction_cache_key(inferred, strict_records)
         cached_reaction_ids = topology_context.inferred_reaction_ids_by_key.get(cache_key)
     else:
-        strict_records = ()
+        if prepared_records is None:
+            prepared_records = _prepare_inference_topology_records(inferred)
         cache_key = None
         cached_reaction_ids = None
+    assert prepared_records is not None
     if cached_reaction_ids is None:
         if topology_context is not None:
             assert cache_key is not None
-            cached_participant_records = (
-                topology_context.inferred_reaction_topology_records_by_key.get(cache_key)
+            precomputed_topology_records: tuple[NormalizedTopologyRecord, ...] = (
+                prepared_records.participant_records
             )
-            if cached_participant_records is None:
-                precomputed_topology_records: tuple[NormalizedTopologyRecord, ...] | None = (
-                    None if legacy_bulk_import else tuple(strict_records[2:])
-                )
-            else:
-                # Preserve the explicit empty sentinel used by preload when
-                # normalization failed. Passing it through makes the
-                # inference fail explicitly instead of silently switching to
-                # RDKit template normalization.
-                precomputed_topology_records = tuple(cached_participant_records)
         else:
             # The endpoint fragments are authoritative MolGR graphs. Reusing
             # their records here avoids sanitizing RDKit reaction templates,
             # which can mutate electronic state and cannot safely inspect some
             # multicoordinate metal structures.
-            records = _inference_topology_records(inferred)
-            precomputed_topology_records = tuple(records[2:])
+            precomputed_topology_records = prepared_records.participant_records
         reaction_result = create_reaction_in_session(
             session,
             CreateReactionCommand(
@@ -2535,6 +2624,11 @@ def _resolve_and_bind_transition_state_reaction(
                 logical_reaction_id,
                 mapped_reaction_id,
             )
+            if prepared_records.participant_records:
+                topology_context.inferred_reaction_topology_records_by_key.setdefault(
+                    cache_key,
+                    prepared_records.participant_records,
+                )
     else:
         logical_reaction_id, mapped_reaction_id = cached_reaction_ids
         if topology_context is not None:
@@ -2592,11 +2686,17 @@ def _persist_successful_inference(
     defer_flush: bool = False,
     defer_thermodynamic_refresh: bool = False,
 ) -> TransitionStateInference:
+    prepared_topology_records = (
+        _inference_topology_records_for_context(inferred, topology_context)
+        if topology_context is not None
+        else _prepare_inference_topology_records(inferred)
+    )
     logical_reaction_id, mapped_reaction_id = _resolve_and_bind_transition_state_reaction(
         session,
         inferred=inferred,
         calculation_frame=calculation_frame,
         topology_context=topology_context,
+        prepared_topology_records=prepared_topology_records,
         refresh_thermodynamics=(topology_context is None and not defer_thermodynamic_refresh),
     )
     inference_values = {
@@ -2639,6 +2739,7 @@ def _persist_successful_inference(
         calculation_frame=calculation_frame,
         inferred=inferred,
         topology_context=topology_context,
+        prepared_topology_records=prepared_topology_records,
         identity_is_new=identity_is_new,
         defer_flush=defer_flush,
     )
@@ -2714,6 +2815,11 @@ def _persist_one_new_inference(
         # back Python-side reconciliation indexes.  Restore both before the
         # failed inference is recorded so the next task cannot reuse a binding
         # that never committed.
+        logger.exception(
+            "failed to persist inferred TS reaction artifact=%s frame=%s",
+            task.deferred.ingestion.artifact_file_id,
+            task.inferred.file_frame_index,
+        )
         _restore_inference_context(topology_context, context_snapshot)
         _set_fast_pending_entities(session, pending_snapshot)
         _add_failed_inference(
@@ -3967,12 +4073,13 @@ def _run_preload_molecular_geometry_context(
         typed_session.info["tricycle_fast_insert"] = previous_fast_insert
 
 
-def _inference_topology_records(
+def _prepare_inference_topology_records(
     inferred: _SuccessfulInference,
     *,
-    reaction_records: tuple[Any, ...] | None = None,
-) -> list[Any]:
-    """Build endpoint and participant identities without sanitizing MolGR graphs.
+    reaction_records: tuple[NormalizedTopologyRecord, ...] | None = None,
+    include_participants: bool = True,
+) -> _PreparedInferenceTopologyRecords:
+    """Normalize inference graphs once, retaining endpoint atom mappings.
 
     Participant records come directly from the source-order MolGR endpoint
     fragments.  This keeps radical, charge, and stereo annotations under the
@@ -3984,23 +4091,27 @@ def _inference_topology_records(
     # perform a second coordinate inference here.
     negative_endpoint = inferred.negative_endpoint
     positive_endpoint = inferred.positive_endpoint
-    records: list[Any] = []
+    normalized_endpoints: list[_PreparedEndpointTopology] = []
     for endpoint, direction in (
         (negative_endpoint, TransitionStateEndpointDirection.NEGATIVE),
         (positive_endpoint, TransitionStateEndpointDirection.POSITIVE),
     ):
-        record, _source_to_topology = _normalize_transition_state_endpoint_topology(
-            endpoint,
-            direction,
+        record, source_to_topology = _normalize_transition_state_endpoint_topology(
+            endpoint, direction
         )
-        records.append(record)
-    if reaction_records is None:
+        normalized_endpoints.append(
+            _PreparedEndpointTopology(
+                record=record,
+                source_to_topology_atom_indices=tuple(source_to_topology),
+            )
+        )
+    if reaction_records is None and include_participants:
         endpoints = sorted(
             (negative_endpoint, positive_endpoint),
             key=lambda endpoint: len(Chem.GetMolFrags(endpoint)),
             reverse=True,
         )
-        participant_records: list[Any] = []
+        normalized_participants: list[NormalizedTopologyRecord] = []
         for side, endpoint in zip(("reactant", "product"), endpoints, strict=True):
             source = Chem.Mol(endpoint)
             for atom_index, atom in enumerate(
@@ -4015,49 +4126,18 @@ def _inference_topology_records(
                 asMols=True,
                 sanitizeFrags=False,
             )
-            # Keep the source fragment for topology normalization and retain a
-            # separate writer projection for deterministic ordering.  The
-            # serialization helper may update a local BondStereo cache while
-            # solving RDKit's traversal constraints; that cache must never
-            # replace the coordinate-authoritative MolGR fragment.
-            serializable_fragments: list[tuple[Chem.Mol, str]] = []
-            for fragment in fragments:
-                try:
-                    projection = ensure_serializable_double_bond_stereochemistry(
-                        fragment,
-                        preserve_atom_maps=True,
-                    )
-                    projection_smiles = Chem.MolToSmiles(
-                        projection,
-                        canonical=True,
-                        isomericSmiles=True,
-                        allHsExplicit=True,
-                    )
-                    # Keep the source fragment conformer through
-                    # normalize_topology. Its canonical atom-order projection
-                    # needs the coordinate-authoritative stereo state; using
-                    # ``projection`` here would reintroduce the local
-                    # BondStereo/BondDir ambiguity one stage later.
-                    serializable_fragments.append((fragment, projection_smiles))
-                except StereoProjectionError:
-                    fragment.RemoveAllConformers()
-                    serializable_fragments.append(
-                        (
-                            fragment,
-                            Chem.MolToSmiles(
-                                fragment,
-                                canonical=True,
-                                isomericSmiles=True,
-                                allHsExplicit=True,
-                            ),
-                        )
-                    )
-            serializable_fragments = sorted(
-                serializable_fragments,
-                key=lambda item: item[1],
+            # Every source atom already has a unique map tied to its endpoint
+            # index. Use that identity to order fragments; serializing solely
+            # for sorting used to canonicalize a stereo projection before the
+            # fragment reached topology normalization.
+            ordered_fragments = sorted(
+                fragments,
+                key=lambda fragment: tuple(
+                    sorted(atom.GetAtomMapNum() for atom in fragment.GetAtoms())
+                ),
             )
-            for template_index, (fragment, _projection_smiles) in enumerate(serializable_fragments):
-                participant_records.append(
+            for template_index, fragment in enumerate(ordered_fragments):
+                normalized_participants.append(
                     normalize_topology(
                         fragment,
                         add_hydrogens=False,
@@ -4068,18 +4148,42 @@ def _inference_topology_records(
                             "topology_source_trusted": True,
                             "source_fragment": True,
                             "source_atom_map_numbers": [
-                                atom.GetAtomMapNum()
-                                for atom in fragment.GetAtoms()  # type: ignore[no-untyped-call]
+                                atom.GetAtomMapNum() for atom in fragment.GetAtoms()
                             ],
                             "side": side,
                             "template_index": template_index,
                         },
                     )
                 )
-        reaction_records = tuple(participant_records)
-    if reaction_records:
-        records.extend(reaction_records)
-    return records
+        reaction_records = tuple(normalized_participants)
+    return _PreparedInferenceTopologyRecords(
+        negative_endpoint=normalized_endpoints[0],
+        positive_endpoint=normalized_endpoints[1],
+        participant_records=reaction_records or (),
+    )
+
+
+def _inference_topology_records_for_context(
+    inferred: _SuccessfulInference,
+    context: GeometryPersistenceContext,
+    *,
+    reaction_records: tuple[NormalizedTopologyRecord, ...] | None = None,
+    include_participants: bool = True,
+) -> _PreparedInferenceTopologyRecords:
+    """Reuse the exact normalized records throughout one persistence batch."""
+
+    cached = context.inference_topology_records_by_object_id.get(id(inferred))
+    if cached is not None and cached[0] is inferred:
+        return cast(_PreparedInferenceTopologyRecords, cached[1])
+    prepared = _prepare_inference_topology_records(
+        inferred,
+        reaction_records=reaction_records,
+        include_participants=include_participants,
+    )
+    # Retaining ``inferred`` in the value prevents id reuse while the context
+    # is alive. Parsed artifacts retain every inference through persistence.
+    context.inference_topology_records_by_object_id[id(inferred)] = (inferred, prepared)
+    return prepared
 
 
 def _inference_molecule_cache_signature(molecule: Chem.Mol) -> object:
@@ -4092,13 +4196,22 @@ def _inference_molecule_cache_signature(molecule: Chem.Mol) -> object:
     """
 
     try:
+        atom_maps = [
+            atom.GetAtomMapNum()
+            for atom in molecule.GetAtoms()  # type: ignore[no-untyped-call]
+        ]
+        has_unique_maps = (
+            bool(atom_maps)
+            and all(number > 0 for number in atom_maps)
+            and len(set(atom_maps)) == len(atom_maps)
+        )
         return {
             "encoding": "rdkit-isomeric-smiles-v1",
-            "value": Chem.MolToSmiles(
+            "value": serialize_molecule_smiles(
                 molecule,
-                canonical=True,
-                isomericSmiles=True,
-                allHsExplicit=True,
+                preserve_atom_maps=has_unique_maps,
+                retain_atom_maps=True,
+                all_hs_explicit=True,
             ),
         }
     except Exception:
@@ -4214,12 +4327,12 @@ def _run_preload_batch_persistence_state(
     *,
     ingestion_ids: list[UUID],
 ) -> tuple[dict[UUID, ArtifactIngestion], dict[UUID, set[UUID]]]:
-    # Keep the batch transaction on the same hot path as the previous local
-    # importer.  Newer correctness/reconciliation features remain available
-    # to single-file and explicitly non-bulk calls, while the durable worker
-    # reparse uses the proven shared batch semantics.
+    # The unified upload path must retain the normal topology/DAG,
+    # logical-reaction, and membership hooks.  Only defer trigger-side source
+    # visibility recomputation inside this transaction; the durable worker
+    # marks profiles dirty after the topology/reconciliation barrier below and
+    # the separate profile worker refreshes them after this transaction commits.
     typed_session = cast(Session, session)
-    typed_session.info[LEGACY_BULK_IMPORT_SESSION_INFO_KEY] = True
     # Source visibility is materialized by the same batch's reconciliation or
     # by the worker's queue-drain profile refresh.  The row-level PostgreSQL
     # triggers otherwise recompute the profile graph once for every frame,
@@ -5276,17 +5389,66 @@ class ArtifactUploadService:
                     )
                     cleanup: ParseCleanupSummary | None = None
                     if clean_reparse and not previous_results_cleared:
+                        # ``clear_previous_parse_results_batch`` expires the
+                        # session after its set-based deletes.  Attach and
+                        # flush newly reserved ArtifactFile rows first;
+                        # otherwise expire_all() can discard their pending
+                        # fast-insert state before the reparse path has a
+                        # chance to create their ingestion rows.
+                        await session.run_sync(_run_flush)
+                        artifact_ids_by_digest = {
+                            digest: _require_id(artifact, label="ArtifactFile")
+                            for digest, artifact in artifacts_by_digest.items()
+                        }
                         cleanup = await session.run_sync(
                             partial(
                                 _run_clear_and_reset_parse_state,
-                                artifact_file_ids=[
-                                    _require_id(artifact, label="ArtifactFile")
-                                    for artifact in artifacts_by_digest.values()
-                                ],
+                                artifact_file_ids=tuple(artifact_ids_by_digest.values()),
                                 started_at=datetime.now(UTC),
                                 defer_thermodynamic_refresh=defer_thermodynamic_refresh,
                             )
                         )
+                        if cleanup.deleted_revision_count:
+                            # The set-based cleanup expires all ORM state after
+                            # deleting old revisions. Rehydrate the artifact
+                            # holders before the rest of this preparation
+                            # transaction reads their IDs/status; otherwise an
+                            # async attribute access attempts a lazy load
+                            # outside ``greenlet_spawn``.
+                            refreshed_artifacts = (
+                                await session.exec(
+                                    select(ArtifactFile).where(
+                                        col(ArtifactFile.id).in_(
+                                            tuple(artifact_ids_by_digest.values())
+                                        )
+                                    )
+                                )
+                            ).all()
+                            refreshed_by_id = {
+                                artifact.id: artifact
+                                for artifact in refreshed_artifacts
+                                if isinstance(artifact.id, UUID)
+                            }
+                            if len(refreshed_by_id) != len(artifact_ids_by_digest):
+                                raise ArtifactUploadError(
+                                    "artifact reservation disappeared after parse cleanup"
+                                )
+                            artifacts_by_digest = {
+                                digest: refreshed_by_id[artifact_id]
+                                for digest, artifact_id in artifact_ids_by_digest.items()
+                            }
+                            reservations_by_digest = {
+                                digest: (
+                                    artifacts_by_digest[digest],
+                                    retired_reservation,
+                                    check_existing_object,
+                                )
+                                for digest, (
+                                    _artifact,
+                                    retired_reservation,
+                                    check_existing_object,
+                                ) in reservations_by_digest.items()
+                            }
                     ingestions_by_artifact_id: dict[UUID, tuple[ArtifactIngestion, bool]] = {}
                     if artifact_kind is ArtifactKind.CALCULATION_OUTPUT:
                         started_by_artifact_id = {
@@ -5852,12 +6014,19 @@ class ArtifactUploadService:
                                         cache_key
                                     )
                                 )
-                                records = _inference_topology_records(
+                                prepared_inference = _inference_topology_records_for_context(
                                     inferred,
+                                    geometry_context,
                                     reaction_records=cached,
+                                    include_participants=cached is None,
                                 )
+                                records = list(prepared_inference.all_records)
                             else:
-                                base_records = tuple(_inference_topology_records(inferred))
+                                prepared_inference = _inference_topology_records_for_context(
+                                    inferred,
+                                    geometry_context,
+                                )
+                                base_records = prepared_inference.all_records
                                 cache_key = _inference_reaction_cache_key(
                                     inferred,
                                     base_records,
@@ -5867,14 +6036,7 @@ class ArtifactUploadService:
                                         cache_key
                                     )
                                 )
-                                records = (
-                                    _inference_topology_records(
-                                        inferred,
-                                        reaction_records=cached,
-                                    )
-                                    if cached is not None
-                                    else list(base_records)
-                                )
+                                records = list(base_records)
                             inference_topology_records.extend(records)
                             if cached is None and len(records) > 2:
                                 geometry_context.inferred_reaction_topology_records_by_key.setdefault(

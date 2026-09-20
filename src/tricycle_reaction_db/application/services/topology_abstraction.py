@@ -6,6 +6,7 @@ small DAG: each edge removes one feature, while the persisted topology rows
 remain independently reusable molecular identities.
 """
 
+from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import lru_cache
@@ -13,6 +14,7 @@ from typing import Any, Literal, cast
 from uuid import UUID
 
 from rdkit import Chem
+from sqlalchemy import case, literal, or_
 from sqlmodel import Session, col, select
 
 from tricycle_reaction_db.application.services._persistence import (
@@ -25,13 +27,18 @@ from tricycle_reaction_db.application.services._persistence import (
 from tricycle_reaction_db.application.services.molecular_geometry import (
     persist_molecular_topology,
 )
+from tricycle_reaction_db.application.services.rdkit_graph_matching import (
+    get_substruct_matches,
+)
 from tricycle_reaction_db.core.chemistry_config import (
     STEREO_ABSTRACTION_MATCH_SCHEMA_VERSION,
     STEREO_ABSTRACTION_POLICY_VERSION,
     STEREO_ABSTRACTION_RECONSTRUCTION_METHOD,
 )
 from tricycle_reaction_db.db.models import MolecularTopology, MolecularTopologyAbstraction
-from tricycle_reaction_db.ingestion.normalization import normalize_topology
+from tricycle_reaction_db.ingestion.normalization import (
+    normalize_topology_with_mapping,
+)
 
 StereoFeatureKind = Literal["atom", "bond"]
 
@@ -45,6 +52,9 @@ _ASSIGNED_BOND_STEREO = frozenset(
         Chem.BondStereo.STEREOATROPCCW,
     }
 )
+_PROJECTION_ATOM_MAPPING_PROVENANCE = "normalized_projection_atom_order_v1"
+_ABSTRACTION_MAPPING_CACHE_KEY = "_stereo_abstraction_mapping_edges"
+_ABSTRACTION_MAPPING_CACHE_MARKER_KEY = "_stereo_abstraction_mapping_edges_marker"
 
 
 class StereoAbstractionError(ValueError):
@@ -171,9 +181,18 @@ def stereo_abstraction_projection(
             + ", ".join(sorted(feature.key for feature in missing))
         )
     selected = tuple(feature for feature in assigned if feature in requested)
+    projected = clear_stereo_features(source, selected)
+    # Database-backed RDKit molecules can retain directional writer flags
+    # whose control atoms no longer agree with BondStereo.GetStereoAtoms().
+    # They are not independent stereo evidence: if left behind, the next
+    # normalization pass may infer the just-cleared E/Z feature again from a
+    # different pair of neighboring bonds. BondStereo is authoritative here;
+    # serialization will regenerate directions from the retained features.
+    for bond in projected.GetBonds():  # type: ignore[no-untyped-call]
+        bond.SetBondDir(Chem.BondDir.NONE)
     return StereoAbstractionProjection(
         cleared_features=selected,
-        molecule=clear_stereo_features(source, selected),
+        molecule=projected,
     )
 
 
@@ -206,12 +225,13 @@ def _find_topology_matches_on_graphs(
         return ()
     if specific_graph.GetNumBonds() != general_graph.GetNumBonds():
         return ()
-    matches = specific_graph.GetSubstructMatches(
+    matches = get_substruct_matches(
+        specific_graph,
         general_graph,
-        useChirality=True,
-        uniquify=True,
+        use_chirality=True,
+        hard_timeout_for_large_molecules=True,
     )
-    return tuple(sorted(tuple(int(index) for index in match) for match in matches))
+    return tuple(sorted(matches))
 
 
 def _is_assigned_atom_stereo(atom: Chem.Atom) -> bool:
@@ -236,6 +256,14 @@ def find_topology_matches(
     distinct legal matches while removing duplicate automorphism reports.
     """
 
+    # Avoid cloning/serializing molecules when the topology identity already
+    # proves that a full graph match is impossible. This is especially useful
+    # for reverse membership lookups, where scalar SQL predicates are followed
+    # by this Python fallback for a bounded candidate set.
+    if specific.GetNumAtoms() != general.GetNumAtoms():
+        return ()
+    if specific.GetNumBonds() != general.GetNumBonds():
+        return ()
     specific_graph = _map_free_copy(specific)
     general_graph = _map_free_copy(general)
     try:
@@ -306,6 +334,321 @@ def find_stereo_abstraction_match(
     return None
 
 
+def _stereo_abstraction_match_for_known_atom_mapping(
+    specific: Chem.Mol,
+    general: Chem.Mol,
+    general_to_specific_atom_indices: tuple[int, ...],
+) -> StereoAbstractionMatch | None:
+    """Validate a provenance-derived atom correspondence in linear time.
+
+    This is for projections made from a known source molecule: normalization
+    returns the source-to-canonical atom permutation, so there is no reason to
+    ask RDKit to rediscover that correspondence with a substructure search.
+    If normalization changed any graph facts or stereo that this check cannot
+    verify directly, callers should use the bounded graph-matching fallback.
+    """
+
+    atom_count = specific.GetNumAtoms()
+    if (
+        atom_count != general.GetNumAtoms()
+        or len(general_to_specific_atom_indices) != atom_count
+        or sorted(general_to_specific_atom_indices) != list(range(atom_count))
+        or specific.GetNumBonds() != general.GetNumBonds()
+    ):
+        return None
+
+    specific_graph = _map_free_copy(specific)
+    general_graph = _map_free_copy(general)
+    try:
+        Chem.AssignStereochemistry(specific_graph, cleanIt=True, force=True)
+        Chem.AssignStereochemistry(general_graph, cleanIt=True, force=True)
+    except (RuntimeError, ValueError):
+        return None
+
+    abstracted_atoms: list[int] = []
+    for general_index, specific_index in enumerate(general_to_specific_atom_indices):
+        general_atom = general_graph.GetAtomWithIdx(general_index)
+        specific_atom = specific_graph.GetAtomWithIdx(specific_index)
+        general_signature = (
+            general_atom.GetAtomicNum(),
+            general_atom.GetIsotope(),
+            general_atom.GetFormalCharge(),
+            general_atom.GetNumRadicalElectrons(),
+            general_atom.GetNumExplicitHs(),
+            general_atom.GetNoImplicit(),
+            general_atom.GetIsAromatic(),
+        )
+        specific_signature = (
+            specific_atom.GetAtomicNum(),
+            specific_atom.GetIsotope(),
+            specific_atom.GetFormalCharge(),
+            specific_atom.GetNumRadicalElectrons(),
+            specific_atom.GetNumExplicitHs(),
+            specific_atom.GetNoImplicit(),
+            specific_atom.GetIsAromatic(),
+        )
+        if general_signature != specific_signature:
+            return None
+
+        general_has_stereo = _is_assigned_atom_stereo(general_atom)
+        specific_has_stereo = _is_assigned_atom_stereo(specific_atom)
+        if general_has_stereo and not specific_has_stereo:
+            return None
+        if general_has_stereo and specific_has_stereo:
+            if not general_atom.HasProp("_CIPCode") or not specific_atom.HasProp("_CIPCode"):
+                # CIP may be undefined for a graph-symmetric centre. Do not
+                # guess parity here; the full stereo-aware matcher remains the
+                # conservative fallback for that uncommon case.
+                return None
+            if general_atom.GetProp("_CIPCode") != specific_atom.GetProp("_CIPCode"):
+                return None
+        elif specific_has_stereo:
+            abstracted_atoms.append(general_index)
+
+    specific_bonds = {
+        frozenset((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())): bond
+        for bond in specific_graph.GetBonds()  # type: ignore[no-untyped-call]
+    }
+    abstracted_bonds: list[int] = []
+    for general_bond in general_graph.GetBonds():  # type: ignore[no-untyped-call]
+        mapped_begin = general_to_specific_atom_indices[general_bond.GetBeginAtomIdx()]
+        mapped_end = general_to_specific_atom_indices[general_bond.GetEndAtomIdx()]
+        specific_bond = specific_bonds.get(frozenset((mapped_begin, mapped_end)))
+        if specific_bond is None:
+            return None
+        if (
+            general_bond.GetBondType() != specific_bond.GetBondType()
+            or general_bond.GetIsAromatic() != specific_bond.GetIsAromatic()
+            or general_bond.GetIsConjugated() != specific_bond.GetIsConjugated()
+        ):
+            return None
+
+        general_has_stereo = _is_assigned_bond_stereo(general_bond)
+        specific_has_stereo = _is_assigned_bond_stereo(specific_bond)
+        if general_has_stereo and not specific_has_stereo:
+            return None
+        if general_has_stereo and specific_has_stereo:
+            general_stereo_atoms = tuple(int(index) for index in general_bond.GetStereoAtoms())
+            specific_stereo_atoms = tuple(int(index) for index in specific_bond.GetStereoAtoms())
+            if len(general_stereo_atoms) != 2 or len(specific_stereo_atoms) != 2:
+                return None
+            expected_stereo_atoms = tuple(
+                general_to_specific_atom_indices[index] for index in general_stereo_atoms
+            )
+            if (mapped_begin, mapped_end) != (
+                specific_bond.GetBeginAtomIdx(),
+                specific_bond.GetEndAtomIdx(),
+            ):
+                expected_stereo_atoms = tuple(reversed(expected_stereo_atoms))
+            if (
+                general_bond.GetStereo() != specific_bond.GetStereo()
+                or expected_stereo_atoms != specific_stereo_atoms
+            ):
+                return None
+        elif specific_has_stereo:
+            abstracted_bonds.append(general_bond.GetIdx())
+
+    result = StereoAbstractionMatch(
+        general_to_specific_atom_indices=general_to_specific_atom_indices,
+        abstracted_atom_indices=tuple(abstracted_atoms),
+        abstracted_bond_indices=tuple(abstracted_bonds),
+    )
+    return result if result.abstracted_feature_count > 0 else None
+
+
+def _abstraction_mapping_cache_marker(session: Session) -> tuple[object, ...]:
+    pending = session.info.get("_fast_pending_entities")
+    pending_marker = (id(pending), len(pending)) if isinstance(pending, list) else (None, 0)
+    return (
+        id(session.get_transaction()),
+        id(session.get_nested_transaction()),
+        pending_marker,
+        len(session.new),
+    )
+
+
+def _invalidate_abstraction_mapping_cache(session: Session) -> None:
+    session.info.pop(_ABSTRACTION_MAPPING_CACHE_KEY, None)
+    session.info.pop(_ABSTRACTION_MAPPING_CACHE_MARKER_KEY, None)
+
+
+def _abstraction_edges_below(
+    session: Session,
+    general_topology_id: UUID,
+    *,
+    project_id: UUID,
+    abstraction_policy_version: str,
+) -> tuple[MolecularTopologyAbstraction, ...]:
+    """Load one general topology's DAG edges once per active transaction."""
+
+    cache_marker = _abstraction_mapping_cache_marker(session)
+    cached_marker = session.info.get(_ABSTRACTION_MAPPING_CACHE_MARKER_KEY)
+    cache = session.info.get(_ABSTRACTION_MAPPING_CACHE_KEY)
+    if cached_marker != cache_marker or not isinstance(cache, dict):
+        cache = {}
+        session.info[_ABSTRACTION_MAPPING_CACHE_KEY] = cache
+        session.info[_ABSTRACTION_MAPPING_CACHE_MARKER_KEY] = cache_marker
+    cache_key = (project_id, general_topology_id, abstraction_policy_version)
+    cached_edges = cache.get(cache_key)
+    if isinstance(cached_edges, tuple):
+        return cast(tuple[MolecularTopologyAbstraction, ...], cached_edges)
+
+    edge_table = cast(Any, MolecularTopologyAbstraction).__table__
+    seed = select(literal(general_topology_id).label("topology_id")).cte(
+        "stereo_abstraction_mapping_nodes",
+        recursive=True,
+    )
+    recursive_term = (
+        select(edge_table.c.specific_topology_id.label("topology_id"))
+        .join(seed, edge_table.c.general_topology_id == seed.c.topology_id)
+        .where(
+            edge_table.c.abstraction_policy_version == abstraction_policy_version,
+            _project_owner_predicate(edge_table.c.project_id, project_id),
+        )
+    )
+    reachable = seed.union(recursive_term)
+    persisted_edges = tuple(
+        session.exec(
+            select(MolecularTopologyAbstraction)
+            .join(
+                reachable,
+                col(MolecularTopologyAbstraction.general_topology_id) == reachable.c.topology_id,
+            )
+            .where(
+                col(MolecularTopologyAbstraction.abstraction_policy_version)
+                == abstraction_policy_version,
+                _project_owner_predicate(
+                    col(MolecularTopologyAbstraction.project_id),
+                    project_id,
+                ),
+            )
+        ).all()
+    )
+    edges = tuple(
+        edge
+        for edge in (*persisted_edges, *_pending_abstraction_entities(session))
+        if edge.project_id == project_id
+        and edge.abstraction_policy_version == abstraction_policy_version
+    )
+
+    # A query can autobegin the Session's transaction; store the result under
+    # the post-query marker so the next participant in the batch can reuse it.
+    current_marker = _abstraction_mapping_cache_marker(session)
+    if session.info.get(_ABSTRACTION_MAPPING_CACHE_MARKER_KEY) != current_marker:
+        cache = {}
+        session.info[_ABSTRACTION_MAPPING_CACHE_KEY] = cache
+        session.info[_ABSTRACTION_MAPPING_CACHE_MARKER_KEY] = current_marker
+    elif len(cache) >= 64 and cache_key not in cache:
+        cache.clear()
+    cache[cache_key] = edges
+    return edges
+
+
+def topology_abstraction_mapping_witness(
+    session: Session,
+    specific_topology: MolecularTopology,
+    general_topology: MolecularTopology,
+    *,
+    project_id: UUID | None = None,
+    abstraction_policy_version: str = STEREO_ABSTRACTION_POLICY_VERSION,
+    require_projection_provenance: bool = False,
+    require_unique: bool = False,
+) -> tuple[int, ...] | None:
+    """Return a DAG-proven general-to-specific atom mapping, if available.
+
+    Every edge stores a mapping from its general node's atom indices to its
+    specific node's indices. Paths compose those mappings without molecular
+    graph search. Generic persisted matches are enough to prove membership;
+    atom-map transfer can require the stronger source-order projection
+    provenance and uniqueness guarantees.
+    """
+
+    specific_id = _require_id(specific_topology, label="specific MolecularTopology")
+    general_id = _require_id(general_topology, label="general MolecularTopology")
+    atom_count = general_topology.atom_count
+    if (
+        specific_topology.project_id != general_topology.project_id
+        or specific_topology.atom_count != atom_count
+        or specific_topology.project_id is None
+    ):
+        return None
+    owner_project_id = specific_topology.project_id if project_id is None else project_id
+    if owner_project_id != specific_topology.project_id:
+        return None
+    if specific_id == general_id:
+        return tuple(range(atom_count))
+
+    reachable_edges = _abstraction_edges_below(
+        session,
+        general_id,
+        project_id=owner_project_id,
+        abstraction_policy_version=abstraction_policy_version,
+    )
+    edges_by_general: dict[UUID, list[tuple[UUID, tuple[int, ...], bool]]] = {}
+    for edge in reachable_edges:
+        if (
+            edge.project_id != owner_project_id
+            or edge.abstraction_policy_version != abstraction_policy_version
+        ):
+            continue
+        specific_edge_id = edge.specific_topology_id
+        general_edge_id = edge.general_topology_id
+        metadata = edge.abstraction_metadata
+        if not isinstance(specific_edge_id, UUID) or not isinstance(general_edge_id, UUID):
+            continue
+        if not isinstance(metadata, dict):
+            continue
+        if metadata.get("match_schema_version") != STEREO_ABSTRACTION_MATCH_SCHEMA_VERSION:
+            continue
+        raw_mapping = metadata.get("general_to_specific_atom_indices")
+        if not isinstance(raw_mapping, list) or len(raw_mapping) != atom_count:
+            continue
+        if any(not isinstance(index, int) or isinstance(index, bool) for index in raw_mapping):
+            continue
+        mapping = tuple(raw_mapping)
+        if sorted(mapping) != list(range(atom_count)):
+            continue
+        caller_metadata = metadata.get("caller_metadata")
+        trusted_mapping = (
+            isinstance(caller_metadata, dict)
+            and caller_metadata.get("atom_mapping_provenance")
+            == _PROJECTION_ATOM_MAPPING_PROVENANCE
+        )
+        edges_by_general.setdefault(general_edge_id, []).append(
+            (specific_edge_id, mapping, trusted_mapping)
+        )
+
+    initial_mapping = tuple(range(atom_count))
+    frontier = deque([(general_id, initial_mapping, True)])
+    visited: set[tuple[UUID, tuple[int, ...], bool]] = {(general_id, initial_mapping, True)}
+    witnesses: set[tuple[int, ...]] = set()
+    max_states = 4096
+    while frontier:
+        current_id, root_to_current, path_is_trusted = frontier.popleft()
+        for child_id, current_to_child, edge_is_trusted in edges_by_general.get(current_id, ()):
+            next_is_trusted = path_is_trusted and edge_is_trusted
+            if require_projection_provenance and not next_is_trusted:
+                continue
+            composed = tuple(current_to_child[index] for index in root_to_current)
+            if child_id == specific_id:
+                witnesses.add(composed)
+                if not require_unique:
+                    return composed
+                if len(witnesses) > 1:
+                    return None
+                continue
+            state = (child_id, composed, next_is_trusted)
+            if state in visited:
+                continue
+            visited.add(state)
+            if len(visited) > max_states:
+                # The provenance graph is unexpectedly large/ambiguous. The
+                # caller can retain the bounded, exact matching fallback.
+                return None
+            frontier.append(state)
+    return next(iter(witnesses)) if len(witnesses) == 1 else None
+
+
 def persist_stereo_abstraction(
     session: Session,
     specific_topology: MolecularTopology,
@@ -314,6 +657,7 @@ def persist_stereo_abstraction(
     project_id: UUID | None = None,
     abstraction_policy_version: str = STEREO_ABSTRACTION_POLICY_VERSION,
     abstraction_metadata: dict[str, Any] | None = None,
+    known_match: StereoAbstractionMatch | None = None,
 ) -> MolecularTopologyAbstraction:
     """Validate and idempotently persist one directed abstraction edge."""
 
@@ -330,23 +674,16 @@ def persist_stereo_abstraction(
         raise StereoAbstractionError(
             "general topology is not marked as a stereo-abstraction upstream"
         )
-    match = find_stereo_abstraction_match(specific_topology.mol, general_topology.mol)
-    if match is None:
-        raise StereoAbstractionError(
-            "specific topology is not a strict stereo specialization of general topology"
+
+    verified_known_match = (
+        _stereo_abstraction_match_for_known_atom_mapping(
+            specific_topology.mol,
+            general_topology.mol,
+            known_match.general_to_specific_atom_indices,
         )
-    # Edges are stored as ``specific -> general``.  A cycle would therefore
-    # already exist when the proposed general node is reachable below the
-    # proposed specific node.  The opposite direction is the normal
-    # idempotent case: the specific topology is already below this general
-    # topology and the existing edge should simply be reused below.
-    if general_id in specialized_topology_ids(
-        session,
-        specific_topology,
-        project_id=owner_project_id,
-        abstraction_policy_version=abstraction_policy_version,
-    ):
-        raise StereoAbstractionError("stereo abstraction edges must form an acyclic graph")
+        if known_match is not None
+        else None
+    )
     _acquire_identity_locks(
         session,
         (
@@ -357,6 +694,27 @@ def persist_stereo_abstraction(
             abstraction_policy_version,
         ),
     )
+
+    def match_metadata(
+        match: StereoAbstractionMatch,
+        previous: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        metadata = match.metadata()
+        previous_caller_metadata = (
+            previous.get("caller_metadata") if isinstance(previous, dict) else None
+        )
+        caller_metadata = (
+            dict(previous_caller_metadata) if isinstance(previous_caller_metadata, dict) else {}
+        )
+        caller_metadata.update(abstraction_metadata or {})
+        if verified_known_match is not None:
+            caller_metadata["atom_mapping_provenance"] = _PROJECTION_ATOM_MAPPING_PROVENANCE
+        else:
+            caller_metadata.pop("atom_mapping_provenance", None)
+        if caller_metadata:
+            metadata["caller_metadata"] = caller_metadata
+        return metadata
+
     existing = session.exec(
         select(MolecularTopologyAbstraction).where(
             MolecularTopologyAbstraction.specific_topology_id == specific_id,
@@ -369,8 +727,14 @@ def persist_stereo_abstraction(
         )
     ).first()
     if existing is not None:
+        if verified_known_match is not None:
+            existing.abstraction_metadata = match_metadata(
+                verified_known_match,
+                existing.abstraction_metadata,
+            )
+            _invalidate_abstraction_mapping_cache(session)
         return existing
-    for pending in session.info.get("_fast_pending_entities", ()):
+    for pending in _pending_abstraction_entities(session):
         if not isinstance(pending, MolecularTopologyAbstraction):
             continue
         if (
@@ -379,10 +743,32 @@ def persist_stereo_abstraction(
             and pending.general_topology_id == general_id
             and pending.abstraction_policy_version == abstraction_policy_version
         ):
+            if verified_known_match is not None:
+                pending.abstraction_metadata = match_metadata(
+                    verified_known_match,
+                    pending.abstraction_metadata,
+                )
+                _invalidate_abstraction_mapping_cache(session)
             return pending
-    metadata = match.metadata()
-    if abstraction_metadata:
-        metadata["caller_metadata"] = dict(abstraction_metadata)
+
+    match = verified_known_match or find_stereo_abstraction_match(
+        specific_topology.mol,
+        general_topology.mol,
+    )
+    if match is None:
+        raise StereoAbstractionError(
+            "specific topology is not a strict stereo specialization of general topology"
+        )
+    # Edges are stored as ``specific -> general``. A cycle would exist when
+    # the proposed general node is already reachable below the specific node.
+    if general_id in specialized_topology_ids(
+        session,
+        specific_topology,
+        project_id=owner_project_id,
+        abstraction_policy_version=abstraction_policy_version,
+    ):
+        raise StereoAbstractionError("stereo abstraction edges must form an acyclic graph")
+
     edge = _new_entity(
         session,
         MolecularTopologyAbstraction,
@@ -390,9 +776,10 @@ def persist_stereo_abstraction(
         general_topology=general_topology,
         project_id=owner_project_id,
         abstraction_policy_version=abstraction_policy_version,
-        abstraction_metadata=metadata,
+        abstraction_metadata=match_metadata(match),
     )
     _flush_new_entity(session, edge, label="MolecularTopologyAbstraction")
+    _invalidate_abstraction_mapping_cache(session)
     return edge
 
 
@@ -415,6 +802,7 @@ def find_upstream_topologies(
     specific_id = _require_id(specific_topology, label="specific MolecularTopology")
     specific_project_id = getattr(specific_topology, "project_id", None)
     owner_project_id = specific_project_id if project_id is None else project_id
+    specific_graph_hash = getattr(specific_topology, "stereo_agnostic_graph_hash", None)
     candidates_by_id: dict[UUID, MolecularTopology] = {}
     for candidate in candidate_topologies:
         candidate_id = _require_id(candidate, label="candidate MolecularTopology")
@@ -422,34 +810,51 @@ def find_upstream_topologies(
             candidate_id != specific_id
             and candidate.is_stereo_abstraction_upstream
             and candidate.formula_id == specific_topology.formula_id
+            and (
+                specific_graph_hash is None
+                or getattr(candidate, "stereo_agnostic_graph_hash", None) == specific_graph_hash
+            )
             and getattr(candidate, "project_id", None) == owner_project_id
         ):
             candidates_by_id[candidate_id] = candidate
-    for candidate in session.exec(
-        select(MolecularTopology).where(
-            col(MolecularTopology.formula_id) == specific_topology.formula_id,
-            col(MolecularTopology.atom_count) == specific_topology.atom_count,
-            col(MolecularTopology.formal_charge) == specific_topology.formal_charge,
-            col(MolecularTopology.is_stereo_abstraction_upstream).is_(True),
-            col(MolecularTopology.id) != specific_id,
-            _project_owner_predicate(col(MolecularTopology.project_id), owner_project_id),
+    upstream_predicates = [
+        col(MolecularTopology.formula_id) == specific_topology.formula_id,
+        col(MolecularTopology.atom_count) == specific_topology.atom_count,
+        col(MolecularTopology.formal_charge) == specific_topology.formal_charge,
+        col(MolecularTopology.is_stereo_abstraction_upstream).is_(True),
+        col(MolecularTopology.id) != specific_id,
+        _project_owner_predicate(col(MolecularTopology.project_id), owner_project_id),
+    ]
+    if specific_graph_hash is not None:
+        upstream_predicates.append(
+            col(MolecularTopology.stereo_agnostic_graph_hash) == specific_graph_hash
         )
-    ).all():
+    for candidate in session.exec(select(MolecularTopology).where(*upstream_predicates)).all():
         candidate_id = _require_id(candidate, label="candidate MolecularTopology")
         candidates_by_id[candidate_id] = candidate
 
-    matches = tuple(
-        candidate
-        for candidate in sorted(
-            candidates_by_id.values(),
-            key=lambda item: (
-                item.graph_hash,
-                str(_require_id(item, label="MolecularTopology")),
-            ),
-        )
-        if find_stereo_abstraction_match(specific_topology.mol, candidate.mol) is not None
-    )
-    return matches or (specific_topology,)
+    matches: list[MolecularTopology] = []
+    for candidate in sorted(
+        candidates_by_id.values(),
+        key=lambda item: (
+            item.graph_hash,
+            str(_require_id(item, label="MolecularTopology")),
+        ),
+    ):
+        # A previously validated DAG path is already a complete proof. Do not
+        # rediscover the same atom correspondence for every repeated ingestion.
+        if (
+            topology_abstraction_mapping_witness(
+                session,
+                specific_topology,
+                candidate,
+                project_id=owner_project_id,
+                abstraction_policy_version=abstraction_policy_version,
+            )
+            is not None
+        ) or find_stereo_abstraction_match(specific_topology.mol, candidate.mol) is not None:
+            matches.append(candidate)
+    return tuple(matches) or (specific_topology,)
 
 
 def ensure_topology_upstreams(
@@ -551,40 +956,33 @@ def backfill_stereo_abstraction_downstreams(
             "general topology is not marked as a stereo-abstraction upstream"
         )
 
+    general_graph_hash = getattr(general_topology, "stereo_agnostic_graph_hash", None)
     candidates_by_id: dict[UUID, MolecularTopology] = {}
     for candidate in candidate_topologies:
         candidate_id = _require_id(candidate, label="candidate MolecularTopology")
         if (
             candidate_id != general_id
+            and (
+                general_graph_hash is None
+                or getattr(candidate, "stereo_agnostic_graph_hash", None) == general_graph_hash
+            )
             and getattr(candidate, "project_id", None) == owner_project_id
         ):
             candidates_by_id[candidate_id] = candidate
-    for candidate in session.exec(
-        select(MolecularTopology).where(
-            col(MolecularTopology.formula_id) == general_topology.formula_id,
-            col(MolecularTopology.atom_count) == general_topology.atom_count,
-            col(MolecularTopology.formal_charge) == general_topology.formal_charge,
-            col(MolecularTopology.id) != general_id,
-            _project_owner_predicate(col(MolecularTopology.project_id), owner_project_id),
+    downstream_predicates = [
+        col(MolecularTopology.formula_id) == general_topology.formula_id,
+        col(MolecularTopology.atom_count) == general_topology.atom_count,
+        col(MolecularTopology.formal_charge) == general_topology.formal_charge,
+        col(MolecularTopology.id) != general_id,
+        _project_owner_predicate(col(MolecularTopology.project_id), owner_project_id),
+    ]
+    if general_graph_hash is not None:
+        downstream_predicates.append(
+            col(MolecularTopology.stereo_agnostic_graph_hash) == general_graph_hash
         )
-    ).all():
+    for candidate in session.exec(select(MolecularTopology).where(*downstream_predicates)).all():
         candidates_by_id[_require_id(candidate, label="candidate MolecularTopology")] = candidate
 
-    matches = []
-    for candidate in candidates_by_id.values():
-        match = find_stereo_abstraction_match(candidate.mol, general_topology.mol)
-        if match is not None:
-            matches.append((match.abstracted_feature_count, candidate, match))
-    # Add the nearest materialized level first.  This preserves the intended
-    # abstraction chain and avoids a redundant direct edge from a two-centre
-    # topology to a zero-centre topology when a one-centre path already exists.
-    matches.sort(
-        key=lambda item: (
-            item[0],
-            item[1].graph_hash,
-            str(_require_id(item[1], label="candidate MolecularTopology")),
-        )
-    )
     pending_edges = list(_pending_abstraction_entities(session))
     rows = session.exec(
         select(
@@ -621,6 +1019,31 @@ def backfill_stereo_abstraction_downstreams(
             and edge.project_id == owner_project_id
         ):
             general_by_specific.setdefault(edge_specific_id, set()).add(edge_general_id)
+
+    matches = []
+    for candidate in candidates_by_id.values():
+        # Existing DAG descendants were already validated when their edge was
+        # written; backfill should only run expensive chemistry matching for
+        # disconnected candidates that may need a new relation.
+        if _topology_reaches_general(
+            general_by_specific,
+            _require_id(candidate, label="candidate MolecularTopology"),
+            general_id,
+        ):
+            continue
+        match = find_stereo_abstraction_match(candidate.mol, general_topology.mol)
+        if match is not None:
+            matches.append((match.abstracted_feature_count, candidate, match))
+    # Add the nearest materialized level first.  This preserves the intended
+    # abstraction chain and avoids a redundant direct edge from a two-centre
+    # topology to a zero-centre topology when a one-centre path already exists.
+    matches.sort(
+        key=lambda item: (
+            item[0],
+            item[1].graph_hash,
+            str(_require_id(item[1], label="candidate MolecularTopology")),
+        )
+    )
     edges: list[MolecularTopologyAbstraction] = []
     for _feature_count, candidate, _match in matches:
         candidate_id = _require_id(candidate, label="candidate MolecularTopology")
@@ -664,7 +1087,7 @@ def persist_stereo_abstraction_projection(
 
     specific_id = _require_id(specific_topology, label="specific MolecularTopology")
     projection = stereo_abstraction_projection(specific_topology.mol, cleared_features)
-    normalized = normalize_topology(
+    normalized, source_to_general = normalize_topology_with_mapping(
         projection.molecule,
         add_hydrogens=False,
         reconstruction_method=STEREO_ABSTRACTION_RECONSTRUCTION_METHOD,
@@ -677,7 +1100,20 @@ def persist_stereo_abstraction_projection(
             "is_stereo_abstraction_upstream": True,
         },
     )
-    persisted = persist_molecular_topology(session, normalized, context=context)
+    persisted = persist_molecular_topology(
+        session,
+        normalized,
+        context=context,
+        register_upstream=False,
+    )
+    general_to_specific = [0] * len(source_to_general)
+    for specific_index, general_index in enumerate(source_to_general):
+        general_to_specific[general_index] = specific_index
+    known_match = _stereo_abstraction_match_for_known_atom_mapping(
+        specific_topology.mol,
+        persisted.topology.mol,
+        tuple(general_to_specific),
+    )
     edge = persist_stereo_abstraction(
         session,
         specific_topology,
@@ -689,6 +1125,7 @@ def persist_stereo_abstraction_projection(
         ),
         abstraction_policy_version=abstraction_policy_version,
         abstraction_metadata=abstraction_metadata,
+        known_match=known_match,
     )
     context_candidates = tuple(
         topology
@@ -776,6 +1213,105 @@ def specialized_topology_ids(
     return tuple(row if isinstance(row, UUID) else row[0] for row in rows)
 
 
+def topology_dag_components_by_root(
+    session: Session,
+    topology_ids: Iterable[UUID],
+    *,
+    project_id: UUID,
+    abstraction_policy_version: str = STEREO_ABSTRACTION_POLICY_VERSION,
+) -> dict[UUID, tuple[UUID, ...]]:
+    """Return each root's bounded inheritance component in one recursive query.
+
+    The abstraction edge is stored as ``specific -> general``. Compatibility
+    lookup needs both directions because a source geometry may be a strict
+    specialization, a generalization, or a sibling reached through their
+    shared abstraction parent. The root identity is carried through the
+    recursive CTE so components stay separate even when several reactions are
+    processed in one batch.
+    """
+
+    roots = tuple(sorted(set(topology_ids), key=str))
+    if not roots:
+        return {}
+    edge_table = cast(Any, MolecularTopologyAbstraction).__table__
+    seed: Any = (
+        select(
+            col(MolecularTopology.id).label("root_id"),
+            col(MolecularTopology.id).label("topology_id"),
+        )
+        .where(
+            col(MolecularTopology.id).in_(roots),
+            col(MolecularTopology.project_id) == project_id,
+        )
+        .cte("molecular_topology_dag_components_by_root", recursive=True)
+    )
+    recursive_term = (
+        select(
+            seed.c.root_id,
+            case(
+                (
+                    edge_table.c.specific_topology_id == seed.c.topology_id,
+                    edge_table.c.general_topology_id,
+                ),
+                else_=edge_table.c.specific_topology_id,
+            ).label("topology_id"),
+        )
+        .select_from(seed)
+        .join(
+            edge_table,
+            or_(
+                edge_table.c.specific_topology_id == seed.c.topology_id,
+                edge_table.c.general_topology_id == seed.c.topology_id,
+            ),
+        )
+        .where(
+            edge_table.c.project_id == project_id,
+            edge_table.c.abstraction_policy_version == abstraction_policy_version,
+        )
+    )
+    reachable = seed.union(recursive_term)
+    rows = session.exec(
+        select(reachable.c.root_id, reachable.c.topology_id).select_from(reachable).distinct()
+    ).all()
+    components: dict[UUID, set[UUID]] = {root_id: set() for root_id in roots}
+    for row in rows:
+        root_id = cast(UUID | None, row[0])
+        topology_id = cast(UUID | None, row[1])
+        if isinstance(root_id, UUID) and isinstance(topology_id, UUID):
+            components.setdefault(root_id, set()).add(topology_id)
+    return {
+        root_id: tuple(sorted(component_ids, key=str))
+        for root_id, component_ids in components.items()
+    }
+
+
+def topology_dag_component_ids(
+    session: Session,
+    topology_ids: Iterable[UUID],
+    *,
+    project_id: UUID,
+    abstraction_policy_version: str = STEREO_ABSTRACTION_POLICY_VERSION,
+) -> tuple[UUID, ...]:
+    """Return the union of the bounded components around the supplied roots.
+
+    Use :func:`topology_dag_components_by_root` when candidate ownership must
+    remain scoped to an individual root.
+    """
+
+    components = topology_dag_components_by_root(
+        session,
+        topology_ids,
+        project_id=project_id,
+        abstraction_policy_version=abstraction_policy_version,
+    )
+    return tuple(
+        sorted(
+            {topology_id for component_ids in components.values() for topology_id in component_ids},
+            key=str,
+        )
+    )
+
+
 def specialized_topologies(
     session: Session,
     general_topology: MolecularTopology | UUID,
@@ -841,4 +1377,7 @@ __all__ = [
     "specialized_topologies",
     "specialized_topology_ids",
     "stereo_abstraction_projection",
+    "topology_dag_component_ids",
+    "topology_dag_components_by_root",
+    "topology_abstraction_mapping_witness",
 ]

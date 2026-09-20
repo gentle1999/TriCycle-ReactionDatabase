@@ -436,6 +436,45 @@ def test_mapped_smiles_restores_ez_after_database_round_trip(
     assert "/" in mapped_smiles or "\\" in mapped_smiles
 
 
+def test_transition_state_mapping_smiles_can_omit_unrepresentable_metal_ez() -> None:
+    """TS map identity remains serializable when E/Z uses a dative metal bond."""
+
+    molecule = Chem.RWMol()
+    for atomic_number, formal_charge in ((7, 0), (6, 0), (45, 3), (8, -1), (6, 0)):
+        atom = Chem.Atom(atomic_number)
+        atom.SetFormalCharge(formal_charge)
+        molecule.AddAtom(atom)
+    molecule.AddBond(0, 1, Chem.BondType.DOUBLE)
+    molecule.AddBond(0, 2, Chem.BondType.DATIVE)
+    molecule.AddBond(1, 3, Chem.BondType.SINGLE)
+    molecule.AddBond(1, 4, Chem.BondType.SINGLE)
+    topology_mol = molecule.GetMol()
+    double_bond = topology_mol.GetBondBetweenAtoms(0, 1)
+    assert double_bond is not None
+    double_bond.SetStereoAtoms(2, 3)
+    double_bond.SetStereo(Chem.BondStereo.STEREOE)
+    topology = SimpleNamespace(atom_count=topology_mol.GetNumAtoms(), mol=topology_mol)
+
+    with pytest.raises(ValueError, match="no SMILES traversal preserves"):
+        mapped_smiles_for_topology(topology, range(1, topology.atom_count + 1))
+
+    mapped_smiles = mapped_smiles_for_topology(
+        topology,
+        range(1, topology.atom_count + 1),
+        include_stereochemistry=False,
+    )
+    parser = Chem.SmilesParserParams()
+    parser.removeHs = False
+    parsed = Chem.MolFromSmiles(mapped_smiles, parser)
+    assert parsed is not None
+    assert {atom.GetAtomMapNum() for atom in parsed.GetAtoms()} == {1, 2, 3, 4, 5}
+    assert not any(
+        bond.GetStereo() in {Chem.BondStereo.STEREOE, Chem.BondStereo.STEREOZ}
+        for bond in parsed.GetBonds()
+    )
+    assert "/" not in mapped_smiles and "\\" not in mapped_smiles
+
+
 def test_mapped_smiles_keeps_distinct_symmetric_diene_configurations() -> None:
     """Adding reaction maps must not collapse strict E/Z topologies."""
 

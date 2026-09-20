@@ -71,6 +71,32 @@ docker compose -f compose.yaml -f compose.compute.yaml run --rm --no-deps \
 这里只接受真实 Gaussian/ORCA 文件或目录，禁止使用仓库中的合成 fixture；如果某一批触发 PostgreSQL 的
 `TRICYCLE_QUERY_STATEMENT_TIMEOUT_MS`，该批应视为失败，而不是用放宽超时后的结果代表当前生产配置。
 
+### 真实文件解析性能报告
+
+CI 的 `real-world-ingestion-performance` job 会解析 256 个真实 product/TS 文件及 7 个极限回归样本，
+以 runner 可见的全部 CPU 启动共享 MolOP 进程池，并导出 JSON 与 Markdown artifact。也可以在本地生成同格式报告：
+
+```bash
+mkdir -p .tmp/real-world-batch-256
+for archive in tests/fixtures/real_world_batch_256/corpus-*.tar.gz; do
+  tar -xzf "$archive" -C .tmp/real-world-batch-256
+done
+uv run --frozen python scripts/benchmark_real_world_ingestion.py \
+  --fixture-dir .tmp/real-world-batch-256 \
+  --fixture-dir tests/fixtures/real_world_extremes \
+  --n-jobs -1 \
+  --output .tmp/performance-reports/real-world-ingestion.json \
+  --markdown-output .tmp/performance-reports/real-world-ingestion.md
+```
+
+报告逐文件记录输入哈希/大小、帧和 segment 数、TS inference 成败、排队等待与解析耗时，以及
+汇总帧/秒和 MiB/秒。256 个批量样本以多个小型 tar.gz 分片存储，但 CI/本地会先解包成原始 `.log`；其余 gzip 极限样本也会在计时前展开，
+因此计时中的所有解析输入都是未压缩文本。指标覆盖共享 MolOP 解析与帧物化，不含归档解包、RustFS、数据库持久化或 profile 刷新；
+文件准入并发默认为进程池大小的 4 倍，避免高并行进程池断粮；
+不同硬件之间不应直接用绝对耗时作回归门槛。样本说明见
+[`real_world_batch_256`](../tests/fixtures/real_world_batch_256/README.md) 和
+[`real_world_extremes`](../tests/fixtures/real_world_extremes/README.md)。
+
 ## 数据库
 
 启动明确版本 tag 的 PostgreSQL/RDKit 容器：
@@ -544,6 +570,7 @@ writer endpoint 对应用呈现为同一个逻辑 engine，节点数量不会变
 | `TRICYCLE_UPLOAD_WORKER_CONCURRENCY` | `2` | 仅用于旧 pending-ingestion 恢复的并发数 |
 | `TRICYCLE_UPLOAD_WORKER_LEASE_SECONDS` | `3600` | worker 处理 lease 的有效期；worker 用心跳续租，过期后可被重新领取 |
 | `TRICYCLE_UPLOAD_WORKER_PROFILE_REFRESH_MAX_DELAY_SECONDS` | `60` | 解析队列持续繁忙时，延迟 thermodynamic profile 刷新的最长时间；队列排空时立即刷新 |
+| `TRICYCLE_UPLOAD_WORKER_PROFILE_REFRESH_BATCH_SIZE` | `32` | profile 独立领取/提交微批大小；建议保持在 16–32 |
 | `TRICYCLE_UPLOAD_CLIENT_LEASE_SECONDS` | `900` | HTTP 上传 lease 的恢复阈值；请求中断后超过此时间可回到队列 |
 | `TRICYCLE_UPLOAD_WORKER_POLL_INTERVAL_SECONDS` | `1` | upload-worker 轮询 staged 项和过期 lease 的间隔 |
 | `TRICYCLE_UPLOAD_WORKER_STATEMENT_TIMEOUT_MS` | `120000` | 后台解析/持久化单条 PostgreSQL statement 的独立超时；交互 API 仍使用 `TRICYCLE_QUERY_STATEMENT_TIMEOUT_MS` |
@@ -553,7 +580,11 @@ writer endpoint 对应用呈现为同一个逻辑 engine，节点数量不会变
 | `TRICYCLE_STRUCTURE_QUERY_MAX_CHARACTERS` | `16384` | SMILES/SMARTS/reaction 输入长度上限 |
 | `TRICYCLE_STRUCTURE_CANDIDATE_LIMIT` | `50000` | 需要逐候选后处理的最大关系行数 |
 | `TRICYCLE_MOLOP_BATCH_N_JOBS` | `-1` | 共享 MolOP 进程数；`-1` 使用 worker 可见的全部 CPU 核，正整数用于主动限界 |
-| `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS` | `60` | 10 MiB 文件的 MolOP 解析与 MolGR 帧重建基准时长；更大文件按体积等比例放大，较小文件至少使用该基准；超时文件单独失败，批次继续处理 |
+| `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS` | `60` | 前 10 MiB 的解析基准时长；之后每增加 10 MiB，按 size multiplier 增加预算；gzip 按可用的未压缩体积提示估算 |
+| `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SIZE_MULTIPLIER` | `1.5` | 每增加 10 MiB 所加预算的倍率；默认每 10 MiB 增加 90 秒，超时只隔离当前文件 |
+| `TRICYCLE_MOLECULAR_GRAPH_MATCH_TIMEOUT_SECONDS` | `5` | 大分子单次 RDKit 全图匹配的硬超时；超时会终止隔离子进程 |
+| `TRICYCLE_MOLECULAR_GRAPH_MATCH_ISOLATION_ATOM_COUNT` | `48` | 触发可终止隔离进程的分子原子数阈值；小分子保留进程内快速路径 |
+| `TRICYCLE_MOLECULAR_GRAPH_MATCH_MAX_RESULTS` | `1000` | 单次 RDKit 匹配最多返回的映射数，防止对称结构无限扩张结果集 |
 
 描述符、Murcko scaffold、手性和匹配次数等逐候选计算必须先通过 Formula、
 Topology 或
@@ -728,9 +759,12 @@ RustFS 并将 item 标记为 `staged`，独立 `upload-worker` 按小页连续�
 不会因为多个用户或多个单文件上传会话而并发打开一批数据库持久化会话。实际解析并发只由
 `TRICYCLE_MOLOP_BATCH_N_JOBS` 决定，`-1` 使用 worker 可见的全部 CPU 核。
 
-持久化仍使用 legacy bulk 热路径：reaction SMILES topology 缓存和单次 set-based Geometry
-匹配保持开启，逐文件 concrete/logical/reverse reconciliation 不得直接插入；项目范围和所有权
-约束仍然必须执行。修改这些边界前必须同步更新架构说明并用同一批真实文件复测字节吞吐和失败隔离。
+持久化消费者使用统一的正确性路径：reaction SMILES topology 缓存和 set-based Geometry
+预加载保持开启，同时为每个微批建立并完成拓扑 DAG、concrete/logical membership 和 reverse
+reconciliation；只有这个屏障完成后才会写入 profile dirty 队列。统一 upload-worker 不再进入
+旧的 legacy bulk bypass，因此单文件、批次、本地导入和远程上传都遵守相同顺序。项目范围和
+所有权约束仍然必须执行。修改这些边界前必须同步更新架构说明并用同一批真实文件复测字节吞吐
+和失败隔离。
 
 #### 项目级批量变更后的统计刷新
 
@@ -743,7 +777,7 @@ PostgreSQL 的自动 ANALYZE 阈值按整张表计算。单个项目即使刚刚
 
 解析微批只写入帧、几何、反应绑定和持久化队列状态，不在每个微批中重建全局
 thermodynamic profile。受影响的 `MappedReaction` 会持久化标记为 dirty；队列排空后，worker
-在独立短事务中按最多 256 个 reaction 分块刷新 profile，然后再执行项目级 `ANALYZE`。队列持续
+在独立短事务中按最多 32 个 reaction 分块刷新 profile，然后再执行项目级 `ANALYZE`。队列持续
 有任务时，`TRICYCLE_UPLOAD_WORKER_PROFILE_REFRESH_MAX_DELAY_SECONDS` 提供最长延迟兜底；worker
 重启后也会从 dirty 标记恢复未完成的刷新。
 
@@ -793,7 +827,7 @@ make import-artifacts
 - 指纹阶段使用独立线程池，当前内部上限为 `32` 个 worker，没有对应的环境变量或 CLI 参数。若统计中的瓶颈在 fingerprint 阶段，应先检查磁盘和 SHA-256 读取开销，不要盲目增大 MolOP 解析并发。
 - `IMPORT_COMMIT_BATCH_FILES` 目前仅为旧 CLI 参数保留，不再控制本地事务、worker 领取窗口或持久化微批；worker 默认按 16 个文件或 256 帧提交，可通过 `TRICYCLE_UPLOAD_WORKER_PERSISTENCE_BATCH_FILES` 和 `TRICYCLE_UPLOAD_WORKER_PERSISTENCE_FRAME_LIMIT` 调整。若调整该边界，应同步观察锁竞争、statement timeout 和数据库内存压力。
 - `IMPORT_MAX_TRANSIENT_RETRIES=3` 建议保持不变。它只用于死锁、序列化冲突、连接瞬断等瞬态错误；提高它不能修复持续性错误，只会延长失败恢复时间。
-- `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS=60` 是 10 MiB 文件的基准预算，并随源文件大小放大；它是异常文件隔离参数，不是提速参数。慢磁盘或大文件较多时提高，想更快跳过异常文件时降低，但应先确认失败率。
+- `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SECONDS=60` 覆盖前 10 MiB；之后每增加 10 MiB，默认再增加 90 秒（由 `TRICYCLE_MOLOP_FILE_PARSE_TIMEOUT_SIZE_MULTIPLIER=1.5` 控制）。gzip 使用未压缩体积提示估算。它用于按文件大小隔离异常任务，不是提速参数；调整前应观察真实大文件的解析时长和失败率。
 - `TRICYCLE_MOLOP_CAPTURE_SOURCE_EVIDENCE=true` 是强制设置。segment 边界、frame role、source locator、source span 和 block hash 是无损入库与重解析替换所需的证据；设为 `false` 会直接拒绝启动。`TRICYCLE_MOLOP_PARALLEL_FRAME_PERSISTENCE=true` 应保持开启。
 
 浏览器和远程 API 上传使用统一的 durable `upload-worker`，参数不要与本地导入的 `IMPORT_*` 混用。`TRICYCLE_UPLOAD_MAX_CONCURRENCY=8` 限制 RustFS 读取；`TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES=0` 自动设置连续领取的预取上限，持久化提交微批默认按 16 个文件或 256 帧；`TRICYCLE_UPLOAD_WORKER_CONCURRENCY` 仅用于旧 pending-ingestion 恢复。专用算力主机默认使用 `TRICYCLE_MOLOP_BATCH_N_JOBS=-1`，并根据 CPU、内存和数据库写入延迟复测。

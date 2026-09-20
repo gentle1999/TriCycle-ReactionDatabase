@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
+import logging
+
 from rdkit import Chem
+
+from tricycle_reaction_db.application.services.rdkit_graph_matching import (
+    MolecularGraphMatchTimeoutError,
+    get_substruct_matches,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _electronic_graph_projection(molecule: Chem.Mol) -> Chem.Mol:
@@ -61,13 +70,22 @@ def source_geometry_compatible_topology(
     extra_bonds = endpoint_graph.GetNumBonds() - source_graph.GetNumBonds()
     if extra_bonds < 0 or extra_bonds > max_endpoint_extra_bonds:
         return False
-    return bool(
-        endpoint_graph.GetSubstructMatches(
-            source_graph,
-            useChirality=False,
-            uniquify=True,
+    try:
+        return bool(
+            get_substruct_matches(
+                endpoint_graph,
+                source_graph,
+                use_chirality=False,
+                max_matches=1,
+                hard_timeout_for_large_molecules=True,
+            )
         )
-    )
+    except MolecularGraphMatchTimeoutError:
+        # Compatibility is a conservative source-selection predicate. A
+        # timed-out candidate is not eligible, while the surrounding upload or
+        # profile refresh can continue with the remaining DAG candidates.
+        logger.warning("Skipping source geometry compatibility after an RDKit graph-match timeout")
+        return False
 
 
 __all__ = ["source_geometry_compatible_topology"]

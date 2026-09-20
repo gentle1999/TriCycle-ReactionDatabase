@@ -1,0 +1,2314 @@
+{
+  "expected_file_count": 256,
+  "reaction_pair_count": 128,
+  "samples": [
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "prod",
+      "file": "000__000000000000_000000403256__prod.log",
+      "pair_id": "000000000000_000000403256",
+      "source_relative_path": "000000000000_000000403256/00/prod/000000000000_000000403256_00_00.prod.log",
+      "source_sha256": "878609ebdaea0fe52684026f751804ae4e8001d0a96e6cbdb6581ba0f519b1f4",
+      "source_size_bytes": 515319
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "ts",
+      "file": "001__000000000000_000000403256__ts.log",
+      "pair_id": "000000000000_000000403256",
+      "source_relative_path": "000000000000_000000403256/00/ts/000000000000_000000403256_00_conf_00_ts.f77fea256d6c.log",
+      "source_sha256": "b2000904ff43eb170ffcca411aaf8fcfd0716537fdc3dc057465ed7248a80892",
+      "source_size_bytes": 913636
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "prod",
+      "file": "002__000000000000_000005183621__prod.log",
+      "pair_id": "000000000000_000005183621",
+      "source_relative_path": "000000000000_000005183621/00/prod/000000000000_000005183621_00_00.prod.log",
+      "source_sha256": "bb90eb8ed6be9e3fa853f340ff318f34754dd101f88ff7192b70b851a24ddc65",
+      "source_size_bytes": 210041
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "ts",
+      "file": "003__000000000000_000005183621__ts.log",
+      "pair_id": "000000000000_000005183621",
+      "source_relative_path": "000000000000_000005183621/00/ts/000000000000_000005183621_00_conf_02_ts.2b5bdab6d162.log",
+      "source_sha256": "23a905608c2e1be14e5a0078b4110b4e52c1ccd2909355942cdb9a8fc6d7525b",
+      "source_size_bytes": 3624646
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "prod",
+      "file": "004__000000000000_000039339604__prod.log",
+      "pair_id": "000000000000_000039339604",
+      "source_relative_path": "000000000000_000039339604/00/prod/000000000000_000039339604_00_00.prod.log",
+      "source_sha256": "4e9fb21b08f404f9b5f290c66bb24aca453a3d6a70ddaa02a621728e695a0782",
+      "source_size_bytes": 656193
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "ts",
+      "file": "005__000000000000_000039339604__ts.log",
+      "pair_id": "000000000000_000039339604",
+      "source_relative_path": "000000000000_000039339604/00/ts/000000000000_000039339604_00_conf_00_ts.f9a2c76496e9.log",
+      "source_sha256": "e455166d4e5bb8257e039f3f8767a49c3cb0f30ec06cae14a1e0a2b4cf87351f",
+      "source_size_bytes": 1515710
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "prod",
+      "file": "006__000000000000_000137677401__prod.log",
+      "pair_id": "000000000000_000137677401",
+      "source_relative_path": "000000000000_000137677401/00/prod/000000000000_000137677401_00_00.prod.log",
+      "source_sha256": "49d831a2bea55837fc3aa45b1c06b815bda2d415b0b5a5e8a8754e94a95c775f",
+      "source_size_bytes": 1454950
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "ts",
+      "file": "007__000000000000_000137677401__ts.log",
+      "pair_id": "000000000000_000137677401",
+      "source_relative_path": "000000000000_000137677401/00/ts/000000000000_000137677401_00_conf_00_ts.baa01da0f307.log",
+      "source_sha256": "a5a9b7ad82204db1d5354c7fcf4c5076273886f578d1509844300f61d3197433",
+      "source_size_bytes": 5582259
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "prod",
+      "file": "008__000001577290_000004994469__prod.log",
+      "pair_id": "000001577290_000004994469",
+      "source_relative_path": "000001577290_000004994469/00/prod/000001577290_000004994469_00_00.prod.log",
+      "source_sha256": "e9af236548d8e958e3a8589c98e180fbf57a84e603122603baa109ab5164d6ab",
+      "source_size_bytes": 101944
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "ts",
+      "file": "009__000001577290_000004994469__ts.log",
+      "pair_id": "000001577290_000004994469",
+      "source_relative_path": "000001577290_000004994469/00/ts/000001577290_000004994469_00_conf_00_ts.a8a35777e23b.log",
+      "source_sha256": "ba9101e5c53dca65594ddc6186fb95705fc7851f2235c961075602ee08a09b34",
+      "source_size_bytes": 1042395
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "prod",
+      "file": "010__000001577290_000031414746__prod.log",
+      "pair_id": "000001577290_000031414746",
+      "source_relative_path": "000001577290_000031414746/00/prod/000001577290_000031414746_00_00.prod.log",
+      "source_sha256": "8bd339c9f4a9fda1b75e4a394cd82b5b63f34c9639f510a837a435c62d65b267",
+      "source_size_bytes": 731446
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "ts",
+      "file": "011__000001577290_000031414746__ts.log",
+      "pair_id": "000001577290_000031414746",
+      "source_relative_path": "000001577290_000031414746/00/ts/000001577290_000031414746_00_conf_04_ts.943ef1c58917.log",
+      "source_sha256": "485401667cd5968d99bdddb76f2559e41577762903d1730c9790660532f640df",
+      "source_size_bytes": 2412514
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "prod",
+      "file": "012__000001577290_000104374202__prod.log",
+      "pair_id": "000001577290_000104374202",
+      "source_relative_path": "000001577290_000104374202/00/prod/000001577290_000104374202_00_00.prod.log",
+      "source_sha256": "2c45b5df5c5a4b37fe4e0586e1ece130d1267ca339649bf353b4681346966900",
+      "source_size_bytes": 753076
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "ts",
+      "file": "013__000001577290_000104374202__ts.log",
+      "pair_id": "000001577290_000104374202",
+      "source_relative_path": "000001577290_000104374202/00/ts/000001577290_000104374202_00_conf_00_ts.151571c70510.log",
+      "source_sha256": "44b9ad3cc97414254551c61d6cd6d62568920b76f1b3510f84c5b415267b62e4",
+      "source_size_bytes": 1749435
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "prod",
+      "file": "014__000001590021_000002041074__prod.log",
+      "pair_id": "000001590021_000002041074",
+      "source_relative_path": "000001590021_000002041074/00/prod/000001590021_000002041074_00_00.prod.log",
+      "source_sha256": "4f3413d49393e20e3424f8386902691a86a6edc73784419387184fe856ef9b26",
+      "source_size_bytes": 564519
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "ts",
+      "file": "015__000001590021_000002041074__ts.log",
+      "pair_id": "000001590021_000002041074",
+      "source_relative_path": "000001590021_000002041074/00/ts/000001590021_000002041074_00_conf_00_ts.b6a4620b432b.log",
+      "source_sha256": "ee07bdf3cce395aa4896d96b933b862667ec0c24d9c4d84eee90866719e1a26a",
+      "source_size_bytes": 1236125
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "prod",
+      "file": "016__000001590021_000018022367__prod.log",
+      "pair_id": "000001590021_000018022367",
+      "source_relative_path": "000001590021_000018022367/00/prod/000001590021_000018022367_00_00.prod.log",
+      "source_sha256": "358903e2b9cba8138e54c08184f16782102fb0b9ea45bb97062abadcad915125",
+      "source_size_bytes": 983773
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "ts",
+      "file": "017__000001590021_000018022367__ts.log",
+      "pair_id": "000001590021_000018022367",
+      "source_relative_path": "000001590021_000018022367/00/ts/000001590021_000018022367_00_conf_00_ts.e531d9a84282.log",
+      "source_sha256": "a17cdba91b4e671b48d20369dbc898405a7376a28dc240abd987ac63f141fb3a",
+      "source_size_bytes": 1841593
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "prod",
+      "file": "018__000001590021_000103643031__prod.log",
+      "pair_id": "000001590021_000103643031",
+      "source_relative_path": "000001590021_000103643031/00/prod/000001590021_000103643031_00_00.prod.log",
+      "source_sha256": "627842509b1ff16e764ac25347e8fef0d709708ed5d3134f2223dc623766626f",
+      "source_size_bytes": 1406678
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "ts",
+      "file": "019__000001590021_000103643031__ts.log",
+      "pair_id": "000001590021_000103643031",
+      "source_relative_path": "000001590021_000103643031/00/ts/000001590021_000103643031_00_conf_00_ts.63c97ee01c81.log",
+      "source_sha256": "ffebc33c0a53852585fa0d7afd189deb0eb75c8321239f15f13f68308781f279",
+      "source_size_bytes": 1614332
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "prod",
+      "file": "020__000001680735_000001735147__prod.log",
+      "pair_id": "000001680735_000001735147",
+      "source_relative_path": "000001680735_000001735147/00/prod/000001680735_000001735147_00_00.prod.log",
+      "source_sha256": "461fea7a9bdf938d8b597b1b305fd6b2f5413d8c88cf7129af8260b8b36d1b0a",
+      "source_size_bytes": 1288140
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "ts",
+      "file": "021__000001680735_000001735147__ts.log",
+      "pair_id": "000001680735_000001735147",
+      "source_relative_path": "000001680735_000001735147/00/ts/000001680735_000001735147_00_conf_00_ts.f0671407f690.log",
+      "source_sha256": "4fa7ae2ee59c7d338d2908212f753b6e04d448fc0437c7e06475d2c6fbe3bb08",
+      "source_size_bytes": 5666586
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "prod",
+      "file": "022__000001680735_000016928457__prod.log",
+      "pair_id": "000001680735_000016928457",
+      "source_relative_path": "000001680735_000016928457/00/prod/000001680735_000016928457_00_00.prod.log",
+      "source_sha256": "2a13f6029df612d307176823ea696a1de7d033ce10f530e170c6946f9253ddcf",
+      "source_size_bytes": 1894656
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "ts",
+      "file": "023__000001680735_000016928457__ts.log",
+      "pair_id": "000001680735_000016928457",
+      "source_relative_path": "000001680735_000016928457/00/ts/000001680735_000016928457_00_conf_02_ts.8a0c86dbc2de.log",
+      "source_sha256": "107a0b12d5722e6870bd757aecac951c5cc15995ae4eea2f92b8d4218bf5ab79",
+      "source_size_bytes": 2458030
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "prod",
+      "file": "024__000001680735_000100467200__prod.log",
+      "pair_id": "000001680735_000100467200",
+      "source_relative_path": "000001680735_000100467200/00/prod/000001680735_000100467200_00_00.prod.log",
+      "source_sha256": "308f328f815da90bc769cfb3a8c4c867d59b7ec2f068285d1bfbb923e604a889",
+      "source_size_bytes": 1270533
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "ts",
+      "file": "025__000001680735_000100467200__ts.log",
+      "pair_id": "000001680735_000100467200",
+      "source_relative_path": "000001680735_000100467200/00/ts/000001680735_000100467200_00_conf_00_ts.855791b9c284.log",
+      "source_sha256": "9003f016de82fbe8be64db6dc79b74dd1188b43c490fc6868a5f55a49f15b3c2",
+      "source_size_bytes": 3145128
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "prod",
+      "file": "026__000001690282_000001705072__prod.log",
+      "pair_id": "000001690282_000001705072",
+      "source_relative_path": "000001690282_000001705072/00/prod/000001690282_000001705072_00_00.prod.log",
+      "source_sha256": "91779f9ff885484f0c8ef3181e251ed511b6663983a4cd0e0195ef645294ce1f",
+      "source_size_bytes": 266272
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "ts",
+      "file": "027__000001690282_000001705072__ts.log",
+      "pair_id": "000001690282_000001705072",
+      "source_relative_path": "000001690282_000001705072/00/ts/000001690282_000001705072_00_conf_01_ts.d645522608cf.log",
+      "source_sha256": "d794a9d02e9e0df47fe10f90845cc7dc3c1fa3408c1549e959f59179ce860051",
+      "source_size_bytes": 2789060
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "prod",
+      "file": "028__000001690282_000012405128__prod.log",
+      "pair_id": "000001690282_000012405128",
+      "source_relative_path": "000001690282_000012405128/00/prod/000001690282_000012405128_00_00.prod.log",
+      "source_sha256": "e2a59f29278c356a458c4159e0b1a4be9a0daa85f85b1edad881ae7e9a1491f6",
+      "source_size_bytes": 201298
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "ts",
+      "file": "029__000001690282_000012405128__ts.log",
+      "pair_id": "000001690282_000012405128",
+      "source_relative_path": "000001690282_000012405128/00/ts/000001690282_000012405128_00_conf_07_ts.00e06d354f10.log",
+      "source_sha256": "5d17d9ad7603f5524b34f3eec8d8f4726dff4bbb5a8a1f903155d115a6d503f4",
+      "source_size_bytes": 3530004
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "prod",
+      "file": "030__000001690282_000100014472__prod.log",
+      "pair_id": "000001690282_000100014472",
+      "source_relative_path": "000001690282_000100014472/00/prod/000001690282_000100014472_00_00.prod.log",
+      "source_sha256": "425103316a7953f169ec148cbdb3f9de7da5459522062fb94511c3a0bea96665",
+      "source_size_bytes": 1022608
+    },
+    {
+      "archive_file": "corpus-001.tar.gz",
+      "category": "ts",
+      "file": "031__000001690282_000100014472__ts.log",
+      "pair_id": "000001690282_000100014472",
+      "source_relative_path": "000001690282_000100014472/00/ts/000001690282_000100014472_00_conf_00_ts.3477e627af55.log",
+      "source_sha256": "6b8c0bc37bb82b7d5db84c6012455e3bdd704245c710eacb04546ddf4d32edcd",
+      "source_size_bytes": 2541246
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "prod",
+      "file": "032__000001699509_000001597767__prod.log",
+      "pair_id": "000001699509_000001597767",
+      "source_relative_path": "000001699509_000001597767/00/prod/000001699509_000001597767_00_00.prod.log",
+      "source_sha256": "e93b38666c6a7d534978ece72d3716cb5d94c3b6fe2dcc104b9f9cac000fca01",
+      "source_size_bytes": 594196
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "ts",
+      "file": "033__000001699509_000001597767__ts.log",
+      "pair_id": "000001699509_000001597767",
+      "source_relative_path": "000001699509_000001597767/00/ts/000001699509_000001597767_00_conf_00_ts.f8c4522ef3b5.log",
+      "source_sha256": "b2faf1eeeb97f5f952e18930ac6a1a3f1236f0d6456af44af1e9e2a19ece957c",
+      "source_size_bytes": 1217328
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "prod",
+      "file": "034__000001699509_000006184829__prod.log",
+      "pair_id": "000001699509_000006184829",
+      "source_relative_path": "000001699509_000006184829/00/prod/000001699509_000006184829_00_00.prod.log",
+      "source_sha256": "2fa3f6a2a658873c8b24b80311e311f1cddaf8aef2626906e75dd5ae8f84a74c",
+      "source_size_bytes": 679432
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "ts",
+      "file": "035__000001699509_000006184829__ts.log",
+      "pair_id": "000001699509_000006184829",
+      "source_relative_path": "000001699509_000006184829/00/ts/000001699509_000006184829_00_conf_02_ts.ec641b6440d8.log",
+      "source_sha256": "e90de9c533050b769eba664c8ed6be7784629dcfda70ec5f97ddd2d22df207bd",
+      "source_size_bytes": 2247301
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "prod",
+      "file": "036__000001699509_000095881906__prod.log",
+      "pair_id": "000001699509_000095881906",
+      "source_relative_path": "000001699509_000095881906/00/prod/000001699509_000095881906_00_00.prod.log",
+      "source_sha256": "d2013d792f6c64b7e4dfb17086b5913482d2b86119926e293935c44cb108a14d",
+      "source_size_bytes": 1351011
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "ts",
+      "file": "037__000001699509_000095881906__ts.log",
+      "pair_id": "000001699509_000095881906",
+      "source_relative_path": "000001699509_000095881906/00/ts/000001699509_000095881906_00_conf_00_ts.d23340ed7029.log",
+      "source_sha256": "1e8fbfa10591f86ba403174239870d32a33deb07fc5fb1ca3779c9488f78c7ac",
+      "source_size_bytes": 2617631
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "prod",
+      "file": "038__000001699509_001772799802__prod.log",
+      "pair_id": "000001699509_001772799802",
+      "source_relative_path": "000001699509_001772799802/00/prod/000001699509_001772799802_00_00.prod.log",
+      "source_sha256": "f0276e57bb7321a74173c74f6f8688a989041410c8c0f3814c71307139f01f74",
+      "source_size_bytes": 1032088
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "ts",
+      "file": "039__000001699509_001772799802__ts.log",
+      "pair_id": "000001699509_001772799802",
+      "source_relative_path": "000001699509_001772799802/00/ts/000001699509_001772799802_00_conf_00_ts.bfae1c352b3d.log",
+      "source_sha256": "661bc550a3c82aa2e92d69c599985a7059fe6b6509ad1e0f99b59209146b71ec",
+      "source_size_bytes": 2452302
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "prod",
+      "file": "040__000001703063_000005048701__prod.log",
+      "pair_id": "000001703063_000005048701",
+      "source_relative_path": "000001703063_000005048701/00/prod/000001703063_000005048701_00_00.prod.log",
+      "source_sha256": "0832d42adf10692dd2d2461eca3e3c4a4b4856934c0db3647dab52f210cd8a3a",
+      "source_size_bytes": 441003
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "ts",
+      "file": "041__000001703063_000005048701__ts.log",
+      "pair_id": "000001703063_000005048701",
+      "source_relative_path": "000001703063_000005048701/00/ts/000001703063_000005048701_00_conf_00_ts.b61e42d0eb53.log",
+      "source_sha256": "8b357abc4616c6cbdf91001d6401bab7acfd5345f948f250d9ef6d842b3b718d",
+      "source_size_bytes": 1258002
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "prod",
+      "file": "042__000001703063_000039017304__prod.log",
+      "pair_id": "000001703063_000039017304",
+      "source_relative_path": "000001703063_000039017304/00/prod/000001703063_000039017304_00_00.prod.log",
+      "source_sha256": "de7ca4c31e7b944f4e1b2ecb89e43fd8f7ce3d8c9556aba75b896e6c44130020",
+      "source_size_bytes": 1034323
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "ts",
+      "file": "043__000001703063_000039017304__ts.log",
+      "pair_id": "000001703063_000039017304",
+      "source_relative_path": "000001703063_000039017304/00/ts/000001703063_000039017304_00_conf_00_ts.c6f2fc260b0a.log",
+      "source_sha256": "f7f22bf9f700d999f535b063aa2a4c7e1e6e1730cf2891a6696d40a47031834f",
+      "source_size_bytes": 1395007
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "prod",
+      "file": "044__000001703063_000114278939__prod.log",
+      "pair_id": "000001703063_000114278939",
+      "source_relative_path": "000001703063_000114278939/00/prod/000001703063_000114278939_00_00.prod.log",
+      "source_sha256": "4684358d5d3bfbd1617a634e5f257f3b8eeec86eba75a0ed4b9e2ad00493e2be",
+      "source_size_bytes": 999361
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "ts",
+      "file": "045__000001703063_000114278939__ts.log",
+      "pair_id": "000001703063_000114278939",
+      "source_relative_path": "000001703063_000114278939/00/ts/000001703063_000114278939_00_conf_00_ts.6358c6344175.log",
+      "source_sha256": "466e8197679609f0bec3f8ed897c3aa09de124a7bd00726a18736e1e8dd2e45f",
+      "source_size_bytes": 1016351
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "prod",
+      "file": "046__000001718551_000003875954__prod.log",
+      "pair_id": "000001718551_000003875954",
+      "source_relative_path": "000001718551_000003875954/00/prod/000001718551_000003875954_00_00.prod.log",
+      "source_sha256": "48f90c26ec9c12533632513dca700de9ee2270e0f40532f53f38d1724fa684f2",
+      "source_size_bytes": 1516868
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "ts",
+      "file": "047__000001718551_000003875954__ts.log",
+      "pair_id": "000001718551_000003875954",
+      "source_relative_path": "000001718551_000003875954/00/ts/000001718551_000003875954_00_conf_05_ts.299a6f4f24f9.log",
+      "source_sha256": "7b5c9c14feb6cdcb16c6e160e4a24dcd87e201f049fc3fb05533419989749374",
+      "source_size_bytes": 3870848
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "prod",
+      "file": "048__000001718551_000031317755__prod.log",
+      "pair_id": "000001718551_000031317755",
+      "source_relative_path": "000001718551_000031317755/00/prod/000001718551_000031317755_00_00.prod.log",
+      "source_sha256": "004e03cc84bc0882b429b6069d958d25cc64375779a2163bed2d508005ce51e9",
+      "source_size_bytes": 1465366
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "ts",
+      "file": "049__000001718551_000031317755__ts.log",
+      "pair_id": "000001718551_000031317755",
+      "source_relative_path": "000001718551_000031317755/00/ts/000001718551_000031317755_00_conf_00_ts.3e17e1ad5b9c.log",
+      "source_sha256": "abacb1d20ed0338d167465e9e83e9fe9dcfd29135e4752d0b102746f23c8264e",
+      "source_size_bytes": 5985234
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "prod",
+      "file": "050__000001718551_000104323088__prod.log",
+      "pair_id": "000001718551_000104323088",
+      "source_relative_path": "000001718551_000104323088/00/prod/000001718551_000104323088_00_00.prod.log",
+      "source_sha256": "73b6c1e9f4e21e71f1c94e51f2c63a2ccafbf90ae2002e206b007551004208e4",
+      "source_size_bytes": 985143
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "ts",
+      "file": "051__000001718551_000104323088__ts.log",
+      "pair_id": "000001718551_000104323088",
+      "source_relative_path": "000001718551_000104323088/00/ts/000001718551_000104323088_00_conf_00_ts.cedb3e8afcf5.log",
+      "source_sha256": "3c0794ef1ebf404a240867e1cb41074ff1c99eeb8622fa0b843039bff1185ffe",
+      "source_size_bytes": 2624710
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "prod",
+      "file": "052__000001845724_000002026867__prod.log",
+      "pair_id": "000001845724_000002026867",
+      "source_relative_path": "000001845724_000002026867/00/prod/000001845724_000002026867_00_00.prod.log",
+      "source_sha256": "a5c054b9c3d624e35426c499874d0250c35ef05ea7429c12b076c01e1ad298fa",
+      "source_size_bytes": 1312967
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "ts",
+      "file": "053__000001845724_000002026867__ts.log",
+      "pair_id": "000001845724_000002026867",
+      "source_relative_path": "000001845724_000002026867/00/ts/000001845724_000002026867_00_conf_00_ts.f966f1f9a847.log",
+      "source_sha256": "abe8995cae6756f23a83cdb10e5beec3a9f6c0c7e211533424fab0cce4176a9c",
+      "source_size_bytes": 1566265
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "prod",
+      "file": "054__000001845724_000017022733__prod.log",
+      "pair_id": "000001845724_000017022733",
+      "source_relative_path": "000001845724_000017022733/00/prod/000001845724_000017022733_00_00.prod.log",
+      "source_sha256": "5ed71ab5222afaa23a1678cc47db257201c390e769592a6f41118209d741c945",
+      "source_size_bytes": 1898674
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "ts",
+      "file": "055__000001845724_000017022733__ts.log",
+      "pair_id": "000001845724_000017022733",
+      "source_relative_path": "000001845724_000017022733/00/ts/000001845724_000017022733_00_conf_02_ts.b57e68f63650.log",
+      "source_sha256": "c96a7a05e05e2593023da4b7e93feb0892dcd6955c9b950456028d8aa8c28155",
+      "source_size_bytes": 7184316
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "prod",
+      "file": "056__000001845724_000103555587__prod.log",
+      "pair_id": "000001845724_000103555587",
+      "source_relative_path": "000001845724_000103555587/00/prod/000001845724_000103555587_00_00.prod.log",
+      "source_sha256": "18732fc79aad653c4ce58cde71aef11d32ca1b95a4acb9328482687a88ac6c16",
+      "source_size_bytes": 1033143
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "ts",
+      "file": "057__000001845724_000103555587__ts.log",
+      "pair_id": "000001845724_000103555587",
+      "source_relative_path": "000001845724_000103555587/00/ts/000001845724_000103555587_00_conf_00_ts.3e367c932ab5.log",
+      "source_sha256": "a0fc5a8a6a1061a27b22acc210020ea7d257affadc574fd1985226a841804783",
+      "source_size_bytes": 1821021
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "prod",
+      "file": "058__000002011429_000001729072__prod.log",
+      "pair_id": "000002011429_000001729072",
+      "source_relative_path": "000002011429_000001729072/00/prod/000002011429_000001729072_00_00.prod.log",
+      "source_sha256": "e1c4c284e7235c93889c6df11b532a6d9d8662bfa6c7dc8fd64bcc94be012edb",
+      "source_size_bytes": 3243569
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "ts",
+      "file": "059__000002011429_000001729072__ts.log",
+      "pair_id": "000002011429_000001729072",
+      "source_relative_path": "000002011429_000001729072/00/ts/000002011429_000001729072_00_conf_00_ts.7308693812b7.log",
+      "source_sha256": "6622eeabdd124dfa16d3174be8008ce6653ae58115caa15ee6653e9612089a98",
+      "source_size_bytes": 3464130
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "prod",
+      "file": "060__000002011429_000013610661__prod.log",
+      "pair_id": "000002011429_000013610661",
+      "source_relative_path": "000002011429_000013610661/00/prod/000002011429_000013610661_00_00.prod.log",
+      "source_sha256": "450d1f6e347bbdb435b5a8f0f718514ecec327701bdb07af36b7a2c5846a6a10",
+      "source_size_bytes": 933149
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "ts",
+      "file": "061__000002011429_000013610661__ts.log",
+      "pair_id": "000002011429_000013610661",
+      "source_relative_path": "000002011429_000013610661/00/ts/000002011429_000013610661_00_conf_00_ts.d9c5a7afa15c.log",
+      "source_sha256": "3bb91fa34c27cdd708afa6e3e3164a12a49cfe1181f029f62b06a9e4e2ab9464",
+      "source_size_bytes": 2023451
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "prod",
+      "file": "062__000002011429_000100439885__prod.log",
+      "pair_id": "000002011429_000100439885",
+      "source_relative_path": "000002011429_000100439885/00/prod/000002011429_000100439885_00_00.prod.log",
+      "source_sha256": "9da981eca4d8156a33f57eee0f6e672133055278b91ebc418d3c4bfe7ff04697",
+      "source_size_bytes": 1286607
+    },
+    {
+      "archive_file": "corpus-002.tar.gz",
+      "category": "ts",
+      "file": "063__000002011429_000100439885__ts.log",
+      "pair_id": "000002011429_000100439885",
+      "source_relative_path": "000002011429_000100439885/00/ts/000002011429_000100439885_00_conf_03_ts.a8313c3a426d.log",
+      "source_sha256": "bad6d6cc5255babed0f81c555eefc9a9e0180e7c62414b5ae5ae8054f74a707b",
+      "source_size_bytes": 2258193
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "prod",
+      "file": "064__000002140986_000001699550__prod.log",
+      "pair_id": "000002140986_000001699550",
+      "source_relative_path": "000002140986_000001699550/00/prod/000002140986_000001699550_00_00.prod.log",
+      "source_sha256": "5f169d9e68b082f0e8423eb0a03d9a94da756ee2e09c6328e8932f1339dce297",
+      "source_size_bytes": 760954
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "ts",
+      "file": "065__000002140986_000001699550__ts.log",
+      "pair_id": "000002140986_000001699550",
+      "source_relative_path": "000002140986_000001699550/00/ts/000002140986_000001699550_00_conf_00_ts.66d24381eb56.log",
+      "source_sha256": "8a325b53cf8121445b300b06c51e669879741105672631a19f53eaddd62d1178",
+      "source_size_bytes": 2186533
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "prod",
+      "file": "066__000002140986_000012358611__prod.log",
+      "pair_id": "000002140986_000012358611",
+      "source_relative_path": "000002140986_000012358611/00/prod/000002140986_000012358611_00_00.prod.log",
+      "source_sha256": "72668c92dcfaa52bba75f9997732467dc160260f02610165a63abf94fde64ee3",
+      "source_size_bytes": 1192219
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "ts",
+      "file": "067__000002140986_000012358611__ts.log",
+      "pair_id": "000002140986_000012358611",
+      "source_relative_path": "000002140986_000012358611/00/ts/000002140986_000012358611_00_conf_00_ts.a392dc7bab0e.log",
+      "source_sha256": "22bfeb2b05f15e7e3ea39a0568268e913c428f9aa6f70714e01ae55fbd3787ba",
+      "source_size_bytes": 3685763
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "prod",
+      "file": "068__000002140986_000096034859__prod.log",
+      "pair_id": "000002140986_000096034859",
+      "source_relative_path": "000002140986_000096034859/00/prod/000002140986_000096034859_00_00.prod.log",
+      "source_sha256": "72668c92dcfaa52bba75f9997732467dc160260f02610165a63abf94fde64ee3",
+      "source_size_bytes": 1192219
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "ts",
+      "file": "069__000002140986_000096034859__ts.log",
+      "pair_id": "000002140986_000096034859",
+      "source_relative_path": "000002140986_000096034859/00/ts/000002140986_000096034859_00_conf_00_ts.d99974e74bae.log",
+      "source_sha256": "01739edf1b88b0610c39ff4378309e719205e599738b44249f7663af2653fd5c",
+      "source_size_bytes": 3863651
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "prod",
+      "file": "070__000002569653_000000409235__prod.log",
+      "pair_id": "000002569653_000000409235",
+      "source_relative_path": "000002569653_000000409235/00/prod/000002569653_000000409235_00_00.prod.log",
+      "source_sha256": "bfd5b8e6cc51b90f281c6c03c7afe84fe8c00d63b70c960dff4a157bb4382be0",
+      "source_size_bytes": 1853810
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "ts",
+      "file": "071__000002569653_000000409235__ts.log",
+      "pair_id": "000002569653_000000409235",
+      "source_relative_path": "000002569653_000000409235/00/ts/000002569653_000000409235_00_conf_00_ts.b55a15cd450b.log",
+      "source_sha256": "1d2e8a93fda628a58a3db1b5fbe879719fbda20f23227b41f8d67c63ac4c933e",
+      "source_size_bytes": 4020292
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "prod",
+      "file": "072__000002569653_000005452594__prod.log",
+      "pair_id": "000002569653_000005452594",
+      "source_relative_path": "000002569653_000005452594/00/prod/000002569653_000005452594_00_00.prod.log",
+      "source_sha256": "6ea3044e0be7c314f928815e8c1a42c4baba712a8d18456a2f7045b6514f171c",
+      "source_size_bytes": 1244926
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "ts",
+      "file": "073__000002569653_000005452594__ts.log",
+      "pair_id": "000002569653_000005452594",
+      "source_relative_path": "000002569653_000005452594/00/ts/000002569653_000005452594_00_conf_00_ts.491124f6c162.log",
+      "source_sha256": "e8712725d6f9d7e0c05a4d2efbda7079ca1a02cba1b3374b3eeebf8808adc6dc",
+      "source_size_bytes": 4725422
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "prod",
+      "file": "074__000002569653_000071775431__prod.log",
+      "pair_id": "000002569653_000071775431",
+      "source_relative_path": "000002569653_000071775431/00/prod/000002569653_000071775431_00_00.prod.log",
+      "source_sha256": "ae39d970f7c7676aacfbbe09045c388620ae21df68458cd5adea964d5a1b4780",
+      "source_size_bytes": 639808
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "ts",
+      "file": "075__000002569653_000071775431__ts.log",
+      "pair_id": "000002569653_000071775431",
+      "source_relative_path": "000002569653_000071775431/00/ts/000002569653_000071775431_00_conf_00_ts.6c6867c43d89.log",
+      "source_sha256": "d94fdd2e470581a9402d9649fbb09303445f6f9ce3f333dc89a64d0127c12b00",
+      "source_size_bytes": 1875556
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "prod",
+      "file": "076__000002569653_000143233603__prod.log",
+      "pair_id": "000002569653_000143233603",
+      "source_relative_path": "000002569653_000143233603/00/prod/000002569653_000143233603_00_00.prod.log",
+      "source_sha256": "eec53411e36b92618d6959a1297c13541ccf92d3f01f745e11d72419546d854f",
+      "source_size_bytes": 2088427
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "ts",
+      "file": "077__000002569653_000143233603__ts.log",
+      "pair_id": "000002569653_000143233603",
+      "source_relative_path": "000002569653_000143233603/00/ts/000002569653_000143233603_00_conf_00_ts.45616a6fe389.log",
+      "source_sha256": "48ad4870112b5465f74ad715cf16cf2d50695de43101c2a4225a83c981661a9d",
+      "source_size_bytes": 4704699
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "prod",
+      "file": "078__000004521345_000004994469__prod.log",
+      "pair_id": "000004521345_000004994469",
+      "source_relative_path": "000004521345_000004994469/00/prod/000004521345_000004994469_00_00.prod.log",
+      "source_sha256": "939ce05a48ec7ae586f1d9575f2fac3a40a6384e06ddeb24313b18e69922ac2b",
+      "source_size_bytes": 568319
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "ts",
+      "file": "079__000004521345_000004994469__ts.log",
+      "pair_id": "000004521345_000004994469",
+      "source_relative_path": "000004521345_000004994469/00/ts/000004521345_000004994469_00_conf_00_ts.c2ee26a95ace.log",
+      "source_sha256": "7d66d063b9263baac922d4360f06cdba7cd9a8cb5df46f7a77017764d12a028c",
+      "source_size_bytes": 1716041
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "prod",
+      "file": "080__000004521345_000038234396__prod.log",
+      "pair_id": "000004521345_000038234396",
+      "source_relative_path": "000004521345_000038234396/00/prod/000004521345_000038234396_00_00.prod.log",
+      "source_sha256": "e39526e7d7b0db6dbf7d4aac64c0c26333af1aa9904597af2ae8c0981f5dcdff",
+      "source_size_bytes": 1041778
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "ts",
+      "file": "081__000004521345_000038234396__ts.log",
+      "pair_id": "000004521345_000038234396",
+      "source_relative_path": "000004521345_000038234396/00/ts/000004521345_000038234396_00_conf_00_ts.eebfc9cc9942.log",
+      "source_sha256": "529ef7b57c30260e3b5f3fb03e9f83a1532e98afb71d79aae7d5fa51beea694e",
+      "source_size_bytes": 1919751
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "prod",
+      "file": "082__000004521345_000114278939__prod.log",
+      "pair_id": "000004521345_000114278939",
+      "source_relative_path": "000004521345_000114278939/00/prod/000004521345_000114278939_00_00.prod.log",
+      "source_sha256": "b52635cbe60e2d8f5ccfb1f6730532de468acc9b2848ce43a17dd9fab142fbab",
+      "source_size_bytes": 922324
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "ts",
+      "file": "083__000004521345_000114278939__ts.log",
+      "pair_id": "000004521345_000114278939",
+      "source_relative_path": "000004521345_000114278939/00/ts/000004521345_000114278939_00_conf_00_ts.901c833a21d0.log",
+      "source_sha256": "90193cd8c9a697427e3c2b0890224b4f6d71696cefc91512651649d7c1ff91b3",
+      "source_size_bytes": 1467480
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "prod",
+      "file": "084__000004529297_000003875954__prod.log",
+      "pair_id": "000004529297_000003875954",
+      "source_relative_path": "000004529297_000003875954/00/prod/000004529297_000003875954_00_00.prod.log",
+      "source_sha256": "7a748874f6691716d4ea96dd28e287bee44f5592dcef3a63057649fe792717bb",
+      "source_size_bytes": 1345536
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "ts",
+      "file": "085__000004529297_000003875954__ts.log",
+      "pair_id": "000004529297_000003875954",
+      "source_relative_path": "000004529297_000003875954/00/ts/000004529297_000003875954_00_conf_01_ts.ff5fad71f24e.log",
+      "source_sha256": "35f7aa90d4182fc11a4cd24d2259c14a5577b17786c34b560fac9e636ea454e6",
+      "source_size_bytes": 2242477
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "prod",
+      "file": "086__000004529297_000031317755__prod.log",
+      "pair_id": "000004529297_000031317755",
+      "source_relative_path": "000004529297_000031317755/00/prod/000004529297_000031317755_00_00.prod.log",
+      "source_sha256": "632ec40b9bdb1d467e15750be171bd39f346bcbab2f5b19f30bae8a4d130679a",
+      "source_size_bytes": 1466258
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "ts",
+      "file": "087__000004529297_000031317755__ts.log",
+      "pair_id": "000004529297_000031317755",
+      "source_relative_path": "000004529297_000031317755/00/ts/000004529297_000031317755_00_conf_00_ts.42f8dc7bce2d.log",
+      "source_sha256": "7119182adeb12cf4e3d50af82ba4f7472c88f8a61cf8e647ea7b7c2a4870e963",
+      "source_size_bytes": 5003367
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "prod",
+      "file": "088__000004529297_000104323088__prod.log",
+      "pair_id": "000004529297_000104323088",
+      "source_relative_path": "000004529297_000104323088/00/prod/000004529297_000104323088_00_00.prod.log",
+      "source_sha256": "37e2222f36ddd512cfbe37623d7f38a79b349ffca938902f2aca840eaaa58d27",
+      "source_size_bytes": 537466
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "ts",
+      "file": "089__000004529297_000104323088__ts.log",
+      "pair_id": "000004529297_000104323088",
+      "source_relative_path": "000004529297_000104323088/00/ts/000004529297_000104323088_00_conf_00_ts.49c0457b29fb.log",
+      "source_sha256": "b3e50461786ba772fc0f2c2ef3e311881ec957915b9ab03733a62b2977c2bced",
+      "source_size_bytes": 1035517
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "prod",
+      "file": "090__000004682861_000002026867__prod.log",
+      "pair_id": "000004682861_000002026867",
+      "source_relative_path": "000004682861_000002026867/00/prod/000004682861_000002026867_00_00.prod.log",
+      "source_sha256": "bc9c1eaeb0dc86ddae35970e5c273d9db6e4d039fa8b376f5b1ce36bcc2f0993",
+      "source_size_bytes": 1235295
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "ts",
+      "file": "091__000004682861_000002026867__ts.log",
+      "pair_id": "000004682861_000002026867",
+      "source_relative_path": "000004682861_000002026867/00/ts/000004682861_000002026867_00_conf_00_ts.114dc8f87a06.log",
+      "source_sha256": "57c61593dd6db9ea65ed3e823692cf9245bca5b5261bf4c4d937921548a2ddda",
+      "source_size_bytes": 1813111
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "prod",
+      "file": "092__000004682861_000017022733__prod.log",
+      "pair_id": "000004682861_000017022733",
+      "source_relative_path": "000004682861_000017022733/00/prod/000004682861_000017022733_00_00.prod.log",
+      "source_sha256": "c399c04ac25aeca6109982c6d5b4ebfe13fc8104faa03f49756eb0db415cfcb3",
+      "source_size_bytes": 1815369
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "ts",
+      "file": "093__000004682861_000017022733__ts.log",
+      "pair_id": "000004682861_000017022733",
+      "source_relative_path": "000004682861_000017022733/00/ts/000004682861_000017022733_00_conf_01_ts.cd52156ffffb.log",
+      "source_sha256": "ec6dbd840a542b26ed51e095e5d53a7e8fff8ec4841dbe0773e44bf0b249791e",
+      "source_size_bytes": 7302631
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "prod",
+      "file": "094__000004682861_000100467203__prod.log",
+      "pair_id": "000004682861_000100467203",
+      "source_relative_path": "000004682861_000100467203/00/prod/000004682861_000100467203_00_00.prod.log",
+      "source_sha256": "1c5d3d4ac721649a224c8b048c6a752610c8bae928051e9410ac0084db38c6e6",
+      "source_size_bytes": 1965284
+    },
+    {
+      "archive_file": "corpus-003.tar.gz",
+      "category": "ts",
+      "file": "095__000004682861_000100467203__ts.log",
+      "pair_id": "000004682861_000100467203",
+      "source_relative_path": "000004682861_000100467203/00/ts/000004682861_000100467203_00_conf_02_ts.fbcfee638c28.log",
+      "source_sha256": "b78a751a1533eeba590ff2b3a3ce5ca62dc8fc913d3749caafe6f90fb31a84c3",
+      "source_size_bytes": 2172425
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "prod",
+      "file": "096__000005112522_000001712477__prod.log",
+      "pair_id": "000005112522_000001712477",
+      "source_relative_path": "000005112522_000001712477/00/prod/000005112522_000001712477_00_00.prod.log",
+      "source_sha256": "2c2a03d13e19c2b7bf25f29cf031c43e2be90bb226ca05acb3cba3cbdd1250f2",
+      "source_size_bytes": 1169101
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "ts",
+      "file": "097__000005112522_000001712477__ts.log",
+      "pair_id": "000005112522_000001712477",
+      "source_relative_path": "000005112522_000001712477/00/ts/000005112522_000001712477_00_conf_00_ts.3cf5b9d058d0.log",
+      "source_sha256": "5708b537a4ae6edee8aae3c487f96959448133beac0c51996af4264363f3741d",
+      "source_size_bytes": 3655584
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "prod",
+      "file": "098__000005112522_000013610661__prod.log",
+      "pair_id": "000005112522_000013610661",
+      "source_relative_path": "000005112522_000013610661/00/prod/000005112522_000013610661_00_00.prod.log",
+      "source_sha256": "424c932092af92de26d328de3845279c32896d364484c1850c1aad5019d6b5d1",
+      "source_size_bytes": 1212523
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "ts",
+      "file": "099__000005112522_000013610661__ts.log",
+      "pair_id": "000005112522_000013610661",
+      "source_relative_path": "000005112522_000013610661/00/ts/000005112522_000013610661_00_conf_00_ts.2e2706e46f4a.log",
+      "source_sha256": "f35efdc723fc1a53efbbc012b363e23d9bfbeb5b36e4e67fd721d30db0b3aec6",
+      "source_size_bytes": 4179720
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "prod",
+      "file": "100__000005112522_000100439885__prod.log",
+      "pair_id": "000005112522_000100439885",
+      "source_relative_path": "000005112522_000100439885/00/prod/000005112522_000100439885_00_00.prod.log",
+      "source_sha256": "fbe33be2713b36289d9270e3dc90c4f82e8d04878a3d62858e0f9c81c6894f2b",
+      "source_size_bytes": 714580
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "ts",
+      "file": "101__000005112522_000100439885__ts.log",
+      "pair_id": "000005112522_000100439885",
+      "source_relative_path": "000005112522_000100439885/00/ts/000005112522_000100439885_00_conf_00_ts.e21eced52aaf.log",
+      "source_sha256": "402294cc47f7599862fd395e64b03877f47fed072c26e9a34fc63a4b82b3a206",
+      "source_size_bytes": 2980107
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "prod",
+      "file": "102__000005133132_000001699550__prod.log",
+      "pair_id": "000005133132_000001699550",
+      "source_relative_path": "000005133132_000001699550/00/prod/000005133132_000001699550_00_00.prod.log",
+      "source_sha256": "f8cd457eb4e75d9978fc5789ed6963c5561395d077924c1f2405c50457950e5e",
+      "source_size_bytes": 653572
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "ts",
+      "file": "103__000005133132_000001699550__ts.log",
+      "pair_id": "000005133132_000001699550",
+      "source_relative_path": "000005133132_000001699550/00/ts/000005133132_000001699550_00_conf_00_ts.c975b719a912.log",
+      "source_sha256": "36a58af63762abbf0a29638336361d7cafea334f6aaa9d978688bef9d79856fb",
+      "source_size_bytes": 2393275
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "prod",
+      "file": "104__000005133132_000012358611__prod.log",
+      "pair_id": "000005133132_000012358611",
+      "source_relative_path": "000005133132_000012358611/00/prod/000005133132_000012358611_00_00.prod.log",
+      "source_sha256": "5305d29fa53f250780b1c58ae058f2bc183554f43130b304d0ebc99e0cc2ae91",
+      "source_size_bytes": 1266437
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "ts",
+      "file": "105__000005133132_000012358611__ts.log",
+      "pair_id": "000005133132_000012358611",
+      "source_relative_path": "000005133132_000012358611/00/ts/000005133132_000012358611_00_conf_04_ts.8f681b494334.log",
+      "source_sha256": "3344cb9427fbff668d6e990317139fe64cd164b6d1b6f5e8570a68049bfae126",
+      "source_size_bytes": 2908431
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "prod",
+      "file": "106__000005133132_000096034859__prod.log",
+      "pair_id": "000005133132_000096034859",
+      "source_relative_path": "000005133132_000096034859/00/prod/000005133132_000096034859_00_00.prod.log",
+      "source_sha256": "5305d29fa53f250780b1c58ae058f2bc183554f43130b304d0ebc99e0cc2ae91",
+      "source_size_bytes": 1266437
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "ts",
+      "file": "107__000005133132_000096034859__ts.log",
+      "pair_id": "000005133132_000096034859",
+      "source_relative_path": "000005133132_000096034859/00/ts/000005133132_000096034859_00_conf_04_ts.dfd09461cb67.log",
+      "source_sha256": "b996bf939bcfc01e3d093b250192d1fb1975179190dbb280219d2165c15db25e",
+      "source_size_bytes": 2907739
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "prod",
+      "file": "108__000005134270_000000409235__prod.log",
+      "pair_id": "000005134270_000000409235",
+      "source_relative_path": "000005134270_000000409235/00/prod/000005134270_000000409235_00_00.prod.log",
+      "source_sha256": "556b5d138a0e1c92b5120b04f98ce9a413897e12d2b7ffbbf2f806c8d00431fa",
+      "source_size_bytes": 1078987
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "ts",
+      "file": "109__000005134270_000000409235__ts.log",
+      "pair_id": "000005134270_000000409235",
+      "source_relative_path": "000005134270_000000409235/00/ts/000005134270_000000409235_00_conf_00_ts.6aa7942ebb24.log",
+      "source_sha256": "4d1ed14a3c0fae4e5e21f816eac88a3d24fd5252c268d941e57ef89830a4f93d",
+      "source_size_bytes": 3634840
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "prod",
+      "file": "110__000005134270_000005452594__prod.log",
+      "pair_id": "000005134270_000005452594",
+      "source_relative_path": "000005134270_000005452594/00/prod/000005134270_000005452594_00_00.prod.log",
+      "source_sha256": "a3425ca6b11b5ce47b7b9f6f2b613a497a757294a306fbb94291b2e181c7539c",
+      "source_size_bytes": 1123803
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "ts",
+      "file": "111__000005134270_000005452594__ts.log",
+      "pair_id": "000005134270_000005452594",
+      "source_relative_path": "000005134270_000005452594/00/ts/000005134270_000005452594_00_conf_00_ts.61a1c28a0689.log",
+      "source_sha256": "562f3d5a2c962cef635f6a978864d9831e09b67ebc02080ce98f8a4531c53321",
+      "source_size_bytes": 3608626
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "prod",
+      "file": "112__000005134270_000039339604__prod.log",
+      "pair_id": "000005134270_000039339604",
+      "source_relative_path": "000005134270_000039339604/00/prod/000005134270_000039339604_00_00.prod.log",
+      "source_sha256": "08986addf3ea8f3e1fddaa2934706e05f0be9c2d3a0872bee470cdcfe9085f56",
+      "source_size_bytes": 1517571
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "ts",
+      "file": "113__000005134270_000039339604__ts.log",
+      "pair_id": "000005134270_000039339604",
+      "source_relative_path": "000005134270_000039339604/00/ts/000005134270_000039339604_00_conf_00_ts.5c12bd1c8c87.log",
+      "source_sha256": "18d85e7c8e35c399dfeb32d8104dc52f0ba76e83d1e17c34f446472bb3987043",
+      "source_size_bytes": 2796150
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "prod",
+      "file": "114__000005134270_000137677401__prod.log",
+      "pair_id": "000005134270_000137677401",
+      "source_relative_path": "000005134270_000137677401/00/prod/000005134270_000137677401_00_00.prod.log",
+      "source_sha256": "a3a77fe987e483a5c6a3e7ce43e829c245c764686dac7556668fbf83300c12be",
+      "source_size_bytes": 3639158
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "ts",
+      "file": "115__000005134270_000137677401__ts.log",
+      "pair_id": "000005134270_000137677401",
+      "source_relative_path": "000005134270_000137677401/00/ts/000005134270_000137677401_00_conf_00_ts.27f08084624e.log",
+      "source_sha256": "e3dc0f86b404e1cb9364c5baa816259159559af1776af01a5883d42acfccecdd",
+      "source_size_bytes": 4114026
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "prod",
+      "file": "116__000005225095_000004994469__prod.log",
+      "pair_id": "000005225095_000004994469",
+      "source_relative_path": "000005225095_000004994469/00/prod/000005225095_000004994469_00_00.prod.log",
+      "source_sha256": "83b75f08db8368f946111e46dacf92a05915d96061ea51b9c06e0807abee50e4",
+      "source_size_bytes": 700783
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "ts",
+      "file": "117__000005225095_000004994469__ts.log",
+      "pair_id": "000005225095_000004994469",
+      "source_relative_path": "000005225095_000004994469/00/ts/000005225095_000004994469_00_conf_00_ts.8bc09b83680c.log",
+      "source_sha256": "82c6266f1a2953615a56bdeecdedbc3472db02d5e284b3fcfb8e8a73ecab2c96",
+      "source_size_bytes": 2387041
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "prod",
+      "file": "118__000005225095_000036466062__prod.log",
+      "pair_id": "000005225095_000036466062",
+      "source_relative_path": "000005225095_000036466062/00/prod/000005225095_000036466062_00_00.prod.log",
+      "source_sha256": "000f81223deeeee42a6b9e4945172dd94b27b5746482ee1fae8e7ab548608601",
+      "source_size_bytes": 825644
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "ts",
+      "file": "119__000005225095_000036466062__ts.log",
+      "pair_id": "000005225095_000036466062",
+      "source_relative_path": "000005225095_000036466062/00/ts/000005225095_000036466062_00_conf_01_ts.759d013b070d.log",
+      "source_sha256": "553351af5805fae4cba7ac4ef759d27dd29f94e98935bee4e6e76d30976db924",
+      "source_size_bytes": 3294654
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "prod",
+      "file": "120__000005225095_000104374255__prod.log",
+      "pair_id": "000005225095_000104374255",
+      "source_relative_path": "000005225095_000104374255/00/prod/000005225095_000104374255_00_00.prod.log",
+      "source_sha256": "f6f40f159c5d076d94ca6502f429b7496de35b884a137c4672994ba2e0ab0b2d",
+      "source_size_bytes": 1367592
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "ts",
+      "file": "121__000005225095_000104374255__ts.log",
+      "pair_id": "000005225095_000104374255",
+      "source_relative_path": "000005225095_000104374255/00/ts/000005225095_000104374255_00_conf_00_ts.e0b3b4c61d9e.log",
+      "source_sha256": "dbc9ca87ee03abf99662f3a4783fa320b747ed477df2d466700eb725d7f22843",
+      "source_size_bytes": 3775212
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "prod",
+      "file": "122__000005663589_000002517009__prod.log",
+      "pair_id": "000005663589_000002517009",
+      "source_relative_path": "000005663589_000002517009/00/prod/000005663589_000002517009_00_00.prod.log",
+      "source_sha256": "6a34d4e560a0143aef14f7c5a02802b307bd858dc8ec7035bba66cd970822e5e",
+      "source_size_bytes": 2152698
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "ts",
+      "file": "123__000005663589_000002517009__ts.log",
+      "pair_id": "000005663589_000002517009",
+      "source_relative_path": "000005663589_000002517009/00/ts/000005663589_000002517009_00_conf_00_ts.e15008ee5ea7.log",
+      "source_sha256": "557076597a5b90548c15c3a084960697f523bd86a47b4644a45142a68bb4a002",
+      "source_size_bytes": 5555900
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "prod",
+      "file": "124__000005663589_000018120428__prod.log",
+      "pair_id": "000005663589_000018120428",
+      "source_relative_path": "000005663589_000018120428/00/prod/000005663589_000018120428_00_00.prod.log",
+      "source_sha256": "8008513668c01f9fe4f9b9e678f400541ed441e1c4b9e40924514c849daca688",
+      "source_size_bytes": 782669
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "ts",
+      "file": "125__000005663589_000018120428__ts.log",
+      "pair_id": "000005663589_000018120428",
+      "source_relative_path": "000005663589_000018120428/00/ts/000005663589_000018120428_00_conf_00_ts.06c3c33e16b0.log",
+      "source_sha256": "003f1f24a8676d88872f5c0af13435b057464c2a24bd3440662eb15b748f593f",
+      "source_size_bytes": 1961709
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "prod",
+      "file": "126__000005663589_000104134409__prod.log",
+      "pair_id": "000005663589_000104134409",
+      "source_relative_path": "000005663589_000104134409/00/prod/000005663589_000104134409_00_00.prod.log",
+      "source_sha256": "4ad75e090629821aae144bc71e0bb9eb1c02b92b8c81749b12f5227eb4657472",
+      "source_size_bytes": 1742398
+    },
+    {
+      "archive_file": "corpus-004.tar.gz",
+      "category": "ts",
+      "file": "127__000005663589_000104134409__ts.log",
+      "pair_id": "000005663589_000104134409",
+      "source_relative_path": "000005663589_000104134409/00/ts/000005663589_000104134409_00_conf_03_ts.9a4979af209c.log",
+      "source_sha256": "dd6e0554068ed4b2a17ef882289db807d98913dd3caf760e9cdc21cf35570bd1",
+      "source_size_bytes": 7945837
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "prod",
+      "file": "128__000005966211_000001735147__prod.log",
+      "pair_id": "000005966211_000001735147",
+      "source_relative_path": "000005966211_000001735147/00/prod/000005966211_000001735147_00_00.prod.log",
+      "source_sha256": "dbf12bdfda39f660e88b8eff093abfbf875134412a1805d76170a6b97b929e79",
+      "source_size_bytes": 1646829
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "ts",
+      "file": "129__000005966211_000001735147__ts.log",
+      "pair_id": "000005966211_000001735147",
+      "source_relative_path": "000005966211_000001735147/00/ts/000005966211_000001735147_00_conf_00_ts.5b44536ac82f.log",
+      "source_sha256": "8faea2ab205d7dfafaf03ddf303e325166700c22558da75ba544a7cd1ac8608f",
+      "source_size_bytes": 4820672
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "prod",
+      "file": "130__000005966211_000016928457__prod.log",
+      "pair_id": "000005966211_000016928457",
+      "source_relative_path": "000005966211_000016928457/00/prod/000005966211_000016928457_00_00.prod.log",
+      "source_sha256": "ef42240c00ea49fef96ccb0668935970f943db213340254c07bcc4b088286975",
+      "source_size_bytes": 1002422
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "ts",
+      "file": "131__000005966211_000016928457__ts.log",
+      "pair_id": "000005966211_000016928457",
+      "source_relative_path": "000005966211_000016928457/00/ts/000005966211_000016928457_00_conf_04_ts.c76ab282c690.log",
+      "source_sha256": "224c964c8b28368a8d10541aee8eb217b408b148a181335223a5a963e5c84869",
+      "source_size_bytes": 6320000
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "prod",
+      "file": "132__000005966211_000100467200__prod.log",
+      "pair_id": "000005966211_000100467200",
+      "source_relative_path": "000005966211_000100467200/00/prod/000005966211_000100467200_00_00.prod.log",
+      "source_sha256": "b7a84840f4aa23ea83d5be870a4380292a06a34f47d3df24c564c2af5edc0314",
+      "source_size_bytes": 1482099
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "ts",
+      "file": "133__000005966211_000100467200__ts.log",
+      "pair_id": "000005966211_000100467200",
+      "source_relative_path": "000005966211_000100467200/00/ts/000005966211_000100467200_00_conf_01_ts.3b5d5285bfc0.log",
+      "source_sha256": "b8b01d42b41d4b2f825cc7160cf4ecbc25cda9555c8f0a2b78fb0aa158a05fc1",
+      "source_size_bytes": 2708651
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "prod",
+      "file": "134__000008220708_000001705075__prod.log",
+      "pair_id": "000008220708_000001705075",
+      "source_relative_path": "000008220708_000001705075/00/prod/000008220708_000001705075_00_00.prod.log",
+      "source_sha256": "34d8eb014131290e263f33e1771fe490f509950d77c271317dbb70691c34a8dd",
+      "source_size_bytes": 994198
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "ts",
+      "file": "135__000008220708_000001705075__ts.log",
+      "pair_id": "000008220708_000001705075",
+      "source_relative_path": "000008220708_000001705075/00/ts/000008220708_000001705075_00_conf_01_ts.783c22c31017.log",
+      "source_sha256": "91f1f89f986d07318c933f27cb783c4bd743191257424526ab3bbfded4c08097",
+      "source_size_bytes": 3379173
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "prod",
+      "file": "136__000008220708_000013610655__prod.log",
+      "pair_id": "000008220708_000013610655",
+      "source_relative_path": "000008220708_000013610655/00/prod/000008220708_000013610655_00_00.prod.log",
+      "source_sha256": "b72e721156e6fb5012b403bf6979ab7d509509f02cde3973460880d2d4fed87e",
+      "source_size_bytes": 687759
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "ts",
+      "file": "137__000008220708_000013610655__ts.log",
+      "pair_id": "000008220708_000013610655",
+      "source_relative_path": "000008220708_000013610655/00/ts/000008220708_000013610655_00_conf_00_ts.5a7faf38920f.log",
+      "source_sha256": "95f41463cef458878255c0ae80095de77e67d65b8b35e38a29caad4591754235",
+      "source_size_bytes": 1369809
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "prod",
+      "file": "138__000008220708_000100037708__prod.log",
+      "pair_id": "000008220708_000100037708",
+      "source_relative_path": "000008220708_000100037708/00/prod/000008220708_000100037708_00_00.prod.log",
+      "source_sha256": "cdc4c2d4895e4cd3e11ca52858a6fc68beb318ffbf38a249fd7712306469acaa",
+      "source_size_bytes": 642180
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "ts",
+      "file": "139__000008220708_000100037708__ts.log",
+      "pair_id": "000008220708_000100037708",
+      "source_relative_path": "000008220708_000100037708/00/ts/000008220708_000100037708_00_conf_00_ts.4368b1c78567.log",
+      "source_sha256": "97d0576be42fe578e305e1525e61c905f36a4e3c14e3244f1ef48ac2987eea09",
+      "source_size_bytes": 2162240
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "prod",
+      "file": "140__000012760069_000001662498__prod.log",
+      "pair_id": "000012760069_000001662498",
+      "source_relative_path": "000012760069_000001662498/00/prod/000012760069_000001662498_00_00.prod.log",
+      "source_sha256": "b2f84f55d952837da786d9058139c8d6bd2d00347365c5c2dd072aa7bf9ded6d",
+      "source_size_bytes": 1518974
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "ts",
+      "file": "141__000012760069_000001662498__ts.log",
+      "pair_id": "000012760069_000001662498",
+      "source_relative_path": "000012760069_000001662498/00/ts/000012760069_000001662498_00_conf_00_ts.fbabb6d43b83.log",
+      "source_sha256": "3da04f8498964e886ad2b94616c4db486e97b31b17b76055ce5d24427e6188ee",
+      "source_size_bytes": 4058998
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "prod",
+      "file": "142__000012760069_000011535535__prod.log",
+      "pair_id": "000012760069_000011535535",
+      "source_relative_path": "000012760069_000011535535/00/prod/000012760069_000011535535_00_00.prod.log",
+      "source_sha256": "3acd1cc5af68376396fe85a5130e9d60064b3949dddf2b2ed0e4a4c30e9c9c32",
+      "source_size_bytes": 2037879
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "ts",
+      "file": "143__000012760069_000011535535__ts.log",
+      "pair_id": "000012760069_000011535535",
+      "source_relative_path": "000012760069_000011535535/00/ts/000012760069_000011535535_00_conf_00_ts.297adb5ca6ca.log",
+      "source_sha256": "8fa436b62490734c6f60fddb54b67406f933e4643a0cc7e9ce20f267cc5804b3",
+      "source_size_bytes": 3645410
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "prod",
+      "file": "144__000012760069_000095881906__prod.log",
+      "pair_id": "000012760069_000095881906",
+      "source_relative_path": "000012760069_000095881906/00/prod/000012760069_000095881906_00_00.prod.log",
+      "source_sha256": "17141eee8266f29302bd4379fbf418f0e4d9d5eb835bad7a0aee16a1f54bfa3a",
+      "source_size_bytes": 1372352
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "ts",
+      "file": "145__000012760069_000095881906__ts.log",
+      "pair_id": "000012760069_000095881906",
+      "source_relative_path": "000012760069_000095881906/00/ts/000012760069_000095881906_00_conf_00_ts.004d08e21ab7.log",
+      "source_sha256": "0396cc86928a19844920d1281a16c65aadf335ec6c4260fbef61c3adfa8f9486",
+      "source_size_bytes": 3265649
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "prod",
+      "file": "146__000012760069_001772799802__prod.log",
+      "pair_id": "000012760069_001772799802",
+      "source_relative_path": "000012760069_001772799802/00/prod/000012760069_001772799802_00_00.prod.log",
+      "source_sha256": "62c0e37f0d3a0bb805ab41c07340e77186f0b1677e063572dcee5ba37a4966b8",
+      "source_size_bytes": 1116983
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "ts",
+      "file": "147__000012760069_001772799802__ts.log",
+      "pair_id": "000012760069_001772799802",
+      "source_relative_path": "000012760069_001772799802/00/ts/000012760069_001772799802_00_conf_00_ts.c8b5500ac4ee.log",
+      "source_sha256": "fcc6b615721dc90766f31d165166b7a2a4cfc85c1dc54196a030fd27627e0a57",
+      "source_size_bytes": 2972424
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "prod",
+      "file": "148__000013409685_000005048701__prod.log",
+      "pair_id": "000013409685_000005048701",
+      "source_relative_path": "000013409685_000005048701/00/prod/000013409685_000005048701_00_00.prod.log",
+      "source_sha256": "374fb51084d4d558bf61de368f5f597bd3b1ab934b9777a73e6766e0cfcc2855",
+      "source_size_bytes": 570711
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "ts",
+      "file": "149__000013409685_000005048701__ts.log",
+      "pair_id": "000013409685_000005048701",
+      "source_relative_path": "000013409685_000005048701/00/ts/000013409685_000005048701_00_conf_00_ts.28546dc09f61.log",
+      "source_sha256": "c634b7897902d0f52cccb808845cbf7f8966972146a7411d53bd46d761ea67af",
+      "source_size_bytes": 1004845
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "prod",
+      "file": "150__000013409685_000039017304__prod.log",
+      "pair_id": "000013409685_000039017304",
+      "source_relative_path": "000013409685_000039017304/00/prod/000013409685_000039017304_00_00.prod.log",
+      "source_sha256": "843b9e206657151f8ca243e6ec7937660995268522848d979e2e71313d49e2bb",
+      "source_size_bytes": 991359
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "ts",
+      "file": "151__000013409685_000039017304__ts.log",
+      "pair_id": "000013409685_000039017304",
+      "source_relative_path": "000013409685_000039017304/00/ts/000013409685_000039017304_00_conf_00_ts.9aba5be66049.log",
+      "source_sha256": "07ce73a6748e2e597a4fc12a37bfe57aff914e9efca605130eead1965e88e823",
+      "source_size_bytes": 1481636
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "prod",
+      "file": "152__000013409685_000118489718__prod.log",
+      "pair_id": "000013409685_000118489718",
+      "source_relative_path": "000013409685_000118489718/00/prod/000013409685_000118489718_00_00.prod.log",
+      "source_sha256": "5cdd98fa7122aaae12a047bba19f76563d0badecb8ba5b2ea40ae4c2fc45d2b1",
+      "source_size_bytes": 1185454
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "ts",
+      "file": "153__000013409685_000118489718__ts.log",
+      "pair_id": "000013409685_000118489718",
+      "source_relative_path": "000013409685_000118489718/00/ts/000013409685_000118489718_00_conf_00_ts.6a151a9a6aba.log",
+      "source_sha256": "49ec66af3fb92265b4b4daaf32785d58b0064e7707d9837ead09e2c3f408bce3",
+      "source_size_bytes": 3234740
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "prod",
+      "file": "154__000013410577_000004521703__prod.log",
+      "pair_id": "000013410577_000004521703",
+      "source_relative_path": "000013410577_000004521703/00/prod/000013410577_000004521703_00_00.prod.log",
+      "source_sha256": "e98d675645f5f06fa34ac18fee6ad7bb239d5fe1046871f127233fd7ff5370f6",
+      "source_size_bytes": 1070156
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "ts",
+      "file": "155__000013410577_000004521703__ts.log",
+      "pair_id": "000013410577_000004521703",
+      "source_relative_path": "000013410577_000004521703/00/ts/000013410577_000004521703_00_conf_00_ts.559f465a8ab9.log",
+      "source_sha256": "6137f822d9171853db6886367be5e19562e2b74880abff0c49405f2b99c1fd57",
+      "source_size_bytes": 2696994
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "prod",
+      "file": "156__000013410577_000031414746__prod.log",
+      "pair_id": "000013410577_000031414746",
+      "source_relative_path": "000013410577_000031414746/00/prod/000013410577_000031414746_00_00.prod.log",
+      "source_sha256": "b09e8d82fa5259de1f8c5ae790da0b80ec632801f3b62655cdd82753ecbf80b4",
+      "source_size_bytes": 1043256
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "ts",
+      "file": "157__000013410577_000031414746__ts.log",
+      "pair_id": "000013410577_000031414746",
+      "source_relative_path": "000013410577_000031414746/00/ts/000013410577_000031414746_00_conf_00_ts.0dbeb4a6f299.log",
+      "source_sha256": "d5a43e6aa1c5673e74d7e492107db3d1675747eb7d82e76fc825308a98337999",
+      "source_size_bytes": 4031072
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "prod",
+      "file": "158__000013410577_000104374202__prod.log",
+      "pair_id": "000013410577_000104374202",
+      "source_relative_path": "000013410577_000104374202/00/prod/000013410577_000104374202_00_00.prod.log",
+      "source_sha256": "7702d0fcae2d39279625203923cd27622182a3cb61d97c03bf22b7d54fa7da4c",
+      "source_size_bytes": 1275530
+    },
+    {
+      "archive_file": "corpus-005.tar.gz",
+      "category": "ts",
+      "file": "159__000013410577_000104374202__ts.log",
+      "pair_id": "000013410577_000104374202",
+      "source_relative_path": "000013410577_000104374202/00/ts/000013410577_000104374202_00_conf_01_ts.aca16822b976.log",
+      "source_sha256": "1f3638db1fb2e9debd23698856155e064730c0af592cc78239ea7db1c3743dbb",
+      "source_size_bytes": 2240036
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "prod",
+      "file": "160__000013950911_000002041074__prod.log",
+      "pair_id": "000013950911_000002041074",
+      "source_relative_path": "000013950911_000002041074/00/prod/000013950911_000002041074_00_00.prod.log",
+      "source_sha256": "2312eb91ea5d4bfcba64569b80fcee0cb14d0e892b7c4b2de4df080a5143fa3a",
+      "source_size_bytes": 564959
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "ts",
+      "file": "161__000013950911_000002041074__ts.log",
+      "pair_id": "000013950911_000002041074",
+      "source_relative_path": "000013950911_000002041074/00/ts/000013950911_000002041074_00_conf_00_ts.25c738cf3f17.log",
+      "source_sha256": "da88c2a2b7767f116674d6c28d67531606af640fb6efc433a3164f1b52938fcc",
+      "source_size_bytes": 1191584
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "prod",
+      "file": "162__000013950911_000017022733__prod.log",
+      "pair_id": "000013950911_000017022733",
+      "source_relative_path": "000013950911_000017022733/00/prod/000013950911_000017022733_00_00.prod.log",
+      "source_sha256": "f2c96fd772aad24387e3c9a5d62d55d6039d05803da8599f3e7f0310bb04a7bc",
+      "source_size_bytes": 1523863
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "ts",
+      "file": "163__000013950911_000017022733__ts.log",
+      "pair_id": "000013950911_000017022733",
+      "source_relative_path": "000013950911_000017022733/00/ts/000013950911_000017022733_00_conf_01_ts.90a2d8f85156.log",
+      "source_sha256": "c5c2b7f157d3d7c3062ba387b6955979c3baf1fc5eb4301bbfe27301380c3b78",
+      "source_size_bytes": 7070495
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "prod",
+      "file": "164__000013950911_000103555587__prod.log",
+      "pair_id": "000013950911_000103555587",
+      "source_relative_path": "000013950911_000103555587/00/prod/000013950911_000103555587_00_00.prod.log",
+      "source_sha256": "6ce4fae3324bb3c9590e067b9f9c067e37e948e00f643a8eae1ea70046dac491",
+      "source_size_bytes": 1666437
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "ts",
+      "file": "165__000013950911_000103555587__ts.log",
+      "pair_id": "000013950911_000103555587",
+      "source_relative_path": "000013950911_000103555587/00/ts/000013950911_000103555587_00_conf_00_ts.f00bdf0c7131.log",
+      "source_sha256": "c98ac3695a27e7b5d4211054a08f91e29763158d734ece46c615ee8c3fba584d",
+      "source_size_bytes": 2057304
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "prod",
+      "file": "166__000017022497_000001729072__prod.log",
+      "pair_id": "000017022497_000001729072",
+      "source_relative_path": "000017022497_000001729072/00/prod/000017022497_000001729072_00_00.prod.log",
+      "source_sha256": "ae06039a208310ccf7c78adcc56d94c3707c4b6f3787107052127596653daa61",
+      "source_size_bytes": 1239198
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "ts",
+      "file": "167__000017022497_000001729072__ts.log",
+      "pair_id": "000017022497_000001729072",
+      "source_relative_path": "000017022497_000001729072/00/ts/000017022497_000001729072_00_conf_00_ts.629a129d935a.log",
+      "source_sha256": "5e09326fa007467cd0519626771f412f22f0e395c658fc5f771773da28ef2157",
+      "source_size_bytes": 2591917
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "prod",
+      "file": "168__000017022497_000014650441__prod.log",
+      "pair_id": "000017022497_000014650441",
+      "source_relative_path": "000017022497_000014650441/00/prod/000017022497_000014650441_00_00.prod.log",
+      "source_sha256": "f7bac58c0eabed8eefbd1e5faeca1150e9dcdd028793dc22228385f7cee986cd",
+      "source_size_bytes": 1735440
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "ts",
+      "file": "169__000017022497_000014650441__ts.log",
+      "pair_id": "000017022497_000014650441",
+      "source_relative_path": "000017022497_000014650441/00/ts/000017022497_000014650441_00_conf_00_ts.0105ec98a1d1.log",
+      "source_sha256": "0057d1456cddb6d86ab0dd196ec22b82fcbb0e2e37bc30ea4d16f7740ea2bb56",
+      "source_size_bytes": 1809963
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "prod",
+      "file": "170__000017022497_000100443415__prod.log",
+      "pair_id": "000017022497_000100443415",
+      "source_relative_path": "000017022497_000100443415/00/prod/000017022497_000100443415_00_00.prod.log",
+      "source_sha256": "2bbf93189a637e4014a8bf4039d069b6575c6b958f1d224562efb72c70c1db47",
+      "source_size_bytes": 633064
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "ts",
+      "file": "171__000017022497_000100443415__ts.log",
+      "pair_id": "000017022497_000100443415",
+      "source_relative_path": "000017022497_000100443415/00/ts/000017022497_000100443415_00_conf_00_ts.fc082de430fb.log",
+      "source_sha256": "a3d3f0e9faeed3d976922f49a2f5cee2ea46d22360274ec410c0520447d65234",
+      "source_size_bytes": 1827758
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "prod",
+      "file": "172__000017263645_000001705072__prod.log",
+      "pair_id": "000017263645_000001705072",
+      "source_relative_path": "000017263645_000001705072/00/prod/000017263645_000001705072_00_00.prod.log",
+      "source_sha256": "aabaeac3f32b7bf32d6cea51a3433243390c0f2d4a7f7e49d9bf573ea1996a85",
+      "source_size_bytes": 731931
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "ts",
+      "file": "173__000017263645_000001705072__ts.log",
+      "pair_id": "000017263645_000001705072",
+      "source_relative_path": "000017263645_000001705072/00/ts/000017263645_000001705072_00_conf_00_ts.9bc2baf4173d.log",
+      "source_sha256": "7e267632c370b2bececb7a2584d4e2704a3d58f8c4833e3c14d5221f7041d82f",
+      "source_size_bytes": 1842543
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "prod",
+      "file": "174__000017263645_000012405128__prod.log",
+      "pair_id": "000017263645_000012405128",
+      "source_relative_path": "000017263645_000012405128/00/prod/000017263645_000012405128_00_00.prod.log",
+      "source_sha256": "3aaa03f305c4516fb2ec896168a21db24b6119eba634d51755e1aedfde0eacb9",
+      "source_size_bytes": 588714
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "ts",
+      "file": "175__000017263645_000012405128__ts.log",
+      "pair_id": "000017263645_000012405128",
+      "source_relative_path": "000017263645_000012405128/00/ts/000017263645_000012405128_00_conf_05_ts.7fe787d4a740.log",
+      "source_sha256": "8bdd6d8ae4ceee04af274682286241e6ff6029236ac2dff9ce9709b19fae9da4",
+      "source_size_bytes": 2202292
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "prod",
+      "file": "176__000017263645_000100014472__prod.log",
+      "pair_id": "000017263645_000100014472",
+      "source_relative_path": "000017263645_000100014472/00/prod/000017263645_000100014472_00_00.prod.log",
+      "source_sha256": "543a99be74b7e3c0ac37ba25773d0642d24f9bba636ebff06eeca9a333e1f23f",
+      "source_size_bytes": 810540
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "ts",
+      "file": "177__000017263645_000100014472__ts.log",
+      "pair_id": "000017263645_000100014472",
+      "source_relative_path": "000017263645_000100014472/00/ts/000017263645_000100014472_00_conf_02_ts.214012ba34d7.log",
+      "source_sha256": "dc0f437cc4d26d23a6025b31515697c1ceb5faad1fc00735ba0695ddf848e7e4",
+      "source_size_bytes": 2092203
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "prod",
+      "file": "178__000034496577_000000409235__prod.log",
+      "pair_id": "000034496577_000000409235",
+      "source_relative_path": "000034496577_000000409235/00/prod/000034496577_000000409235_00_00.prod.log",
+      "source_sha256": "6fd488ea5f0c724a08f9d7065a88daea29e5cdc18ee53e962fbe2766fc864f3b",
+      "source_size_bytes": 1130357
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "ts",
+      "file": "179__000034496577_000000409235__ts.log",
+      "pair_id": "000034496577_000000409235",
+      "source_relative_path": "000034496577_000000409235/00/ts/000034496577_000000409235_00_conf_00_ts.a9e581b5b0aa.log",
+      "source_sha256": "161cd9b68b02a4a77d51fcf2f952d2a3ad17cfc2893c9e0783aab8de15fb567a",
+      "source_size_bytes": 4037143
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "prod",
+      "file": "180__000034496577_000005452594__prod.log",
+      "pair_id": "000034496577_000005452594",
+      "source_relative_path": "000034496577_000005452594/00/prod/000034496577_000005452594_00_00.prod.log",
+      "source_sha256": "a6f7eea04fee1d787caf1145da6532db5204e1781f1cc538f84e6775ad1626ad",
+      "source_size_bytes": 1189231
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "ts",
+      "file": "181__000034496577_000005452594__ts.log",
+      "pair_id": "000034496577_000005452594",
+      "source_relative_path": "000034496577_000005452594/00/ts/000034496577_000005452594_00_conf_00_ts.864b6ff9ef11.log",
+      "source_sha256": "8680d083710ca09a66c6708d9532a2f92468b1a354c8b0bbe3ab82bb8db19c1d",
+      "source_size_bytes": 5374574
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "prod",
+      "file": "182__000034496577_000071775431__prod.log",
+      "pair_id": "000034496577_000071775431",
+      "source_relative_path": "000034496577_000071775431/00/prod/000034496577_000071775431_00_00.prod.log",
+      "source_sha256": "8dd8c87912fe82bebfe3b3f7a3f41e82be8f91bcba7b9f72a7155dadc8a1b04f",
+      "source_size_bytes": 631551
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "ts",
+      "file": "183__000034496577_000071775431__ts.log",
+      "pair_id": "000034496577_000071775431",
+      "source_relative_path": "000034496577_000071775431/00/ts/000034496577_000071775431_00_conf_00_ts.00eb2f2a408d.log",
+      "source_sha256": "96276e3ee8e15877982f177b72cd80159db9b87a04d38134402e37dd62643099",
+      "source_size_bytes": 2245809
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "prod",
+      "file": "184__000034496577_000143233603__prod.log",
+      "pair_id": "000034496577_000143233603",
+      "source_relative_path": "000034496577_000143233603/00/prod/000034496577_000143233603_00_00.prod.log",
+      "source_sha256": "290263b2bdd490fe11519add931e322991a2fa0d24109e4b04d647fe37e8bdfb",
+      "source_size_bytes": 1730811
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "ts",
+      "file": "185__000034496577_000143233603__ts.log",
+      "pair_id": "000034496577_000143233603",
+      "source_relative_path": "000034496577_000143233603/00/ts/000034496577_000143233603_00_conf_00_ts.c5d79d7342f7.log",
+      "source_sha256": "7ee0b43dc016261b655c7db796b8250d526327ce8c41adc7cfeff73c9fb5a935",
+      "source_size_bytes": 5726693
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "prod",
+      "file": "186__000055169539_000005046191__prod.log",
+      "pair_id": "000055169539_000005046191",
+      "source_relative_path": "000055169539_000005046191/00/prod/000055169539_000005046191_00_00.prod.log",
+      "source_sha256": "0d49b7826faa2335125da5766f393c469d68cad20de597b62bdb111d64d696b7",
+      "source_size_bytes": 1912310
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "ts",
+      "file": "187__000055169539_000005046191__ts.log",
+      "pair_id": "000055169539_000005046191",
+      "source_relative_path": "000055169539_000005046191/00/ts/000055169539_000005046191_00_conf_03_ts.0f93783c9a39.log",
+      "source_sha256": "9b199ef3c1d92dfd615b1a69fe71b7c5110c58328dfd4c7fb2ac36077a7d8271",
+      "source_size_bytes": 5792315
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "prod",
+      "file": "188__000055169539_000038234396__prod.log",
+      "pair_id": "000055169539_000038234396",
+      "source_relative_path": "000055169539_000038234396/00/prod/000055169539_000038234396_00_00.prod.log",
+      "source_sha256": "f2caef4d87c477d78b7258196bfb8982bcf5a80d42287d62b4fd0e09d8e6a401",
+      "source_size_bytes": 1114736
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "ts",
+      "file": "189__000055169539_000038234396__ts.log",
+      "pair_id": "000055169539_000038234396",
+      "source_relative_path": "000055169539_000038234396/00/ts/000055169539_000038234396_00_conf_00_ts.0e2c73223f0b.log",
+      "source_sha256": "a22989d5824c964aeed8647a8659a3d5ca7d8c8e6350776ee0078d575d8ec784",
+      "source_size_bytes": 2583342
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "prod",
+      "file": "190__000055169539_000114278939__prod.log",
+      "pair_id": "000055169539_000114278939",
+      "source_relative_path": "000055169539_000114278939/00/prod/000055169539_000114278939_00_00.prod.log",
+      "source_sha256": "e0a4d456cc41e066641cf39e2b16be50ae22b9558118f052f442d3a038872172",
+      "source_size_bytes": 1297187
+    },
+    {
+      "archive_file": "corpus-006.tar.gz",
+      "category": "ts",
+      "file": "191__000055169539_000114278939__ts.log",
+      "pair_id": "000055169539_000114278939",
+      "source_relative_path": "000055169539_000114278939/00/ts/000055169539_000114278939_00_conf_00_ts.ee32e8ff7999.log",
+      "source_sha256": "7f2ef92feda70a77ab7965d1486ec303af030a08a5182435bc07d7516c2d46ef",
+      "source_size_bytes": 2766568
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "prod",
+      "file": "192__000057988965_000003875954__prod.log",
+      "pair_id": "000057988965_000003875954",
+      "source_relative_path": "000057988965_000003875954/00/prod/000057988965_000003875954_00_00.prod.log",
+      "source_sha256": "57c230e09558ff9a210c83abbfc479b5061f8c99bd3f8fbe6604111724932bfe",
+      "source_size_bytes": 1503288
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "ts",
+      "file": "193__000057988965_000003875954__ts.log",
+      "pair_id": "000057988965_000003875954",
+      "source_relative_path": "000057988965_000003875954/00/ts/000057988965_000003875954_00_conf_05_ts.6702b12d0822.log",
+      "source_sha256": "31f38fa6dbb68026c30ac275051637df41a6d5f6f123cc60b1641602c5d48843",
+      "source_size_bytes": 4114417
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "prod",
+      "file": "194__000057988965_000031317755__prod.log",
+      "pair_id": "000057988965_000031317755",
+      "source_relative_path": "000057988965_000031317755/00/prod/000057988965_000031317755_00_00.prod.log",
+      "source_sha256": "12eb4f568ef0631df2290b0c2af7834ca3d217da3cdb7627ef2c911002051215",
+      "source_size_bytes": 3177575
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "ts",
+      "file": "195__000057988965_000031317755__ts.log",
+      "pair_id": "000057988965_000031317755",
+      "source_relative_path": "000057988965_000031317755/00/ts/000057988965_000031317755_00_conf_01_ts.5626a7c9ffd5.log",
+      "source_sha256": "b2cc48874bb7a396a97cc2ce15960101cd3f1af6fa1f20db5ee5078813286466",
+      "source_size_bytes": 4788517
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "prod",
+      "file": "196__000057988965_000104134409__prod.log",
+      "pair_id": "000057988965_000104134409",
+      "source_relative_path": "000057988965_000104134409/00/prod/000057988965_000104134409_00_00.prod.log",
+      "source_sha256": "1a470464eb81e5490717865349df958b4089489dd9505f9e7cde0000430ab969",
+      "source_size_bytes": 1609596
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "ts",
+      "file": "197__000057988965_000104134409__ts.log",
+      "pair_id": "000057988965_000104134409",
+      "source_relative_path": "000057988965_000104134409/00/ts/000057988965_000104134409_00_conf_02_ts.7dd954dbb2ef.log",
+      "source_sha256": "e4c353c5f8ccf8c430bf8700425a977bc8829bfda224530e78ca7a40f4049cbb",
+      "source_size_bytes": 6194982
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "prod",
+      "file": "198__000064370176_000001845828__prod.log",
+      "pair_id": "000064370176_000001845828",
+      "source_relative_path": "000064370176_000001845828/00/prod/000064370176_000001845828_00_00.prod.log",
+      "source_sha256": "9164cb95968364939201e2441977ba18da8b223adb1f7099dd3e84c8f8e005ad",
+      "source_size_bytes": 322630
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "ts",
+      "file": "199__000064370176_000001845828__ts.log",
+      "pair_id": "000064370176_000001845828",
+      "source_relative_path": "000064370176_000001845828/00/ts/000064370176_000001845828_00_conf_00_ts.98cf68d0d943.log",
+      "source_sha256": "7f06155d1a0e847d0e4041748ee42f60206b83222d4a54b1943240491ec89851",
+      "source_size_bytes": 1852241
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "prod",
+      "file": "200__000064370176_000016978810__prod.log",
+      "pair_id": "000064370176_000016978810",
+      "source_relative_path": "000064370176_000016978810/00/prod/000064370176_000016978810_00_00.prod.log",
+      "source_sha256": "6e15d289a668a3dbfdec20d67eabdf03b0da90c06a7095e9f9ab27227b3f82c9",
+      "source_size_bytes": 588684
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "ts",
+      "file": "201__000064370176_000016978810__ts.log",
+      "pair_id": "000064370176_000016978810",
+      "source_relative_path": "000064370176_000016978810/00/ts/000064370176_000016978810_00_conf_00_ts.8013ace25830.log",
+      "source_sha256": "fdd43b9b1ba3f142c1287650ca7c2e377487281bf2cf5242ddd635806c6c8c19",
+      "source_size_bytes": 2357183
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "prod",
+      "file": "202__000064370176_000100467203__prod.log",
+      "pair_id": "000064370176_000100467203",
+      "source_relative_path": "000064370176_000100467203/00/prod/000064370176_000100467203_00_00.prod.log",
+      "source_sha256": "6e15d289a668a3dbfdec20d67eabdf03b0da90c06a7095e9f9ab27227b3f82c9",
+      "source_size_bytes": 588684
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "ts",
+      "file": "203__000064370176_000100467203__ts.log",
+      "pair_id": "000064370176_000100467203",
+      "source_relative_path": "000064370176_000100467203/00/ts/000064370176_000100467203_00_conf_00_ts.04ec31a5af30.log",
+      "source_sha256": "319ac21dcb9030711c24a4d3d1e7e57d3c22772dd04b24c410606743d0ca3280",
+      "source_size_bytes": 2359526
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "prod",
+      "file": "204__000064624264_000001712477__prod.log",
+      "pair_id": "000064624264_000001712477",
+      "source_relative_path": "000064624264_000001712477/00/prod/000064624264_000001712477_00_00.prod.log",
+      "source_sha256": "2b012f642c561acb71ff06d4e227c7db98f8d73b63fa0e38e75b42e0ba033c49",
+      "source_size_bytes": 1381125
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "ts",
+      "file": "205__000064624264_000001712477__ts.log",
+      "pair_id": "000064624264_000001712477",
+      "source_relative_path": "000064624264_000001712477/00/ts/000064624264_000001712477_00_conf_01_ts.65fa9d67ef3d.log",
+      "source_sha256": "7da05b468dfbdcd5ffde84bb1481f284a09f479e5b163f1b301ac3ee6bcf980c",
+      "source_size_bytes": 7293024
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "prod",
+      "file": "206__000064624264_000013610661__prod.log",
+      "pair_id": "000064624264_000013610661",
+      "source_relative_path": "000064624264_000013610661/00/prod/000064624264_000013610661_00_00.prod.log",
+      "source_sha256": "c16d8625ad039a5d5aecfff331441e900415aa928dde236bd32753037f47587e",
+      "source_size_bytes": 1983648
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "ts",
+      "file": "207__000064624264_000013610661__ts.log",
+      "pair_id": "000064624264_000013610661",
+      "source_relative_path": "000064624264_000013610661/00/ts/000064624264_000013610661_00_conf_00_ts.93c6aa9d0102.log",
+      "source_sha256": "7f349b9afaf47cb7b55e532dfd07921d86d2e9258e4ab891f9fca02441349823",
+      "source_size_bytes": 3546824
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "prod",
+      "file": "208__000064624264_000100439885__prod.log",
+      "pair_id": "000064624264_000100439885",
+      "source_relative_path": "000064624264_000100439885/00/prod/000064624264_000100439885_00_00.prod.log",
+      "source_sha256": "74eab946f46a54eb2fd7ce4ab149087405e88ed3b7d7626a113fb70301470c50",
+      "source_size_bytes": 996501
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "ts",
+      "file": "209__000064624264_000100439885__ts.log",
+      "pair_id": "000064624264_000100439885",
+      "source_relative_path": "000064624264_000100439885/00/ts/000064624264_000100439885_00_conf_00_ts.139d3b832626.log",
+      "source_sha256": "204fab9273ac6e4c48f5a92f32e92db3d9c47eb35964d184b1c80c0956d937eb",
+      "source_size_bytes": 5379912
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "prod",
+      "file": "210__000071771985_000001699550__prod.log",
+      "pair_id": "000071771985_000001699550",
+      "source_relative_path": "000071771985_000001699550/00/prod/000071771985_000001699550_00_00.prod.log",
+      "source_sha256": "af623ecebf49d8b16706d487f76bab0f19bf9fe2ae9f07eb5003c4ee98387f6b",
+      "source_size_bytes": 1218539
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "ts",
+      "file": "211__000071771985_000001699550__ts.log",
+      "pair_id": "000071771985_000001699550",
+      "source_relative_path": "000071771985_000001699550/00/ts/000071771985_000001699550_00_conf_00_ts.e92912d3171f.log",
+      "source_sha256": "07b0b86aa2367934488490b13f70d1b40bacb468a7f12499aa761727db89b71c",
+      "source_size_bytes": 1957295
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "prod",
+      "file": "212__000071771985_000011535535__prod.log",
+      "pair_id": "000071771985_000011535535",
+      "source_relative_path": "000071771985_000011535535/00/prod/000071771985_000011535535_00_00.prod.log",
+      "source_sha256": "506b8d936d5b81627e804c492f157f013e07ff6c0b92f9d3fedfbb5dac79cba4",
+      "source_size_bytes": 1073414
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "ts",
+      "file": "213__000071771985_000011535535__ts.log",
+      "pair_id": "000071771985_000011535535",
+      "source_relative_path": "000071771985_000011535535/00/ts/000071771985_000011535535_00_conf_00_ts.66df2cf83035.log",
+      "source_sha256": "c0d74a7039c303898e76625ef595a4dc928c25c1edb2153190fdaa78f249b11b",
+      "source_size_bytes": 2681152
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "prod",
+      "file": "214__000071771985_000095917617__prod.log",
+      "pair_id": "000071771985_000095917617",
+      "source_relative_path": "000071771985_000095917617/00/prod/000071771985_000095917617_00_00.prod.log",
+      "source_sha256": "fec5c11e05b8bac653828f3973029cb3715d2905a1f229d14e5f4dd38f23a4b6",
+      "source_size_bytes": 1152954
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "ts",
+      "file": "215__000071771985_000095917617__ts.log",
+      "pair_id": "000071771985_000095917617",
+      "source_relative_path": "000071771985_000095917617/00/ts/000071771985_000095917617_00_conf_02_ts.0bfb8a578b74.log",
+      "source_sha256": "b4984d7b6fa968ee479ea1dd167c2c2fff181be1e89175ca13acc9e020934485",
+      "source_size_bytes": 1924020
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "prod",
+      "file": "216__000071785494_000000403256__prod.log",
+      "pair_id": "000071785494_000000403256",
+      "source_relative_path": "000071785494_000000403256/00/prod/000071785494_000000403256_00_00.prod.log",
+      "source_sha256": "1dab33e52b9a62afd0d7ad36f82b3751e29d693e0dd088a12887ce2587a60f44",
+      "source_size_bytes": 1120355
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "ts",
+      "file": "217__000071785494_000000403256__ts.log",
+      "pair_id": "000071785494_000000403256",
+      "source_relative_path": "000071785494_000000403256/00/ts/000071785494_000000403256_00_conf_00_ts.4029dc1582f0.log",
+      "source_sha256": "0914b35e8371fb4ca7df981107e3f4d35001bafba8eb6fb4986362cb6e65f9e3",
+      "source_size_bytes": 1972490
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "prod",
+      "file": "218__000071785494_000005183621__prod.log",
+      "pair_id": "000071785494_000005183621",
+      "source_relative_path": "000071785494_000005183621/00/prod/000071785494_000005183621_00_00.prod.log",
+      "source_sha256": "1a2a8b84d58e1f27b56099b2e3566c6fd7cf45186b5c529fe06237f597e5a732",
+      "source_size_bytes": 2598798
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "ts",
+      "file": "219__000071785494_000005183621__ts.log",
+      "pair_id": "000071785494_000005183621",
+      "source_relative_path": "000071785494_000005183621/00/ts/000071785494_000005183621_00_conf_00_ts.5d77c1ee44cf.log",
+      "source_sha256": "c7fcbc7935e219d598b45689b3a958ad0963f46db5d630259738c01bfbd8ff06",
+      "source_size_bytes": 9759057
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "prod",
+      "file": "220__000071785494_000039339604__prod.log",
+      "pair_id": "000071785494_000039339604",
+      "source_relative_path": "000071785494_000039339604/00/prod/000071785494_000039339604_00_00.prod.log",
+      "source_sha256": "2b5ecb641fe18405f06aad0bc94b53e696b577e2e378c0e84f593e92f49a376b",
+      "source_size_bytes": 1301565
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "ts",
+      "file": "221__000071785494_000039339604__ts.log",
+      "pair_id": "000071785494_000039339604",
+      "source_relative_path": "000071785494_000039339604/00/ts/000071785494_000039339604_00_conf_00_ts.0e01521feb53.log",
+      "source_sha256": "70173c7310f63faab47aa2f848c1da0c1a0ff8953f301df557eef42da092c677",
+      "source_size_bytes": 4488047
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "prod",
+      "file": "222__000071785494_000137677401__prod.log",
+      "pair_id": "000071785494_000137677401",
+      "source_relative_path": "000071785494_000137677401/00/prod/000071785494_000137677401_00_00.prod.log",
+      "source_sha256": "44096835b04e9054e5261c0f5c403348844d047af1fbd8cfd574a863899a2f45",
+      "source_size_bytes": 1985869
+    },
+    {
+      "archive_file": "corpus-007.tar.gz",
+      "category": "ts",
+      "file": "223__000071785494_000137677401__ts.log",
+      "pair_id": "000071785494_000137677401",
+      "source_relative_path": "000071785494_000137677401/00/ts/000071785494_000137677401_00_conf_00_ts.4b0f9d0802b5.log",
+      "source_sha256": "00e35fe67328b13717fa66400459f0309e426d610404e912300d3d7756fdcb4c",
+      "source_size_bytes": 6399808
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "prod",
+      "file": "224__000071785583_000004994469__prod.log",
+      "pair_id": "000071785583_000004994469",
+      "source_relative_path": "000071785583_000004994469/00/prod/000071785583_000004994469_00_00.prod.log",
+      "source_sha256": "8be82bdc728cf6d68efd23fd1152eca3bbf4acd19c0e04bb195dd470baf4e7a9",
+      "source_size_bytes": 580182
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "ts",
+      "file": "225__000071785583_000004994469__ts.log",
+      "pair_id": "000071785583_000004994469",
+      "source_relative_path": "000071785583_000004994469/00/ts/000071785583_000004994469_00_conf_00_ts.3c5c694603e1.log",
+      "source_sha256": "2afd65affcbf0177e99d679618ec1900df2c29519ee736f32e60a179a1ce4d79",
+      "source_size_bytes": 1607043
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "prod",
+      "file": "226__000071785583_000036466062__prod.log",
+      "pair_id": "000071785583_000036466062",
+      "source_relative_path": "000071785583_000036466062/00/prod/000071785583_000036466062_00_00.prod.log",
+      "source_sha256": "4f8a288567efcbca60c12ed9eb0187bdc509806c8c12b7798592406626342145",
+      "source_size_bytes": 668746
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "ts",
+      "file": "227__000071785583_000036466062__ts.log",
+      "pair_id": "000071785583_000036466062",
+      "source_relative_path": "000071785583_000036466062/00/ts/000071785583_000036466062_00_conf_00_ts.b3f4d6e932ff.log",
+      "source_sha256": "2bef633d6a1a724942d44d9024205f1e776b2bbb16fcd2fe6029c129bd81bd2f",
+      "source_size_bytes": 3683796
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "prod",
+      "file": "228__000071785583_000104374255__prod.log",
+      "pair_id": "000071785583_000104374255",
+      "source_relative_path": "000071785583_000104374255/00/prod/000071785583_000104374255_00_00.prod.log",
+      "source_sha256": "0c2986a123bd036dfd1e7d54187e2ef91c99cd0f0286bfdbd8fff3599ce0df43",
+      "source_size_bytes": 1362980
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "ts",
+      "file": "229__000071785583_000104374255__ts.log",
+      "pair_id": "000071785583_000104374255",
+      "source_relative_path": "000071785583_000104374255/00/ts/000071785583_000104374255_00_conf_00_ts.33a63871f21b.log",
+      "source_sha256": "84e7cf21a70ef97056cb398093ba4c8617cacf08100a070fd3a65f98d38fe698",
+      "source_size_bytes": 3377586
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "prod",
+      "file": "230__000095682148_000002041074__prod.log",
+      "pair_id": "000095682148_000002041074",
+      "source_relative_path": "000095682148_000002041074/00/prod/000095682148_000002041074_00_00.prod.log",
+      "source_sha256": "b572f0c0643ab6f0e014fbc06f21b7091c91093aa90b968894ac9c35f879aa5a",
+      "source_size_bytes": 303956
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "ts",
+      "file": "231__000095682148_000002041074__ts.log",
+      "pair_id": "000095682148_000002041074",
+      "source_relative_path": "000095682148_000002041074/00/ts/000095682148_000002041074_00_conf_00_ts.447cf2bf82f1.log",
+      "source_sha256": "003778a01cc905eb919f53126bf6cbd16011ceb60a5530b55a44c05997a020e6",
+      "source_size_bytes": 777405
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "prod",
+      "file": "232__000095682148_000018022367__prod.log",
+      "pair_id": "000095682148_000018022367",
+      "source_relative_path": "000095682148_000018022367/00/prod/000095682148_000018022367_00_00.prod.log",
+      "source_sha256": "f68d804907e9c49c039a7111a2328c1d9f5225332563d32ba2d37c958e84a2aa",
+      "source_size_bytes": 423013
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "ts",
+      "file": "233__000095682148_000018022367__ts.log",
+      "pair_id": "000095682148_000018022367",
+      "source_relative_path": "000095682148_000018022367/00/ts/000095682148_000018022367_00_conf_00_ts.68a028a473c9.log",
+      "source_sha256": "03b79f06af963410ed3f29c9d05446ed765d3012042456e7e2993433e6b25000",
+      "source_size_bytes": 1286688
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "prod",
+      "file": "234__000095682148_000103643031__prod.log",
+      "pair_id": "000095682148_000103643031",
+      "source_relative_path": "000095682148_000103643031/00/prod/000095682148_000103643031_00_00.prod.log",
+      "source_sha256": "1069da7bcee3eddc360eefdc5dbf95afa9e7e1194433af5124e8d72ed6a81003",
+      "source_size_bytes": 737915
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "ts",
+      "file": "235__000095682148_000103643031__ts.log",
+      "pair_id": "000095682148_000103643031",
+      "source_relative_path": "000095682148_000103643031/00/ts/000095682148_000103643031_00_conf_00_ts.a8860e54122d.log",
+      "source_sha256": "a90f8360ee9931b6549a481f8f2f5b82e19e71a5a7cee1044992688fc3cbef26",
+      "source_size_bytes": 1103606
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "prod",
+      "file": "236__000095707752_000001735147__prod.log",
+      "pair_id": "000095707752_000001735147",
+      "source_relative_path": "000095707752_000001735147/00/prod/000095707752_000001735147_00_00.prod.log",
+      "source_sha256": "02fd13a16ea0216d2a9cf33642e0c103d6d60d90209105b36a72035d204662f6",
+      "source_size_bytes": 1753548
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "ts",
+      "file": "237__000095707752_000001735147__ts.log",
+      "pair_id": "000095707752_000001735147",
+      "source_relative_path": "000095707752_000001735147/00/ts/000095707752_000001735147_00_conf_00_ts.4e7e7534c626.log",
+      "source_sha256": "73e1778a29af4b6d73b1d92278f8342d9c9e465d0f19596e70d136da19f8644a",
+      "source_size_bytes": 4953763
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "prod",
+      "file": "238__000095707752_000016928457__prod.log",
+      "pair_id": "000095707752_000016928457",
+      "source_relative_path": "000095707752_000016928457/00/prod/000095707752_000016928457_00_00.prod.log",
+      "source_sha256": "3fbf7d54135dfde26c99619f815838e9fbc98094d8dc0bee92e0fa2d5bd63cbd",
+      "source_size_bytes": 837868
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "ts",
+      "file": "239__000095707752_000016928457__ts.log",
+      "pair_id": "000095707752_000016928457",
+      "source_relative_path": "000095707752_000016928457/00/ts/000095707752_000016928457_00_conf_09_ts.87f57479c754.log",
+      "source_sha256": "d3cf8bc73cdcbc62b917b43a5afd02559d601d85fd7fc1280c1d6585976cf8c4",
+      "source_size_bytes": 4880197
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "prod",
+      "file": "240__000095707752_000100467200__prod.log",
+      "pair_id": "000095707752_000100467200",
+      "source_relative_path": "000095707752_000100467200/00/prod/000095707752_000100467200_00_00.prod.log",
+      "source_sha256": "4efd44c8622d34ce1af61724821196d3854d68e2af1f745435e70dc967258081",
+      "source_size_bytes": 862397
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "ts",
+      "file": "241__000095707752_000100467200__ts.log",
+      "pair_id": "000095707752_000100467200",
+      "source_relative_path": "000095707752_000100467200/00/ts/000095707752_000100467200_00_conf_00_ts.eef7a75f5ce3.log",
+      "source_sha256": "146acdd68b56890b866f6d9fcff22c7f56eaa652984b45f8a4725e59746f8ec8",
+      "source_size_bytes": 1727471
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "prod",
+      "file": "242__000215831272_000001705075__prod.log",
+      "pair_id": "000215831272_000001705075",
+      "source_relative_path": "000215831272_000001705075/00/prod/000215831272_000001705075_00_00.prod.log",
+      "source_sha256": "0ffcfd69981f28b142e5e30ee57e2d648cb9a1c3c2d81be3e13b729b1a3baa05",
+      "source_size_bytes": 1836305
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "ts",
+      "file": "243__000215831272_000001705075__ts.log",
+      "pair_id": "000215831272_000001705075",
+      "source_relative_path": "000215831272_000001705075/00/ts/000215831272_000001705075_00_conf_05_ts.a971a7d75827.log",
+      "source_sha256": "94152d6f7c3f9e349a5ffdf1ccc735d390eae5ce9cfb749c9f4647223eb88689",
+      "source_size_bytes": 3247085
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "prod",
+      "file": "244__000215831272_000013610655__prod.log",
+      "pair_id": "000215831272_000013610655",
+      "source_relative_path": "000215831272_000013610655/00/prod/000215831272_000013610655_00_00.prod.log",
+      "source_sha256": "53d0b324c9bd021ae20412b4a4c6a447002b9ed5ea3558720917321d0711fcf4",
+      "source_size_bytes": 793901
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "ts",
+      "file": "245__000215831272_000013610655__ts.log",
+      "pair_id": "000215831272_000013610655",
+      "source_relative_path": "000215831272_000013610655/00/ts/000215831272_000013610655_00_conf_00_ts.7aafba116de8.log",
+      "source_sha256": "a21ccfe8e72aa1fb80f4d8a51e8d8ebbd63571965d5ad593c4e8a5465a32e801",
+      "source_size_bytes": 2123699
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "prod",
+      "file": "246__000215831272_000100014472__prod.log",
+      "pair_id": "000215831272_000100014472",
+      "source_relative_path": "000215831272_000100014472/00/prod/000215831272_000100014472_00_00.prod.log",
+      "source_sha256": "702af034339f0720e876683c6fff37a5b6e1a219d9422b9135e455f25dc80172",
+      "source_size_bytes": 756480
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "ts",
+      "file": "247__000215831272_000100014472__ts.log",
+      "pair_id": "000215831272_000100014472",
+      "source_relative_path": "000215831272_000100014472/00/ts/000215831272_000100014472_00_conf_00_ts.448a2398aebc.log",
+      "source_sha256": "a9dada77211d171381ac273692390002e736167dd14c46cb053608438bdc75f6",
+      "source_size_bytes": 2104130
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "prod",
+      "file": "248__000256080694_000001597767__prod.log",
+      "pair_id": "000256080694_000001597767",
+      "source_relative_path": "000256080694_000001597767/00/prod/000256080694_000001597767_00_00.prod.log",
+      "source_sha256": "50c291ba2ffcb9da7dd31f840fd39ec51d4dc4635c77550da146e00ae3f161e7",
+      "source_size_bytes": 379693
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "ts",
+      "file": "249__000256080694_000001597767__ts.log",
+      "pair_id": "000256080694_000001597767",
+      "source_relative_path": "000256080694_000001597767/00/ts/000256080694_000001597767_00_conf_00_ts.da8652a9e7fb.log",
+      "source_sha256": "5ecc5557d44fe150428cdab56f9d1694d532966dc937fbcba954a36eb0ecaa81",
+      "source_size_bytes": 1051255
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "prod",
+      "file": "250__000256080694_000006184829__prod.log",
+      "pair_id": "000256080694_000006184829",
+      "source_relative_path": "000256080694_000006184829/00/prod/000256080694_000006184829_00_00.prod.log",
+      "source_sha256": "771542aa79b6f90b313e116dbfd984d69a3fc9731d911f7681137173ffbe5b63",
+      "source_size_bytes": 554038
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "ts",
+      "file": "251__000256080694_000006184829__ts.log",
+      "pair_id": "000256080694_000006184829",
+      "source_relative_path": "000256080694_000006184829/00/ts/000256080694_000006184829_00_conf_00_ts.7cb0aa98e6c5.log",
+      "source_sha256": "3c4626c0b1dbef74afadf2f1c2cddd8e47c4f24bf26cb3273bcd8de2a523e390",
+      "source_size_bytes": 1145723
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "prod",
+      "file": "252__000256080694_000095881906__prod.log",
+      "pair_id": "000256080694_000095881906",
+      "source_relative_path": "000256080694_000095881906/00/prod/000256080694_000095881906_00_00.prod.log",
+      "source_sha256": "ca8b77d3fbdef25ed1014e4b891171587057bab733ebc66143885a46f2e25658",
+      "source_size_bytes": 1402100
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "ts",
+      "file": "253__000256080694_000095881906__ts.log",
+      "pair_id": "000256080694_000095881906",
+      "source_relative_path": "000256080694_000095881906/00/ts/000256080694_000095881906_00_conf_01_ts.ef5511786ab3.log",
+      "source_sha256": "efb56013eb164b1f552512efb0b98d302aee60b14e854f3559c945b1e9733417",
+      "source_size_bytes": 2232489
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "prod",
+      "file": "254__000256080694_001772799802__prod.log",
+      "pair_id": "000256080694_001772799802",
+      "source_relative_path": "000256080694_001772799802/00/prod/000256080694_001772799802_00_00.prod.log",
+      "source_sha256": "904a622324c5c6b952d53a06ae90fda05d5161ad2a737054352c02a9f29243c8",
+      "source_size_bytes": 958120
+    },
+    {
+      "archive_file": "corpus-008.tar.gz",
+      "category": "ts",
+      "file": "255__000256080694_001772799802__ts.log",
+      "pair_id": "000256080694_001772799802",
+      "source_relative_path": "000256080694_001772799802/00/ts/000256080694_001772799802_00_conf_00_ts.250267d8983e.log",
+      "source_sha256": "55d7f5e73f6aa7985b4b678110166de70ef3caedf9efdb4211cbfd2aac956a40",
+      "source_size_bytes": 1028973
+    }
+  ],
+  "sampling": "evenly spaced reaction-pair IDs, one product and one TS log per pair",
+  "schema_version": "real-world-batch-corpus-v2",
+  "source_dataset": "complete_set",
+  "storage_format": "sharded tar.gz archives containing raw .log members"
+}

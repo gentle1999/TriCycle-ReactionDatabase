@@ -33,8 +33,9 @@ from tricycle_reaction_db.domain.enums import ThermodynamicProfileRefreshJobStat
 logger = logging.getLogger(__name__)
 
 # Compatibility constant for callers that used the old refresh service. The
-# worker's actual batch size is now deployment-configurable.
-THERMODYNAMIC_PROFILE_REFRESH_CHUNK_SIZE = 256
+# worker's durable claim and commit microbatch defaults to 32 reactions so a
+# slow topology/source selection path cannot hold one long transaction.
+THERMODYNAMIC_PROFILE_REFRESH_CHUNK_SIZE = 32
 _ERROR_MAX_LENGTH = 4_000
 _RETRY_MAX_SECONDS = 300
 
@@ -227,122 +228,149 @@ async def _reschedule_profile_refresh_jobs(
         await session.commit()
 
 
-async def _process_profile_refresh_jobs(
+async def _process_profile_refresh_batch(
     claimed_jobs: tuple[ClaimedProfileRefreshJob, ...],
 ) -> int:
     if not claimed_jobs:
         return 0
     claimed_by_id = {job.mapped_reaction_id: job for job in claimed_jobs}
     mapped_reaction_ids = tuple(claimed_by_id)
-    try:
-        # Do not lock MappedReaction while the synchronous profile algorithm
-        # reads source rows and performs RDKit/policy work.  A source write can
-        # advance the generation concurrently; the short finalization
-        # transaction below will detect that and keep the job pending.
-        async with session_factory() as session:
-            reactions = (
-                await session.exec(
-                    select(MappedReaction).where(col(MappedReaction.id).in_(mapped_reaction_ids))
-                )
-            ).all()
-            reactions_by_id = {
-                reaction.id: reaction for reaction in reactions if isinstance(reaction.id, UUID)
-            }
-            refreshable = tuple(
-                reaction
-                for reaction in reactions
-                if isinstance(reaction.id, UUID)
-                and reaction.thermodynamic_profile_materialized_generation
-                < max(
-                    claimed_by_id[reaction.id].requested_generation,
-                    reaction.thermodynamic_profile_generation,
-                )
+    # Do not lock MappedReaction while the synchronous profile algorithm
+    # reads source rows and performs RDKit/policy work.  A source write can
+    # advance the generation concurrently; the short finalization
+    # transaction below will detect that and keep the job pending.
+    async with session_factory() as session:
+        reactions = (
+            await session.exec(
+                select(MappedReaction).where(col(MappedReaction.id).in_(mapped_reaction_ids))
             )
-            refreshed_ids = tuple(
-                reaction.id for reaction in refreshable if isinstance(reaction.id, UUID)
+        ).all()
+        refreshable = tuple(
+            reaction
+            for reaction in reactions
+            if isinstance(reaction.id, UUID)
+            and reaction.thermodynamic_profile_materialized_generation
+            < max(
+                claimed_by_id[reaction.id].requested_generation,
+                reaction.thermodynamic_profile_generation,
             )
-            if refreshable:
-                await session.execute(
-                    text("SET LOCAL tricycle.defer_profile_source_visibility = 'on'")
+        )
+        refreshed_ids = tuple(
+            reaction.id for reaction in refreshable if isinstance(reaction.id, UUID)
+        )
+        if refreshable:
+            await session.execute(text("SET LOCAL tricycle.defer_profile_source_visibility = 'on'"))
+
+            def _refresh_profiles(sync_session: SQLAlchemySession, /) -> None:
+                refresh_mapped_reactions_thermodynamics(
+                    cast(SQLModelSession, sync_session),
+                    mapped_reactions=refreshable,
+                    clear_refresh_jobs=False,
                 )
 
-                def _refresh_profiles(sync_session: SQLAlchemySession, /) -> None:
-                    refresh_mapped_reactions_thermodynamics(
-                        cast(SQLModelSession, sync_session),
-                        mapped_reactions=refreshable,
-                        clear_refresh_jobs=False,
-                    )
+            await session.run_sync(_refresh_profiles)
+        # Commit profile replacement before running source visibility SQL.
+        # This releases profile/reaction write locks while the visibility
+        # dependency graph is traversed and lets upload/delete transactions
+        # proceed independently.
+        await session.commit()
 
-                await session.run_sync(_refresh_profiles)
-            # Commit profile replacement before running source visibility SQL.
-            # This releases profile/reaction write locks while the visibility
-            # dependency graph is traversed and lets upload/delete transactions
-            # proceed independently.
-            await session.commit()
+    # Visibility is deliberately a separate short transaction. If it fails,
+    # the still-processing lease is rescheduled and the profile is retried
+    # rather than leaving a permanently stale visible/hidden state.
+    async with session_factory() as session:
+        await _refresh_source_visibility(session, refreshed_ids)
+        current_reactions = (
+            await session.exec(
+                select(MappedReaction)
+                .where(col(MappedReaction.id).in_(mapped_reaction_ids))
+                .with_for_update()
+            )
+        ).all()
+        jobs = (
+            await session.exec(
+                select(MappedReactionThermodynamicProfileRefreshJob)
+                .where(
+                    col(MappedReactionThermodynamicProfileRefreshJob.mapped_reaction_id).in_(
+                        mapped_reaction_ids
+                    ),
+                    col(MappedReactionThermodynamicProfileRefreshJob.status)
+                    == ThermodynamicProfileRefreshJobStatus.PROCESSING,
+                )
+                .with_for_update()
+            )
+        ).all()
+        reactions_by_id = {
+            reaction.id: reaction for reaction in current_reactions if isinstance(reaction.id, UUID)
+        }
+        jobs_by_id = {job.mapped_reaction_id: job for job in jobs}
+        now = datetime.now(UTC)
+        completed = 0
+        for mapped_reaction_id, claimed in claimed_by_id.items():
+            job = jobs_by_id.get(mapped_reaction_id)
+            if job is None or job.lease_id != claimed.lease_id:
+                continue
+            reaction = reactions_by_id.get(mapped_reaction_id)
+            if reaction is None:
+                await session.delete(job)
+                completed += 1
+                continue
+            current_generation = reaction.thermodynamic_profile_generation
+            requested_generation = max(job.requested_generation, current_generation)
+            if reaction.thermodynamic_profile_materialized_generation >= requested_generation:
+                await session.delete(job)
+                completed += 1
+                continue
+            # New source evidence arrived while this job was running. Keep
+            # the coalesced row and immediately schedule one more pass.
+            job.status = ThermodynamicProfileRefreshJobStatus.PENDING
+            job.requested_generation = requested_generation
+            job.available_at = now
+            job.lease_id = None
+            job.lease_expires_at = None
+            job.last_error = None
+            job.updated_at = now
+            session.add(job)
+        await session.commit()
+        return completed
 
-        # Visibility is deliberately a separate short transaction. If it fails,
-        # the still-processing lease is rescheduled and the profile is retried
-        # rather than leaving a permanently stale visible/hidden state.
-        async with session_factory() as session:
-            await _refresh_source_visibility(session, refreshed_ids)
-            current_reactions = (
-                await session.exec(
-                    select(MappedReaction)
-                    .where(col(MappedReaction.id).in_(mapped_reaction_ids))
-                    .with_for_update()
-                )
-            ).all()
-            jobs = (
-                await session.exec(
-                    select(MappedReactionThermodynamicProfileRefreshJob)
-                    .where(
-                        col(MappedReactionThermodynamicProfileRefreshJob.mapped_reaction_id).in_(
-                            mapped_reaction_ids
-                        ),
-                        col(MappedReactionThermodynamicProfileRefreshJob.status)
-                        == ThermodynamicProfileRefreshJobStatus.PROCESSING,
-                    )
-                    .with_for_update()
-                )
-            ).all()
-            reactions_by_id = {
-                reaction.id: reaction
-                for reaction in current_reactions
-                if isinstance(reaction.id, UUID)
-            }
-            jobs_by_id = {job.mapped_reaction_id: job for job in jobs}
-            now = datetime.now(UTC)
-            completed = 0
-            for mapped_reaction_id, claimed in claimed_by_id.items():
-                job = jobs_by_id.get(mapped_reaction_id)
-                if job is None or job.lease_id != claimed.lease_id:
-                    continue
-                reaction = reactions_by_id.get(mapped_reaction_id)
-                if reaction is None:
-                    await session.delete(job)
-                    completed += 1
-                    continue
-                current_generation = reaction.thermodynamic_profile_generation
-                requested_generation = max(job.requested_generation, current_generation)
-                if reaction.thermodynamic_profile_materialized_generation >= requested_generation:
-                    await session.delete(job)
-                    completed += 1
-                    continue
-                # New source evidence arrived while this job was running. Keep
-                # the coalesced row and immediately schedule one more pass.
-                job.status = ThermodynamicProfileRefreshJobStatus.PENDING
-                job.requested_generation = requested_generation
-                job.available_at = now
-                job.lease_id = None
-                job.lease_expires_at = None
-                job.last_error = None
-                job.updated_at = now
-                session.add(job)
-            await session.commit()
-            return completed
-    except Exception as error:
-        await _reschedule_profile_refresh_jobs(claimed_jobs, error)
-        raise
+
+async def _process_profile_refresh_jobs(
+    claimed_jobs: tuple[ClaimedProfileRefreshJob, ...],
+) -> int:
+    """Process claimed jobs as independently committed, observable microbatches."""
+
+    if not claimed_jobs:
+        return 0
+    batch_size = get_settings().upload_worker_profile_refresh_batch_size
+    total_completed = 0
+    for batch_start in range(0, len(claimed_jobs), batch_size):
+        batch = claimed_jobs[batch_start : batch_start + batch_size]
+        batch_started_at = perf_counter()
+        try:
+            completed = await _process_profile_refresh_batch(batch)
+        except Exception as error:
+            # Jobs in this and later chunks are still leased. Return all of
+            # them to the durable queue; already committed earlier chunks are
+            # intentionally left completed.
+            await _reschedule_profile_refresh_jobs(claimed_jobs[batch_start:], error)
+            logger.exception(
+                "thermodynamic profile microbatch failed jobs=%d offset=%d elapsed_ms=%.1f",
+                len(batch),
+                batch_start,
+                (perf_counter() - batch_started_at) * 1000,
+            )
+            raise
+        total_completed += completed
+        logger.info(
+            "thermodynamic profile microbatch committed "
+            "jobs=%d completed=%d offset=%d elapsed_ms=%.1f",
+            len(batch),
+            completed,
+            batch_start,
+            (perf_counter() - batch_started_at) * 1000,
+        )
+    return total_completed
 
 
 async def refresh_pending_mapped_reaction_profiles(

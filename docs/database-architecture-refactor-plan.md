@@ -148,11 +148,12 @@ manifest/API/local/MCP staging
   它不写解析数据库。所有 parser task 共用同一个可复用的 `spawn` MolOP 进程池，
   `TRICYCLE_MOLOP_BATCH_N_JOBS=-1` 使用 worker 可见的全部 CPU 核，正整数才主动限界。
 - 一个持久化消费者按 project/user 形成授权隔离组，旧 parse 清理、结果物化和 UploadBatch
-  收尾由项目写锁协调。每 8 个完成文件或 128 帧提交一个微批；结果队列暂时为空只执行
+  收尾由项目写锁协调。每 16 个完成文件或 256 帧提交一个微批；结果队列暂时为空只执行
   预加载结果持久化，不把未凑够微批的结果单独提交；MolOP 没有待处理任务时提交尾批。
   不同项目/user 组串行写入，客户端单文件 UploadBatch 不能绕过该微批边界。
-- `persist_parsed_microbatch` 复用 `upload_batch` 的 legacy bulk 持久化核心，不复制第二套
-  frame/reaction/geometry 入库逻辑。失败文件独立写入失败状态，不回滚无关文件；队列项由
+- `persist_parsed_microbatch` 复用 `upload_batch` 的统一持久化核心，不复制第二套
+  frame/reaction/geometry 入库逻辑；每个微批先完成 topology DAG、membership 和 reverse
+  reconciliation，再进入 profile dirty 队列。失败文件独立写入失败状态，不回滚无关文件；队列项由
   worker 按原始 lease 完成或回收。
 - `TRICYCLE_UPLOAD_MAX_CONCURRENCY` 只控制 RustFS 读取，`TRICYCLE_UPLOAD_WORKER_CONCURRENCY`
   只用于旧 pending-ingestion 恢复；二者都不能替代 MolOP 进程数或创建额外解析池。生产推荐
@@ -176,7 +177,7 @@ manifest/API/local/MCP staging
 | --- | --- | --- | --- |
 | 解析准入 | CLI 不运行 MolOP | `TRICYCLE_MOLOP_BATCH_N_JOBS`，`-1` 使用 worker 可见的全部 CPU 核 | 不是 RustFS 读取并发 |
 | 暂存候选窗口 | `IMPORT_PIPELINE_WINDOW_FILES` | `TRICYCLE_UPLOAD_WORKER_PREFETCH_FILES`，`0` 自动计算 | 只负责背压/预取，不是 parser batch |
-| 持久化交接 | worker 统一处理 staged 结果 | 8 个文件或 128 帧；队列空只做 preload，MolOP 空闲时提交尾批 | 不能等客户端 batch 完成才写库 |
+| 持久化交接 | worker 统一处理 staged 结果 | 16 个文件或 256 帧；队列空只做 preload，MolOP 空闲时提交尾批 | 不能等客户端 batch 完成才写库 |
 | 兼容检查点 | `IMPORT_COMMIT_BATCH_FILES` 仅兼容参数 | 由 worker 微批和 lease 收尾管理 | 不控制解析或数据库并发 |
 
 实现约束如下：
@@ -185,18 +186,19 @@ manifest/API/local/MCP staging
   `ProcessPoolExecutor`；`_file_worker_submission_slots` 是文件级解析准入点，禁止恢复
   成每文件创建进程池/执行器，也禁止把 native OpenMP/BLAS 线程数当成文件并发。
 - `_run_streaming_cycle` 必须在 parser task 完成后立即连续补位，结果通过一个有界队列交给
-  一个持久化消费者。消费者按 project/user 保持授权隔离，按 8 文件或 128 帧提交微批；
+  一个持久化消费者。消费者按 project/user 保持授权隔离，按 16 文件或 256 帧提交微批；
   解析和数据库写入保持流水线重叠。
 - 旧 parse 清理、微批物化和 UploadBatch 状态完成必须由项目写锁协调。多个单文件客户端
   batch 只能影响展示和 lease，不得创建多个并行持久化会话。
-- `persist_parsed_microbatch` 只复用 `upload_batch` 的 legacy bulk 热路径；reaction
-  SMILES topology 缓存和 set-based Geometry 匹配保持开启，逐文件 concrete/logical/reverse
-  reconciliation 不得直接插入。失败文件独立收尾，不回滚无关文件。
+- `persist_parsed_microbatch` 复用 `upload_batch` 的统一持久化路径；reaction SMILES
+  topology 缓存和 set-based Geometry 匹配保持开启，每个微批必须先完成 topology DAG、
+  concrete/logical membership 和 reverse reconciliation，之后才能入 profile dirty 队列。
+  失败文件独立收尾，不回滚无关文件。
 - 生产推荐只运行一个 upload-worker 副本。API 节点可以横向扩展，但多个 worker 副本会各自
   创建 MolOP 进程池和持久化消费者，改变这里的资源上限和串行组语义。
 
 因此，导入链路的固定关系是：RustFS 暂存完成后，所有来源都进入同一个连续 dispatcher；
-有效 MolOP 进程数持续取任务，结果按 8 个文件或 128 帧交给统一持久化消费者，项目/user
+有效 MolOP 进程数持续取任务，结果按 16 个文件或 256 帧交给统一持久化消费者，项目/user
 组串行提交。客户端单文件批次不能绕过服务端微批。
 - 在隔离数据库构建 public、私有 A、私有 B 三种来源，包含共享反应/Geometry、同协议多次
   解析、不同协议同分、退役源、无匹配 profile 区间、退化坐标和重复刷新场景。

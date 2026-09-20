@@ -12,6 +12,7 @@ from collections.abc import Iterable
 from typing import Any, cast
 from uuid import UUID
 
+from sqlalchemy import or_
 from sqlalchemy.orm.attributes import set_committed_value
 from sqlmodel import Session, col, select
 
@@ -25,6 +26,7 @@ from tricycle_reaction_db.application.services._persistence import (
 from tricycle_reaction_db.application.services.topology_abstraction import (
     find_topology_matches,
     specialized_topologies,
+    topology_abstraction_mapping_witness,
 )
 from tricycle_reaction_db.core.chemistry_config import (
     LOGICAL_PARTICIPANT_CONCRETE_MATCH_POLICY_VERSION,
@@ -148,11 +150,15 @@ def _compatible_topology_candidate(
     candidate: MolecularTopology,
     concrete_topology: MolecularTopology,
 ) -> bool:
+    candidate_hash = getattr(candidate, "stereo_agnostic_graph_hash", None)
+    concrete_hash = getattr(concrete_topology, "stereo_agnostic_graph_hash", None)
     return (
         candidate.project_id == concrete_topology.project_id
         and candidate.formula_id == concrete_topology.formula_id
         and candidate.atom_count == concrete_topology.atom_count
         and candidate.formal_charge == concrete_topology.formal_charge
+        and candidate.fragment_count == concrete_topology.fragment_count
+        and (concrete_hash is None or candidate_hash is None or candidate_hash == concrete_hash)
     )
 
 
@@ -160,17 +166,28 @@ def _match_metadata(
     logical_topology: MolecularTopology,
     concrete_topology: MolecularTopology,
     matches: tuple[tuple[int, ...], ...],
+    *,
+    all_mappings_enumerated: bool = True,
 ) -> dict[str, Any]:
     return {
         "match_schema_version": LOGICAL_PARTICIPANT_CONCRETE_MATCH_SCHEMA_VERSION,
         "logical_topology_id": str(_require_id(logical_topology, label="MolecularTopology")),
         "concrete_topology_id": str(_require_id(concrete_topology, label="MolecularTopology")),
-        "candidate_match_count": len(matches),
+        "candidate_match_count": len(matches) if all_mappings_enumerated else None,
         # A unique match is convenient for downstream mapping transfer.  For a
         # symmetric graph, retain every legal match and leave selection to the
         # reaction-level mapping constraints instead of taking an arbitrary one.
-        "general_to_concrete_atom_indices": list(matches[0]) if len(matches) == 1 else None,
-        "candidate_general_to_concrete_atom_indices": [list(match) for match in matches],
+        "general_to_concrete_atom_indices": (
+            list(matches[0]) if all_mappings_enumerated and len(matches) == 1 else None
+        ),
+        "candidate_general_to_concrete_atom_indices": (
+            [list(match) for match in matches] if all_mappings_enumerated else []
+        ),
+        "atom_mapping_witness": (
+            list(matches[0]) if matches and not all_mappings_enumerated else None
+        ),
+        "all_candidate_mappings_enumerated": all_mappings_enumerated,
+        "match_method": "stereo_abstraction_dag" if not all_mappings_enumerated else "graph_match",
     }
 
 
@@ -235,7 +252,17 @@ def persist_logical_participant_concrete_topology(
         raise ConcreteTopologyMembershipError(
             "concrete topology differs in formula, atom count, or formal charge"
         )
-    matches = find_topology_matches(concrete_topology.mol, logical_topology.mol)
+    dag_mapping = topology_abstraction_mapping_witness(
+        session,
+        concrete_topology,
+        logical_topology,
+    )
+    all_mappings_enumerated = dag_mapping is None
+    matches = (
+        find_topology_matches(concrete_topology.mol, logical_topology.mol)
+        if dag_mapping is None
+        else (dag_mapping,)
+    )
     if not matches:
         raise ConcreteTopologyMembershipError(
             "concrete topology is not a stereo-aware graph match for the logical topology"
@@ -268,7 +295,12 @@ def persist_logical_participant_concrete_topology(
         )
     if membership is not None:
         _cache_membership(session, membership)
-    metadata = _match_metadata(logical_topology, concrete_topology, matches)
+    metadata = _match_metadata(
+        logical_topology,
+        concrete_topology,
+        matches,
+        all_mappings_enumerated=all_mappings_enumerated,
+    )
     if match_metadata:
         metadata["caller_metadata"] = dict(match_metadata)
     if membership is not None:
@@ -411,6 +443,24 @@ def logical_participant_matches_for_concrete_topology(
                 and logical_reaction.project_id == concrete_topology.project_id
             ):
                 participants_by_id[participant_id] = participant
+    candidate_predicates = [
+        col(MolecularTopology.formula_id) == concrete_topology.formula_id,
+        col(MolecularTopology.atom_count) == concrete_topology.atom_count,
+        col(MolecularTopology.formal_charge) == concrete_topology.formal_charge,
+        col(MolecularTopology.fragment_count) == concrete_topology.fragment_count,
+        col(MolecularTopology.project_id) == concrete_topology.project_id,
+        col(LogicalReaction.project_id) == concrete_topology.project_id,
+    ]
+    concrete_hash = getattr(concrete_topology, "stereo_agnostic_graph_hash", None)
+    if concrete_hash is not None:
+        # The migration backfills all persisted rows.  The NULL arm keeps
+        # synthetic/legacy fixtures usable until their topology is normalized.
+        candidate_predicates.append(
+            or_(
+                col(MolecularTopology.stereo_agnostic_graph_hash) == concrete_hash,
+                col(MolecularTopology.stereo_agnostic_graph_hash).is_(None),
+            )
+        )
     rows = session.exec(
         select(
             LogicalReactionParticipant,
@@ -435,13 +485,7 @@ def logical_participant_matches_for_concrete_topology(
                 col(LogicalParticipantConcreteTopology.concrete_topology_id) == concrete_topology.id
             ),
         )
-        .where(
-            col(MolecularTopology.formula_id) == concrete_topology.formula_id,
-            col(MolecularTopology.atom_count) == concrete_topology.atom_count,
-            col(MolecularTopology.formal_charge) == concrete_topology.formal_charge,
-            col(MolecularTopology.project_id) == concrete_topology.project_id,
-            col(LogicalReaction.project_id) == concrete_topology.project_id,
-        )
+        .where(*candidate_predicates)
     ).all()
     for participant, logical_reaction, membership in rows:
         # The mapping expansion consumes ``participant.logical_reaction`` for
@@ -468,9 +512,15 @@ def logical_participant_matches_for_concrete_topology(
             str(_require_id(item, label="LogicalReactionParticipant")),
         ),
     ):
-        topology_matches = find_topology_matches(
-            concrete_topology.mol,
-            participant.topology.mol,
+        dag_mapping = topology_abstraction_mapping_witness(
+            session,
+            concrete_topology,
+            participant.topology,
+        )
+        topology_matches = (
+            find_topology_matches(concrete_topology.mol, participant.topology.mol)
+            if dag_mapping is None
+            else (dag_mapping,)
         )
         if topology_matches:
             matches.append((participant, topology_matches))

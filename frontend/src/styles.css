@@ -5115,6 +5115,95 @@ table.data-table {
   font-size: 11px;
 }
 
+.artifact-batch-download-progress {
+  display: grid;
+  gap: 7px;
+  margin: -6px 0 14px;
+  padding: 10px 12px;
+  color: var(--ink-soft);
+  background: var(--surface-muted);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--teal);
+  font-size: 10px;
+}
+
+.artifact-batch-download-progress-heading,
+.artifact-batch-download-progress-heading > span,
+.artifact-batch-download-progress-meta {
+  display: flex;
+  align-items: center;
+}
+
+.artifact-batch-download-progress-heading {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.artifact-batch-download-progress-heading > span {
+  min-width: 0;
+  gap: 6px;
+}
+
+.artifact-batch-download-progress-heading strong {
+  color: var(--teal);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.artifact-batch-download-progress-bar,
+.artifact-batch-download-progress-track {
+  width: 100%;
+  height: 6px;
+  overflow: hidden;
+  appearance: none;
+  border: 0;
+  border-radius: 2px;
+  background: var(--line);
+}
+
+.artifact-batch-download-progress-bar::-webkit-progress-bar {
+  background: var(--line);
+}
+
+.artifact-batch-download-progress-bar::-webkit-progress-value {
+  background: var(--teal);
+}
+
+.artifact-batch-download-progress-bar::-moz-progress-bar {
+  background: var(--teal);
+}
+
+.artifact-batch-download-progress-track {
+  position: relative;
+}
+
+.artifact-batch-download-progress-track span {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 34%;
+  background: var(--teal);
+  transform: translateX(-100%);
+}
+
+.artifact-batch-download-progress-track.is-indeterminate span {
+  animation: artifact-download-progress 1.25s ease-in-out infinite;
+}
+
+.artifact-batch-download-progress-meta {
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 9px;
+}
+
+@keyframes artifact-download-progress {
+  0% { transform: translateX(-100%); }
+  55% { transform: translateX(195%); }
+  100% { transform: translateX(300%); }
+}
+
 .command-button-danger {
   color: #fff;
   background: var(--danger);

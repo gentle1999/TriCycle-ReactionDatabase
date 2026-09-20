@@ -912,6 +912,9 @@ def seed_da_bench_fixture(
                         mapped_smiles=mapped_smiles_for_topology(
                             authority_frame.geometry.topology,
                             topology_atom_maps,
+                            include_stereochemistry=(
+                                node.role is not MappedReactionNodeRole.TRANSITION_STATE
+                            ),
                         ),
                         mapping_method="manifest-explicit",
                         mapping_version="coordinate-map-v1",

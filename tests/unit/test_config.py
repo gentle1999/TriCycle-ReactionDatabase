@@ -46,6 +46,10 @@ def test_settings_accept_psycopg_database_url() -> None:
     assert settings.molop_capture_source_evidence is True
     assert settings.molop_parallel_frame_persistence is True
     assert settings.molop_file_parse_timeout_seconds == 60.0
+    assert settings.molop_file_parse_timeout_size_multiplier == 1.5
+    assert settings.molecular_graph_match_timeout_seconds == 5.0
+    assert settings.molecular_graph_match_isolation_atom_count == 48
+    assert settings.molecular_graph_match_max_results == 1_000
 
 
 def test_database_pool_settings_can_match_worker_concurrency() -> None:

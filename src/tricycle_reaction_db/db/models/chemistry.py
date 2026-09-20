@@ -216,6 +216,11 @@ class MolecularTopology(SQLModel, table=True):
             "formula_id",
             "is_stereo_abstraction_upstream",
         ),
+        Index(
+            "ix_molecular_topology_project_stereo_agnostic_graph_hash",
+            "project_id",
+            "stereo_agnostic_graph_hash",
+        ),
     )
     model_config = ConfigDict(arbitrary_types_allowed=True)  # type: ignore[assignment]
 
@@ -263,6 +268,14 @@ class MolecularTopology(SQLModel, table=True):
         nullable=True,
     )
     graph_hash: str = Field(max_length=64, nullable=False)
+    # Nullable only for synthetic/legacy rows that cannot be normalized. The
+    # 0057 migration backfills every persisted topology; new normalized rows
+    # always carry this hash.
+    stereo_agnostic_graph_hash: str | None = Field(
+        default=None,
+        max_length=64,
+        nullable=True,
+    )
     identity_schema_version: str = Field(
         default=TOPOLOGY_IDENTITY_VERSION,
         sa_column=Column(
