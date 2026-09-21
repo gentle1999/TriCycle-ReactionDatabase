@@ -703,7 +703,7 @@ def _normalize_aromatic_bond_flags(mol: Chem.Mol) -> None:
     atoms and connectivity unchanged, while making the final bond flags agree
     with the explicit bond orders that RDKit serializes and reads back.
     """
-    for bond in mol.GetBonds():
+    for bond in mol.GetBonds():  # type: ignore[no-untyped-call]
         if bond.GetBondType() != Chem.BondType.AROMATIC and bond.GetIsAromatic():
             bond.SetIsAromatic(False)
 
@@ -711,14 +711,14 @@ def _normalize_aromatic_bond_flags(mol: Chem.Mol) -> None:
 def _clear_nonstereogenic_double_bond_tags(mol: Chem.Mol) -> None:
     """Remove assignments on bonds with no independent geometric isomerism."""
     probe = Chem.Mol(mol)
-    for atom in probe.GetAtoms():
+    for atom in probe.GetAtoms():  # type: ignore[no-untyped-call]
         atom.SetAtomMapNum(0)
     potential = {
         int(info.centeredOn)
         for info in Chem.FindPotentialStereo(probe, cleanIt=True)
         if info.type == Chem.StereoType.Bond_Double
     }
-    for bond in mol.GetBonds():
+    for bond in mol.GetBonds():  # type: ignore[no-untyped-call]
         if bond.GetStereo() in _SERIALIZED_DOUBLE_BOND_STEREO and bond.GetIdx() not in potential:
             bond.SetStereo(Chem.BondStereo.STEREONONE)
 
@@ -731,7 +731,7 @@ def _normalize_coordination_ring_stereo(mol: Chem.Mol) -> None:
     dative bonds. Check the actual ring control atoms, not the E/Z enum. A
     trans assignment is never discarded here.
     """
-    for bond in mol.GetBonds():
+    for bond in mol.GetBonds():  # type: ignore[no-untyped-call]
         stereo = _LEGACY_DOUBLE_BOND_STEREO_TO_E_Z.get(bond.GetStereo(), bond.GetStereo())
         if stereo not in _DOUBLE_BOND_E_Z_STEREO:
             continue
@@ -739,11 +739,11 @@ def _normalize_coordination_ring_stereo(mol: Chem.Mol) -> None:
         refs = tuple(bond.GetStereoAtoms())
         if len(refs) != 2:
             continue
-        paths = [(begin,)]
+        paths: list[list[int]] = [[begin]]
         visited = {begin}
         found = None
         for path in paths:
-            if len(path) >= 7:
+            if not path or len(path) >= 7:
                 continue
             for neighbor in mol.GetAtomWithIdx(path[-1]).GetNeighbors():
                 index = neighbor.GetIdx()
@@ -754,7 +754,7 @@ def _normalize_coordination_ring_stereo(mol: Chem.Mol) -> None:
                     break
                 if index not in visited:
                     visited.add(index)
-                    paths.append((*path, index))
+                    paths.append([*path, index])
             if found is not None:
                 break
         if found is None or not any(
@@ -1108,10 +1108,10 @@ def _validate_smiles_round_trip(
     # metal state. Ordinary atoms still require an exact radical round trip.
     metal_spin_identities = {
         identity
-        for identity, atom in zip(source_identities, source.GetAtoms(), strict=True)
+        for identity, atom in zip(source_identities, source.GetAtoms(), strict=True)  # type: ignore[no-untyped-call]
         if atom.HasProp(METAL_UNPAIRED_ELECTRONS_PROP) or atom.HasProp(RADICAL_ELECTRONS_PROP)
     }
-    for atom in source.GetAtoms():
+    for atom in source.GetAtoms():  # type: ignore[no-untyped-call]
         if atom.HasProp(RADICAL_ELECTRONS_PROP) and (
             atom.GetIntProp(RADICAL_ELECTRONS_PROP) != atom.GetNumRadicalElectrons()
         ):
@@ -1372,7 +1372,8 @@ def _serialize_molecule_smiles_once(
     ) -> tuple[str, list[int] | None]:
         candidate = Chem.Mol(molecule)
         _clear_smiles_output_order(candidate)
-        params = Chem.SmilesWriteParams()
+        # RDKit's stubs incorrectly type these writable scalar attributes.
+        params: Any = Chem.SmilesWriteParams()
         params.canonical = canonical
         params.rootedAtAtom = -1 if root is None else root
         params.doIsomericSmiles = True
@@ -1862,7 +1863,10 @@ def ensure_serializable_double_bond_stereochemistry(
     if parsed is None:
         raise ValueError("validated stereo SMILES could not be parsed")
     Chem.SetBondStereoFromDirections(parsed)
-    by_identity = {atom.GetAtomMapNum(): atom.GetIdx() for atom in parsed.GetAtoms()}
+    by_identity = {
+        atom.GetAtomMapNum(): atom.GetIdx()
+        for atom in parsed.GetAtoms()  # type: ignore[no-untyped-call]
+    }
     if set(by_identity) != set(range(1, projected.GetNumAtoms() + 1)):
         raise ValueError("validated stereo SMILES changed atom identities")
     ordered = Chem.RenumberAtoms(

@@ -6,8 +6,9 @@ import json
 from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 from molop.structure.ts_analysis import most_frequent_topology, sample_vibration_amplitudes
-from openbabel import openbabel as ob
+from openbabel import openbabel as ob  # type: ignore[import-untyped]
 from rdkit import Chem
 
 ENDPOINT_PROVENANCE_PROP = "_tricycle_ts_endpoint_provenance"
@@ -41,12 +42,17 @@ def strict_side_endpoint(frame: Any, signed_direction: int) -> Chem.Mol:
             ):
                 candidates.append(graph)
                 break
-    return most_frequent_topology(
+    endpoint = most_frequent_topology(
         candidates, side="positive" if signed_direction < 0 else "negative"
     )
+    if not isinstance(endpoint, Chem.Mol):
+        raise ValueError("MolOP did not return a molecular endpoint")
+    return endpoint
 
 
-def openbabel_endpoint(frame: Any, coordinates: np.ndarray, *, strict_error: Exception) -> Chem.Mol:
+def openbabel_endpoint(
+    frame: Any, coordinates: npt.NDArray[np.float64], *, strict_error: Exception
+) -> Chem.Mol:
     """Perceive a compatibility graph, never claim MolOP/MolGR validation."""
     molecule = ob.OBMol()
     molecule.BeginModify()
@@ -63,7 +69,9 @@ def openbabel_endpoint(frame: Any, coordinates: np.ndarray, *, strict_error: Exc
     if not writer.SetOutFormat("mol"):
         raise ValueError("Open Babel MOL writer is unavailable")
     endpoint = Chem.MolFromMolBlock(writer.WriteString(molecule), sanitize=False, removeHs=False)
-    if endpoint is None or [a.GetAtomicNum() for a in endpoint.GetAtoms()] != list(frame.atoms):
+    if endpoint is None or [
+        endpoint.GetAtomWithIdx(i).GetAtomicNum() for i in range(endpoint.GetNumAtoms())
+    ] != list(frame.atoms):
         raise ValueError("Open Babel fallback did not preserve source atoms and order")
     # MOL text rounds Cartesian coordinates. Restore the exact mode-ratio=1
     # positions and forbid implicit atoms not present in the source file.
@@ -75,7 +83,9 @@ def openbabel_endpoint(frame: Any, coordinates: np.ndarray, *, strict_error: Exc
         endpoint.GetAtomWithIdx(index).SetNoImplicit(True)
     endpoint.AddConformer(conformer)
     endpoint.UpdatePropertyCache(strict=False)
-    graph_charge = sum(atom.GetFormalCharge() for atom in endpoint.GetAtoms())
+    graph_charge = sum(
+        endpoint.GetAtomWithIdx(i).GetFormalCharge() for i in range(endpoint.GetNumAtoms())
+    )
     endpoint.SetProp(
         ENDPOINT_PROVENANCE_PROP,
         json.dumps(

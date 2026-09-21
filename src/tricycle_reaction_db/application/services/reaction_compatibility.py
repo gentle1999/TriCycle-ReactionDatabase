@@ -1,11 +1,17 @@
 """Reaction-level summaries of explicitly unverified TS endpoint evidence."""
 
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import and_, func, or_
 from sqlmodel import col, select
 
-from tricycle_reaction_db.application.dtos.query_views import LogicalReactionSummary
+from tricycle_reaction_db.application.dtos.query_views import (
+    LogicalReactionDetail,
+    LogicalReactionPage,
+    LogicalReactionSummary,
+    MappedReactionPage,
+    MappedReactionSummary,
+)
 from tricycle_reaction_db.db.models import LogicalReaction, MappedReaction, TransitionStateInference
 from tricycle_reaction_db.db.session import session_factory
 
@@ -20,13 +26,14 @@ FALLBACK_FILTERS = frozenset(
 
 def fallback_sides() -> tuple[Any, Any]:
     settings = col(TransitionStateInference.inference_settings)
-    return tuple(
+    negative, positive = (
         func.coalesce(
             settings["endpoint_validation"][side]["validation_status"].as_string() == "unverified",
             False,
         )
         for side in ("negative", "positive")
     )
+    return negative, positive
 
 
 def fallback_predicate(field: str, *, mapped: bool = False) -> Any:
@@ -45,14 +52,23 @@ def fallback_predicate(field: str, *, mapped: bool = False) -> Any:
     return select(TransitionStateInference.id).where(source == target, condition).exists()
 
 
-async def annotate_reaction_compatibility(result: Any) -> Any:
+async def annotate_reaction_compatibility[
+    ResultT: LogicalReactionPage
+    | MappedReactionPage
+    | LogicalReactionSummary
+    | MappedReactionSummary
+](result: ResultT) -> ResultT:
     """One batched lookup for already-authorized result IDs, never an N+1 query.
 
     Mixed evidence keeps the warning: a strict source must not hide an unverified
     source. Dual means both sides of the SAME inference, not two different files.
     Missing historical evidence is not inferred to be strict.
     """
-    summaries = list(result.items) if hasattr(result, "items") else [result]
+    summaries: list[LogicalReactionSummary | MappedReactionSummary] = (
+        list(result.items)
+        if isinstance(result, (LogicalReactionPage, MappedReactionPage))
+        else [result]
+    )
     for summary in list(summaries):
         summaries.extend(getattr(summary, "mapped_reactions", []))
     logical_ids = {s.id for s in summaries if isinstance(s, LogicalReactionSummary)}
@@ -83,17 +99,22 @@ async def annotate_reaction_compatibility(result: Any) -> Any:
         evidence.setdefault((True, logical_id), set()).add(count)
         evidence.setdefault((False, mapped_id), set()).add(count)
 
-    def annotated(summary: Any) -> Any:
+    def annotated[SummaryT: LogicalReactionSummary | MappedReactionSummary](
+        summary: SummaryT,
+    ) -> SummaryT:
         counts = evidence.get((isinstance(summary, LogicalReactionSummary), summary.id), set())
         updates: dict[str, Any] = {
             "has_compatibility_endpoints": bool(counts),
             "has_single_endpoint_fallback": 1 in counts,
             "has_dual_endpoint_fallback": 2 in counts,
         }
-        if hasattr(summary, "mapped_reactions"):
+        if isinstance(summary, LogicalReactionDetail):
             updates["mapped_reactions"] = [annotated(item) for item in summary.mapped_reactions]
-        return summary.model_copy(update=updates)
+        return cast(SummaryT, summary.model_copy(update=updates))
 
-    if hasattr(result, "items"):
-        return result.model_copy(update={"items": [annotated(item) for item in result.items]})
+    if isinstance(result, (LogicalReactionPage, MappedReactionPage)):
+        return cast(
+            ResultT,
+            result.model_copy(update={"items": [annotated(item) for item in result.items]}),
+        )
     return annotated(result)

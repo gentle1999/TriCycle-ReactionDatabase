@@ -56,9 +56,12 @@ def _two_center_molecule() -> Chem.Mol:
 
 def test_identity_abstraction_is_a_noop_without_a_self_edge():
     topology = SimpleNamespace(id=UUID(int=301), project_id=PROJECT_ID)
-    assert topology_abstraction.persist_stereo_abstraction(
-        cast(Any, object()), cast(Any, topology), cast(Any, topology)
-    ) is None
+    assert (
+        topology_abstraction.persist_stereo_abstraction(
+            cast(Any, object()), cast(Any, topology), cast(Any, topology)
+        )
+        is None
+    )
 
 
 def test_square_planar_parity_survives_reordering_but_rejects_other_isomer():

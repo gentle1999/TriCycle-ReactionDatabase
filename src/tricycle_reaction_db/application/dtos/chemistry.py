@@ -252,7 +252,7 @@ class MolecularTopologyRecord(BaseModel):
 
     mol: Chem.Mol
 
-    @computed_field
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def mol_atom_properties(self) -> dict[str, int]:
         return mol_atom_properties(self.mol)
@@ -326,7 +326,7 @@ class GeometryRecord(BaseModel):
 
     mol: Chem.Mol
 
-    @computed_field
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def mol_atom_properties(self) -> dict[str, int]:
         return mol_atom_properties(self.mol)

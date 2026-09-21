@@ -8,7 +8,7 @@ RADICAL_ELECTRONS_PROP = "_tricycle_source_radical_electrons"
 
 def annotate_electronic_state(molecule: Chem.Mol) -> None:
     """Retain explicit source evidence, including a known zero on open valences."""
-    for atom in molecule.GetAtoms():
+    for atom in molecule.GetAtoms():  # type: ignore[no-untyped-call]
         if not atom.HasProp(METAL_UNPAIRED_ELECTRONS_PROP):
             atom.SetIntProp(RADICAL_ELECTRONS_PROP, atom.GetNumRadicalElectrons())
 
@@ -22,13 +22,13 @@ def mol_atom_properties(molecule: Chem.Mol) -> dict[str, int]:
 
     properties = {
         str(atom.GetIdx()): atom.GetIntProp(METAL_UNPAIRED_ELECTRONS_PROP)
-        for atom in molecule.GetAtoms()
+        for atom in molecule.GetAtoms()  # type: ignore[no-untyped-call]
         if atom.HasProp(METAL_UNPAIRED_ELECTRONS_PROP)
     }
     properties.update(
         {
             f"radical:{atom.GetIdx()}": atom.GetIntProp(RADICAL_ELECTRONS_PROP)
-            for atom in molecule.GetAtoms()
+            for atom in molecule.GetAtoms()  # type: ignore[no-untyped-call]
             if atom.HasProp(RADICAL_ELECTRONS_PROP)
         }
     )
@@ -60,7 +60,7 @@ def metal_spin_identity(molecule: Chem.Mol) -> dict[str, str]:
 
     graph = Chem.Mol(molecule)
     Chem.RemoveStereochemistry(graph)
-    for atom in graph.GetAtoms():
+    for atom in graph.GetAtoms():  # type: ignore[no-untyped-call]
         # Disjoint labels preserve metal evidence and survive atom reordering.
         label = 2 * atom.GetNumRadicalElectrons() + 2
         if atom.HasProp(METAL_UNPAIRED_ELECTRONS_PROP):

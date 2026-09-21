@@ -510,7 +510,13 @@ def _stereo_abstraction_match_for_known_atom_mapping(
                 order = (specific_bond.GetBeginAtomIdx(), specific_bond.GetEndAtomIdx())
                 edge = frozenset(order)
                 if not _stereo_signatures_match(
-                    {edge: (general_stereo, expected_stereo_atoms, order)},
+                    {
+                        edge: (
+                            general_stereo,
+                            (expected_stereo_atoms[0], expected_stereo_atoms[1]),
+                            order,
+                        )
+                    },
                     {edge: (specific_stereo, specific_stereo_atoms, order)},
                 ):
                     return None
@@ -1128,7 +1134,7 @@ def backfill_stereo_abstraction_downstreams(
             general_id,
         ):
             continue
-        edge = persist_stereo_abstraction(
+        persisted_edge = persist_stereo_abstraction(
             session,
             candidate,
             general_topology,
@@ -1139,8 +1145,8 @@ def backfill_stereo_abstraction_downstreams(
                 "backfill_existing_downstream": True,
             },
         )
-        if edge is not None:
-            edges.append(edge)
+        if persisted_edge is not None:
+            edges.append(persisted_edge)
         general_by_specific.setdefault(candidate_id, set()).add(general_id)
     return tuple(edges)
 

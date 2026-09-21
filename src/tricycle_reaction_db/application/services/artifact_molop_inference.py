@@ -155,9 +155,14 @@ def signed_ts_endpoints(
                     and endpoint.GetProp("_MolGRReconstructionStatus") == "suspicious_fallback"
                 ):
                     raise ValueError("MolOP returned a suspicious fallback topology")
-                if [a.GetAtomicNum() for a in endpoint.GetAtoms()] != list(frame.atoms):
+                if [
+                    endpoint.GetAtomWithIdx(i).GetAtomicNum() for i in range(endpoint.GetNumAtoms())
+                ] != list(frame.atoms):
                     raise ValueError("MolOP endpoint did not preserve source atom order")
-                if sum(a.GetFormalCharge() for a in endpoint.GetAtoms()) != int(frame.charge):
+                if sum(
+                    endpoint.GetAtomWithIdx(i).GetFormalCharge()
+                    for i in range(endpoint.GetNumAtoms())
+                ) != int(frame.charge):
                     raise ValueError("MolOP endpoint formal charge differs from source charge")
                 ratio = _signed_ratio(endpoint)
                 if not np.isfinite(ratio) or ratio * direction <= 0:

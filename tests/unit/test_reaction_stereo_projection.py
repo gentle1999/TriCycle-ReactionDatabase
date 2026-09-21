@@ -130,9 +130,7 @@ def test_large_molecule_inversion_rules_do_not_spawn_graph_matching(monkeypatch)
         "_run_isolated_substructure_matches",
         fail_if_called,
     )
-    molecule = Chem.MolFromSmiles(
-        "[N:1]([CH3:2])([CH3:3])[CH3:4]." + "C" * 50
-    )
+    molecule = Chem.MolFromSmiles("[N:1]([CH3:2])([CH3:3])[CH3:4]." + "C" * 50)
     assert molecule is not None
     assert molecule.GetNumAtoms() >= 48
 

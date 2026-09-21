@@ -530,9 +530,7 @@ def _copy_rows_to_postgresql_sync(
 def _copy_compatible(columns: tuple[Any, ...]) -> bool:
     """Return whether COPY can preserve every SQLAlchemy bind expression."""
 
-    return all(
-        not isinstance(column.type, (RdkitMol, RdkitReaction)) for column in columns
-    )
+    return all(not isinstance(column.type, (RdkitMol, RdkitReaction)) for column in columns)
 
 
 def _bulk_insert_pending_entities(session: Session) -> None:

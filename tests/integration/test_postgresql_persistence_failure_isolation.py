@@ -1,4 +1,4 @@
-"""Real PostgreSQL COPY rollback/isolation, using connection-local tables only."""
+"""PostgreSQL COPY rollback/isolation, using connection-local tables only."""
 
 import json
 import os

@@ -2187,7 +2187,7 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             maximum_name="maximum_mapped_reaction_count",
         )
         thermodynamic_profile_kwargs: dict[str, Any] = {}
-        for name, value in (
+        for name, energy_value in (
             (
                 "minimum_activation_gibbs_free_energy_kcal_mol",
                 minimum_activation_gibbs_free_energy_kcal_mol,
@@ -2205,8 +2205,8 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                 maximum_reaction_gibbs_free_energy_kcal_mol,
             ),
         ):
-            if value is not None:
-                thermodynamic_profile_kwargs[name] = value
+            if energy_value is not None:
+                thermodynamic_profile_kwargs[name] = energy_value
         if has_activation_gibbs_free_energy is True:
             thermodynamic_profile_kwargs["has_activation_gibbs_free_energy"] = True
         if has_reaction_gibbs_free_energy is True:
