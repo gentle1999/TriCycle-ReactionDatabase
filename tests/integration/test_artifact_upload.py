@@ -223,6 +223,8 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
             mapped_reaction = session.get(MappedReaction, inference.mapped_reaction_id)
             assert logical_reaction is not None
             assert mapped_reaction is not None
+            first_reaction_hash = logical_reaction.reaction_hash
+            first_mapping_hash = mapped_reaction.mapping_hash
             assert logical_reaction.project_id == artifact.project_id
             assert mapped_reaction.project_id == artifact.project_id
             ts_frame = session.exec(
@@ -561,7 +563,21 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
                 )
             ).one()
             assert reparse_inference.calculation_frame_id != first_inference_frame_id
-            assert reparse_inference.mapped_reaction_id == first_mapped_reaction_id
+            # Clean reparse collects the now-unreferenced mapping. Chemical
+            # identity is stable, but disposable materialization IDs are not.
+            assert reparse_inference.mapped_reaction_id != first_mapped_reaction_id
+            assert (
+                session.exec(
+                    select(MappedReaction.id).where(MappedReaction.id == first_mapped_reaction_id)
+                ).first()
+                is None
+            )
+            rebuilt_mapping = session.get(MappedReaction, reparse_inference.mapped_reaction_id)
+            rebuilt_reaction = session.get(LogicalReaction, reparse_inference.logical_reaction_id)
+            assert rebuilt_mapping is not None
+            assert rebuilt_reaction is not None
+            assert rebuilt_mapping.mapping_hash == first_mapping_hash
+            assert rebuilt_reaction.reaction_hash == first_reaction_hash
     finally:
         transaction.rollback()
         connection.close()
@@ -761,6 +777,8 @@ def test_nonconverged_ts_binds_geometry_and_converged_reparse_adds_evidence() ->
 
             mapped_reaction = session.get(MappedReaction, first_inference.mapped_reaction_id)
             assert mapped_reaction is not None
+            first_mapping_hash = mapped_reaction.mapping_hash
+            first_ts_node_id = ts_node.id
             duplicate_first_binding = bind_transition_state_frame(
                 session,
                 mapped_reaction=mapped_reaction,
@@ -801,14 +819,35 @@ def test_nonconverged_ts_binds_geometry_and_converged_reparse_adds_evidence() ->
                     TransitionStateInference.parse_revision_id == second_revision_id
                 )
             ).one()
-            assert second_inference.mapped_reaction_id == first_mapped_reaction_id
+            assert second_inference.mapped_reaction_id != first_mapped_reaction_id
+            assert (
+                session.exec(
+                    select(MappedReaction.id).where(MappedReaction.id == first_mapped_reaction_id)
+                ).first()
+                is None
+            )
+            assert (
+                session.exec(
+                    select(MappedReactionNode.id).where(MappedReactionNode.id == first_ts_node_id)
+                ).first()
+                is None
+            )
+            rebuilt_mapping = session.get(MappedReaction, second_inference.mapped_reaction_id)
+            assert rebuilt_mapping is not None
+            assert rebuilt_mapping.mapping_hash == first_mapping_hash
+            rebuilt_ts_node = session.exec(
+                select(MappedReactionNode).where(
+                    MappedReactionNode.mapped_reaction_id == second_inference.mapped_reaction_id,
+                    MappedReactionNode.role == MappedReactionNodeRole.TRANSITION_STATE,
+                )
+            ).one()
             assert second_inference.calculation_frame_id != first_inference_frame_id
             second_frame = session.get(CalculationFrame, second_inference.calculation_frame_id)
             assert second_frame is not None
             assert second_frame.optimization_status is OptimizationStatus.CONVERGED
             assert session.exec(
                 select(MappedReactionNodeGeometry).where(
-                    MappedReactionNodeGeometry.mapped_reaction_node_id == ts_node.id,
+                    MappedReactionNodeGeometry.mapped_reaction_node_id == rebuilt_ts_node.id,
                     MappedReactionNodeGeometry.geometry_id == second_frame.geometry_id,
                 )
             ).all()

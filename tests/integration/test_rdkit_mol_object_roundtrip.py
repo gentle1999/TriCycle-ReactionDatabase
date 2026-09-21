@@ -155,8 +155,14 @@ def test_python_mol_round_trip_preserves_chemical_graph(database_engine: Engine)
         assert _stereo_signature(loaded) == _stereo_signature(source)
 
 
-def test_conformers_are_approximate_and_custom_properties_are_not_persisted(
+@pytest.mark.parametrize(
+    "pickle_properties",
+    [Chem.PropertyPickleOptions.NoProps, Chem.PropertyPickleOptions.AllProps],
+    ids=["no-properties", "all-properties"],
+)
+def test_conformers_are_approximate_and_custom_properties_follow_pickle_policy(
     database_engine: Engine,
+    pickle_properties: Chem.PropertyPickleOptions,
 ) -> None:
     source = Chem.MolFromSmiles("[13CH3:7][C@H:8](F)/C=C\\[2H:9]")
     assert source is not None
@@ -181,7 +187,14 @@ def test_conformers_are_approximate_and_custom_properties_are_not_persisted(
             )
         source.AddConformer(conformer, assignId=False)
 
-    loaded = _round_trip(database_engine, [source])[0]
+    # Ingestion enables AllProps for process-pool transfers. Do not depend on
+    # which parser test ran first, and do not leak this probe's policy either.
+    previous_properties = Chem.GetDefaultPickleProperties()
+    try:
+        Chem.SetDefaultPickleProperties(pickle_properties)
+        loaded = _round_trip(database_engine, [source])[0]
+    finally:
+        Chem.SetDefaultPickleProperties(previous_properties)
 
     assert loaded.GetNumConformers() == source.GetNumConformers()
     for source_conformer, loaded_conformer in zip(
@@ -196,7 +209,19 @@ def test_conformers_are_approximate_and_custom_properties_are_not_persisted(
             assert loaded_position.y == pytest.approx(source_position.y, abs=1e-6)
             assert loaded_position.z == pytest.approx(source_position.z, abs=1e-6)
 
-    assert not loaded.HasProp("workflow_label")
+    preserves_properties = pickle_properties == Chem.PropertyPickleOptions.AllProps
+    assert bool(loaded.HasProp("workflow_label")) == preserves_properties
+    # The cartridge retains molecule/conformer properties from AllProps but
+    # drops atom/bond properties. Electronic annotations still need a sidecar.
     assert not loaded.GetAtomWithIdx(0).HasProp("partial_charge")
     assert not loaded.GetBondWithIdx(0).HasProp("bond_annotation")
-    assert all(not conformer.HasProp("source_geometry") for conformer in loaded.GetConformers())
+    assert all(
+        bool(conformer.HasProp("source_geometry")) == preserves_properties
+        for conformer in loaded.GetConformers()
+    )
+    if preserves_properties:
+        assert loaded.GetProp("workflow_label") == "gaussian-ts"
+        assert [c.GetProp("source_geometry") for c in loaded.GetConformers()] == [
+            "gaussian-17",
+            "gaussian-29",
+        ]
