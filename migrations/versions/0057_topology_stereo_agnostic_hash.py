@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 from rdkit import Chem
-from sqlmodel import Session, select
+from sqlmodel import Session
 
 from tricycle_reaction_db.db.models import MolecularTopology
 from tricycle_reaction_db.ingestion.normalization import stereo_agnostic_graph_hash
@@ -35,13 +35,17 @@ def _backfill_existing_topologies() -> None:
     connection = op.get_bind()
     session = Session(bind=connection, expire_on_commit=False)
     try:
-        rows = session.exec(
-            select(MolecularTopology.id, MolecularTopology.mol).where(
-                MolecularTopology.stereo_agnostic_graph_hash.is_(None),
+        # This migration precedes the electronic-annotation sidecar. Do not
+        # use the current model's MOL reader, which needs that later column.
+        rows = session.execute(
+            sa.text(
+                "SELECT id, mol_send(mol) FROM molecular_topology "
+                "WHERE stereo_agnostic_graph_hash IS NULL"
             )
         ).all()
         updates: list[dict[str, object]] = []
-        for topology_id, molecule in rows:
+        for topology_id, binary in rows:
+            molecule = Chem.Mol(bytes(binary)) if binary is not None else None
             if topology_id is None or not isinstance(molecule, Chem.Mol):
                 raise RuntimeError(
                     "molecular topology backfill encountered an invalid RDKit molecule"

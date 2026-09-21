@@ -258,6 +258,12 @@ onBeforeUnmount(() => previewController?.abort());
       :height="280"
     />
     <section v-if="frame.transition_state_endpoints.length === 2" class="transition-state-mode-views" aria-label="虚频模式插值视图">
+      <p v-if="frame.transition_state_endpoints.some((item) => item.validation_status === 'unverified')" role="alert">
+        注意：
+        <span v-for="endpoint in frame.transition_state_endpoints.filter((item) => item.validation_status === 'unverified')" :key="endpoint.direction">
+          {{ endpoint.direction === 'negative' ? '负向' : '正向' }}端点使用 Open Babel 兼容回退（mode ratio=1），未经严格检验。
+        </span>
+      </p>
       <ChemDoodleTransitionStateMode3D
         :frame-id="frame.id"
         :project-id="projectId"

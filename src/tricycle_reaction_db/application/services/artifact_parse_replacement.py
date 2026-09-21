@@ -23,6 +23,8 @@ from sqlmodel import Session, col, select
 from tricycle_reaction_db.db.models import (
     CalculationFrame,
     CalculationSegment,
+    Geometry,
+    LogicalReaction,
     MappedReaction,
     MappedReactionNode,
     MappedReactionNodeGeometry,
@@ -42,6 +44,9 @@ class ParseCleanupSummary:
     deleted_inference_count: int = 0
     deleted_segment_count: int = 0
     deleted_node_geometry_count: int = 0
+    deleted_geometry_count: int = 0
+    deleted_mapped_reaction_count: int = 0
+    deleted_logical_reaction_count: int = 0
 
 
 def clear_previous_parse_results_batch(
@@ -108,6 +113,9 @@ def clear_previous_parse_results_batch(
         ).all()
         if isinstance(mapped_reaction_id, UUID)
     }
+    # Only inference-linked reactions are candidates for collection; sibling
+    # mappings may be user-created and are inspected only for stale bindings.
+    inferred_mapped_reaction_ids = set(old_mapped_reaction_ids)
     if old_logical_reaction_ids:
         old_mapped_reaction_ids.update(
             mapped_reaction_id
@@ -173,6 +181,14 @@ def clear_previous_parse_results_batch(
         .execution_options(synchronize_session=False)
     )
 
+    # Delete frames while their revision/artifact joins are still visible to
+    # the catalogue decrement trigger. A parent-first cascade loses that join.
+    session.execute(
+        delete(CalculationFrame)
+        .where(col(CalculationFrame.parse_revision_id).in_(old_revision_ids))
+        .execution_options(synchronize_session=False)
+    )
+
     # CalculationSegment owns the frame cascade, and all frame-owned
     # scientific results/endpoints have CASCADE foreign keys. Inferences were
     # deleted first because their frame link is intentionally RESTRICT. A
@@ -182,6 +198,49 @@ def clear_previous_parse_results_batch(
     session.execute(
         delete(ParseRevision)
         .where(col(ParseRevision.id).in_(old_revision_ids))
+        .execution_options(synchronize_session=False)
+    )
+
+    # Collect only this reset's candidates, never sweep unrelated project
+    # data. Remaining inference or geometry evidence protects shared mappings.
+    mapped_result = session.execute(
+        delete(MappedReaction)
+        .where(
+            col(MappedReaction.id).in_(inferred_mapped_reaction_ids),
+            ~select(TransitionStateInference.id)
+            .where(TransitionStateInference.mapped_reaction_id == MappedReaction.id)
+            .exists(),
+            ~select(MappedReactionNodeGeometry.id)
+            .join(MappedReactionNode)
+            .where(MappedReactionNode.mapped_reaction_id == MappedReaction.id)
+            .exists(),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    logical_result = session.execute(
+        delete(LogicalReaction)
+        .where(
+            col(LogicalReaction.id).in_(old_logical_reaction_ids),
+            ~select(TransitionStateInference.id)
+            .where(TransitionStateInference.logical_reaction_id == LogicalReaction.id)
+            .exists(),
+            ~select(MappedReaction.id)
+            .where(MappedReaction.logical_reaction_id == LogicalReaction.id)
+            .exists(),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    geometry_result = session.execute(
+        delete(Geometry)
+        .where(
+            col(Geometry.id).in_(old_geometry_ids),
+            ~select(CalculationFrame.id)
+            .where(CalculationFrame.geometry_id == Geometry.id)
+            .exists(),
+            ~select(MappedReactionNodeGeometry.id)
+            .where(MappedReactionNodeGeometry.geometry_id == Geometry.id)
+            .exists(),
+        )
         .execution_options(synchronize_session=False)
     )
     session.expire_all()
@@ -194,6 +253,9 @@ def clear_previous_parse_results_batch(
         deleted_inference_count=deleted_inference_count,
         deleted_segment_count=deleted_segment_count,
         deleted_node_geometry_count=deleted_node_geometry_count,
+        deleted_geometry_count=int(cast(Any, geometry_result).rowcount or 0),
+        deleted_mapped_reaction_count=int(cast(Any, mapped_result).rowcount or 0),
+        deleted_logical_reaction_count=int(cast(Any, logical_result).rowcount or 0),
     )
 
 

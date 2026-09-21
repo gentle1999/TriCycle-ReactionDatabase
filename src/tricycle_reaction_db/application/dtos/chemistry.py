@@ -6,7 +6,7 @@ from uuid import UUID
 
 import numpy as np
 import numpy.typing as npt
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 from rdkit import Chem
 
 from tricycle_reaction_db.domain.enums import (
@@ -16,6 +16,7 @@ from tricycle_reaction_db.domain.enums import (
 )
 from tricycle_reaction_db.domain.formulas import ELEMENT_COUNT_VECTOR_SIZE
 from tricycle_reaction_db.domain.internal_coordinates import internal_coordinate_hash
+from tricycle_reaction_db.domain.mol_properties import mol_atom_properties
 
 
 class MolecularFormulaRecord(BaseModel):
@@ -250,6 +251,12 @@ class MolecularTopologyRecord(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
     mol: Chem.Mol
+
+    @computed_field
+    @property
+    def mol_atom_properties(self) -> dict[str, int]:
+        return mol_atom_properties(self.mol)
+
     canonical_isomeric_smiles: str | None = None
     graph_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     stereo_agnostic_graph_hash: str | None = Field(
@@ -318,6 +325,12 @@ class GeometryRecord(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
     mol: Chem.Mol
+
+    @computed_field
+    @property
+    def mol_atom_properties(self) -> dict[str, int]:
+        return mol_atom_properties(self.mol)
+
     internal_coordinates: npt.NDArray[np.float64]
     internal_coordinate_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     geometry_hash: str = Field(pattern=r"^[0-9a-f]{64}$")

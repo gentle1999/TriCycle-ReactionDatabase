@@ -2677,6 +2677,8 @@ class UploadBatchService:
             if finalized:
 
                 def item_case(column: object, values: Mapping[UUID, object]) -> object:
+                    if not values:
+                        return column
                     return case(values, value=col(UploadBatchItem.id), else_=column)
 
                 def item_jsonb_case(

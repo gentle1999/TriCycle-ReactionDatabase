@@ -449,6 +449,31 @@ async def test_file_pipeline_timeout_isolated_to_one_file(monkeypatch: pytest.Mo
         await _run_molop_file_pipeline(b"source", "slow.log")
 
 
+@pytest.mark.asyncio
+async def test_parser_queue_wait_and_multiframe_work_do_not_consume_parser_deadline(monkeypatch):
+    settings = Settings(_env_file=None, molop_file_parse_timeout_seconds=0.01)
+    monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
+
+    async def parse(*args, **kwargs):
+        return "parsed"
+
+    async def frames(parsed, **kwargs):
+        await asyncio.sleep(0.03)
+        return parsed
+
+    monkeypatch.setattr(upload_module, "_run_molop_source_parser", parse)
+    monkeypatch.setattr(upload_module, "_process_parsed_artifact_frames", frames)
+    slots = asyncio.Semaphore(1)
+    await slots.acquire()
+    task = asyncio.create_task(
+        _run_molop_file_pipeline(b"source", "many.log", submission_slots=slots)
+    )
+    await asyncio.sleep(0.03)
+    assert not task.done()
+    slots.release()
+    assert await task == "parsed"
+
+
 @pytest.mark.parametrize(
     ("size_bytes", "expected_seconds"),
     [

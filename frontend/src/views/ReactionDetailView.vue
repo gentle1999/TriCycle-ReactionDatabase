@@ -9,6 +9,7 @@ import ChemDoodleMolecule from "@/components/ChemDoodleMolecule.vue";
 import FrameDrawer from "@/components/FrameDrawer.vue";
 import MappedReactionExpansion from "@/components/MappedReactionExpansion.vue";
 import MappedReactionSummaryCard from "@/components/MappedReactionSummaryCard.vue";
+import ReactionCompatibilityBadge from "@/components/ReactionCompatibilityBadge.vue";
 import { useProjectContext } from "@/composables/useProjectContext";
 import { labelFor, shortId } from "@/format";
 import { withoutAccessState } from "@/routeAccessState";
@@ -100,7 +101,8 @@ function participantRole(participant: LogicalReactionParticipant): string {
           <RouterLink v-else class="entity-back-link" :to="{ name: 'reactions', query: navigationQuery }"><ArrowLeft :size="15" aria-hidden="true" />反应路径目录</RouterLink>
           <span class="eyebrow">MappedReaction · 映射反应</span>
           <h1 id="mapped-reaction-detail-title">{{ mappedReaction?.label || mappedReaction?.mapped_reaction_key || "映射反应详情" }}</h1>
-          <p>严格的原子映射、具体拓扑、节点几何和计算帧。</p>
+          <p>原子映射、具体拓扑、节点几何和计算帧。</p>
+          <ReactionCompatibilityBadge v-if="mappedReaction" :reaction="mappedReaction" detail />
         </div>
       </header>
     </template>
@@ -110,7 +112,8 @@ function participantRole(participant: LogicalReactionParticipant): string {
           <RouterLink class="entity-back-link" :to="{ name: 'reactions', query: navigationQuery }"><ArrowLeft :size="15" aria-hidden="true" />反应路径目录</RouterLink>
           <span class="eyebrow">LogicalReaction · 逻辑反应</span>
           <h1 id="reaction-detail-title">{{ reaction?.label || reaction?.reaction_key || "逻辑反应详情" }}</h1>
-          <p>逻辑反应拓扑及其对应的多个严格映射反应。</p>
+          <p>逻辑反应拓扑及其对应的多个映射反应。</p>
+          <ReactionCompatibilityBadge v-if="reaction" :reaction="reaction" detail />
         </div>
       </header>
     </template>

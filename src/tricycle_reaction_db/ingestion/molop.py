@@ -30,6 +30,9 @@ def configure_molecular_graph_reconstruction(*, allow_native_parallel: bool = Fa
     frames keep flowing into the TS inference gate.
     """
 
+    # ProcessPoolExecutor pickles normalized records and endpoint MOLs. RDKit's
+    # default pickle omits atom properties, including MolGR metal spin evidence.
+    Chem.SetDefaultPickleProperties(Chem.PropertyPickleOptions.AllProps)
     molopconfig.reconstruction_failure_policy = MOLECULAR_GRAPH_RECONSTRUCTION_FAILURE_POLICY
     molopconfig.apply_molgr_reconstruction_policy()
     cpp_backend = MOLGR_CONFIG.cpp_backend

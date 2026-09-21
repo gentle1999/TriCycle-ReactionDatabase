@@ -238,6 +238,9 @@ class GeometryDetail(GeometrySummary):
 
 
 class LogicalReactionSummary(QueryView):
+    has_compatibility_endpoints: bool = False
+    has_single_endpoint_fallback: bool = False
+    has_dual_endpoint_fallback: bool = False
     id: UUID
     reaction_key: str
     label: str | None = None
@@ -276,6 +279,9 @@ class LogicalReactionParticipantView(QueryView):
 
 
 class MappedReactionSummary(QueryView):
+    has_compatibility_endpoints: bool = False
+    has_single_endpoint_fallback: bool = False
+    has_dual_endpoint_fallback: bool = False
     id: UUID
     logical_reaction_id: UUID
     mapped_reaction_key: str
@@ -377,6 +383,9 @@ class TransitionStateEndpointView(QueryView):
     displacement_ratio: float
     source_coordinate_hash: str
     source_to_topology_atom_indices: list[int]
+    validation_status: str = "unknown"
+    strict_validation_passed: bool = False
+    provenance_json: str = "{}"
 
 
 class ArtifactIngestionSummary(QueryView):

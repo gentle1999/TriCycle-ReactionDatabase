@@ -5,7 +5,7 @@
 > 状态：MolOP 契约已实现，数据库 schema 已对齐
 > 契约版本：`molop-calculation-export-v1`
 > 使用方：Example Chemistry Database（部署显示名可由环境变量覆盖）
-> 最低兼容基线：PyPI `molop>=0.2.18`、`molgr>=0.1.8`
+> 最低兼容基线：PyPI `molop>=0.2.20`、`molgr>=0.1.8`
 > 复核日期：2026-08-09
 
 ## 1. 目标
@@ -298,7 +298,7 @@ MolOP 当前已实现：
 
 数据库接入状态：
 
-1. 依赖要求为 PyPI MolOP `>=0.2.18` 与 MolGR `>=0.1.8`。Gaussian 进程内导入直接消费 MolOP
+1. 依赖要求为 PyPI MolOP `>=0.2.20` 与 MolGR `>=0.1.8`。Gaussian 进程内导入直接消费 MolOP
    公共模型的 `model_dump(mode="python", exclude_none=False)` payload，不重复实现
    locator、状态判断、拓扑重建或模型校验。数据库侧只做字段裁剪、Quantity 单位归一化、
    ndarray sidecar 摘要/转换、计算协议归一化和数据库 identity 绑定。可信 MolGR 图只重建 ring info；数据库不再

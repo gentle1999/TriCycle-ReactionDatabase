@@ -606,11 +606,14 @@ The Makefile equivalents are `IMPORT_INCLUDE_SUFFIXES`,
 
 ## Dependency Upgrades
 
-MolOP `>=0.2.18` and MolGR `>=0.1.8` are installed from PyPI. MolOP's unified
+MolOP `>=0.2.20` and MolGR `>=0.1.8` are installed from PyPI. MolOP's unified
 file- and frame-level `comments` containers are persisted in
 `ParseRevision.comments` and `CalculationFrame.comments`; artifact and frame
 detail pages expose them as read-only parsed provenance, separate from editable
-`ArtifactFile.notes`. After changing
+`ArtifactFile.notes`. All calculation parsing entrypoints use
+`ParseOptions(source_decode_errors="surrogateescape")` for native local decoding
+tolerance while preserving source evidence and original byte hashes. TriCycle
+does not rewrite the input or join wrapped UTF-8 bytes. After changing
 MolOP, MolGR, OpenBabel, or RDKit, run:
 
 ```bash

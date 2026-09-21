@@ -55,6 +55,7 @@ from tricycle_reaction_db.application.services.reactions import (
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
     LogicalReaction,
+    LogicalReactionParticipant,
     MappedReaction,
     MolecularFormula,
     MolecularTopology,
@@ -296,6 +297,53 @@ def _logicalize_components(
     return logical_components
 
 
+def _align_participant_indices(
+    components: list[_ResolvedComponent],
+    logical_components: list[_ResolvedComponent],
+    existing: list[LogicalReactionParticipant],
+) -> tuple[list[_ResolvedComponent], list[_ResolvedComponent]]:
+    slots: dict[tuple[LogicalReactionParticipantSide, UUID], list[int]] = {}
+    for participant in sorted(existing, key=lambda item: item.participant_index):
+        slots.setdefault((participant.side, participant.topology_id), []).append(
+            participant.participant_index
+        )
+    indices: dict[tuple[LogicalReactionParticipantSide, int], int] = {}
+    next_index: dict[LogicalReactionParticipantSide, int] = {}
+    ordered = sorted(
+        logical_components,
+        key=lambda component: (
+            component.side.value,
+            (component.logical_topology or component.topology).graph_hash,
+            tuple(sorted(component.topology_atom_map_numbers)),
+            component.template_index,
+        ),
+    )
+    for component in ordered:
+        side = component.side
+        topology = component.logical_topology or component.topology
+        if existing:
+            available = slots.get((side, _require_id(topology, label="MolecularTopology")))
+            if not available:
+                raise ValueError(
+                    "logical reaction identity has incompatible participant topology multiplicities"
+                )
+            index = available.pop(0)
+        else:
+            index = next_index.get(side, 0)
+            next_index[side] = index + 1
+        indices[(side, component.template_index)] = index
+    if any(slots.values()):
+        raise ValueError("logical reaction identity contains unmatched participants")
+
+    def reindex(items: list[_ResolvedComponent]) -> list[_ResolvedComponent]:
+        return [
+            replace(item, template_index=indices[(item.side, item.template_index)])
+            for item in items
+        ]
+
+    return reindex(components), reindex(logical_components)
+
+
 def _automatic_reaction_label(
     components: list[_ResolvedComponent],
     reaction_hash: str,
@@ -329,6 +377,7 @@ def _create_reaction(
     include_creation_metadata: bool = True,
     reconciliation_cache: ReconciliationBatchCache | None = None,
     precomputed_topology_records: tuple[NormalizedTopologyRecord, ...] | None = None,
+    allow_unverified_endpoint_charge: bool = False,
 ) -> CreateReactionResult:
     project_id = topology_context.project_id if topology_context is not None else None
     if not isinstance(project_id, UUID):
@@ -386,6 +435,13 @@ def _create_reaction(
         project_id=project_id,
     )
     logical_created = existing_logical is None
+    # Logical identity is order-independent. Reuse existing participant slots
+    # by topology, not by an endpoint's incidental fragment/template order.
+    # Apply the same permutation to concrete components so atom-map bindings
+    # and mapped-reaction templates stay aligned.
+    components, logical_components = _align_participant_indices(
+        components, logical_components, list(logical_reaction.participants)
+    )
     for component in logical_components:
         persist_logical_reaction_participant(
             session,
@@ -401,7 +457,9 @@ def _create_reaction(
                 else (component.topology,)
             ),
         )
-    validate_logical_reaction(logical_reaction)
+    validate_logical_reaction(
+        logical_reaction, allow_unverified_charge=allow_unverified_endpoint_charge
+    )
 
     topology_ids = [
         _require_id(component.logical_topology or component.topology, label="MolecularTopology")

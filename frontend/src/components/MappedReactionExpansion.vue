@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import ReactionCompatibilityBadge from "./ReactionCompatibilityBadge.vue";
 import { ArrowRight, ArrowUpRight, ChevronRight } from "@lucide/vue";
 import { useQuery } from "@tanstack/vue-query";
 import { computed, defineAsyncComponent, ref, watch } from "vue";
@@ -258,7 +259,8 @@ watch(selectedGeometryTotal, (total) => {
   <section class="mapped-reaction-expansion" :aria-labelledby="`mapped-reaction-title-${reaction.id}`">
     <header class="workspace-header compact-workspace-header">
       <div>
-        <span class="eyebrow">MappedReaction · 严格映射反应</span>
+        <span class="eyebrow">MappedReaction · 映射反应</span>
+        <ReactionCompatibilityBadge v-if="mappedReaction" :reaction="mappedReaction" detail />
         <h2 :id="`mapped-reaction-title-${reaction.id}`">{{ mappedReaction?.label || mappedReaction?.mapped_reaction_key || "映射反应详情" }}</h2>
         <code class="mapped-reaction-smiles">{{ mappedReaction?.mapped_reaction_smiles ?? "正在读取映射反应…" }}</code>
       </div>

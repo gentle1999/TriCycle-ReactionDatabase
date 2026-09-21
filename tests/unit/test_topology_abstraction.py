@@ -23,10 +23,57 @@ from tricycle_reaction_db.ingestion.normalization import (
 )
 
 
+def test_retained_bond_stereo_is_not_reassigned_by_atom_cip_validation(monkeypatch):
+    from tricycle_reaction_db.application.services.topology_abstraction import (
+        _stereo_abstraction_match_for_known_atom_mapping,
+    )
+
+    specific = Chem.MolFromSmiles("F/C=C/C=C/F")
+    general = Chem.Mol(specific)
+    double_bonds = [b for b in general.GetBonds() if b.GetBondType() == Chem.BondType.DOUBLE]
+    double_bonds[0].SetStereo(Chem.BondStereo.STEREONONE)
+    original = Chem.AssignStereochemistry
+
+    def corrupt_only_validation_clone(mol, **kwargs):
+        original(mol, **kwargs)
+        for bond in mol.GetBonds():
+            if bond.GetIdx() == double_bonds[1].GetIdx():
+                bond.SetStereo(Chem.BondStereo.STEREOZ)
+
+    monkeypatch.setattr(Chem, "AssignStereochemistry", corrupt_only_validation_clone)
+    match = _stereo_abstraction_match_for_known_atom_mapping(
+        specific, general, tuple(range(specific.GetNumAtoms()))
+    )
+    assert match is not None
+    assert match.abstracted_bond_indices == (double_bonds[0].GetIdx(),)
+
+
 def _two_center_molecule() -> Chem.Mol:
     molecule = Chem.MolFromSmiles("F[C@H](Cl)[C@H](Br)I")
     assert molecule is not None
     return molecule
+
+
+def test_identity_abstraction_is_a_noop_without_a_self_edge():
+    topology = SimpleNamespace(id=UUID(int=301), project_id=PROJECT_ID)
+    assert topology_abstraction.persist_stereo_abstraction(
+        cast(Any, object()), cast(Any, topology), cast(Any, topology)
+    ) is None
+
+
+def test_square_planar_parity_survives_reordering_but_rejects_other_isomer():
+    specific = Chem.MolFromSmiles("Cl[Pd@SP1](Br)(I)F.F/C=C/F")
+    order = list(reversed(range(specific.GetNumAtoms())))
+    general = Chem.RenumberAtoms(specific, order)
+    for bond in general.GetBonds():
+        if bond.GetBondType() == Chem.BondType.DOUBLE:
+            bond.SetStereo(Chem.BondStereo.STEREONONE)
+    validate = topology_abstraction._stereo_abstraction_match_for_known_atom_mapping
+    assert validate(specific, general, tuple(order)) is not None
+    metal = next(a for a in general.GetAtoms() if a.GetSymbol() == "Pd")
+    permutation = metal.GetIntProp("_chiralPermutation")
+    metal.SetIntProp("_chiralPermutation", 2 if permutation != 2 else 1)
+    assert validate(specific, general, tuple(order)) is None
 
 
 def _fail_if_graph_match_runs(*_: object, **__: object) -> None:
@@ -65,6 +112,24 @@ def test_two_center_specialization_is_a_dag_diamond() -> None:
     assert a_to_zero.abstracted_feature_count == 1
     assert b_to_zero.abstracted_feature_count == 1
     assert find_stereo_abstraction_match(one_center_a, one_center_b) is None
+
+
+def test_large_stereo_abstraction_uses_canonical_mapping_without_graph_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    molecule = Chem.MolFromSmiles("C" * 35 + "/C=C/" + "C" * 35)
+    assert molecule is not None
+    feature = assigned_stereo_features(molecule)[0]
+    projected = clear_stereo_features(molecule, (feature,))
+
+    def fail_if_graph_match_runs(*_: object, **__: object) -> object:
+        raise AssertionError("stereo abstraction must not run a full graph match")
+
+    monkeypatch.setattr(topology_abstraction, "find_topology_matches", fail_if_graph_match_runs)
+    match = find_stereo_abstraction_match(molecule, projected)
+
+    assert match is not None
+    assert match.abstracted_bond_indices == (feature.index,)
 
 
 def test_clear_stereo_features_removes_ez_and_directional_bonds() -> None:
@@ -191,6 +256,7 @@ def test_projection_persistence_reuses_normalization_mapping(
     specific = SimpleNamespace(
         id=UUID(int=301),
         project_id=PROJECT_ID,
+        graph_hash="specific-topology",
         mol=_two_center_molecule(),
     )
     context = SimpleNamespace(

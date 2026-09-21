@@ -1,4 +1,7 @@
 export type ReactionQueryField =
+  | "has_compatibility_endpoints"
+  | "has_single_endpoint_fallback"
+  | "has_dual_endpoint_fallback"
   | "topology_id"
   | "reaction_key"
   | "label"
@@ -44,6 +47,9 @@ export interface ReactionSort {
  * reaction catalog only groups those matches back into LogicalReaction paths.
  */
 export interface ReactionQueryFilters {
+  hasCompatibilityEndpoints?: boolean;
+  hasSingleEndpointFallback?: boolean;
+  hasDualEndpointFallback?: boolean;
   projectId?: string;
   topologyId?: string;
   reactionKey?: string;
@@ -97,6 +103,9 @@ export interface ReactionQueryFieldOption {
 }
 
 export const reactionQueryFieldOptions: ReactionQueryFieldOption[] = [
+  { value: "has_compatibility_endpoints", label: "包含兼容回退端点", kind: "boolean" },
+  { value: "has_single_endpoint_fallback", label: "包含单端回退推断", kind: "boolean" },
+  { value: "has_dual_endpoint_fallback", label: "包含双端回退推断", kind: "boolean" },
   { value: "topology_id", label: "拓扑 ID", kind: "text" },
   { value: "reaction_key", label: "反应键", kind: "text" },
   { value: "label", label: "反应名称", kind: "text" },
@@ -136,6 +145,9 @@ export function reactionFilterExpression(filters: ReactionQueryFilters): Reactio
     if (value !== undefined && value !== "") conditions.push({ field, value });
   };
   add("topology_id", filters.topologyId);
+  add("has_compatibility_endpoints", filters.hasCompatibilityEndpoints);
+  add("has_single_endpoint_fallback", filters.hasSingleEndpointFallback);
+  add("has_dual_endpoint_fallback", filters.hasDualEndpointFallback);
   add("reaction_key", filters.reactionKey);
   add("label", filters.label);
   add("reaction_hash", filters.reactionHash);

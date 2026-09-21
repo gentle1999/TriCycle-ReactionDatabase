@@ -119,6 +119,28 @@ def test_configured_inversion_labile_rules_match_requested_atom_types() -> None:
     assert inversion_labile_atom_indices(boron) == ()
 
 
+def test_large_molecule_inversion_rules_do_not_spawn_graph_matching(monkeypatch) -> None:
+    from tricycle_reaction_db.application.services import rdkit_graph_matching
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("single-atom inversion rules must not use graph matching")
+
+    monkeypatch.setattr(
+        rdkit_graph_matching,
+        "_run_isolated_substructure_matches",
+        fail_if_called,
+    )
+    molecule = Chem.MolFromSmiles(
+        "[N:1]([CH3:2])([CH3:3])[CH3:4]." + "C" * 50
+    )
+    assert molecule is not None
+    assert molecule.GetNumAtoms() >= 48
+
+    assert inversion_labile_atom_indices(molecule) == (
+        ("neutral-trivalent-nitrogen-phosphorus-arsenic", 0),
+    )
+
+
 def test_aromatic_trivalent_sulfur_matches_chalcogen_rule() -> None:
     molecule = Chem.MolFromSmiles("[s+:1]1(C)cccc1")
     assert molecule is not None

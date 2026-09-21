@@ -2,6 +2,7 @@
 
 import ast
 import json
+import re
 from collections import Counter
 from contextlib import suppress
 from functools import lru_cache
@@ -42,6 +43,11 @@ from tricycle_reaction_db.domain.internal_coordinates import (
     internal_coordinate_hash,
     internal_coordinates_from_cartesian,
     proper_rigid_alignment,
+)
+from tricycle_reaction_db.domain.mol_properties import (
+    RADICAL_ELECTRONS_PROP,
+    annotate_electronic_state,
+    metal_spin_identity,
 )
 
 _INTERNAL_COORDINATE_ROUNDTRIP_TOLERANCE_ANGSTROM = 1e-7
@@ -112,6 +118,8 @@ def _clear_rdkit_properties(
     for atom in mol.GetAtoms():  # type: ignore[no-untyped-call]
         atom.SetAtomMapNum(0)
         for prop_name in list(atom.GetPropNames(includePrivate=True, includeComputed=True)):
+            if prop_name == RADICAL_ELECTRONS_PROP:
+                continue
             if preserve_stereochemistry and _is_stereochemistry_property(prop_name):
                 continue
             atom.ClearProp(prop_name)
@@ -226,7 +234,11 @@ def clear_inversion_labile_atom_chirality(mol: Chem.Mol) -> Chem.Mol:
 
 
 def _copy_bond_directions(source: Chem.Mol, target: Chem.Mol) -> None:
-    """Copy writer directions by atom pair without copying stereo caches."""
+    """Copy round-trip stereo and directions between graphs in the same order.
+
+    The normalized MOL must carry the same control atoms as its serialized
+    representation, not just the writer's slash flags over stale BondStereo.
+    """
 
     if source.GetNumAtoms() != target.GetNumAtoms():
         raise ValueError("direction source and target atom counts differ")
@@ -238,6 +250,12 @@ def _copy_bond_directions(source: Chem.Mol, target: Chem.Mol) -> None:
         )
         if target_bond is None:
             raise ValueError("direction source and target graphs differ")
+        stereo_atoms = tuple(int(index) for index in source_bond.GetStereoAtoms())
+        if len(stereo_atoms) == 2:
+            if target_bond.GetBeginAtomIdx() != source_bond.GetBeginAtomIdx():
+                stereo_atoms = tuple(reversed(stereo_atoms))
+            target_bond.SetStereoAtoms(*stereo_atoms)
+        target_bond.SetStereo(source_bond.GetStereo())
         target_bond.SetBondDir(source_bond.GetBondDir())
 
 
@@ -493,6 +511,7 @@ def stereo_agnostic_graph_hash(mol: Chem.Mol) -> str:
         return _digest(
             {
                 "schema_version": TOPOLOGY_STEREO_AGNOSTIC_GRAPH_HASH_VERSION,
+                **metal_spin_identity(mol),
                 "graph": {
                     "atoms": sorted(atoms, key=lambda atom: int(atom["rank"])),
                     "bonds": sorted(
@@ -509,6 +528,7 @@ def stereo_agnostic_graph_hash(mol: Chem.Mol) -> str:
     return _digest(
         {
             "schema_version": TOPOLOGY_STEREO_AGNOSTIC_GRAPH_HASH_VERSION,
+            **metal_spin_identity(mol),
             "explicit_graph_smiles": smiles,
         }
     )
@@ -676,6 +696,78 @@ def _has_single_3d_conformer(mol: Chem.Mol) -> bool:
     return mol.GetNumConformers() == 1 and mol.GetConformer().Is3D()
 
 
+def _normalize_aromatic_bond_flags(mol: Chem.Mol) -> None:
+    """Explicit bond orders must not carry stale aromatic bond flags.
+
+    MolGR can retain an aromatic cache flag from the precursor ring. Keep
+    atoms and connectivity unchanged, while making the final bond flags agree
+    with the explicit bond orders that RDKit serializes and reads back.
+    """
+    for bond in mol.GetBonds():
+        if bond.GetBondType() != Chem.BondType.AROMATIC and bond.GetIsAromatic():
+            bond.SetIsAromatic(False)
+
+
+def _clear_nonstereogenic_double_bond_tags(mol: Chem.Mol) -> None:
+    """Remove assignments on bonds with no independent geometric isomerism."""
+    probe = Chem.Mol(mol)
+    for atom in probe.GetAtoms():
+        atom.SetAtomMapNum(0)
+    potential = {
+        int(info.centeredOn)
+        for info in Chem.FindPotentialStereo(probe, cleanIt=True)
+        if info.type == Chem.StereoType.Bond_Double
+    }
+    for bond in mol.GetBonds():
+        if bond.GetStereo() in _SERIALIZED_DOUBLE_BOND_STEREO and bond.GetIdx() not in potential:
+            bond.SetStereo(Chem.BondStereo.STEREONONE)
+
+
+def _normalize_coordination_ring_stereo(mol: Chem.Mol) -> None:
+    """Drop only cis markers already implicit in a small coordination ring.
+
+    RDKit's writer treats dative closures as rings and omits slash markers on
+    rings smaller than eight atoms, although default ring perception excludes
+    dative bonds. Check the actual ring control atoms, not the E/Z enum. A
+    trans assignment is never discarded here.
+    """
+    for bond in mol.GetBonds():
+        stereo = _LEGACY_DOUBLE_BOND_STEREO_TO_E_Z.get(bond.GetStereo(), bond.GetStereo())
+        if stereo not in _DOUBLE_BOND_E_Z_STEREO:
+            continue
+        begin, end = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        refs = tuple(bond.GetStereoAtoms())
+        if len(refs) != 2:
+            continue
+        paths = [(begin,)]
+        visited = {begin}
+        found = None
+        for path in paths:
+            if len(path) >= 7:
+                continue
+            for neighbor in mol.GetAtomWithIdx(path[-1]).GetNeighbors():
+                index = neighbor.GetIdx()
+                if len(path) == 1 and index == end:
+                    continue
+                if index == end:
+                    found = (*path, end)
+                    break
+                if index not in visited:
+                    visited.add(index)
+                    paths.append((*path, index))
+            if found is not None:
+                break
+        if found is None or not any(
+            mol.GetBondBetweenAtoms(a, b).GetBondType() == Chem.BondType.DATIVE
+            for a, b in zip(found, found[1:], strict=False)
+        ):
+            continue
+        flipped = (refs[0] != found[1]) ^ (refs[1] != found[-2])
+        ring_stereo = _flip_e_z_stereo(stereo) if flipped else stereo
+        if ring_stereo == Chem.BondStereo.STEREOZ:
+            bond.SetStereo(Chem.BondStereo.STEREONONE)
+
+
 def infer_molgr_stereochemistry_from_3d(mol: Chem.Mol) -> Chem.Mol:
     """Create one coordinate-authoritative stereo snapshot of a MolGR graph.
 
@@ -689,16 +781,17 @@ def infer_molgr_stereochemistry_from_3d(mol: Chem.Mol) -> Chem.Mol:
         raise ValueError("stereochemistry inference requires one 3D conformer")
 
     inferred = Chem.Mol(mol)
+    annotate_electronic_state(inferred)
+    _normalize_aromatic_bond_flags(inferred)
     if inferred.HasProp("_tricycle_molgr_stereo_normalized"):
         inferred.ClearProp("_tricycle_molgr_stereo_normalized")
     # Existing BondStereo and BondDir values may have come from MolGR's graph
     # reconstruction or from an earlier SMILES traversal. Neither is evidence
     # for a displaced endpoint, so remove both before the coordinate pass.
-    for atom in inferred.GetAtoms():  # type: ignore[no-untyped-call]
-        atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
-    for bond in inferred.GetBonds():  # type: ignore[no-untyped-call]
-        bond.SetBondDir(Chem.BondDir.NONE)
-        bond.SetStereo(Chem.BondStereo.STEREONONE)
+    # Clear computed CIP ranks as well as tags: ranks cached on a graph before
+    # coordination was finalized must not select the new stereo control atoms.
+    Chem.RemoveStereochemistry(inferred)
+    inferred.UpdatePropertyCache(strict=False)
     Chem.AssignStereochemistryFrom3D(
         inferred,
         confId=-1,
@@ -718,6 +811,8 @@ def infer_molgr_stereochemistry_from_3d(mol: Chem.Mol) -> Chem.Mol:
     # clearing it before AssignStereochemistryFrom3D would let the pass add it
     # back immediately.
     inferred = clear_inversion_labile_atom_chirality(inferred)
+    _clear_nonstereogenic_double_bond_tags(inferred)
+    _normalize_coordination_ring_stereo(inferred)
     inferred.SetBoolProp("_tricycle_molgr_stereo_normalized", True)
     return inferred
 
@@ -734,6 +829,9 @@ def normalize_molgr_stereochemistry(mol: Chem.Mol) -> Chem.Mol:
     handed to topology and geometry identity creation.
     """
 
+    mol = Chem.Mol(mol)
+    annotate_electronic_state(mol)
+    _normalize_aromatic_bond_flags(mol)
     if mol.HasProp("_tricycle_molgr_stereo_normalized"):
         # The marker is set only after the coordinate pass and inversion-labile
         # cleanup have completed. Returning the marked graph avoids repeating
@@ -787,6 +885,8 @@ def normalize_molgr_stereochemistry(mol: Chem.Mol) -> Chem.Mol:
             bond.SetStereo(stereo)
     _clear_bond_directions(normalized)
     normalized = clear_inversion_labile_atom_chirality(normalized)
+    _clear_nonstereogenic_double_bond_tags(normalized)
+    _normalize_coordination_ring_stereo(normalized)
     normalized.SetBoolProp("_tricycle_molgr_stereo_normalized", True)
     return normalized
 
@@ -1002,6 +1102,20 @@ def _validate_smiles_round_trip(
     ):
         raise ValueError("SMILES round trip changed the source molecular graph")
 
+    # Metal spin is a MolGR atom property, not information encoded by plain
+    # SMILES. RDKit can infer a different bracket-atom radical count on parse;
+    # that must neither reject a valid stereo projection nor replace MolGR's
+    # metal state. Ordinary atoms still require an exact radical round trip.
+    metal_spin_identities = {
+        identity
+        for identity, atom in zip(source_identities, source.GetAtoms(), strict=True)
+        if atom.HasProp(METAL_UNPAIRED_ELECTRONS_PROP) or atom.HasProp(RADICAL_ELECTRONS_PROP)
+    }
+    for atom in source.GetAtoms():
+        if atom.HasProp(RADICAL_ELECTRONS_PROP) and (
+            atom.GetIntProp(RADICAL_ELECTRONS_PROP) != atom.GetNumRadicalElectrons()
+        ):
+            raise ValueError("source radical annotation disagrees with the MOL")
     source_radicals = {
         identity: int(atom.GetNumRadicalElectrons())
         for identity, atom in zip(
@@ -1009,6 +1123,7 @@ def _validate_smiles_round_trip(
             source.GetAtoms(),  # type: ignore[no-untyped-call]
             strict=True,
         )
+        if identity not in metal_spin_identities
     }
     parsed_radicals = {
         identity: int(atom.GetNumRadicalElectrons())
@@ -1017,6 +1132,7 @@ def _validate_smiles_round_trip(
             parsed.GetAtoms(),  # type: ignore[no-untyped-call]
             strict=True,
         )
+        if identity not in metal_spin_identities
     }
     if source_radicals != parsed_radicals:
         # RDKit's sanitize=False parser deliberately does not infer radical
@@ -1040,6 +1156,7 @@ def _validate_smiles_round_trip(
                     sanitized.GetAtoms(),  # type: ignore[no-untyped-call]
                     strict=True,
                 )
+                if identity not in metal_spin_identities
             }
             if source_radicals != sanitized_radicals:
                 raise ValueError("SMILES round trip changed radical-electron assignments")
@@ -1154,6 +1271,57 @@ def _deterministic_smiles_traversal(
     return traversal
 
 
+def _restore_tree_bond_directions(
+    mol: Chem.Mol, smiles: str, output_order: list[int] | None
+) -> str:
+    """Restore redundant tree-edge slashes omitted by the RDKit writer.
+
+    Coordination adjacent to conjugated double bonds can make the writer
+    incorrectly regard a shared single-bond direction as redundant. Use the
+    writer's own atom order, never graph matching or inferred stereochemistry.
+    Ring-closure syntax is left untouched. The caller must validate the result.
+    """
+    if output_order is None:
+        return smiles
+    tokens = re.findall(r"\[[^\]]+\]|->|<-|%\d{2}|\d|[().=#:~/\\+-]", smiles)
+    if "".join(tokens) != smiles:
+        return smiles
+    result: list[str] = []
+    branches: list[int | None] = []
+    current: int | None = None
+    atom_index = 0
+    for token in tokens:
+        if token.startswith("["):
+            if atom_index >= len(output_order):
+                return smiles
+            following = output_order[atom_index]
+            atom_index += 1
+            if current is not None:
+                bond = mol.GetBondBetweenAtoms(current, following)
+                if bond is not None and bond.GetBondType() == Chem.BondType.SINGLE:
+                    direction = bond.GetBondDir()
+                    if direction in (Chem.BondDir.ENDUPRIGHT, Chem.BondDir.ENDDOWNRIGHT):
+                        forward = direction == Chem.BondDir.ENDUPRIGHT
+                        if bond.GetBeginAtomIdx() != current:
+                            forward = not forward
+                        slash = "/" if forward else "\\"
+                        if result and result[-1] in ("/", "\\", "-"):
+                            result[-1] = slash
+                        else:
+                            result.append(slash)
+            current = following
+        elif token == "(":
+            branches.append(current)
+        elif token == ")":
+            if not branches:
+                return smiles
+            current = branches.pop()
+        elif token == ".":
+            current = None
+        result.append(token)
+    return "".join(result) if atom_index == len(output_order) else smiles
+
+
 def _serialize_molecule_smiles_once(
     mol: Chem.Mol,
     *,
@@ -1204,13 +1372,15 @@ def _serialize_molecule_smiles_once(
     ) -> tuple[str, list[int] | None]:
         candidate = Chem.Mol(molecule)
         _clear_smiles_output_order(candidate)
-        smiles = Chem.MolToSmiles(
-            candidate,
-            canonical=canonical,
-            rootedAtAtom=-1 if root is None else root,
-            isomericSmiles=True,
-            allHsExplicit=all_hs_explicit,
-        )
+        params = Chem.SmilesWriteParams()
+        params.canonical = canonical
+        params.rootedAtAtom = -1 if root is None else root
+        params.doIsomericSmiles = True
+        params.allHsExplicit = all_hs_explicit
+        # Stereo was normalized on the complete graph. The writer must not
+        # run a second cleanup with different coordination/ring assumptions.
+        params.cleanStereo = False
+        smiles = Chem.MolToSmiles(candidate, params)
         return smiles, _smiles_output_atom_order(candidate)
 
     try:
@@ -1235,6 +1405,23 @@ def _serialize_molecule_smiles_once(
             canonical_error = f"{type(error).__name__}: {error}"
 
     attempted_roots: list[int] = []
+    if canonical_smiles:
+        repaired_smiles = _restore_tree_bond_directions(
+            projected, canonical_smiles, canonical_order
+        )
+        if repaired_smiles != canonical_smiles:
+            try:
+                _validate_smiles_round_trip(
+                    projected,
+                    repaired_smiles,
+                    canonical_order,
+                    preserve_atom_maps=preserve_atom_maps,
+                    retain_atom_maps=retain_atom_maps,
+                    isomeric_smiles=isomeric_smiles,
+                )
+                return repaired_smiles
+            except (RuntimeError, ValueError):
+                pass
     last_serialized: dict[frozenset[int], DoubleBondStereoSignature] = {}
     traversal = _deterministic_smiles_traversal(
         projected,
@@ -1267,7 +1454,8 @@ def _serialize_molecule_smiles_once(
     )
     projection_error = _stereo_projection_failure(
         projected,
-        "no SMILES traversal preserves the source molecular graph and E/Z control atoms",
+        "no SMILES traversal preserves the molecular graph and stereochemistry; "
+        f"canonical validation failed: {canonical_error}",
         reason="no_lossless_smiles_traversal",
         expected={edge: signature[0] for edge, signature in expected_stereo.items()},
         serialized={edge: signature[0] for edge, signature in last_serialized.items()},
@@ -1461,6 +1649,32 @@ def _solve_double_bond_direction_constraints(
     if not stereo_bonds:
         return True
     try:
+        # Slash directions cannot be emitted on a dative bond. Switch such a
+        # control atom to the other covalent substituent and flip the relative
+        # cis/trans bit, preserving physical geometry rather than its label.
+        for bond in stereo_bonds:
+            controls = list(bond.GetStereoAtoms())
+            if len(controls) != 2:
+                continue
+            flipped = False
+            ends = (bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+            for side, endpoint in enumerate(ends):
+                control_bond = mol.GetBondBetweenAtoms(endpoint, controls[side])
+                if control_bond.GetBondType() != Chem.BondType.DATIVE:
+                    continue
+                alternatives = [
+                    neighbor.GetIdx()
+                    for neighbor in mol.GetAtomWithIdx(endpoint).GetNeighbors()
+                    if neighbor.GetIdx() != ends[1 - side]
+                    and mol.GetBondBetweenAtoms(endpoint, neighbor.GetIdx()).GetBondType()
+                    != Chem.BondType.DATIVE
+                ]
+                if len(alternatives) == 1:
+                    controls[side] = alternatives[0]
+                    flipped = not flipped
+            bond.SetStereoAtoms(*controls)
+            if flipped:
+                bond.SetStereo(_flip_e_z_stereo(bond.GetStereo()))
         # RDKit already has the correct global solver for conjugated systems.
         # It uses each BondStereo's stored stereo-atom pair and therefore knows
         # when two adjacent E/Z bonds share a directional single bond.  The
@@ -1633,6 +1847,35 @@ def ensure_serializable_double_bond_stereochemistry(
         projected,
         preserve_atom_maps=preserve_atom_maps,
     )
+    # Materialize the stable representation back into the normalized MOL.
+    # Temporary atom identities recover the original order without any graph
+    # matching; only stereo metadata is copied back, retaining coordinates,
+    # electronic state, user atom maps, and molecule-specific properties.
+    mapped = Chem.Mol(projected)
+    for atom in mapped.GetAtoms():  # type: ignore[no-untyped-call]
+        atom.SetAtomMapNum(atom.GetIdx() + 1)
+    smiles = serialize_molecule_smiles(mapped, preserve_atom_maps=True)
+    parser: Any = Chem.SmilesParserParams()
+    parser.removeHs = False
+    parser.sanitize = False
+    parsed = Chem.MolFromSmiles(smiles, parser)
+    if parsed is None:
+        raise ValueError("validated stereo SMILES could not be parsed")
+    Chem.SetBondStereoFromDirections(parsed)
+    by_identity = {atom.GetAtomMapNum(): atom.GetIdx() for atom in parsed.GetAtoms()}
+    if set(by_identity) != set(range(1, projected.GetNumAtoms() + 1)):
+        raise ValueError("validated stereo SMILES changed atom identities")
+    ordered = Chem.RenumberAtoms(
+        parsed, [by_identity[index + 1] for index in range(projected.GetNumAtoms())]
+    )
+    for bond in ordered.GetBonds():  # type: ignore[no-untyped-call]
+        stereo = _LEGACY_DOUBLE_BOND_STEREO_TO_E_Z.get(bond.GetStereo())
+        if stereo is not None:
+            bond.SetStereo(stereo)
+    _copy_bond_directions(ordered, projected)
+    validate_serializable_double_bond_stereochemistry(
+        mol, projected, preserve_atom_maps=preserve_atom_maps
+    )
     return projected
 
 
@@ -1680,9 +1923,8 @@ def _normalized_topology_records(
     source = Chem.Mol(map_free_mol)
     if preserve_stereochemistry:
         try:
-            # This is a one-way writer projection. Keep the source graph and
-            # its BondStereo/stereo-atom cache authoritative; copy only the
-            # generated BondDir values needed by the topology writer.
+            # Adopt the round-trip control atoms and writer directions on the
+            # normalized graph, retaining its source electronic annotations.
             source_projection = ensure_serializable_double_bond_stereochemistry(map_free_mol)
             _copy_bond_directions(source_projection, source)
         except StereoProjectionError as error:
@@ -1861,6 +2103,7 @@ def _normalized_topology_records(
     graph_hash = _digest(
         {
             "schema_version": identity_schema_version,
+            **metal_spin_identity(topology_mol),
             **(
                 {"explicit_graph_smiles": standardized_graph_smiles}
                 if standardized_graph_smiles is not None and stable_topology_projection

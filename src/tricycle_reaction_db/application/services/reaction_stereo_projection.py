@@ -8,9 +8,6 @@ from functools import lru_cache
 from rdkit import Chem
 from sqlmodel import Session
 
-from tricycle_reaction_db.application.services.rdkit_graph_matching import (
-    get_substruct_matches,
-)
 from tricycle_reaction_db.application.services.topology_abstraction import (
     StereoFeature,
     assigned_stereo_features,
@@ -29,6 +26,8 @@ def _rule_query(atom_smarts: str) -> Chem.Mol:
     query = Chem.MolFromSmarts(atom_smarts)
     if query is None:
         raise ValueError(f"inversion-labile SMARTS could not be parsed: {atom_smarts}")
+    if query.GetNumAtoms() != 1:
+        raise ValueError(f"inversion-labile SMARTS must match one atom: {atom_smarts}")
     return query
 
 
@@ -37,21 +36,28 @@ def inversion_labile_atom_indices(
     *,
     rules: Iterable[InversionLabileRule] = INVERSION_LABILE_RULES,
 ) -> tuple[tuple[str, int], ...]:
-    """Return ``(rule_id, atom_index)`` matches in deterministic order."""
+    """Return ``(rule_id, atom_index)`` matches in deterministic order.
 
+    The configured inversion rules are explicitly single-atom SMARTS
+    predicates.  Applying them atom-by-atom preserves their semantics without
+    running a whole-molecule substructure search (or spawning an isolated
+    RDKit process) for every rule and every large topology.
+    """
+
+    target = Chem.Mol(molecule)
+    # SMARTS atom predicates inspect local valence/implicit-H state.  Refresh
+    # that cache without sanitizing or repairing a possibly unsanitized MolGR
+    # graph; atom indices remain identical to the source topology.
+    target.UpdatePropertyCache(strict=False)
     matches: list[tuple[str, int]] = []
     for rule in rules:
         query = _rule_query(rule.atom_smarts)
-        for match in get_substruct_matches(
-            molecule,
-            query,
-            hard_timeout_for_large_molecules=True,
-        ):
-            if len(match) != 1:
-                raise ValueError(
-                    f"inversion-labile rule {rule.rule_id} must match one atom per result"
-                )
-            matches.append((rule.rule_id, int(match[0])))
+        query_atom = query.GetAtomWithIdx(0)
+        matches.extend(
+            (rule.rule_id, atom.GetIdx())
+            for atom in target.GetAtoms()  # type: ignore[no-untyped-call]
+            if query_atom.Match(atom)
+        )
     return tuple(sorted(set(matches), key=lambda item: (item[0], item[1])))
 
 

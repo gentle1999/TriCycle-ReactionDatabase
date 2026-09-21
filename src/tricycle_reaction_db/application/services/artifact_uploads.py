@@ -37,6 +37,9 @@ from molop import AutoFileParser
 from molop.config import molopconfig
 from molop.io.base_models.ChemFileFrame import BaseCalcFrame
 from molop.io.base_models.Molecule import reconstruct_topologies_batch
+from molop.io.codec_types import ParseOptions
+from psycopg import InterfaceError as PsycopgInterfaceError
+from psycopg import OperationalError as PsycopgOperationalError
 from rdkit import Chem
 from sqlalchemy import case, text, update
 from sqlalchemy import cast as sa_cast
@@ -156,6 +159,7 @@ from tricycle_reaction_db.application.services.reaction_geometry_reconciliation 
     bind_transition_state_frame,
     ensure_transition_state_path,
 )
+from tricycle_reaction_db.application.services.ts_endpoint_fallback import endpoint_provenance
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.core.units import CM_INVERSE, magnitude_in
 from tricycle_reaction_db.db.models import (
@@ -218,6 +222,11 @@ class _PreparedInferenceTopologyRecords:
 
 
 MOLOP_VERSION = version("molop")
+MOLOP_PARSE_OPTIONS = ParseOptions(
+    capture_source_evidence=True,
+    release_file_content=True,
+    source_decode_errors="surrogateescape",
+)
 logger = logging.getLogger(__name__)
 # Keep the parser claim window independent from the database write window. A
 # file can contain many frames and one 32-file transaction was large enough to
@@ -232,7 +241,7 @@ PERSISTENCE_BATCH_FRAME_LIMIT = 256
 # MolGR reconstruction is CPU-heavy and each frame crosses a process boundary.
 # Larger chunks amortize pickle/future overhead while retaining enough tasks to
 # keep all configured workers busy across a multi-file batch.
-FRAME_CONVERSION_CHUNK_SIZE = 256
+FRAME_CONVERSION_CHUNK_SIZE = 32
 INFERENCE_PERSIST_BATCH_SIZE = 16
 # The configured timeout covers the first 10 MiB. Above that, each additional
 # 10 MiB gets a configurable allowance. This gives large files headroom without
@@ -427,7 +436,7 @@ def molop_process_worker_count() -> int:
 
 def _frame_submission_limit() -> int:
     workers = _resolve_molop_process_workers(get_settings().molop_batch_n_jobs)
-    return max(1, workers * 2)
+    return max(1, workers)
 
 
 def _file_worker_submission_slots() -> asyncio.Semaphore:
@@ -520,6 +529,9 @@ def _get_molop_process_pool(n_jobs: int) -> ProcessPoolExecutor:
     """Return this API worker's reusable, spawn-safe MolOP process pool."""
 
     global _molop_process_pool, _molop_process_pool_pid, _molop_process_pool_workers
+    # Preserve annotations in parent -> child transfers too; the initializer
+    # applies the same setting for child -> parent results.
+    Chem.SetDefaultPickleProperties(Chem.PropertyPickleOptions.AllProps)
     workers = _resolve_molop_process_workers(n_jobs)
     pid = os.getpid()
     previous_pool: ProcessPoolExecutor | None = None
@@ -534,7 +546,6 @@ def _get_molop_process_pool(n_jobs: int) -> ProcessPoolExecutor:
         _molop_process_pool = ProcessPoolExecutor(
             max_workers=workers,
             mp_context=multiprocessing.get_context("spawn"),
-            max_tasks_per_child=100,
             initializer=_initialize_molop_process_worker,
         )
         _molop_process_pool_workers = workers
@@ -738,20 +749,22 @@ async def _run_molop_file_pipeline(
         # a file must get a worker before its parser deadline starts.
         await effective_file_slots.acquire()
         acquired_file_slot = True
-        async with asyncio.timeout(timeout_seconds):
-            parsed = await _run_molop_source_parser(
-                source,
-                filename,
-                artifact_sha256=artifact_sha256,
-            )
-            return await _process_parsed_artifact_frames(
-                parsed,
-                submission_slots=(
-                    submission_slots
-                    if submission_slots is not None
-                    else _frame_worker_submission_slots()
-                ),
-            )
+        slots = (
+            submission_slots if submission_slots is not None else _frame_worker_submission_slots()
+        )
+        # Parser and reconstruction share the same process pool. Acquire its
+        # admission token before starting a deadline, not while queued behind
+        # another file's native reconstruction.
+        async with slots:
+            async with asyncio.timeout(timeout_seconds):
+                parsed = await _run_molop_source_parser(
+                    source,
+                    filename,
+                    artifact_sha256=artifact_sha256,
+                )
+        # Multi-frame files are work proportional to frame count, not bytes.
+        # Each admitted chunk has its own bounded budget below.
+        return await _process_parsed_artifact_frames(parsed, submission_slots=slots)
 
     except TimeoutError as error:
         raise MolOPFileParseTimeoutError(
@@ -1035,6 +1048,7 @@ def _signed_ts_endpoints(
         frame,
         vibration_position,
         infer_endpoint_stereochemistry=_infer_endpoint_stereochemistry_from_3d,
+        allow_openbabel_fallback=get_settings().ts_endpoint_openbabel_fallback,
     )
 
 
@@ -1465,12 +1479,14 @@ async def _process_parsed_artifact_frames(
                 (_detach_frame_for_process(frame), fallback_index)
                 for frame, fallback_index in chunk
             )
-            return await loop.run_in_executor(
-                pool,
-                _process_frame_chunk_worker,
-                detached_chunk,
-                str(chem_file.schema_version),
-            )
+            budget = get_settings().molop_file_parse_timeout_seconds * max(1, len(chunk) / 16)
+            async with asyncio.timeout(budget):
+                return await loop.run_in_executor(
+                    pool,
+                    _process_frame_chunk_worker,
+                    detached_chunk,
+                    str(chem_file.schema_version),
+                )
 
     async def recover_frame_chunk(
         chunk: tuple[tuple[BaseCalcFrame[Any], int], ...],
@@ -1483,13 +1499,14 @@ async def _process_parsed_artifact_frames(
         ) -> _ProcessedFrame:
             async with submission_slots:
                 try:
-                    return await loop.run_in_executor(
-                        pool,
-                        _process_frame_worker,
-                        _detach_frame_for_process(frame),
-                        fallback_index,
-                        str(chem_file.schema_version),
-                    )
+                    async with asyncio.timeout(get_settings().molop_file_parse_timeout_seconds):
+                        return await loop.run_in_executor(
+                            pool,
+                            _process_frame_worker,
+                            _detach_frame_for_process(frame),
+                            fallback_index,
+                            str(chem_file.schema_version),
+                        )
                 except Exception as error:
                     return _frame_processing_failure(frame, fallback_index, error)
 
@@ -1569,14 +1586,11 @@ def _parse_calculation_path_worker(
     try:
         configure_molecular_graph_reconstruction()
         molopconfig.prewarm_topologies = False
+
         chem_file = AutoFileParser(
             path,
             parser_detection="auto",
-            # Segment boundaries and frame locators are part of the durable
-            # calculation identity.  Every ingestion route uses the same
-            # evidence-complete parser contract.
-            capture_source_evidence=True,
-            release_file_content=True,
+            parse_options=MOLOP_PARSE_OPTIONS,
         )
         return (
             _parsed_artifact_from_chem_file(
@@ -1638,8 +1652,7 @@ def _parse_calculation_output(payload: bytes, filename: str) -> _ParsedArtifact:
         chem_file = AutoFileParser(
             temporary.name,
             parser_detection="auto",
-            capture_source_evidence=True,
-            release_file_content=True,
+            parse_options=MOLOP_PARSE_OPTIONS,
         )
         return _parsed_artifact_from_chem_file(
             chem_file,
@@ -1667,8 +1680,7 @@ def infer_transition_states_from_calculation_output(
         chem_file = AutoFileParser(
             temporary.name,
             parser_detection="auto",
-            capture_source_evidence=True,
-            release_file_content=True,
+            parse_options=MOLOP_PARSE_OPTIONS,
         )
         inferred: list[_Inference] = []
         for fallback_index, frame in enumerate(chem_file):
@@ -2359,7 +2371,11 @@ def _persist_transition_state_endpoint(
         atom.GetFormalCharge()
         for atom in endpoint.GetAtoms()  # type: ignore[no-untyped-call]
     )
-    if endpoint_charge != calculation_frame.charge:
+    validation = endpoint_provenance(endpoint)
+    if (
+        endpoint_charge != calculation_frame.charge
+        and validation["validation_status"] != "unverified"
+    ):
         raise ValueError(
             "TS vibration endpoint atom formal-charge sum differs from its CalculationFrame charge"
         )
@@ -2394,7 +2410,7 @@ def _persist_transition_state_endpoint(
         "source_coordinate_hash": source_coordinate_hash,
         "source_to_topology_atom_indices": list(prepared.source_to_topology_atom_indices),
         "provenance": {
-            "method": "molop.possible_pre_post_ts",
+            **validation,
             "molop_version": MOLOP_VERSION,
             "coordinate_frame": "calculation_frame.observed_coordinates",
             "coordinate_order": "molop_source_atom_order",
@@ -2417,12 +2433,18 @@ def _normalize_transition_state_endpoint_topology(
     endpoint: Chem.Mol,
     direction: TransitionStateEndpointDirection,
 ) -> tuple[Any, list[int]]:
+    validation = endpoint_provenance(endpoint)
     return normalize_topology_with_mapping(
         endpoint,
         add_hydrogens=False,
-        reconstruction_method="molop/possible_pre_post_ts",
-        reconstruction_version=MOLOP_VERSION,
+        reconstruction_method=(
+            validation["method"]
+            if validation["validation_status"] == "unverified"
+            else "molop/possible_pre_post_ts"
+        ),
+        reconstruction_version=validation.get("openbabel_version", MOLOP_VERSION),
         reconstruction_metadata={
+            **validation,
             "coordinate_frame": "calculation_frame.observed_coordinates",
             "coordinate_policy": "source-cartesian-no-independent-normalization",
             "direction": direction.value,
@@ -2610,6 +2632,10 @@ def _resolve_and_bind_transition_state_reaction(
             topology_context=topology_context,
             include_creation_metadata=topology_context is None,
             precomputed_topology_records=precomputed_topology_records,
+            allow_unverified_endpoint_charge=any(
+                endpoint_provenance(endpoint)["validation_status"] == "unverified"
+                for endpoint in (inferred.negative_endpoint, inferred.positive_endpoint)
+            ),
             reconciliation_cache=(
                 topology_context.reconciliation_cache if topology_context is not None else None
             ),
@@ -2699,6 +2725,11 @@ def _persist_successful_inference(
         prepared_topology_records=prepared_topology_records,
         refresh_thermodynamics=(topology_context is None and not defer_thermodynamic_refresh),
     )
+    endpoint_validation = {
+        "negative": endpoint_provenance(inferred.negative_endpoint),
+        "positive": endpoint_provenance(inferred.positive_endpoint),
+    }
+    strictly_validated = all(v["strict_validation_passed"] for v in endpoint_validation.values())
     inference_values = {
         "artifact_ingestion_id": _require_id(ingestion, label="ArtifactIngestion"),
         "artifact_ingestion": ingestion,
@@ -2708,10 +2739,20 @@ def _persist_successful_inference(
         "imaginary_mode_index": inferred.imaginary_mode_index,
         "imaginary_frequency_cm1": inferred.imaginary_frequency_cm1,
         "status": TransitionStateInferenceStatus.SUCCEEDED,
-        "inference_method": "molop/possible_pre_post_ts",
+        "inference_method": (
+            "molop/possible_pre_post_ts"
+            if strictly_validated
+            else "molop/possible_pre_post_ts+openbabel-fallback"
+        ),
         "inference_settings": {
-            "endpoint_selection": "molop.possible_pre_post_ts",
-            "side_topology": "most frequent side topology per signed side",
+            "endpoint_selection": (
+                "molop.possible_pre_post_ts"
+                if strictly_validated
+                else "strict-per-side-with-openbabel-fallback"
+            ),
+            "endpoint_validation": endpoint_validation,
+            "strict_validation_passed": strictly_validated,
+            "side_topology": "MolOP side topology vote; missing sides optionally use Open Babel",
             "reaction_side_semantics": "fragment-rich endpoint first",
             "direction_semantics": (
                 "measured signed displacement along the imaginary mode; "
@@ -3424,6 +3465,9 @@ def _reset_ingestion_for_clean_reparse(
         "deleted_frame_count": cleanup.deleted_frame_count if cleanup else 0,
         "deleted_segment_count": cleanup.deleted_segment_count if cleanup else 0,
         "deleted_inference_count": cleanup.deleted_inference_count if cleanup else 0,
+        "deleted_geometry_count": cleanup.deleted_geometry_count if cleanup else 0,
+        "deleted_mapped_reaction_count": cleanup.deleted_mapped_reaction_count if cleanup else 0,
+        "deleted_logical_reaction_count": cleanup.deleted_logical_reaction_count if cleanup else 0,
     }
 
 
@@ -4744,6 +4788,98 @@ class ArtifactUploadService:
         persistence_frame_limit: int | None = None,
         defer_thermodynamic_refresh: bool = True,
     ) -> dict[UUID, ArtifactUploadResult | Exception]:
+        """Isolate failed writes without reparsing or replaying committed files.
+
+        The normal path keeps its batching. An aborted transaction is closed
+        before a fresh attempt bisects its remaining files. Commit receipts
+        retain earlier successful windows; lease checks still run on every
+        attempt. The worker owns final failure publication for isolated files.
+        Cancellation is deliberately not caught and retains abort recovery.
+        """
+
+        results: dict[UUID, ArtifactUploadResult | Exception] = {}
+
+        async def persist(tasks: list[ParsedArtifactTask]) -> None:
+            if not tasks:
+                return
+            try:
+                outcomes = await cls._persist_parsed_microbatch_once(
+                    tasks,
+                    project_id=project_id,
+                    user_id=user_id,
+                    worker_lease_by_artifact_id=worker_lease_by_artifact_id,
+                    persistence_batch_files=persistence_batch_files,
+                    persistence_frame_limit=persistence_frame_limit,
+                    defer_thermodynamic_refresh=defer_thermodynamic_refresh,
+                    _completed_results=results,
+                )
+                results.update(outcomes)
+            except Exception as error:
+                remaining = [task for task in tasks if task.artifact_id not in results]
+                if not remaining:
+                    return
+                driver_error = getattr(error, "orig", error)
+                sqlstate = getattr(driver_error, "sqlstate", None)
+                if (
+                    isinstance(
+                        driver_error,
+                        (
+                            PsycopgInterfaceError,
+                            PsycopgOperationalError,
+                            ConnectionError,
+                            TimeoutError,
+                        ),
+                    )
+                    or getattr(error, "connection_invalidated", False)
+                    or (sqlstate is not None and sqlstate[:2] not in {"22", "23"})
+                ):
+                    # An unavailable database, cancellation, deadlock or
+                    # resource limit is not evidence against a specific file.
+                    # Do not amplify it into a tree of identical DB attempts.
+                    results.update({task.artifact_id: error for task in remaining})
+                    logger.warning(
+                        "batch-wide persistence error; not splitting project=%s files=%d",
+                        project_id,
+                        len(remaining),
+                        exc_info=True,
+                    )
+                    return
+                if len(tasks) == 1:
+                    results[remaining[0].artifact_id] = error
+                    logger.warning(
+                        "isolated artifact persistence failure project=%s artifact=%s",
+                        project_id,
+                        remaining[0].artifact_id,
+                        exc_info=True,
+                    )
+                    return
+                logger.warning(
+                    "splitting failed persistence microbatch project=%s files=%d remaining=%d",
+                    project_id,
+                    len(tasks),
+                    len(remaining),
+                    exc_info=True,
+                )
+                midpoint = max(1, len(remaining) // 2)
+                await persist(remaining[:midpoint])
+                await persist(remaining[midpoint:])
+
+        await persist(list({task.artifact_id: task for task in parsed_tasks}.values()))
+        return results
+
+    @classmethod
+    async def _persist_parsed_microbatch_once(
+        cls,
+        parsed_tasks: Sequence[ParsedArtifactTask],
+        *,
+        project_id: UUID,
+        user_id: UUID,
+        worker_lease_by_artifact_id: Mapping[UUID, UUID] | None = None,
+        persistence_batch_files: int | None = None,
+        persistence_frame_limit: int | None = None,
+        defer_thermodynamic_refresh: bool = True,
+        _completed_results: dict[UUID, ArtifactUploadResult | Exception],
+    ) -> dict[UUID, ArtifactUploadResult | Exception]:
         """Persist parser results through one bounded SQLAlchemy consumer."""
 
         (
@@ -4757,8 +4893,21 @@ class ArtifactUploadService:
             worker_lease_by_artifact_id=worker_lease_by_artifact_id,
         )
         results: dict[UUID, ArtifactUploadResult | Exception] = dict(preparation_errors)
+        _completed_results.update(preparation_errors)
         if not files:
             return results
+
+        async def record_commit(index: int, item: ArtifactBatchUploadItem) -> None:
+            # This callback runs only after COMMIT. A later window may fail,
+            # but these files must never be retried with force_new_revision.
+            _completed_results[prepared[index].artifact_id] = (
+                item.result
+                if item.result is not None
+                else ArtifactUploadError(
+                    item.error_message or item.error_code or "artifact persistence failed"
+                )
+            )
+
         resolved_batch_files = (
             persistence_batch_files or get_settings().upload_worker_persistence_batch_files
         )
@@ -4774,6 +4923,8 @@ class ArtifactUploadService:
             defer_thermodynamic_refresh=defer_thermodynamic_refresh,
             _preparsed_tasks=preparsed_by_index,
             _prepared_uploads=prepared,
+            on_file_committed=record_commit,
+            _defer_abort_recovery=True,
         )
         timings = batch_result.timings_ms
         logger.info(
@@ -5615,6 +5766,7 @@ class ArtifactUploadService:
         defer_thermodynamic_refresh: bool = True,
         _preparsed_tasks: Mapping[int, ParsedArtifactTask] | None = None,
         _prepared_uploads: Mapping[int, _PreparedCalculationUpload] | None = None,
+        _defer_abort_recovery: bool = False,
     ) -> ArtifactBatchUploadResult:
         """Prepare once, then advance files through an asynchronous pipeline.
 
@@ -5643,6 +5795,8 @@ class ArtifactUploadService:
             )
         if (_preparsed_tasks is None) != (_prepared_uploads is None):
             raise ValueError("preparsed tasks and prepared uploads must be supplied together")
+        if _defer_abort_recovery and _preparsed_tasks is None:
+            raise ValueError("deferred abort recovery requires worker-owned parsed tasks")
         if _preparsed_tasks is not None:
             source_inspections: Mapping[int, _InspectedUploadSource] = {}
         else:
@@ -5684,6 +5838,10 @@ class ArtifactUploadService:
         stored: dict[int, Any] = {}
 
         async def recover_aborted_batch(error: BaseException) -> None:
+            if _defer_abort_recovery and isinstance(error, Exception):
+                # The enclosing worker persistence isolator will retry after
+                # rollback. Do not terminalize its files or revoke its leases.
+                return
             await _recover_aborted_batch(
                 prepared=prepared,
                 stored=stored,
@@ -6348,6 +6506,14 @@ class ArtifactUploadService:
 
                 commit_started = perf_counter()
                 await session.commit()
+                # Publish receipts before any post-commit metrics work can
+                # fail; the isolator must not replay this committed window.
+                if on_file_committed is not None:
+                    for original_index in window_parse_indices:
+                        item = item_by_index.get(original_index)
+                        if item is not None:
+                            await on_file_committed(original_index, item)
+                            committed_callback_indices.add(original_index)
                 timings["persist_commit_db_ms"] = (
                     timings.get("persist_commit_db_ms", 0.0)
                     + (perf_counter() - commit_started) * 1000
@@ -6364,12 +6530,6 @@ class ArtifactUploadService:
                 advisory_lock_stats["requested_ids"] = int(lock_stats.get("requested_ids", 0))
                 advisory_lock_stats["uncached_ids"] = int(lock_stats.get("uncached_ids", 0))
                 advisory_lock_stats["prefixes"] = dict(lock_stats.get("prefixes", {}))
-                if on_file_committed is not None:
-                    for original_index in window_parse_indices:
-                        item = item_by_index.get(original_index)
-                        if item is not None:
-                            await on_file_committed(original_index, item)
-                            committed_callback_indices.add(original_index)
                 persist_write_elapsed_ms += (perf_counter() - window_write_started) * 1000
 
                 # Deferred inference work has been persisted in this

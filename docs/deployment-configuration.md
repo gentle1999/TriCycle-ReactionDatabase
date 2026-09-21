@@ -9,6 +9,28 @@
 
 专用算力主机的 MolOP、upload-worker、PostgreSQL 和 RustFS 吞吐配置见[高性能导入配置指南](performance-tuning.md)。
 
+## TS 前后体兼容回退（可选）
+
+`TRICYCLE_TS_ENDPOINT_OPENBABEL_FALLBACK=false` 默认仅接受 MolOP 严格端点。
+设置为 `true` 后，逐端保留严格结果；缺失或不合法的一端使用虚频模绝对位移
+ratio=1 的坐标，由 Open Babel 重建连接和键级，不进行几何优化。
+API 和 upload-worker 应采用相同设置，并重启相应进程。既有记录不会自动重解析。
+
+回退端点的 provenance 保存 `validation_status=unverified`、
+`strict_validation_passed=false`、方法、版本、位移比例及严格失败原因；帧详情显示警告。
+这不是严格化学验证：电荷分配、金属自旋及反应合理性均不保证；源总电荷和多重度保留，
+图形式电荷及是否与源一致另行记录。无效虚频坐标、Open Babel 或后续处理失败仍报告失败。
+只有明确标记的回退结果可跳过反应两端的图形式电荷守恒检查；严格反应仍要求守恒，
+元素和同位素守恒检查始终保留。查询接口通过 `provenance_json` 返回完整证据 JSON 文本。
+
+反应目录、映射反应卡片和详情显示橙色“兼容反应 · 未经严格检验”标记。
+目录的“TS 端点兼容性”可筛选全部、包含兼容回退、包含单端回退、包含双端回退、无兼容回退记录。
+逻辑与映射反应查询均支持 `has_compatibility_endpoints`、`has_single_endpoint_fallback`、
+`has_dual_endpoint_fallback` 布尔参数；逻辑反应高级条件也支持这三个字段及 AND/OR/取反。
+双端指同一次推断两端均回退；一个反应可同时包含单端、双端及严格来源，警告不会被严格来源覆盖。
+无兼容回退记录不意味着严格检验通过（历史来源可能缺少验证证据）。标记取自当前关联推断，
+无需重解析或额外数据库迁移；筛选在服务端分页前执行。
+
 ## 1. 部署边界
 
 单机和多机生产拓扑都受支持。应用不要求 PostgreSQL、RustFS 或中间件与 API 同机，也不要求

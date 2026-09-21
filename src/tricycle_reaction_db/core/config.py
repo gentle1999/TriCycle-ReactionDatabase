@@ -142,6 +142,7 @@ class Settings(BaseSettings):
     # Fast ingestion batches revision-local frame rows in one transaction.
     # Evidence capture no longer disables deferred topology reconstruction.
     molop_parallel_frame_persistence: bool = True
+    ts_endpoint_openbabel_fallback: bool = False
     # Baseline end-to-end budget for a 10 MiB source; larger files receive an
     # additional size-derived allowance while smaller files retain the baseline.
     molop_file_parse_timeout_seconds: float = Field(default=60.0, gt=0.0, le=86400.0)

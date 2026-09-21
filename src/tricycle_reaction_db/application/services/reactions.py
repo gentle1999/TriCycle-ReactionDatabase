@@ -1377,7 +1377,9 @@ def persist_logical_reaction_participant(
     return participant
 
 
-def validate_logical_reaction(reaction: LogicalReaction) -> None:
+def validate_logical_reaction(
+    reaction: LogicalReaction, *, allow_unverified_charge: bool = False
+) -> None:
     """Validate net identity, conservation, and cross-side atom correspondence."""
 
     participants = list(reaction.participants)
@@ -1419,7 +1421,7 @@ def validate_logical_reaction(reaction: LogicalReaction) -> None:
         participant.topology.formal_charge * participant.stoichiometric_coefficient
         for participant in products
     )
-    if reactant_charge != product_charge:
+    if reactant_charge != product_charge and not allow_unverified_charge:
         raise ValueError("reaction participants do not conserve formal charge")
 
 

@@ -2,6 +2,32 @@
 
 [中文](../deployment-configuration.md) | [Documentation index](README.md)
 
+## Optional TS endpoint compatibility fallback
+
+`TRICYCLE_TS_ENDPOINT_OPENBABEL_FALLBACK=false` keeps strict MolOP endpoints only.
+When enabled, each valid strict side is retained; a missing or invalid side is rebuilt
+with Open Babel from imaginary-mode coordinates at absolute ratio=1, without optimization.
+Set the same value for the API and upload worker and restart them. Existing records are not reparsed.
+
+Fallback endpoint provenance includes `validation_status=unverified`,
+`strict_validation_passed=false`, method, version, displacement ratio and strict failure reason.
+Frame details display a warning. Charge allocation, metal spin and reaction validity are not
+validated. Source charge/multiplicity are retained; graph formal charge and agreement are recorded
+separately. Invalid source modes or failed reconstruction/downstream processing still fail.
+Only explicitly unverified fallback results may bypass reaction graph formal-charge conservation;
+strict reactions still require it. Element/isotope conservation is always checked.
+The query API exposes complete evidence as JSON text in `provenance_json`.
+
+Reaction lists, mapping cards and details show an orange unverified compatibility warning.
+The catalog supports all, any fallback, single-side, dual-side and no recorded fallback filters.
+Logical and mapped reaction queries expose boolean `has_compatibility_endpoints`,
+`has_single_endpoint_fallback`, and `has_dual_endpoint_fallback` parameters; logical advanced
+expressions also accept these fields with AND/OR/negation. Dual-side means both sides of the
+same inference. Mixed strict and fallback sources retain the warning; single/dual filters can
+overlap across different source files. No recorded fallback does not imply strict validation.
+Labels use current linked inference evidence, requiring neither reparsing nor a schema migration.
+Filtering is performed before server-side pagination.
+
 ## Deployment Boundary
 
 The application supports single-host and multi-host production deployments.

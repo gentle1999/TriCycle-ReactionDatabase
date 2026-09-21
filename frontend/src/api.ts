@@ -624,7 +624,8 @@ export const api = {
   reactions: (options: ReactionQueryFilters & Partial<ReactionSort> & { limit?: number; offset?: number } = {}, signal?: AbortSignal) => {
     const limit = options.limit ?? 50;
     const offset = options.offset ?? 0;
-    if (options.filterExpression) {
+    if (options.filterExpression || options.hasCompatibilityEndpoints !== undefined
+      || options.hasSingleEndpointFallback !== undefined || options.hasDualEndpointFallback !== undefined) {
       const filterExpression = reactionFilterExpression(options);
       return requestJson<Page<LogicalReactionSummary>>(
         "/api/logical_reaction_query_service/list_logical_reactions",
@@ -644,8 +645,8 @@ export const api = {
           maximum_activation_gibbs_free_energy_kcal_mol: null,
           minimum_reaction_gibbs_free_energy_kcal_mol: null,
           maximum_reaction_gibbs_free_energy_kcal_mol: null,
-          has_activation_gibbs_free_energy: options.hasActivationGibbsFreeEnergy ?? null,
-          has_reaction_gibbs_free_energy: options.hasReactionGibbsFreeEnergy ?? null,
+          has_activation_gibbs_free_energy: null,
+          has_reaction_gibbs_free_energy: null,
           reactant_product_changed: null,
           created_after: null,
           created_before: null,

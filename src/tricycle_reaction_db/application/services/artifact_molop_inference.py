@@ -21,6 +21,7 @@ from tricycle_reaction_db.ingestion import (
 )
 
 from .artifact_upload_types import _FailedInference, _Inference, _SuccessfulInference
+from .ts_endpoint_fallback import openbabel_endpoint, strict_side_endpoint
 
 EndpointStereoInference = Callable[[Chem.Mol], Chem.Mol]
 SignedEndpointInference = Callable[
@@ -108,10 +109,10 @@ def signed_ts_endpoints(
     infer_endpoint_stereochemistry: EndpointStereoInference = (
         infer_endpoint_stereochemistry_from_3d
     ),
+    allow_openbabel_fallback: bool = False,
 ) -> tuple[Chem.Mol, Chem.Mol, float, float]:
     """Return MolOP's inferred pre/post-TS endpoints with signed displacements."""
 
-    reactant, product = frame.possible_pre_post_ts(show_3D=True)
     if frame.vibrations is None:
         raise ValueError("TS frame has no vibration mode")
     center = np.asarray(magnitude_in(frame.coords, ANGSTROM), dtype=np.float64)
@@ -123,7 +124,13 @@ def signed_ts_endpoints(
         dtype=np.float64,
     )
     mode_norm = float(np.sum(np.square(mode)))
-    if mode.shape != center.shape or mode_norm <= 0:
+    if (
+        mode.shape != center.shape
+        or center.shape != (len(frame.atoms), 3)
+        or not np.isfinite(center).all()
+        or not np.isfinite(mode).all()
+        or mode_norm <= 0
+    ):
         raise ValueError("TS imaginary mode does not match the source coordinates")
 
     def _signed_ratio(endpoint: Chem.Mol) -> float:
@@ -136,6 +143,35 @@ def signed_ts_endpoints(
         if coordinates.shape != center.shape or not np.isfinite(coordinates).all():
             raise ValueError("MolOP TS endpoint coordinates are invalid")
         return float(np.sum((center - coordinates) * mode) / mode_norm)
+
+    if allow_openbabel_fallback:
+        endpoints = []
+        ratios = []
+        for direction in (-1, 1):
+            try:
+                endpoint = strict_side_endpoint(frame, direction)
+                if (
+                    endpoint.HasProp("_MolGRReconstructionStatus")
+                    and endpoint.GetProp("_MolGRReconstructionStatus") == "suspicious_fallback"
+                ):
+                    raise ValueError("MolOP returned a suspicious fallback topology")
+                if [a.GetAtomicNum() for a in endpoint.GetAtoms()] != list(frame.atoms):
+                    raise ValueError("MolOP endpoint did not preserve source atom order")
+                if sum(a.GetFormalCharge() for a in endpoint.GetAtoms()) != int(frame.charge):
+                    raise ValueError("MolOP endpoint formal charge differs from source charge")
+                ratio = _signed_ratio(endpoint)
+                if not np.isfinite(ratio) or ratio * direction <= 0:
+                    raise ValueError("MolOP endpoint is on the wrong imaginary-mode side")
+                endpoint = infer_endpoint_stereochemistry(endpoint)
+            except (ValueError, RuntimeError) as error:
+                endpoint = openbabel_endpoint(frame, center - direction * mode, strict_error=error)
+                endpoint = infer_endpoint_stereochemistry(endpoint)
+                ratio = float(direction)
+            endpoints.append(endpoint)
+            ratios.append(abs(ratio))
+        return endpoints[0], endpoints[1], ratios[0], ratios[1]
+
+    reactant, product = frame.possible_pre_post_ts(show_3D=True)
 
     negative_ratio = _signed_ratio(reactant)
     positive_ratio = _signed_ratio(product)

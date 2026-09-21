@@ -42,6 +42,9 @@ export interface MolecularTopologyDetail {
 }
 
 export interface LogicalReactionSummary {
+  has_compatibility_endpoints?: boolean;
+  has_single_endpoint_fallback?: boolean;
+  has_dual_endpoint_fallback?: boolean;
   id: string;
   reaction_key: string;
   label: string | null;
@@ -72,6 +75,9 @@ export interface LogicalReactionParticipant {
 }
 
 export interface MappedReactionSummary {
+  has_compatibility_endpoints?: boolean;
+  has_single_endpoint_fallback?: boolean;
+  has_dual_endpoint_fallback?: boolean;
   id: string;
   logical_reaction_id: string;
   mapped_reaction_key: string;
@@ -406,6 +412,9 @@ export interface CalculationFrameDetail extends CalculationFrameSummary {
     displacement_ratio: number;
     source_coordinate_hash: string;
     source_to_topology_atom_indices: number[];
+    validation_status?: "strict" | "unverified" | "unknown";
+    strict_validation_passed?: boolean;
+    provenance_json?: string;
   }>;
   thermochemistry: Record<string, number | null> | null;
   calculation_status: Record<string, boolean | null> | null;

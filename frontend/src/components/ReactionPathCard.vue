@@ -8,6 +8,7 @@ import type { LogicalReactionSummary } from "@/types";
 
 import ChemDoodleGeometry3D from "./ChemDoodleGeometry3D.vue";
 import ChemDoodleMolecule from "./ChemDoodleMolecule.vue";
+import ReactionCompatibilityBadge from "./ReactionCompatibilityBadge.vue";
 
 const props = defineProps<{
   reaction: LogicalReactionSummary;
@@ -54,6 +55,7 @@ onBeforeUnmount(() => observer?.disconnect());
         <h3>{{ reaction.label || reaction.reaction_key }}</h3>
       </div>
     </header>
+    <ReactionCompatibilityBadge :reaction="reaction" />
     <div class="reaction-path-strip" aria-label="底物到产物的反应路径">
       <div class="path-stage">
         <div class="path-stage-label">底物</div>

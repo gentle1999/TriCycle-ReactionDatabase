@@ -957,9 +957,13 @@ payload hash 和 metadata。
 
 ## 依赖约束
 
-MolOP `>=0.2.18` 与 MolGR `>=0.1.8` 直接从官方 PyPI 安装；`pyproject.toml` 声明最低
+MolOP `>=0.2.20` 与 MolGR `>=0.1.8` 直接从官方 PyPI 安装；`pyproject.toml` 声明最低
 兼容版本，`uv.lock` 记录当前解析版本。项目不再使用内网 Git source 或
 `override-dependencies`。
+
+所有计算文件解析入口通过 `ParseOptions(source_decode_errors="surrogateescape")`
+启用 MolOP 原生局部编码容忍，同时保留 source evidence 与原始字节哈希。
+不再在数据库侧改写源文件或拼接被换行拆开的 UTF-8 字节。
 
 MolOP 0.2.18 的文件级和帧级统一 `comments` 容器分别写入
 `ParseRevision.comments` 和 `CalculationFrame.comments`；文件详情和计算帧详情会展示这些

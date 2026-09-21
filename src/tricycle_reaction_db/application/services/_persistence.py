@@ -12,6 +12,7 @@ from typing import Any, cast
 from uuid import UUID
 
 import numpy as np
+from molalchemy.rdkit.types import RdkitMol, RdkitReaction
 from pydantic import BaseModel
 from sqlalchemy import insert, text
 from sqlalchemy import inspect as sa_inspect
@@ -530,7 +531,7 @@ def _copy_compatible(columns: tuple[Any, ...]) -> bool:
     """Return whether COPY can preserve every SQLAlchemy bind expression."""
 
     return all(
-        type(column.type).__name__ not in {"RdkitMol", "RdkitReaction"} for column in columns
+        not isinstance(column.type, (RdkitMol, RdkitReaction)) for column in columns
     )
 
 

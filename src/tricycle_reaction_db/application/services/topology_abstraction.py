@@ -37,6 +37,7 @@ from tricycle_reaction_db.core.chemistry_config import (
 )
 from tricycle_reaction_db.db.models import MolecularTopology, MolecularTopologyAbstraction
 from tricycle_reaction_db.ingestion.normalization import (
+    _stereo_signatures_match,
     normalize_topology_with_mapping,
 )
 
@@ -203,6 +204,69 @@ def _map_free_copy(molecule: Chem.Mol) -> Chem.Mol:
     return result
 
 
+def _canonical_stereo_agnostic_graph(
+    molecule: Chem.Mol,
+) -> tuple[str, tuple[int, ...]] | None:
+    """Return a canonical no-stereo signature and its atom traversal.
+
+    Stereo abstraction candidates are already restricted to the same molecular
+    topology.  They do not need RDKit to rediscover an arbitrary substructure
+    embedding: a canonical no-stereo SMILES gives both a deterministic graph
+    identity and the atom order used to build the correspondence.  Returning
+    ``None`` for an unusual graph keeps the caller conservative without
+    entering the unbounded native substructure matcher.
+    """
+
+    projected = _map_free_copy(molecule)
+    for property_name in ("_smilesAtomOutputOrder", "_canonicalAtomRanks"):
+        if projected.HasProp(property_name):
+            projected.ClearProp(property_name)
+    try:
+        Chem.RemoveStereochemistry(projected)
+        signature = Chem.MolToSmiles(
+            projected,
+            canonical=True,
+            isomericSmiles=False,
+            allHsExplicit=True,
+        )
+    except (RuntimeError, ValueError):
+        return None
+    raw_order = projected.GetPropsAsDict(includePrivate=True, includeComputed=True).get(
+        "_smilesAtomOutputOrder"
+    )
+    if raw_order is None:
+        return None
+    order = tuple(int(index) for index in raw_order)
+    if sorted(order) != list(range(projected.GetNumAtoms())):
+        return None
+    return signature, order
+
+
+def _canonical_stereo_agnostic_atom_mapping(
+    specific: Chem.Mol,
+    general: Chem.Mol,
+) -> tuple[int, ...] | None:
+    """Build a general-to-specific mapping without graph substructure search."""
+
+    if (
+        specific.GetNumAtoms() != general.GetNumAtoms()
+        or specific.GetNumBonds() != general.GetNumBonds()
+    ):
+        return None
+    specific_graph = _canonical_stereo_agnostic_graph(specific)
+    general_graph = _canonical_stereo_agnostic_graph(general)
+    if specific_graph is None or general_graph is None:
+        return None
+    specific_signature, specific_order = specific_graph
+    general_signature, general_order = general_graph
+    if specific_signature != general_signature:
+        return None
+    mapping = [0] * general.GetNumAtoms()
+    for canonical_position, general_index in enumerate(general_order):
+        mapping[general_index] = specific_order[canonical_position]
+    return tuple(mapping)
+
+
 @lru_cache(maxsize=4096)
 def _find_topology_matches_cached(
     specific_binary: bytes,
@@ -303,35 +367,41 @@ def find_stereo_abstraction_match(
 
     specific_graph = _map_free_copy(specific)
     general_graph = _map_free_copy(general)
-    matches = find_topology_matches(specific_graph, general_graph)
-    for match in sorted(matches):
-        abstracted_atoms = tuple(
-            general_atom_index
-            for general_atom_index, specific_atom_index in enumerate(match)
-            if not _is_assigned_atom_stereo(general_graph.GetAtomWithIdx(general_atom_index))
-            and _is_assigned_atom_stereo(specific_graph.GetAtomWithIdx(specific_atom_index))
-        )
-        abstracted_bonds: list[int] = []
-        for general_bond in general_graph.GetBonds():  # type: ignore[no-untyped-call]
-            specific_bond = specific_graph.GetBondBetweenAtoms(
-                match[general_bond.GetBeginAtomIdx()],
-                match[general_bond.GetEndAtomIdx()],
-            )
-            if specific_bond is None:
-                break
-            if not _is_assigned_bond_stereo(general_bond) and _is_assigned_bond_stereo(
-                specific_bond
-            ):
-                abstracted_bonds.append(general_bond.GetIdx())
-        else:
-            result = StereoAbstractionMatch(
-                general_to_specific_atom_indices=tuple(int(index) for index in match),
-                abstracted_atom_indices=abstracted_atoms,
-                abstracted_bond_indices=tuple(abstracted_bonds),
-            )
-            if result.abstracted_feature_count > 0:
-                return result
-    return None
+    mapping = _canonical_stereo_agnostic_atom_mapping(specific_graph, general_graph)
+    if mapping is None:
+        return None
+    # The canonical no-stereo graph provides the correspondence.  Reuse the
+    # linear validator so all atom/bond electronic fields and retained stereo
+    # constraints are checked before an abstraction edge is accepted.
+    return _stereo_abstraction_match_for_known_atom_mapping(
+        specific_graph,
+        general_graph,
+        mapping,
+    )
+
+
+def _local_atom_stereo_signature(atom: Chem.Atom, identities: tuple[int, ...]) -> str:
+    """Compare coordination parity on a bounded, provenance-labelled star.
+
+    CIP labels need not exist for square-planar/other metal stereocentres and
+    can change when remote stereo is removed. Unique dummy isotope labels
+    encode the already-known ligand correspondence, not chemical isotopes.
+    Bond insertion follows the source neighbour order, preserving RDKit's
+    tetrahedral tag or non-tetrahedral permutation without a graph search.
+    """
+    star = Chem.RWMol()
+    center = Chem.Atom(atom)
+    center.SetAtomMapNum(0)
+    for name in list(center.GetPropNames(includePrivate=True, includeComputed=True)):
+        if name != "_chiralPermutation":
+            center.ClearProp(name)
+    star.AddAtom(center)
+    for neighbor in atom.GetNeighbors():
+        ligand = Chem.Atom(0)
+        ligand.SetIsotope(identities[neighbor.GetIdx()] + 1)
+        star.AddBond(0, star.AddAtom(ligand), Chem.BondType.SINGLE)
+    star.UpdatePropertyCache(strict=False)
+    return Chem.MolToSmiles(star, canonical=True, isomericSmiles=True)
 
 
 def _stereo_abstraction_match_for_known_atom_mapping(
@@ -357,18 +427,10 @@ def _stereo_abstraction_match_for_known_atom_mapping(
     ):
         return None
 
-    specific_graph = _map_free_copy(specific)
-    general_graph = _map_free_copy(general)
-    try:
-        Chem.AssignStereochemistry(specific_graph, cleanIt=True, force=True)
-        Chem.AssignStereochemistry(general_graph, cleanIt=True, force=True)
-    except (RuntimeError, ValueError):
-        return None
-
     abstracted_atoms: list[int] = []
     for general_index, specific_index in enumerate(general_to_specific_atom_indices):
-        general_atom = general_graph.GetAtomWithIdx(general_index)
-        specific_atom = specific_graph.GetAtomWithIdx(specific_index)
+        general_atom = general.GetAtomWithIdx(general_index)
+        specific_atom = specific.GetAtomWithIdx(specific_index)
         general_signature = (
             general_atom.GetAtomicNum(),
             general_atom.GetIsotope(),
@@ -395,22 +457,20 @@ def _stereo_abstraction_match_for_known_atom_mapping(
         if general_has_stereo and not specific_has_stereo:
             return None
         if general_has_stereo and specific_has_stereo:
-            if not general_atom.HasProp("_CIPCode") or not specific_atom.HasProp("_CIPCode"):
-                # CIP may be undefined for a graph-symmetric centre. Do not
-                # guess parity here; the full stereo-aware matcher remains the
-                # conservative fallback for that uncommon case.
-                return None
-            if general_atom.GetProp("_CIPCode") != specific_atom.GetProp("_CIPCode"):
+            if _local_atom_stereo_signature(
+                general_atom, general_to_specific_atom_indices
+            ) != _local_atom_stereo_signature(specific_atom, tuple(range(atom_count))):
                 return None
         elif specific_has_stereo:
             abstracted_atoms.append(general_index)
 
     specific_bonds = {
         frozenset((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())): bond
-        for bond in specific_graph.GetBonds()  # type: ignore[no-untyped-call]
+        # Use frozen normalized bond/control pairs, never reassigned CIP state.
+        for bond in specific.GetBonds()  # type: ignore[no-untyped-call]
     }
     abstracted_bonds: list[int] = []
-    for general_bond in general_graph.GetBonds():  # type: ignore[no-untyped-call]
+    for general_bond in general.GetBonds():  # type: ignore[no-untyped-call]
         mapped_begin = general_to_specific_atom_indices[general_bond.GetBeginAtomIdx()]
         mapped_end = general_to_specific_atom_indices[general_bond.GetEndAtomIdx()]
         specific_bond = specific_bonds.get(frozenset((mapped_begin, mapped_end)))
@@ -440,9 +500,22 @@ def _stereo_abstraction_match_for_known_atom_mapping(
                 specific_bond.GetEndAtomIdx(),
             ):
                 expected_stereo_atoms = tuple(reversed(expected_stereo_atoms))
-            if (
-                general_bond.GetStereo() != specific_bond.GetStereo()
-                or expected_stereo_atoms != specific_stereo_atoms
+            aliases = {
+                Chem.BondStereo.STEREOCIS: Chem.BondStereo.STEREOZ,
+                Chem.BondStereo.STEREOTRANS: Chem.BondStereo.STEREOE,
+            }
+            general_stereo = aliases.get(general_bond.GetStereo(), general_bond.GetStereo())
+            specific_stereo = aliases.get(specific_bond.GetStereo(), specific_bond.GetStereo())
+            if general_stereo in (Chem.BondStereo.STEREOE, Chem.BondStereo.STEREOZ):
+                order = (specific_bond.GetBeginAtomIdx(), specific_bond.GetEndAtomIdx())
+                edge = frozenset(order)
+                if not _stereo_signatures_match(
+                    {edge: (general_stereo, expected_stereo_atoms, order)},
+                    {edge: (specific_stereo, specific_stereo_atoms, order)},
+                ):
+                    return None
+            elif (
+                general_stereo != specific_stereo or expected_stereo_atoms != specific_stereo_atoms
             ):
                 return None
         elif specific_has_stereo:
@@ -658,7 +731,7 @@ def persist_stereo_abstraction(
     abstraction_policy_version: str = STEREO_ABSTRACTION_POLICY_VERSION,
     abstraction_metadata: dict[str, Any] | None = None,
     known_match: StereoAbstractionMatch | None = None,
-) -> MolecularTopologyAbstraction:
+) -> MolecularTopologyAbstraction | None:
     """Validate and idempotently persist one directed abstraction edge."""
 
     specific_id = _require_id(specific_topology, label="specific MolecularTopology")
@@ -669,7 +742,9 @@ def persist_stereo_abstraction(
     if specific_project_id != owner_project_id or general_project_id != owner_project_id:
         raise StereoAbstractionError("stereo abstraction endpoints must belong to the same project")
     if specific_id == general_id:
-        raise StereoAbstractionError("specific and general topology must be different")
+        # A normalized projection may remove only redundant stereo. This is
+        # an identity operation, not a failed reaction and not a DAG self-edge.
+        return None
     if not general_topology.is_stereo_abstraction_upstream:
         raise StereoAbstractionError(
             "general topology is not marked as a stereo-abstraction upstream"
@@ -1064,7 +1139,8 @@ def backfill_stereo_abstraction_downstreams(
                 "backfill_existing_downstream": True,
             },
         )
-        edges.append(edge)
+        if edge is not None:
+            edges.append(edge)
         general_by_specific.setdefault(candidate_id, set()).add(general_id)
     return tuple(edges)
 
@@ -1077,7 +1153,7 @@ def persist_stereo_abstraction_projection(
     context: Any | None = None,
     abstraction_policy_version: str = STEREO_ABSTRACTION_POLICY_VERSION,
     abstraction_metadata: dict[str, Any] | None = None,
-) -> tuple[MolecularTopology, MolecularTopologyAbstraction]:
+) -> tuple[MolecularTopology, MolecularTopologyAbstraction | None]:
     """Materialize one requested abstraction node and its directed edge.
 
     This is the lazy entry point for topology ingestion and logical-reaction
@@ -1100,6 +1176,8 @@ def persist_stereo_abstraction_projection(
             "is_stereo_abstraction_upstream": True,
         },
     )
+    if normalized.topology.graph_hash == specific_topology.graph_hash:
+        return specific_topology, None
     persisted = persist_molecular_topology(
         session,
         normalized,

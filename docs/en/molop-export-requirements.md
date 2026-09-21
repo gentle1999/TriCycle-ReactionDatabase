@@ -4,6 +4,7 @@
 
 > Status: the contract is implemented at the integration boundary. This page
 > states the requirements used when upgrading MolOP/MolGR or adding parsers.
+> Minimum compatible baseline: PyPI `molop>=0.2.20`, `molgr>=0.1.8`.
 
 ## Purpose and Boundary
 

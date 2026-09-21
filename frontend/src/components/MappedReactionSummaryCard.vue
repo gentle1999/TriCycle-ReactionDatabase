@@ -8,6 +8,7 @@ import { api, reactionDepictionUrl } from "@/api";
 import { formatDurationSeconds, formatNumber, shortId } from "@/format";
 import { withoutAccessState } from "@/routeAccessState";
 import type { MappedReactionSummary } from "@/types";
+import ReactionCompatibilityBadge from "./ReactionCompatibilityBadge.vue";
 
 const props = defineProps<{
   mapped: MappedReactionSummary;
@@ -57,6 +58,7 @@ function energyRange(minimum: number | null, maximum: number | null): string {
     <summary>
       <span class="mapped-summary-index">Mapping {{ String(index + 1).padStart(2, "0") }}</span>
       <strong>{{ mapped.label || mapped.mapped_reaction_key }}</strong>
+      <ReactionCompatibilityBadge :reaction="mapped" />
       <code :title="mapped.mapping_hash">{{ shortId(mapped.mapping_hash) }}</code>
     </summary>
     <div class="mapped-summary-content">

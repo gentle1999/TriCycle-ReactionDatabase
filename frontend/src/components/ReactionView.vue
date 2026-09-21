@@ -38,6 +38,13 @@ const quickReactionInput = ref(props.queryFilters.similarityReactionSmiles ?? pr
 const hasActivationGibbsFreeEnergy = ref(props.queryFilters.hasActivationGibbsFreeEnergy ?? false);
 const hasReactionGibbsFreeEnergy = ref(props.queryFilters.hasReactionGibbsFreeEnergy ?? false);
 const reactantProductChanged = ref<boolean | null>(props.queryFilters.reactantProductChanged ?? null);
+const compatibilityFilter = ref("all");
+watch(() => props.queryFilters, (filters) => {
+  compatibilityFilter.value = filters.hasDualEndpointFallback ? "dual"
+    : filters.hasSingleEndpointFallback ? "single"
+    : filters.hasCompatibilityEndpoints === true ? "any"
+    : filters.hasCompatibilityEndpoints === false ? "none" : "all";
+}, { immediate: true });
 const minimumMappedReactionCount = ref<number | string | null>(props.queryFilters.minimumMappedReactionCount ?? null);
 const maximumMappedReactionCount = ref<number | string | null>(props.queryFilters.maximumMappedReactionCount ?? null);
 const validationError = ref("");
@@ -78,6 +85,10 @@ function selectedEnergyFilters(): ReactionQueryFilters {
   const minimumMappedCount = mappedReactionCountValue(minimumMappedReactionCount.value);
   const maximumMappedCount = mappedReactionCountValue(maximumMappedReactionCount.value);
   return {
+    hasCompatibilityEndpoints: compatibilityFilter.value === "any" ? true
+      : compatibilityFilter.value === "none" ? false : undefined,
+    hasSingleEndpointFallback: compatibilityFilter.value === "single" ? true : undefined,
+    hasDualEndpointFallback: compatibilityFilter.value === "dual" ? true : undefined,
     ...(hasActivationGibbsFreeEnergy.value ? { hasActivationGibbsFreeEnergy: true } : { hasActivationGibbsFreeEnergy: undefined }),
     ...(hasReactionGibbsFreeEnergy.value ? { hasReactionGibbsFreeEnergy: true } : { hasReactionGibbsFreeEnergy: undefined }),
     ...(reactantProductChanged.value === null ? { reactantProductChanged: undefined } : { reactantProductChanged: reactantProductChanged.value }),
@@ -205,6 +216,7 @@ function clearFilters(): void {
   hasActivationGibbsFreeEnergy.value = false;
   hasReactionGibbsFreeEnergy.value = false;
   reactantProductChanged.value = null;
+  compatibilityFilter.value = "all";
   minimumMappedReactionCount.value = null;
   maximumMappedReactionCount.value = null;
   validationError.value = "";
@@ -290,6 +302,17 @@ onBeforeUnmount(() => {
           <option :value="true">发生变化</option>
           <option :value="false">未发生变化</option>
         </select>
+      </label>
+      <label class="filter-select-field">
+        <span>TS 端点兼容性</span>
+        <select v-model="compatibilityFilter" aria-label="TS 端点兼容性筛选" @change="applyOuterEnergyFilters">
+          <option value="all">全部反应</option>
+          <option value="any">包含兼容回退</option>
+          <option value="single">包含单端回退</option>
+          <option value="dual">包含双端回退</option>
+          <option value="none">无兼容回退记录</option>
+        </select>
+        <small>按来源推断筛选；单端与双端可来自不同文件，不互斥。无回退记录不等于严格验证通过。</small>
       </label>
       <div class="reaction-mapping-count-filters" aria-label="映射反应数量筛选">
         <span class="filter-field-label">映射反应数</span>

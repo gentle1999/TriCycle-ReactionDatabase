@@ -144,6 +144,9 @@ celerybeat.pid
 
 # Environments
 .env
+# Local public deployment configuration
+/compose.public.yaml
+/infra/caddy/Caddyfile.public
 secrets/
 .venv
 env/

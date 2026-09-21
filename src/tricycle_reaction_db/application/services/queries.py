@@ -166,6 +166,12 @@ from tricycle_reaction_db.domain.fingerprints import (
 )
 from tricycle_reaction_db.domain.precision import round_energy_hartree
 
+from .reaction_compatibility import (
+    FALLBACK_FILTERS,
+    annotate_reaction_compatibility,
+    fallback_predicate,
+)
+
 PageLimit = Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")]
 PageOffset = Annotated[int, Field(ge=0, description="Number of rows to skip.")]
 
@@ -320,6 +326,7 @@ def reaction_smarts_from_mol_blocks(
 
 _LOGICAL_REACTION_QUERY_EXPRESSION_FIELDS = frozenset(
     {
+        *FALLBACK_FILTERS,
         "topology_id",
         "reaction_key",
         "label",
@@ -691,6 +698,10 @@ def _logical_reaction_query_leaf_predicate(
             if field_name == "minimum_mapped_reaction_count"
             else mapped_count <= comparison_value
         )
+    if field_name in FALLBACK_FILTERS:
+        if not isinstance(value, bool):
+            raise ValueError(f"{field_name} must be a boolean")
+        return fallback_predicate(field_name) == value
     if field_name == "reactant_product_changed":
         if not isinstance(value, bool):
             raise ValueError("reactant_product_changed must be a boolean")
@@ -1972,6 +1983,9 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
         has_activation_gibbs_free_energy: bool | None = None,
         has_reaction_gibbs_free_energy: bool | None = None,
         reactant_product_changed: bool | None = None,
+        has_compatibility_endpoints: bool | None = None,
+        has_single_endpoint_fallback: bool | None = None,
+        has_dual_endpoint_fallback: bool | None = None,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
         limit: PageLimit = 50,
@@ -2029,6 +2043,9 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             has_activation_gibbs_free_energy,
             has_reaction_gibbs_free_energy,
             reactant_product_changed,
+            has_compatibility_endpoints,
+            has_single_endpoint_fallback,
+            has_dual_endpoint_fallback,
             created_after,
             created_before,
         )
@@ -2054,6 +2071,13 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
         )
         scope = await query_visibility_scope(project_id=project_id)
         predicates: list[Any] = [logical_reaction_id_is_visible(scope, col(LogicalReaction.id))]
+        for field, value in (
+            ("has_compatibility_endpoints", has_compatibility_endpoints),
+            ("has_single_endpoint_fallback", has_single_endpoint_fallback),
+            ("has_dual_endpoint_fallback", has_dual_endpoint_fallback),
+        ):
+            if value is not None:
+                predicates.append(fallback_predicate(field) == value)
         if topology_id is not None:
             predicates.append(
                 col(LogicalReaction.id).in_(
@@ -2470,7 +2494,7 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                 logical_id: (minimum, maximum, reaction_minimum, reaction_maximum)
                 for logical_id, minimum, maximum, reaction_minimum, reaction_maximum in barrier_rows
             }
-        return LogicalReactionPage(
+        result = LogicalReactionPage(
             items=[
                 _reaction_summary(
                     reaction,
@@ -2519,6 +2543,8 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
             ],
             page=PageInfo(total=total, limit=limit, offset=offset),
         )
+
+        return await annotate_reaction_compatibility(result)
 
     @query  # type: ignore[untyped-decorator]
     async def get_logical_reaction(
@@ -2672,7 +2698,7 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                 max(reaction_path_maxima) if reaction_path_maxima else None
             ),
         )
-        return LogicalReactionDetail(
+        result = LogicalReactionDetail(
             **summary.model_dump(),
             participants=[
                 LogicalReactionParticipantView(
@@ -2698,6 +2724,8 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                 for path in paths
             ],
         )
+
+        return await annotate_reaction_compatibility(result)
 
 
 class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
@@ -2731,6 +2759,9 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
         reactant_product_changed: bool | None = None,
         limit: PageLimit = 50,
         offset: PageOffset = 0,
+        has_compatibility_endpoints: bool | None = None,
+        has_single_endpoint_fallback: bool | None = None,
+        has_dual_endpoint_fallback: bool | None = None,
     ) -> MappedReactionPage:
         """List mapped paths, including topology and geometry reverse lookups."""
 
@@ -2744,6 +2775,13 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
         )
         scope = await query_visibility_scope(project_id=project_id)
         predicates: list[Any] = [mapped_reaction_id_is_visible(scope, col(MappedReaction.id))]
+        for field, value in (
+            ("has_compatibility_endpoints", has_compatibility_endpoints),
+            ("has_single_endpoint_fallback", has_single_endpoint_fallback),
+            ("has_dual_endpoint_fallback", has_dual_endpoint_fallback),
+        ):
+            if value is not None:
+                predicates.append(fallback_predicate(field, mapped=True) == value)
         if logical_reaction_id is not None:
             predicates.append(col(MappedReaction.logical_reaction_id) == logical_reaction_id)
         if topology_id is not None:
@@ -3092,7 +3130,7 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
                     ).all()
                     if isinstance(mapped_id, UUID)
                 }
-        return MappedReactionPage(
+        result = MappedReactionPage(
             items=[
                 _mapped_reaction_summary(
                     reaction,
@@ -3121,6 +3159,8 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
             ],
             page=PageInfo(total=total, limit=limit, offset=offset),
         )
+
+        return await annotate_reaction_compatibility(result)
 
     @query  # type: ignore[untyped-decorator]
     async def get_mapped_reaction(
@@ -3507,7 +3547,7 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
             ),
             thermodynamic_bounds=profile_bounds,
         )
-        return MappedReactionDetail(
+        result = MappedReactionDetail(
             **summary.model_dump(),
             reaction_key=reaction.reaction_key,
             participants=[
@@ -3559,6 +3599,8 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
                 for edge in edges
             ],
         )
+
+        return await annotate_reaction_compatibility(result)
 
 
 class CalculationQueryService(UseCaseService):  # type: ignore[misc]
@@ -4005,6 +4047,17 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
                     displacement_ratio=endpoint.displacement_ratio,
                     source_coordinate_hash=endpoint.source_coordinate_hash,
                     source_to_topology_atom_indices=(endpoint.source_to_topology_atom_indices),
+                    validation_status=endpoint.provenance.get(
+                        "validation_status",
+                        "strict"
+                        if endpoint.provenance.get("method") == "molop.possible_pre_post_ts"
+                        else "unknown",
+                    ),
+                    strict_validation_passed=endpoint.provenance.get(
+                        "strict_validation_passed",
+                        endpoint.provenance.get("method") == "molop.possible_pre_post_ts",
+                    ),
+                    provenance_json=json.dumps(endpoint.provenance, ensure_ascii=False),
                 )
                 for endpoint in endpoint_rows
             ],

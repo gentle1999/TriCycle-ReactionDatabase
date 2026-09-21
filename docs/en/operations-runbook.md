@@ -2,6 +2,16 @@
 
 [中文](../operations-runbook.md) | [Documentation index](README.md)
 
+## Upload-worker persistence isolation
+
+Successful parser results retain normal microbatch writes. Data/COPY failures roll back before
+the shared persistence service bisects uncompleted files into fresh transactions. Retries reuse
+parsed results, retain lease checks and committed per-file receipts, and do not re-upload sources,
+repeat cleanup or replay committed revisions. The worker publishes isolated terminal failures.
+Look for `splitting failed persistence microbatch` and `isolated artifact persistence failure`.
+Connection, timeout, deadlock and resource errors do not fan out; cancellation retains normal
+abort recovery. This does not repair text/MolOP output or automatically requeue old failed jobs.
+
 ## Scope
 
 This runbook covers multi-host backup, recovery, monitoring, and scheduled

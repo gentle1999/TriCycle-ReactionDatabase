@@ -7,7 +7,7 @@ from uuid import UUID
 import numpy as np
 import numpy.typing as npt
 from molalchemy.rdkit.index import RdkitIndex
-from molalchemy.rdkit.types import RdkitBitFingerprint, RdkitMol
+from molalchemy.rdkit.types import RdkitBitFingerprint
 from pydantic import ConfigDict
 from rdkit import Chem
 from sqlalchemy import (
@@ -35,6 +35,7 @@ from tricycle_reaction_db.core.chemistry_config import (
 )
 from tricycle_reaction_db.db.models.base import created_at_field, uuid_primary_key_field
 from tricycle_reaction_db.db.types import NumpyArray
+from tricycle_reaction_db.db.types.annotated_mol import AnnotatedRdkitMol
 from tricycle_reaction_db.domain.enums import (
     StereoStatus,
     TopologySanitizationStatus,
@@ -239,7 +240,10 @@ class MolecularTopology(SQLModel, table=True):
         index=True,
         nullable=False,
     )
-    mol: Chem.Mol = Field(sa_column=Column(RdkitMol(return_type="mol"), nullable=False))
+    mol: Chem.Mol = Field(sa_column=Column(AnnotatedRdkitMol(return_type="mol"), nullable=False))
+    mol_atom_properties: dict[str, int] = Field(
+        default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default="{}")
+    )
     morgan_bfp: bytes | None = Field(
         default=None,
         sa_column=Column(
@@ -591,7 +595,10 @@ class Geometry(SQLModel, table=True):
         index=True,
         nullable=False,
     )
-    mol: Chem.Mol = Field(sa_column=Column(RdkitMol(return_type="mol"), nullable=False))
+    mol: Chem.Mol = Field(sa_column=Column(AnnotatedRdkitMol(return_type="mol"), nullable=False))
+    mol_atom_properties: dict[str, int] = Field(
+        default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default="{}")
+    )
     internal_coordinates: npt.NDArray[np.generic] = Field(
         sa_column=_geometry_internal_coordinates_column
     )
