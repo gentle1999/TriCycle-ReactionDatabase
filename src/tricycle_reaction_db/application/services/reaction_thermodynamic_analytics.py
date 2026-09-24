@@ -38,7 +38,6 @@ from tricycle_reaction_db.db.models import (
     MappedReactionThermodynamicProfile,
 )
 from tricycle_reaction_db.db.session import session_factory
-from tricycle_reaction_db.domain.enums import ThermodynamicProfileSourceVisibility
 
 HISTOGRAM_BIN_COUNT = 12
 MAX_SCATTER_POINTS = 1_000
@@ -74,17 +73,10 @@ async def _profile_predicate(
     filter_expression: str | None = None,
     has_activation_gibbs_free_energy: bool | None = None,
     has_reaction_gibbs_free_energy: bool | None = None,
-    require_complete_source_evidence: bool = False,
 ) -> Any:
     profile = MappedReactionThermodynamicProfile
     mapped_visibility = mapped_reaction_id_is_visible(scope, col(MappedReaction.id))
     profile_visibility = thermodynamic_profile_is_visible(scope, profile)
-    if require_complete_source_evidence:
-        profile_visibility = and_(
-            profile_visibility,
-            col(profile.source_visibility_status) == ThermodynamicProfileSourceVisibility.VISIBLE,
-            col(profile.source_evidence_complete).is_(True),
-        )
     if (
         filter_expression is None
         and not has_activation_gibbs_free_energy
@@ -383,7 +375,6 @@ class ReactionThermodynamicAnalyticsService:
                 filter_expression=filter_expression,
                 has_activation_gibbs_free_energy=has_activation_gibbs_free_energy,
                 has_reaction_gibbs_free_energy=has_reaction_gibbs_free_energy,
-                require_complete_source_evidence=True,
             )
         return ReactionThermodynamicAnalyticsService._export_csv_rows(
             predicate,

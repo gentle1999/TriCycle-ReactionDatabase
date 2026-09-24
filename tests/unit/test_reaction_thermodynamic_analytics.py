@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 
+from tricycle_reaction_db.application.services import reaction_thermodynamic_analytics as analytics
 from tricycle_reaction_db.application.services.reaction_thermodynamic_analytics import (
     ReactionThermodynamicAnalyticsService,
     _level_label,
@@ -103,3 +104,74 @@ async def test_export_csv_preserves_profile_columns_and_quotes_smiles(
     assert exported[0]["total_running_time_seconds"] == "55.0"
     assert exported[0]["activation_gibbs_free_energy_kcal_mol"] == "13.5"
     assert exported[0]["reaction_gibbs_free_energy_kcal_mol"] == "-3.25"
+
+
+@pytest.mark.asyncio
+async def test_export_csv_uses_the_same_visible_profile_predicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_project_id = uuid4()
+    scope = object()
+    predicate = object()
+    observed: dict[str, Any] = {}
+
+    async def resolve_scope(*, project_id: object) -> object:
+        observed["project_id"] = project_id
+        return scope
+
+    async def profile_predicate(
+        _session: object,
+        requested_scope: object,
+        **filters: object,
+    ) -> object:
+        observed["scope"] = requested_scope
+        observed["filters"] = filters
+        return predicate
+
+    def export_rows(
+        requested_predicate: object,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> AsyncIterator[str]:
+        observed["export"] = (requested_predicate, limit, offset)
+
+        async def chunks() -> AsyncIterator[str]:
+            yield "mapped_reaction_id\n"
+
+        return chunks()
+
+    class _PredicateSessionContext:
+        async def __aenter__(self) -> object:
+            return object()
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(analytics, "query_visibility_scope", resolve_scope)
+    monkeypatch.setattr(analytics, "session_factory", _PredicateSessionContext)
+    monkeypatch.setattr(analytics, "_profile_predicate", profile_predicate)
+    monkeypatch.setattr(
+        ReactionThermodynamicAnalyticsService,
+        "_export_csv_rows",
+        staticmethod(export_rows),
+    )
+
+    stream = await ReactionThermodynamicAnalyticsService.export_csv(
+        requested_project_id,
+        filter_expression='{"field":"reaction_hash","value":"test"}',
+        limit=10,
+        offset=20,
+    )
+
+    assert [chunk async for chunk in stream] == ["mapped_reaction_id\n"]
+    assert observed == {
+        "project_id": requested_project_id,
+        "scope": scope,
+        "filters": {
+            "filter_expression": '{"field":"reaction_hash","value":"test"}',
+            "has_activation_gibbs_free_energy": None,
+            "has_reaction_gibbs_free_energy": None,
+        },
+        "export": (predicate, 10, 20),
+    }
