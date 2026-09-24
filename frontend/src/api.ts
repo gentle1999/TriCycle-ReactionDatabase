@@ -38,6 +38,8 @@ import type {
   UploadBatchItemPage,
   UploadBatchPage,
   UploadBatchStatus,
+  UnitsTsDatasetExportCreated,
+  UnitsTsDatasetExportStatus,
 } from "./types";
 import type { GeometryQueryFilters, GeometrySort } from "./geometryQuery";
 import {
@@ -701,6 +703,46 @@ export const api = {
     requestBlobJson(
       "/api/mapped-reactions/thermodynamics/export.csv",
       reactionAnalyticsPayload(options),
+      signal,
+    ),
+  mappedReactionEnergyTimeExport: (options: {
+    projectId: string;
+    reactionSmarts?: string;
+    hasActivationGibbsFreeEnergy?: boolean;
+    hasReactionGibbsFreeEnergy?: boolean;
+  }, signal?: AbortSignal) => {
+    const reactionSmarts = options.reactionSmarts?.trim();
+    return requestBlobJson(
+      "/api/mapped-reactions/thermodynamics/export.csv",
+      {
+        project_id: options.projectId,
+        ...(reactionSmarts
+          ? {
+            filter_expression: JSON.stringify({
+              field: "reaction_smarts",
+              value: reactionSmarts,
+            }),
+          }
+          : {}),
+        ...(options.hasActivationGibbsFreeEnergy
+          ? { has_activation_gibbs_free_energy: true }
+          : {}),
+        ...(options.hasReactionGibbsFreeEnergy
+          ? { has_reaction_gibbs_free_energy: true }
+          : {}),
+      },
+      signal,
+    );
+  },
+  createUnitsTsDatasetExport: (projectId: string, signal?: AbortSignal) =>
+    requestJson<UnitsTsDatasetExportCreated>(
+      "/api/units-ts-datasets",
+      { project_id: projectId },
+      signal,
+    ),
+  unitsTsDatasetExportStatus: (jobId: string, signal?: AbortSignal) =>
+    request<UnitsTsDatasetExportStatus>(
+      `/api/units-ts-datasets/${encodeURIComponent(jobId)}`,
       signal,
     ),
   reaction: (id: string, options: { projectId?: string } = {}, signal?: AbortSignal) =>

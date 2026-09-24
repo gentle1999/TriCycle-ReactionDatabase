@@ -22,6 +22,8 @@ from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.util import await_only
 from sqlmodel import Session
 
+from tricycle_reaction_db.db.models import LogicalReaction
+
 LEGACY_BULK_IMPORT_SESSION_INFO_KEY = "tricycle_legacy_bulk_import"
 
 _FAST_INSERT_SAFE_LOCK_NAMES = frozenset(
@@ -67,6 +69,7 @@ _FAST_MAPPERS: dict[type[Any], Any] = {}
 
 _FAST_PENDING_ENTITIES_KEY = "_fast_pending_entities"
 _FAST_PENDING_ENTITY_INDEX_KEY = "_fast_pending_entity_index"
+_FAST_PENDING_LOGICAL_REACTION_INDEX_KEY = "_fast_pending_logical_reaction_index"
 _FAST_COPY_MIN_ROWS = 32
 
 
@@ -171,6 +174,7 @@ def _set_fast_pending_entities(session: Session, entities: Iterable[object]) -> 
     if not pending:
         session.info.pop(_FAST_PENDING_ENTITIES_KEY, None)
         session.info.pop(_FAST_PENDING_ENTITY_INDEX_KEY, None)
+        session.info.pop(_FAST_PENDING_LOGICAL_REACTION_INDEX_KEY, None)
         return
     session.info[_FAST_PENDING_ENTITIES_KEY] = pending
     session.info[_FAST_PENDING_ENTITY_INDEX_KEY] = {
@@ -178,6 +182,37 @@ def _set_fast_pending_entities(session: Session, entities: Iterable[object]) -> 
         for entity in pending
         if (identity_key := _entity_identity_key(entity)) is not None
     }
+    session.info[_FAST_PENDING_LOGICAL_REACTION_INDEX_KEY] = {
+        (entity.project_id, entity.reaction_hash): entity
+        for entity in pending
+        if isinstance(entity, LogicalReaction)
+        and entity.project_id is not None
+        and entity.reaction_hash
+    }
+
+
+def _fast_pending_logical_reaction(
+    session: Session,
+    project_id: UUID,
+    reaction_hash: str,
+) -> LogicalReaction | None:
+    """Find a logical reaction queued earlier in this persistence batch."""
+
+    index = session.info.get(_FAST_PENDING_LOGICAL_REACTION_INDEX_KEY)
+    if not isinstance(index, dict):
+        return None
+    reaction = index.get((project_id, reaction_hash))
+    return reaction if isinstance(reaction, LogicalReaction) else None
+
+
+def _is_fast_pending_entity(session: Session, entity: object) -> bool:
+    """Whether an object is still queued for the deferred fast insert."""
+
+    identity_key = _entity_identity_key(entity)
+    if identity_key is None:
+        return False
+    index = session.info.get(_FAST_PENDING_ENTITY_INDEX_KEY)
+    return isinstance(index, dict) and index.get(identity_key) is entity
 
 
 def _fast_pending_entity_count(session: Session) -> int:
@@ -211,6 +246,7 @@ def _pop_fast_pending_entities(session: Session) -> list[object] | None:
 
     pending = session.info.pop(_FAST_PENDING_ENTITIES_KEY, None)
     session.info.pop(_FAST_PENDING_ENTITY_INDEX_KEY, None)
+    session.info.pop(_FAST_PENDING_LOGICAL_REACTION_INDEX_KEY, None)
     return pending if isinstance(pending, list) else None
 
 
@@ -227,6 +263,10 @@ def _queue_fast_pending_entity(session: Session, entity: object) -> None:
         index = session.info.setdefault(_FAST_PENDING_ENTITY_INDEX_KEY, {})
         if isinstance(index, dict):
             index.setdefault(identity_key, entity)
+    if isinstance(entity, LogicalReaction) and entity.project_id is not None:
+        index = session.info.setdefault(_FAST_PENDING_LOGICAL_REACTION_INDEX_KEY, {})
+        if isinstance(index, dict):
+            index.setdefault((entity.project_id, entity.reaction_hash), entity)
 
 
 def _copy_entity_scalar_values(
@@ -782,7 +822,9 @@ __all__ = [
     "_bulk_insert_pending_entities",
     "_assert_record_matches",
     "_fast_pending_entity_count",
+    "_fast_pending_logical_reaction",
     "_fast_insert_enabled",
+    "_is_fast_pending_entity",
     "_new_entity",
     "_project_owner_predicate",
     "_flush_new_entity",

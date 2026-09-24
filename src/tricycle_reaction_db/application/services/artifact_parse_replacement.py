@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import delete, func, update
+from sqlalchemy import delete, func, or_, update
 from sqlmodel import Session, col, select
 
 from tricycle_reaction_db.db.models import (
@@ -203,10 +203,84 @@ def clear_previous_parse_results_batch(
 
     # Collect only this reset's candidates, never sweep unrelated project
     # data. Remaining inference or geometry evidence protects shared mappings.
+    fully_unreferenced_logical_reaction_ids: set[UUID] = set()
+    if old_logical_reaction_ids:
+        mapped_ids_for_logical_reaction = (
+            select(MappedReaction.id)
+            .where(col(MappedReaction.logical_reaction_id) == LogicalReaction.id)
+            .correlate(LogicalReaction)
+        )
+        remaining_inference = select(TransitionStateInference.id).where(
+            or_(
+                col(TransitionStateInference.logical_reaction_id) == LogicalReaction.id,
+                col(TransitionStateInference.mapped_reaction_id).in_(
+                    mapped_ids_for_logical_reaction
+                ),
+            )
+        )
+        fully_unreferenced_logical_reaction_ids = {
+            logical_reaction_id
+            for logical_reaction_id in session.exec(
+                select(LogicalReaction.id).where(
+                    col(LogicalReaction.id).in_(old_logical_reaction_ids),
+                    ~remaining_inference.exists(),
+                )
+            ).all()
+            if isinstance(logical_reaction_id, UUID)
+        }
+
+    unreferenced_mapped_reaction_ids: set[UUID] = set()
+    orphaned_mapped_geometry_ids: set[UUID] = set()
+    if fully_unreferenced_logical_reaction_ids:
+        unreferenced_mapped_reaction_ids = {
+            mapped_reaction_id
+            for mapped_reaction_id in session.exec(
+                select(MappedReaction.id).where(
+                    col(MappedReaction.logical_reaction_id).in_(
+                        fully_unreferenced_logical_reaction_ids
+                    )
+                )
+            ).all()
+            if isinstance(mapped_reaction_id, UUID)
+        }
+    if unreferenced_mapped_reaction_ids:
+        orphaned_mapped_geometry_ids = {
+            geometry_id
+            for geometry_id in session.exec(
+                select(MappedReactionNodeGeometry.geometry_id)
+                .join(
+                    MappedReactionNode,
+                    col(MappedReactionNode.id)
+                    == col(MappedReactionNodeGeometry.mapped_reaction_node_id),
+                )
+                .where(
+                    col(MappedReactionNode.mapped_reaction_id).in_(unreferenced_mapped_reaction_ids)
+                )
+            ).all()
+            if isinstance(geometry_id, UUID)
+        }
+        node_geometry_delete_result = session.execute(
+            delete(MappedReactionNodeGeometry)
+            .where(
+                col(MappedReactionNodeGeometry.mapped_reaction_node_id).in_(
+                    select(MappedReactionNode.id).where(
+                        col(MappedReactionNode.mapped_reaction_id).in_(
+                            unreferenced_mapped_reaction_ids
+                        )
+                    )
+                )
+            )
+            .execution_options(synchronize_session=False)
+        )
+        deleted_node_geometry_count += int(cast(Any, node_geometry_delete_result).rowcount or 0)
+
+    mapped_reaction_delete_candidates = inferred_mapped_reaction_ids | (
+        unreferenced_mapped_reaction_ids
+    )
     mapped_result = session.execute(
         delete(MappedReaction)
         .where(
-            col(MappedReaction.id).in_(inferred_mapped_reaction_ids),
+            col(MappedReaction.id).in_(mapped_reaction_delete_candidates),
             ~select(TransitionStateInference.id)
             .where(TransitionStateInference.mapped_reaction_id == MappedReaction.id)
             .exists(),
@@ -230,10 +304,11 @@ def clear_previous_parse_results_batch(
         )
         .execution_options(synchronize_session=False)
     )
+    candidate_geometry_ids = old_geometry_ids | orphaned_mapped_geometry_ids
     geometry_result = session.execute(
         delete(Geometry)
         .where(
-            col(Geometry.id).in_(old_geometry_ids),
+            col(Geometry.id).in_(candidate_geometry_ids),
             ~select(CalculationFrame.id)
             .where(CalculationFrame.geometry_id == Geometry.id)
             .exists(),

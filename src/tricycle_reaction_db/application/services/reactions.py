@@ -1,6 +1,7 @@
 """Relationship-driven persistence for manifest-declared reaction paths."""
 
 import json
+import re
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -30,7 +31,9 @@ from tricycle_reaction_db.application.services._persistence import (
     _assert_record_matches,
     _attach_or_reuse_entity,
     _attach_pending_entities,
+    _fast_pending_logical_reaction,
     _flush_new_entity,
+    _is_fast_pending_entity,
     _new_entity,
     _project_owner_predicate,
     _require_id,
@@ -74,6 +77,48 @@ MappedReactionConcreteIdentity = tuple[
     tuple[str, int, UUID, str],
     ...,
 ]
+
+_SOURCE_ATOM_MAP_PATTERN = re.compile(r":([0-9]+)\]")
+
+
+def _validate_source_mapped_reaction_smiles(
+    reaction_smiles: str,
+    *,
+    expected_atom_maps_by_side: Mapping[LogicalReactionParticipantSide, set[int]],
+) -> str:
+    """Validate source-order reaction text without parsing a reaction graph.
+
+    MolOP TS inference has already assigned map numbers from the source atom
+    sequence. Parsing the complete reaction through RDKit would make that
+    serialized projection compete with the endpoint topology as a second
+    source of atom order, and can also reject valid metal-rich endpoints.
+    """
+
+    sides = reaction_smiles.split(">>")
+    if len(sides) != 2 or any(not side.strip() for side in sides):
+        raise ValueError("source mapped reaction must contain non-empty reactant and product sides")
+
+    observed_atom_maps_by_side: list[set[int]] = []
+    for side in sides:
+        atom_maps = [int(number) for number in _SOURCE_ATOM_MAP_PATTERN.findall(side)]
+        if not atom_maps or any(number <= 0 for number in atom_maps):
+            raise ValueError("source mapped reaction must contain positive atom-map numbers")
+        if len(atom_maps) != len(set(atom_maps)):
+            raise ValueError("source mapped reaction atom-map numbers must be unique per side")
+        observed_atom_maps_by_side.append(set(atom_maps))
+
+    reactant_maps, product_maps = observed_atom_maps_by_side
+    if reactant_maps != product_maps:
+        raise ValueError("source mapped reaction atom-map sets must match across both sides")
+    for side, observed_maps in zip(
+        (LogicalReactionParticipantSide.REACTANT, LogicalReactionParticipantSide.PRODUCT),
+        observed_atom_maps_by_side,
+        strict=True,
+    ):
+        if observed_maps != expected_atom_maps_by_side[side]:
+            raise ValueError("source mapped reaction atom maps do not match topology bindings")
+    return reaction_smiles
+
 
 _ENDPOINT_NODE_KEY_ALIASES: dict[MappedReactionNodeRole, tuple[str, ...]] = {
     MappedReactionNodeRole.REACTANT: ("reactants", "reactant"),
@@ -286,7 +331,7 @@ def atom_maps_from_source_order(
     source_atom_map_numbers: Iterable[int],
     source_to_geometry_atom_indices: Iterable[int] | None = None,
 ) -> list[int]:
-    """Convert one frame's source atom maps into Geometry/Topology order."""
+    """Convert one frame's source atom maps into ``Geometry.mol`` atom order."""
 
     source_maps = list(source_atom_map_numbers)
     if len(source_maps) != geometry.atom_count:
@@ -301,32 +346,27 @@ def atom_maps_from_source_order(
     if sorted(source_to_geometry) != list(range(geometry.atom_count)):
         raise ValueError("source-to-Geometry atom indices must be a full permutation")
 
-    topology_maps = [0] * geometry.atom_count
+    geometry_maps = [0] * geometry.atom_count
     for source_index, geometry_index in enumerate(source_to_geometry):
-        topology_maps[geometry_index] = source_maps[source_index]
-    return topology_maps
+        geometry_maps[geometry_index] = source_maps[source_index]
+    return geometry_maps
 
 
-def mapped_smiles_for_topology(
-    topology: MolecularTopology,
+def _mapped_smiles_for_molecule(
+    molecule: Chem.Mol,
+    atom_count: int,
     atom_map_numbers: Iterable[int],
     *,
-    include_stereochemistry: bool = True,
+    stereo_status: StereoStatus | None,
+    include_stereochemistry: bool,
 ) -> str:
-    """Render a topology with business atom-map numbers.
-
-    Transition-state coordinate mappings use this same representation with
-    ``include_stereochemistry=False``: their map vector is source-order
-    evidence, while TS geometry stereo is independent of endpoint stereo.
-    """
-
     atom_maps = list(atom_map_numbers)
-    if len(atom_maps) != topology.atom_count:
-        raise ValueError("atom-map count must match MolecularTopology.atom_count")
+    if len(atom_maps) != atom_count:
+        raise ValueError("atom-map count must match molecule atom count")
     if any(number <= 0 for number in atom_maps) or len(set(atom_maps)) != len(atom_maps):
         raise ValueError("atom-map numbers must be unique positive integers")
 
-    mapped = Chem.Mol(topology.mol)
+    mapped = Chem.Mol(molecule)
     for atom, map_number in zip(mapped.GetAtoms(), atom_maps, strict=True):  # type: ignore[no-untyped-call]
         atom.SetAtomMapNum(map_number)
     # PostgreSQL/RDKit preserves the BondStereo assignment but may drop the
@@ -335,9 +375,8 @@ def mapped_smiles_for_topology(
     # unassigned, conflicting, and ambiguous stereo must be connectivity-only;
     # otherwise stale direction flags can turn an unassigned terminal alkene
     # into an arbitrary E/Z reaction component.
-    stereo_status = getattr(topology, "stereo_status", None)
-    # ``None`` is retained for lightweight/legacy topology objects that do
-    # not expose the status field; their graph itself is the only available
+    # ``None`` is retained for lightweight/legacy molecular objects that do
+    # not expose a status field; their graph itself is the only available
     # stereo evidence. Persisted MolecularTopology rows always carry an
     # explicit status and therefore require ASSIGNED before isomeric output.
     isomeric_smiles = include_stereochemistry and (
@@ -348,6 +387,46 @@ def mapped_smiles_for_topology(
         preserve_atom_maps=True,
         isomeric_smiles=isomeric_smiles,
         all_hs_explicit=True,
+    )
+
+
+def mapped_smiles_for_topology(
+    topology: MolecularTopology,
+    atom_map_numbers: Iterable[int],
+    *,
+    include_stereochemistry: bool = True,
+) -> str:
+    """Render a topology with map numbers in ``MolecularTopology.mol`` order."""
+
+    return _mapped_smiles_for_molecule(
+        topology.mol,
+        topology.atom_count,
+        atom_map_numbers,
+        stereo_status=getattr(topology, "stereo_status", None),
+        include_stereochemistry=include_stereochemistry,
+    )
+
+
+def mapped_smiles_for_geometry(
+    geometry: Geometry,
+    atom_map_numbers: Iterable[int],
+    *,
+    include_stereochemistry: bool = True,
+) -> str:
+    """Render map numbers in ``Geometry.mol`` order, the coordinate atom order.
+
+    A Geometry can point to a reused MolecularTopology whose representative
+    molecule uses a different atom order. Coordinate map vectors must
+    therefore be serialized against the Geometry molecule itself.
+    """
+
+    topology = getattr(geometry, "topology", None)
+    return _mapped_smiles_for_molecule(
+        geometry.mol,
+        geometry.atom_count,
+        atom_map_numbers,
+        stereo_status=getattr(topology, "stereo_status", None),
+        include_stereochemistry=include_stereochemistry,
     )
 
 
@@ -1277,18 +1356,22 @@ def persist_logical_reaction(
     if not isinstance(project_id, UUID):
         raise ValueError("project-scoped reaction persistence requires project_id")
     _acquire_identity_locks(session, ("logical_reaction", project_id, record.reaction_hash))
-    reaction = session.exec(
-        select(LogicalReaction).where(
-            LogicalReaction.reaction_hash == record.reaction_hash,
-            LogicalReaction.project_id == project_id,
-        )
-    ).first()
+    reaction = _fast_pending_logical_reaction(session, project_id, record.reaction_hash)
+    is_fast_pending = reaction is not None
+    if reaction is None:
+        reaction = session.exec(
+            select(LogicalReaction).where(
+                LogicalReaction.reaction_hash == record.reaction_hash,
+                LogicalReaction.project_id == project_id,
+            )
+        ).first()
     if reaction is not None:
         # Automatic endpoint inference leaves the class unset. A later curator
         # command may explicitly classify that same topology identity.
         if reaction.reaction_class is None and record.reaction_class is not None:
             reaction.reaction_class = record.reaction_class
-            session.flush()
+            if not is_fast_pending:
+                session.flush()
         return reaction
     reaction = _new_entity(
         session,
@@ -1319,13 +1402,23 @@ def persist_logical_reaction_participant(
         session,
         ("logical_reaction_participant", reaction_id, record.side.value, record.participant_index),
     )
-    participant = session.exec(
-        select(LogicalReactionParticipant).where(
-            LogicalReactionParticipant.logical_reaction_id == reaction_id,
-            LogicalReactionParticipant.side == record.side,
-            LogicalReactionParticipant.participant_index == record.participant_index,
-        )
-    ).first()
+    participant = next(
+        (
+            candidate
+            for candidate in reaction.participants
+            if candidate.side is record.side
+            and candidate.participant_index == record.participant_index
+        ),
+        None,
+    )
+    if participant is None:
+        participant = session.exec(
+            select(LogicalReactionParticipant).where(
+                LogicalReactionParticipant.logical_reaction_id == reaction_id,
+                LogicalReactionParticipant.side == record.side,
+                LogicalReactionParticipant.participant_index == record.participant_index,
+            )
+        ).first()
     if participant is not None:
         if participant.topology_id != topology_id:
             raise ValueError("LogicalReactionParticipant identity resolved to a different Topology")
@@ -1338,9 +1431,10 @@ def persist_logical_reaction_participant(
         if record.role is not None:
             if participant.role is None:
                 participant.role = record.role
-                session.add(participant)
-                _attach_pending_entities(session)
-                session.flush()
+                if not _is_fast_pending_entity(session, participant):
+                    session.add(participant)
+                    _attach_pending_entities(session)
+                    session.flush()
             elif participant.role is not record.role:
                 raise ValueError(
                     "LogicalReactionParticipant identity resolved to different role: "
@@ -1438,6 +1532,7 @@ def persist_mapped_reaction(
     | None = None,
     precomputed_mapped_smiles_by_template: Mapping[tuple[LogicalReactionParticipantSide, int], str]
     | None = None,
+    source_mapped_reaction_smiles: str | None = None,
     topology_context: Any | None = None,
 ) -> MappedReaction:
     """Insert or reuse one explicit mapped reaction under a logical reaction."""
@@ -1472,23 +1567,49 @@ def persist_mapped_reaction(
             key: tuple(int(number) for number in atom_maps)
             for key, atom_maps in source_atom_maps_by_template.items()
         }
-        canonical_sides: dict[LogicalReactionParticipantSide, list[tuple[int, str]]] = {
-            LogicalReactionParticipantSide.REACTANT: [],
-            LogicalReactionParticipantSide.PRODUCT: [],
+        expected_atom_maps_by_side: dict[LogicalReactionParticipantSide, set[int]] = {
+            LogicalReactionParticipantSide.REACTANT: set(),
+            LogicalReactionParticipantSide.PRODUCT: set(),
         }
-        for (side, template_index), mapped_smiles in precomputed_mapped_smiles_by_template.items():
-            canonical_sides[side].append((template_index, mapped_smiles))
-        reactants = ".".join(
-            smiles for _, smiles in sorted(canonical_sides[LogicalReactionParticipantSide.REACTANT])
-        )
-        products = ".".join(
-            smiles for _, smiles in sorted(canonical_sides[LogicalReactionParticipantSide.PRODUCT])
-        )
-        canonical_smiles = f"{reactants}>>{products}"
+        for (side, _template_index), component_map_numbers in normalized_atom_maps.items():
+            positive_maps = {number for number in component_map_numbers if number > 0}
+            if len(positive_maps) != len(component_map_numbers):
+                raise ValueError(
+                    "precomputed mapped reaction atom maps must be complete and positive"
+                )
+            if expected_atom_maps_by_side[side] & positive_maps:
+                raise ValueError("precomputed mapped reaction atom maps must be unique per side")
+            expected_atom_maps_by_side[side].update(positive_maps)
+
+        if source_mapped_reaction_smiles is not None:
+            canonical_smiles = _validate_source_mapped_reaction_smiles(
+                source_mapped_reaction_smiles,
+                expected_atom_maps_by_side=expected_atom_maps_by_side,
+            )
+        else:
+            canonical_sides: dict[LogicalReactionParticipantSide, list[tuple[int, str]]] = {
+                LogicalReactionParticipantSide.REACTANT: [],
+                LogicalReactionParticipantSide.PRODUCT: [],
+            }
+            for (
+                side,
+                template_index,
+            ), mapped_smiles in precomputed_mapped_smiles_by_template.items():
+                canonical_sides[side].append((template_index, mapped_smiles))
+            reactants = ".".join(
+                smiles
+                for _, smiles in sorted(canonical_sides[LogicalReactionParticipantSide.REACTANT])
+            )
+            products = ".".join(
+                smiles
+                for _, smiles in sorted(canonical_sides[LogicalReactionParticipantSide.PRODUCT])
+            )
+            canonical_smiles = f"{reactants}>>{products}"
         expected_hash = sha256(canonical_smiles.encode("utf-8")).hexdigest()
         if record.mapped_reaction_smiles != canonical_smiles:
             raise ValueError(
-                "precomputed mapped_reaction_smiles must match its trusted topology components"
+                "precomputed mapped_reaction_smiles must match its trusted source "
+                "or topology components"
             )
         if record.mapping_hash != expected_hash:
             raise ValueError("mapping_hash does not match mapped_reaction_smiles")
@@ -1668,7 +1789,7 @@ def persist_mapped_reaction(
         if len(unused) != len(templates):
             raise ValueError("mapped reaction template count must match logical participants")
         for template_index, template in enumerate(templates):
-            match = None
+            match: tuple[LogicalReactionParticipant, list[int], str] | None = None
             template_key = (side, template_index)
             source_atom_maps = normalized_source_atom_maps[template_key]
             expected_topology_id = topology_ids_by_template[template_key]
@@ -1696,32 +1817,37 @@ def persist_mapped_reaction(
                 ):
                     continue
                 try:
-                    atom_maps, logical_mapped_smiles = _mapping_assignment_for_topology(
-                        template,
-                        participant.topology,
-                        source_atom_map_numbers=source_atom_maps,
+                    assigned_atom_map_numbers, logical_mapped_smiles = (
+                        _mapping_assignment_for_topology(
+                            template,
+                            participant.topology,
+                            source_atom_map_numbers=source_atom_maps,
+                        )
                     )
                     mapped_smiles = (
-                        mapped_smiles_for_topology(expected_concrete_topology, atom_maps)
+                        mapped_smiles_for_topology(
+                            expected_concrete_topology,
+                            assigned_atom_map_numbers,
+                        )
                         if expected_concrete_topology is not None
                         else logical_mapped_smiles
                     )
                 except ValueError:
                     continue
-                match = participant, atom_maps, mapped_smiles
+                match = participant, assigned_atom_map_numbers, mapped_smiles
                 break
             if match is None:
                 raise ValueError(
                     "mapped reaction templates cannot be assigned to logical topologies"
                 )
-            participant, atom_maps, mapped_smiles = match
+            participant, assigned_atom_map_numbers, mapped_smiles = match
             unused.remove(participant)
             persist_mapped_reaction_participant(
                 session,
                 mapped_reaction,
                 participant,
                 template_index=template_index,
-                atom_map_numbers=atom_maps,
+                atom_map_numbers=assigned_atom_map_numbers,
                 mapped_smiles=mapped_smiles,
                 concrete_topology=expected_concrete_topology,
                 identity_is_new=mapped_reaction_created,
@@ -2164,10 +2290,18 @@ def persist_mapped_reaction_node_geometry_mapping(
     transition_state_mapping = node.role is MappedReactionNodeRole.TRANSITION_STATE
     if len(record.geometry_atom_map_numbers) != node_geometry.geometry.atom_count:
         raise ValueError("Geometry atom-map count must match the bound Geometry")
-    expected_smiles = mapped_smiles_for_topology(
-        node_geometry.geometry.topology,
-        record.geometry_atom_map_numbers,
-        include_stereochemistry=not transition_state_mapping,
+    expected_smiles = (
+        mapped_smiles_for_geometry(
+            node_geometry.geometry,
+            record.geometry_atom_map_numbers,
+            include_stereochemistry=False,
+        )
+        if transition_state_mapping
+        else mapped_smiles_for_topology(
+            node_geometry.geometry.topology,
+            record.geometry_atom_map_numbers,
+            include_stereochemistry=True,
+        )
     )
     if record.mapped_smiles != expected_smiles:
         raise ValueError("mapped_smiles does not match the converted coordinate mapping")
@@ -2200,20 +2334,25 @@ def persist_mapped_reaction_node_geometry_mapping(
         ).first()
     if binding is not None:
         existing_smiles = (
-            mapped_smiles_for_topology(
-                node_geometry.geometry.topology,
+            mapped_smiles_for_geometry(
+                node_geometry.geometry,
                 binding.geometry_atom_map_numbers,
                 include_stereochemistry=False,
             )
             if transition_state_mapping
             else binding.mapped_smiles
         )
-        if not _reaction_mapping_isomorphic(
-            expected_atom_map_numbers=binding.geometry_atom_map_numbers,
-            expected_mapped_smiles=existing_smiles,
-            observed_atom_map_numbers=record.geometry_atom_map_numbers,
-            observed_mapped_smiles=record.mapped_smiles,
-        ):
+        mapping_matches = (
+            binding.geometry_atom_map_numbers == record.geometry_atom_map_numbers
+            if transition_state_mapping
+            else _reaction_mapping_isomorphic(
+                expected_atom_map_numbers=binding.geometry_atom_map_numbers,
+                expected_mapped_smiles=existing_smiles,
+                observed_atom_map_numbers=record.geometry_atom_map_numbers,
+                observed_mapped_smiles=record.mapped_smiles,
+            )
+        )
+        if not mapping_matches:
             raise ValueError("node Geometry has an incompatible reaction mapping")
         if transition_state_mapping:
             # A legacy TS binding may have serialized endpoint-irrelevant
@@ -2224,9 +2363,9 @@ def persist_mapped_reaction_node_geometry_mapping(
             binding.mapping_method = REACTION_TS_GEOMETRY_LINK_METHOD
             binding.mapping_version = REACTION_TS_GEOMETRY_LINK_POLICY_VERSION
             session.add(binding)
-        # A Geometry mapping is expressed in canonical Geometry/Topology
-        # order.  Source atom order and its permutation belong to each Frame,
-        # so an equivalent mapping is reusable across QM programs and files.
+        # TS map vectors are expressed in Geometry.mol order. Source atom order
+        # and its permutation belong to each CalculationFrame, so an equivalent
+        # Geometry mapping can be reused across QM programs and files.
         return binding
     binding = _new_entity(
         session,

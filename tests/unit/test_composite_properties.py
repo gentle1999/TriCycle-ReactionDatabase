@@ -245,7 +245,7 @@ def test_ts_thermodynamic_only_composite_chooses_complete_lowest_gibbs_frame() -
     assert composite.view.entropy_cal_mol_k == pytest.approx(11.0)
 
 
-def test_protocol_version_difference_is_not_equivalent() -> None:
+def test_protocol_version_difference_is_equivalent_for_energy_selection() -> None:
     geometry_id = uuid4()
     first_protocol = _protocol("B3LYP", "def2-SVP", software="gaussian")
     second_protocol = first_protocol.model_copy(update={"qm_software_version": "different"})
@@ -260,8 +260,8 @@ def test_protocol_version_difference_is_not_equivalent() -> None:
         ],
     )
 
-    assert composite.view.electronic_selection_status == "ambiguous"
-    assert composite.view.electronic_energy_hartree is None
+    assert composite.view.electronic_selection_status == "selected"
+    assert composite.view.electronic_energy_hartree == pytest.approx(-100.0)
 
 
 def test_derived_energies_are_quantized_after_float_arithmetic() -> None:

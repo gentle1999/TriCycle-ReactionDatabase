@@ -99,3 +99,85 @@ def test_cleanup_collects_only_unreferenced_candidates_and_rolls_back():
             )
     finally:
         engine.dispose()
+
+
+def test_cleanup_collects_detached_ts_geometry_for_unreferenced_reaction_and_rolls_back():
+    engine = create_engine(get_settings().database_url)
+    try:
+        with engine.connect() as connection:
+            transaction = connection.begin()
+            try:
+                with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
+                    candidate = session.execute(
+                        text(
+                            "SELECT r.artifact_file_id, i.logical_reaction_id, "
+                            "i.mapped_reaction_id "
+                            "FROM transition_state_inference i "
+                            "JOIN parse_revision r ON r.id=i.parse_revision_id "
+                            "WHERE i.status='succeeded' AND i.logical_reaction_id IS NOT NULL "
+                            "AND i.mapped_reaction_id IS NOT NULL "
+                            "AND (SELECT count(*) FROM transition_state_inference other "
+                            "WHERE other.logical_reaction_id=i.logical_reaction_id)=1 "
+                            "AND (SELECT count(*) FROM transition_state_inference other "
+                            "WHERE other.mapped_reaction_id=i.mapped_reaction_id)=1 "
+                            "AND EXISTS (SELECT 1 FROM mapped_reaction_node n "
+                            "JOIN mapped_reaction_node_geometry g "
+                            "ON g.mapped_reaction_node_id=n.id "
+                            "WHERE n.mapped_reaction_id=i.mapped_reaction_id) "
+                            "LIMIT 1"
+                        )
+                    ).one_or_none()
+                    if candidate is None:
+                        pytest.skip("requires an unshared inferred reaction with TS geometry")
+                    artifact_id, logical_reaction_id, mapped_reaction_id = candidate
+                    geometry_ids = set(
+                        session.execute(
+                            text(
+                                "SELECT g.geometry_id FROM mapped_reaction_node_geometry g "
+                                "JOIN mapped_reaction_node n "
+                                "ON n.id=g.mapped_reaction_node_id "
+                                "WHERE n.mapped_reaction_id=:mapped_reaction_id"
+                            ),
+                            {"mapped_reaction_id": mapped_reaction_id},
+                        ).scalars()
+                    )
+
+                    summary = clear_previous_parse_results_batch(
+                        session,
+                        artifact_file_ids=[artifact_id],
+                    )
+
+                    assert summary.deleted_node_geometry_count > 0
+                    assert summary.deleted_mapped_reaction_count > 0
+                    assert summary.deleted_logical_reaction_count > 0
+                    assert (
+                        session.execute(
+                            text("SELECT count(*) FROM logical_reaction WHERE id=:id"),
+                            {"id": logical_reaction_id},
+                        ).scalar_one()
+                        == 0
+                    )
+                    assert (
+                        session.execute(
+                            text("SELECT count(*) FROM mapped_reaction WHERE id=:id"),
+                            {"id": mapped_reaction_id},
+                        ).scalar_one()
+                        == 0
+                    )
+                    assert (
+                        session.execute(
+                            text(
+                                "SELECT count(*) FROM geometry g WHERE g.id=ANY(:geometry_ids) "
+                                "AND NOT EXISTS (SELECT 1 FROM calculation_frame f "
+                                "WHERE f.geometry_id=g.id) "
+                                "AND NOT EXISTS (SELECT 1 FROM mapped_reaction_node_geometry b "
+                                "WHERE b.geometry_id=g.id)"
+                            ),
+                            {"geometry_ids": list(geometry_ids)},
+                        ).scalar_one()
+                        == 0
+                    )
+            finally:
+                transaction.rollback()
+    finally:
+        engine.dispose()

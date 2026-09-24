@@ -36,6 +36,7 @@ from tricycle_reaction_db.core.units import radians_to_degrees
 from tricycle_reaction_db.db.models import (
     Geometry,
     LogicalParticipantConcreteTopology,
+    LogicalReaction,
     LogicalReactionParticipant,
     MappedReaction,
     MappedReactionParticipant,
@@ -166,6 +167,10 @@ class GeometryPersistenceContext:
     # existing reaction lookup.
     mapped_reactions_to_reconcile: dict[UUID, MappedReaction] = field(default_factory=dict)
     topologies_to_resolve_reactions: set[UUID] = field(default_factory=set)
+    # Batch reaction creation can defer expansion until every topology and
+    # participant row is visible to SQL. Keep those logical reactions for the
+    # same reconciliation barrier that resolves newly persisted topologies.
+    logical_reactions_to_resolve_mappings: dict[UUID, LogicalReaction] = field(default_factory=dict)
     # TS inference commonly repeats the same strict endpoint reaction across
     # files. The cache key is a digest of the mapped reaction plus the strict
     # endpoint/topology identities; reaction_smiles alone is not sufficient

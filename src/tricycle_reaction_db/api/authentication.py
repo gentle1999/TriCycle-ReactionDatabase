@@ -35,6 +35,7 @@ _PUBLIC_PATHS = {
 }
 _ANONYMOUS_ARTIFACT_PATH = re.compile(r"^/api/artifacts/[^/]+(?:/(?:preview|download))?$")
 _ANONYMOUS_DEPICTION_PATH = re.compile(r"^/api/depictions/")
+_ANONYMOUS_UNITS_DATASET_PATH = re.compile(r"^/api/units-ts-datasets/download/[A-Za-z0-9_-]+$")
 _CSRF_FORM_PATHS = {"/api/artifacts/batch-download/form"}
 _bearer_scheme = HTTPBearer(auto_error=False)
 BearerCredential = Annotated[
@@ -59,6 +60,7 @@ def _allows_anonymous_principal(request: Request) -> bool:
     return (
         path == "/api/artifacts"
         or _ANONYMOUS_ARTIFACT_PATH.fullmatch(path) is not None
+        or _ANONYMOUS_UNITS_DATASET_PATH.fullmatch(path) is not None
         or _ANONYMOUS_DEPICTION_PATH.match(path) is not None
     )
 

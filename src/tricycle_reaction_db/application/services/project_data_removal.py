@@ -1,11 +1,10 @@
-"""Project-scoped destructive cleanup for uploaded scientific data.
+"""Project-scoped destructive cleanup for uploaded and generated data.
 
-The project remains available after cleanup.  This service removes the raw
-artifact catalogue entries, durable upload queue rows, parser materialization,
-reaction mappings, project-owned chemistry identities, and their project
-directory entries.  Reusable RustFS objects are deleted only after PostgreSQL
-no longer references them and only when no other live artifact uses the same
-object key.
+The project remains available after cleanup. This service removes raw artifacts,
+generated dataset exports, durable upload queue rows, parser materialization,
+reaction mappings, project-owned chemistry identities, and project directory
+entries. Reusable RustFS objects are deleted only after PostgreSQL no longer
+references them and only when no other live artifact uses the same object key.
 """
 
 from __future__ import annotations
@@ -62,6 +61,7 @@ from tricycle_reaction_db.db.models import (
     ProjectGeometryCatalogCount,
     TransitionStateEndpoint,
     TransitionStateInference,
+    UnitsTsDatasetExportJob,
     UploadBatch,
     UploadBatchItem,
     WorkflowManifest,
@@ -155,6 +155,56 @@ async def _artifact_object_references(
     )
 
 
+async def _dataset_export_object_references(
+    session: AsyncSession,
+    project_id: UUID,
+) -> tuple[_ObjectReference, ...]:
+    rows = (
+        await session.exec(
+            select(
+                col(UnitsTsDatasetExportJob.bucket),
+                col(UnitsTsDatasetExportJob.object_key),
+            ).where(
+                col(UnitsTsDatasetExportJob.project_id) == project_id,
+                col(UnitsTsDatasetExportJob.bucket).is_not(None),
+                col(UnitsTsDatasetExportJob.object_key).is_not(None),
+            )
+        )
+    ).all()
+    unique = {
+        _ObjectReference(bucket=bucket, object_key=object_key, version_id=None)
+        for bucket, object_key in rows
+        if bucket is not None and object_key is not None
+    }
+    return tuple(
+        sorted(unique, key=lambda item: (item.bucket, item.object_key, item.version_id or ""))
+    )
+
+
+async def _project_object_references(
+    session: AsyncSession,
+    project_id: UUID,
+    artifact_ids: Any,
+) -> tuple[_ObjectReference, ...]:
+    unique = set(await _artifact_object_references(session, artifact_ids))
+    unique.update(await _dataset_export_object_references(session, project_id))
+    return tuple(
+        sorted(unique, key=lambda item: (item.bucket, item.object_key, item.version_id or ""))
+    )
+
+
+async def _delete_project_dataset_export_jobs(
+    session: AsyncSession,
+    project_id: UUID,
+) -> int:
+    return await _delete(
+        session,
+        delete(UnitsTsDatasetExportJob).where(
+            col(UnitsTsDatasetExportJob.project_id) == project_id
+        ),
+    )
+
+
 async def _preview_in_session(
     session: AsyncSession,
     project: Project,
@@ -172,7 +222,11 @@ async def _preview_in_session(
         col(LogicalReaction.project_id) == project_id
     )
 
-    object_references = await _artifact_object_references(session, artifact_ids)
+    object_references = await _project_object_references(
+        session,
+        project_id,
+        artifact_ids,
+    )
     return ProjectDataRemovalPreview(
         project_id=project_id,
         project_slug=project.slug,
@@ -255,6 +309,11 @@ async def _preview_in_session(
             session,
             ProjectGeometryCatalogCount,
             col(ProjectGeometryCatalogCount.project_id) == project_id,
+        ),
+        units_ts_dataset_export_job_count=await _count(
+            session,
+            UnitsTsDatasetExportJob,
+            col(UnitsTsDatasetExportJob.project_id) == project_id,
         ),
         rustfs_object_count=len(object_references),
         processing_item_count=await _count(
@@ -655,6 +714,8 @@ async def _delete_project_rows(
         label, count = external_reference
         raise ProjectDataRemovalConflictError(f"{label}: {count}")
 
+    await _delete_project_dataset_export_jobs(session, project_id)
+
     ingestion_ids = select(col(ArtifactIngestion.id)).where(
         col(ArtifactIngestion.artifact_file_id).in_(artifact_ids)
     )
@@ -911,8 +972,9 @@ class ProjectDataRemovalService:
                 raise ProjectDataRemovalConflictError(
                     "confirmation must exactly match the project slug"
                 )
-            references = await _artifact_object_references(
+            references = await _project_object_references(
                 session,
+                project_id,
                 select(col(ArtifactFile.id)).where(col(ArtifactFile.project_id) == project_id),
             )
             try:

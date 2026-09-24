@@ -29,6 +29,7 @@ class ProjectDataRemovalPreview(BaseModel):
     manifest_count: int = Field(ge=0)
     geometry_catalog_entry_count: int = Field(ge=0)
     geometry_catalog_count_row_count: int = Field(ge=0)
+    units_ts_dataset_export_job_count: int = Field(ge=0)
     rustfs_object_count: int = Field(ge=0)
     processing_item_count: int = Field(ge=0)
     pending_ingestion_count: int = Field(ge=0)

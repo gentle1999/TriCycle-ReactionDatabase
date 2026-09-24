@@ -137,6 +137,19 @@ operation.
 | Audit | `list_project_audit` | Project manager or organization admin |
 | Calculation logs | `upload_calculation_log` | Requires project `artifact:upload`; the request only performs size, authorization, and RustFS staging; MolOP/persistence run asynchronously in the worker |
 
+#### MCP exports and content tools
+
+These tools provide MCP access to REST streaming/file operations. Use the corresponding REST download route when the requested payload exceeds the MCP response budget.
+
+| Capability | MCP tool | Permission and bounds |
+| --- | --- | --- |
+| UniTS feature JSONL | `export_units_ts_dataset_jsonl` | Project `artifact:download`; up to 100 records and 512 KiB per page; continue with `after_binding_id` |
+| Mapped-reaction TS geometry JSONL | `export_mapped_reaction_transition_state_geometries` | Project `artifact:download`; up to 100 records and 512 KiB per page; continue with the binding ID |
+| Thermodynamics CSV | `export_mapped_reaction_thermodynamics_csv` | Project `artifact:read`; supports filters, up to 100 rows and 512 KiB per page; the first offset page includes the CSV header |
+| Artifact preview | `preview_artifact_content` | Private files require project `artifact:read`; text previews are capped at 256 KiB; unsupported media types return `unsupported_media_type` |
+| Artifact download/batch download | `download_artifact_content`, `download_artifacts_batch` | Project download access; Base64 content capped at 512 KiB per file or batch, up to 100 files; batch returns individual files rather than a ZIP |
+| Scientific-array preview/NPY | `preview_scientific_array`, `download_scientific_array_npy` | Project `artifact:download`; previews up to 4,096 values and NPY payloads up to 512 KiB |
+
 `upload_calculation_log` accepts standard Base64 in `content_base64` (without a
 Data URL prefix). The per-file limit is `TRICYCLE_MAX_UPLOAD_BYTES` (64 MiB by
 default). The response contains the durable `UploadBatch` and item in `staged`/

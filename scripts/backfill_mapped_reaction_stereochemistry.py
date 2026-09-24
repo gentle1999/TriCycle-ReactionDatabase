@@ -1,9 +1,10 @@
 """Repair persisted mapped-reaction SMILES after the lossless stereo fix.
 
 The old serializer could persist an assigned E/Z value without the slash
-directions needed to recover it from mapped SMILES.  This maintenance command
-re-renders every persisted participant from its trusted topology and then
-rebuilds the reaction-level projection from those participants.
+directions needed to recover it from mapped SMILES. It also rendered TS
+coordinate-map vectors against the linked topology projection, even though
+those vectors are in Geometry.mol order. This maintenance command repairs both
+projections and then rebuilds reaction-level strings from the participants.
 
 The default mode is a read-only preflight. Use ``--apply`` only after the
 reported collision checks are clean.
@@ -20,7 +21,14 @@ from typing import Any, cast
 from sqlalchemy.orm import selectinload
 from sqlmodel import select
 
-from tricycle_reaction_db.application.services.reactions import mapped_smiles_for_topology
+from tricycle_reaction_db.application.services.reactions import (
+    mapped_smiles_for_geometry,
+    mapped_smiles_for_topology,
+)
+from tricycle_reaction_db.core.chemistry_config import (
+    REACTION_TS_GEOMETRY_LINK_METHOD,
+    REACTION_TS_GEOMETRY_LINK_POLICY_VERSION,
+)
 from tricycle_reaction_db.db.models import (
     Geometry,
     LogicalReactionParticipant,
@@ -30,12 +38,15 @@ from tricycle_reaction_db.db.models import (
     MappedReactionParticipant,
 )
 from tricycle_reaction_db.db.session import session_factory
+from tricycle_reaction_db.domain.enums import MappedReactionNodeRole
 
 
 @dataclass(slots=True)
 class RepairPlan:
     participant_updates: list[tuple[MappedReactionParticipant, str]]
-    node_mapping_updates: list[tuple[MappedReactionNodeGeometryMapping, str]]
+    node_mapping_updates: list[
+        tuple[MappedReactionNodeGeometryMapping, str, str | None, str | None]
+    ]
     reaction_updates: list[tuple[MappedReaction, str, str, str | None]]
     errors: list[str]
     collisions: list[str]
@@ -66,7 +77,9 @@ def _expected_reaction_smiles(
 
 async def _build_plan() -> RepairPlan:
     participant_updates: list[tuple[MappedReactionParticipant, str]] = []
-    node_mapping_updates: list[tuple[MappedReactionNodeGeometryMapping, str]] = []
+    node_mapping_updates: list[
+        tuple[MappedReactionNodeGeometryMapping, str, str | None, str | None]
+    ] = []
     reaction_updates: list[tuple[MappedReaction, str, str, str | None]] = []
     errors: list[str] = []
 
@@ -99,21 +112,54 @@ async def _build_plan() -> RepairPlan:
             await session.exec(
                 select(MappedReactionNodeGeometryMapping).options(
                     selectinload(
-                        cast(Any, MappedReactionNodeGeometryMapping.mapped_reaction_node_geometry)
+                        cast(
+                            Any,
+                            MappedReactionNodeGeometryMapping.mapped_reaction_node_geometry,
+                        )
                     )
                     .selectinload(cast(Any, MappedReactionNodeGeometry.geometry))
-                    .selectinload(cast(Any, Geometry.topology))
+                    .selectinload(cast(Any, Geometry.topology)),
+                    selectinload(
+                        cast(
+                            Any,
+                            MappedReactionNodeGeometryMapping.mapped_reaction_node_geometry,
+                        )
+                    ).selectinload(cast(Any, MappedReactionNodeGeometry.mapped_reaction_node)),
                 )
             )
         ).all()
         for mapping in node_rows:
             try:
-                expected = mapped_smiles_for_topology(
-                    mapping.mapped_reaction_node_geometry.geometry.topology,
-                    mapping.geometry_atom_map_numbers,
+                node_geometry = mapping.mapped_reaction_node_geometry
+                transition_state = (
+                    node_geometry.mapped_reaction_node.role
+                    is MappedReactionNodeRole.TRANSITION_STATE
                 )
-                if expected != mapping.mapped_smiles:
-                    node_mapping_updates.append((mapping, expected))
+                if transition_state:
+                    expected = mapped_smiles_for_geometry(
+                        node_geometry.geometry,
+                        mapping.geometry_atom_map_numbers,
+                        include_stereochemistry=False,
+                    )
+                    mapping_method = REACTION_TS_GEOMETRY_LINK_METHOD
+                    mapping_version = REACTION_TS_GEOMETRY_LINK_POLICY_VERSION
+                else:
+                    expected = mapped_smiles_for_topology(
+                        node_geometry.geometry.topology,
+                        mapping.geometry_atom_map_numbers,
+                    )
+                    mapping_method = None
+                    mapping_version = None
+                if (
+                    expected != mapping.mapped_smiles
+                    or mapping_version is not None
+                    and mapping.mapping_version != mapping_version
+                    or mapping_method is not None
+                    and mapping.mapping_method != mapping_method
+                ):
+                    node_mapping_updates.append(
+                        (mapping, expected, mapping_method, mapping_version)
+                    )
             except Exception as exc:
                 errors.append(f"node mapping {mapping.id}: {type(exc).__name__}: {exc}")
 
@@ -207,9 +253,13 @@ async def _apply(plan: RepairPlan) -> None:
         for participant, expected in plan.participant_updates:
             session.add(participant)
             participant.mapped_smiles = expected
-        for mapping, expected in plan.node_mapping_updates:
+        for mapping, expected, mapping_method, mapping_version in plan.node_mapping_updates:
             session.add(mapping)
             mapping.mapped_smiles = expected
+            if mapping_method is not None:
+                mapping.mapping_method = mapping_method
+            if mapping_version is not None:
+                mapping.mapping_version = mapping_version
         for mapped_reaction, expected_smiles, expected_hash, expected_key in plan.reaction_updates:
             session.add(mapped_reaction)
             mapped_reaction.mapped_reaction_smiles = expected_smiles

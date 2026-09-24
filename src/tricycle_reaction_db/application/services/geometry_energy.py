@@ -291,7 +291,12 @@ def _protocol_identity(protocol: CalculationProtocol | None) -> tuple[object, ..
 
 
 def _protocol_selection_identity(protocol: CalculationProtocol | None) -> tuple[object, ...] | None:
-    """Return the complete protocol identity used for scientific equivalence."""
+    """Return calculation-semantic identity used for scientific equivalence.
+
+    The QM software version is provenance, not a change to the requested
+    calculation protocol.  Candidate observations are still compared below,
+    so version-specific numerical differences remain ambiguous.
+    """
 
     if protocol is None:
         return None
@@ -324,7 +329,6 @@ def _protocol_selection_identity(protocol: CalculationProtocol | None) -> tuple[
     protocol_identity = _protocol_identity(protocol) or ()
     return (
         software,
-        protocol.qm_software_version,
         protocol.spec_schema_version,
         tuple(protocol.task_requests),
         normalized_spec,
@@ -338,9 +342,8 @@ def _electronic_protocol_selection_identity(
     """Identify the protocol dimensions that determine electronic energy.
 
     Task-level route details (for example ``Opt`` versus a checkpoint-backed
-    ``Freq`` follow-up) do not change the electronic method identity.  They do
-    matter for thermochemistry provenance, so thermal selection continues to
-    use ``_protocol_selection_identity``.
+    ``Freq`` follow-up) and the QM software version do not change the
+    electronic method identity.  The observed energies still have to agree.
     """
 
     if protocol is None:
@@ -348,7 +351,6 @@ def _electronic_protocol_selection_identity(
     software = getattr(protocol.qm_software, "value", protocol.qm_software)
     return (
         software,
-        protocol.qm_software_version,
         protocol.spec_schema_version,
         _protocol_identity(protocol),
     )

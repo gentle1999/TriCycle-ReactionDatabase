@@ -77,6 +77,7 @@ from tricycle_reaction_db.db.models import (
     ArtifactFile,
     CalculationFrame,
     ElectronicState,
+    MolecularTopology,
     ParseRevision,
 )
 from tricycle_reaction_db.domain.enums import (
@@ -149,6 +150,8 @@ _GEOMETRY_CONTEXT_FIELDS = (
     "equivalent_geometry_keys_loaded",
     "in_memory_geometries_by_identity",
     "geometries_to_reconcile",
+    "topologies_to_resolve_reactions",
+    "logical_reactions_to_resolve_mappings",
     "reaction_participants_by_topology",
     "mapped_reactions_by_id",
     "mapped_reactions_by_logical_reaction",
@@ -840,11 +843,6 @@ def reconcile_molop_geometry_context(
         raise ValueError("MolOP reconciliation requires a project-owned Geometry context")
     _attach_pending_entities(session)
     _flush_if_needed(session)
-    reconcilable_ids = reconcilable_geometry_ids(
-        session,
-        set(context.geometries_to_reconcile),
-        project_id=project_id,
-    )
     # Deferred TS inference may already have populated path/node identities in
     # this cache before participant reconciliation.  Reuse it so those rows
     # remain visible to the final geometry pass; a fresh cache would discard
@@ -853,6 +851,63 @@ def reconcile_molop_geometry_context(
     if not isinstance(reconciliation_cache, ReconciliationBatchCache):
         reconciliation_cache = ReconciliationBatchCache()
     context.reconciliation_cache = reconciliation_cache
+
+    # Geometry persistence and inferred reaction persistence both defer
+    # concrete mapping expansion in a batch. Resolve those queues only after
+    # the pending topology, membership, and reaction rows have been flushed,
+    # so mapping-transfer queries see the complete batch.
+    from tricycle_reaction_db.application.services.reaction_mapping_resolution import (
+        ensure_mapped_reactions_for_concrete_topology,
+        ensure_mapped_reactions_for_logical_reaction,
+    )
+
+    previous_fast_insert = session.info.get("tricycle_fast_insert", False)
+    previous_expansion_autoflush = session.autoflush
+    session.info["tricycle_fast_insert"] = False
+    session.autoflush = True
+    processed_topology_ids: set[UUID] = set()
+    try:
+        for logical_reaction_id in sorted(context.logical_reactions_to_resolve_mappings, key=str):
+            logical_reaction = context.logical_reactions_to_resolve_mappings[logical_reaction_id]
+            if logical_reaction.project_id != project_id:
+                raise ValueError("reaction expansion crosses project boundary")
+            ensure_mapped_reactions_for_logical_reaction(
+                session,
+                logical_reaction,
+                topology_context=context,
+                reconciliation_cache=reconciliation_cache,
+                refresh_thermodynamics=False,
+                processed_topology_ids=processed_topology_ids,
+            )
+        for topology_id in sorted(context.topologies_to_resolve_reactions, key=str):
+            if topology_id in processed_topology_ids:
+                continue
+            topology = context.molecular_topologies_by_id.get(topology_id)
+            if topology is None:
+                topology = session.get(MolecularTopology, topology_id)
+            if topology is None or topology.project_id != project_id:
+                raise ValueError("reaction expansion topology crosses project boundary")
+            ensure_mapped_reactions_for_concrete_topology(
+                session,
+                topology,
+                topology_context=context,
+                reconciliation_cache=reconciliation_cache,
+                refresh_thermodynamics=False,
+                skip_topology_ids=processed_topology_ids,
+            )
+        context.logical_reactions_to_resolve_mappings.clear()
+        context.topologies_to_resolve_reactions.clear()
+    finally:
+        session.autoflush = previous_expansion_autoflush
+        session.info["tricycle_fast_insert"] = previous_fast_insert
+    _attach_pending_entities(session)
+    _flush_if_needed(session)
+
+    reconcilable_ids = reconcilable_geometry_ids(
+        session,
+        set(context.geometries_to_reconcile),
+        project_id=project_id,
+    )
 
     reconciliation_cache.thermodynamic_property_geometry_ids.update(reconcilable_ids)
     preload_reconciliation_context(

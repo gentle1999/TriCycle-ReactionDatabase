@@ -34,7 +34,7 @@ from tricycle_reaction_db.application.services.reaction_geometry_policy import (
 from tricycle_reaction_db.application.services.reactions import (
     _reaction_mapping_isomorphic,
     atom_maps_from_source_order,
-    mapped_smiles_for_topology,
+    mapped_smiles_for_geometry,
     persist_mapped_reaction_edge,
     persist_mapped_reaction_node,
     persist_mapped_reaction_node_geometry,
@@ -431,7 +431,7 @@ def _ensure_mapping(
     session: Session,
     *,
     node_geometry: MappedReactionNodeGeometry,
-    topology_atom_maps: list[int],
+    coordinate_atom_maps: list[int],
     mapped_smiles: str,
     cache: ReconciliationBatchCache | None = None,
 ) -> MappedReactionNodeGeometryMapping:
@@ -444,9 +444,9 @@ def _ensure_mapping(
         # record binds source atom identity to TS coordinates; TS E/Z must not
         # constrain endpoint mappings and metal-controlled E/Z may not have a
         # lossless SMILES representation.
-        mapped_smiles = mapped_smiles_for_topology(
-            node_geometry.geometry.topology,
-            topology_atom_maps,
+        mapped_smiles = mapped_smiles_for_geometry(
+            node_geometry.geometry,
+            coordinate_atom_maps,
             include_stereochemistry=False,
         )
         mapping_method = REACTION_TS_GEOMETRY_LINK_METHOD
@@ -461,20 +461,25 @@ def _ensure_mapping(
     )
     if existing is not None:
         existing_mapped_smiles = (
-            mapped_smiles_for_topology(
-                node_geometry.geometry.topology,
+            mapped_smiles_for_geometry(
+                node_geometry.geometry,
                 existing.geometry_atom_map_numbers,
                 include_stereochemistry=False,
             )
             if transition_state_mapping
             else existing.mapped_smiles
         )
-        if not _reaction_mapping_isomorphic(
-            expected_atom_map_numbers=existing.geometry_atom_map_numbers,
-            expected_mapped_smiles=existing_mapped_smiles,
-            observed_atom_map_numbers=topology_atom_maps,
-            observed_mapped_smiles=mapped_smiles,
-        ):
+        mapping_matches = (
+            existing.geometry_atom_map_numbers == coordinate_atom_maps
+            if transition_state_mapping
+            else _reaction_mapping_isomorphic(
+                expected_atom_map_numbers=existing.geometry_atom_map_numbers,
+                expected_mapped_smiles=existing_mapped_smiles,
+                observed_atom_map_numbers=coordinate_atom_maps,
+                observed_mapped_smiles=mapped_smiles,
+            )
+        )
+        if not mapping_matches:
             raise ValueError("existing node Geometry has an incompatible reaction mapping")
         if transition_state_mapping and (
             existing.mapped_smiles != existing_mapped_smiles
@@ -485,15 +490,15 @@ def _ensure_mapping(
             existing.mapping_method = mapping_method
             existing.mapping_version = mapping_version
             session.add(existing)
-        # Source atom order belongs to each CalculationFrame.  A Geometry-level
-        # reaction mapping is reusable when its Geometry-order map is equivalent,
-        # even if another software/frame reports a different source permutation.
+        # TS map identity is geometry-indexed: two vectors are reusable only
+        # when every Geometry atom keeps the same reaction map, including
+        # symmetry-equivalent atoms whose canonical mapped SMILES may coincide.
         return existing
     mapping = persist_mapped_reaction_node_geometry_mapping(
         session,
         node_geometry,
         MappedReactionNodeGeometryMappingRecord(
-            geometry_atom_map_numbers=topology_atom_maps,
+            geometry_atom_map_numbers=coordinate_atom_maps,
             mapped_smiles=mapped_smiles,
             mapping_method=mapping_method,
             mapping_version=mapping_version,
@@ -537,7 +542,7 @@ def _bind_participant_geometry(
         _ensure_mapping(
             session,
             node_geometry=node_geometry,
-            topology_atom_maps=topology_atom_maps,
+            coordinate_atom_maps=topology_atom_maps,
             mapped_smiles=participant.mapped_smiles,
             cache=cache,
         )
@@ -807,7 +812,7 @@ def share_mapped_reaction_evidence(
             _ensure_mapping(
                 session,
                 node_geometry=node_geometry,
-                topology_atom_maps=list(target_participant.atom_map_numbers),
+                coordinate_atom_maps=list(target_participant.atom_map_numbers),
                 mapped_smiles=target_participant.mapped_smiles,
                 cache=cache,
             )
@@ -844,7 +849,7 @@ def share_mapped_reaction_evidence(
             _ensure_mapping(
                 session,
                 node_geometry=node_geometry,
-                topology_atom_maps=list(source_mapping.geometry_atom_map_numbers),
+                coordinate_atom_maps=list(source_mapping.geometry_atom_map_numbers),
                 mapped_smiles=source_mapping.mapped_smiles,
                 cache=cache,
             )
@@ -1644,7 +1649,7 @@ def bind_transition_state_frame(
     geometry = calculation_frame.geometry
     frame_source_atom_maps = list(range(1, geometry.atom_count + 1))
     source_to_geometry_atom_indices = list(calculation_frame.observed_to_geometry_atom_indices)
-    topology_atom_maps = atom_maps_from_source_order(
+    geometry_atom_maps = atom_maps_from_source_order(
         geometry,
         frame_source_atom_maps,
         source_to_geometry_atom_indices,
@@ -1662,10 +1667,10 @@ def bind_transition_state_frame(
     _ensure_mapping(
         session,
         node_geometry=node_geometry,
-        topology_atom_maps=topology_atom_maps,
-        mapped_smiles=mapped_smiles_for_topology(
-            geometry.topology,
-            topology_atom_maps,
+        coordinate_atom_maps=geometry_atom_maps,
+        mapped_smiles=mapped_smiles_for_geometry(
+            geometry,
+            geometry_atom_maps,
             include_stereochemistry=False,
         ),
         cache=cache,

@@ -9,7 +9,7 @@ from typing import Annotated, Any, cast
 from urllib.parse import quote
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from nexusx import DefineSubset, ErDiagram, ErManager  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, Field
@@ -58,6 +58,22 @@ from tricycle_reaction_db.application.services import (
     iter_artifact_download,
     write_artifact_archive,
 )
+from tricycle_reaction_db.application.services.authorization import (
+    AuthorizationService,
+    ProjectAccessDeniedError,
+    ProjectPermission,
+)
+from tricycle_reaction_db.application.services.mapped_reaction_geometry_export import (
+    iter_mapped_reaction_geometry_export,
+)
+from tricycle_reaction_db.application.services.units_ts_dataset_export import (
+    UnitsDatasetExportExpiredError,
+    UnitsDatasetExportNotFoundError,
+    UnitsDatasetExportPendingError,
+    UnitsDatasetExportUnavailableError,
+    UnitsTsDatasetExportService,
+    iter_units_ts_dataset_jsonl,
+)
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import MolecularFormula, MolecularTopology
 from tricycle_reaction_db.db.session import session_factory
@@ -89,14 +105,31 @@ OptionalPrincipal = Annotated[
 
 
 class ReactionThermodynamicAnalyticsQuery(BaseModel):
-    """The logical-reaction filters shared by statistics and CSV export."""
+    """Project-scoped logical-reaction filters for thermodynamic analytics.
+
+    The CSV export always restricts rows to mapped reactions with complete,
+    visible calculation-frame source evidence. That database-side cleaning
+    rule is inherent to the export and has no separate ``cleaned_only`` field.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    project_id: UUID
-    filter_expression: str | None = None
-    has_activation_gibbs_free_energy: bool | None = None
-    has_reaction_gibbs_free_energy: bool | None = None
+    project_id: UUID = Field(description="Internal database project ID used as the data scope.")
+    filter_expression: str | None = Field(
+        default=None,
+        description=(
+            "Database-supported JSON logical filter. Leaf nodes use field/value; for example "
+            '{"field":"reaction_smarts","value":"<reaction SMARTS>"}.'
+        ),
+    )
+    has_activation_gibbs_free_energy: bool | None = Field(
+        default=None,
+        description="If true, include only profiles with a database activation Gibbs value.",
+    )
+    has_reaction_gibbs_free_energy: bool | None = Field(
+        default=None,
+        description="If true, include only profiles with a database reaction Gibbs value.",
+    )
 
 
 class ArtifactBatchDownloadRequest(BaseModel):
@@ -105,6 +138,14 @@ class ArtifactBatchDownloadRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     artifact_ids: list[UUID] = Field(min_length=1, max_length=500)
+
+
+class UnitsTsDatasetExportRequest(BaseModel):
+    """Project whose persisted transition-state geometries should be exported."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: UUID
 
 
 class MolecularFormulaCoreDTO(DefineSubset):  # type: ignore[misc]
@@ -446,6 +487,165 @@ async def download_artifact(
     )
 
 
+@router.post("/units-ts-datasets", status_code=status.HTTP_202_ACCEPTED)
+async def create_units_ts_dataset(
+    request: Request,
+    payload: UnitsTsDatasetExportRequest,
+    principal: OptionalPrincipal,
+) -> dict[str, Any]:
+    """Queue a UniTS dataset export and return its status and unique download links."""
+
+    if principal is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required"
+        )
+    try:
+        result = await UnitsTsDatasetExportService.create(payload.project_id, principal.user_id)
+    except ProjectAccessDeniedError as error:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(error)) from error
+    job_id = result["job_id"]
+    token = result["download_url_path"].rsplit("/", maxsplit=1)[-1]
+    result["status_url"] = str(request.url_for("get_units_ts_dataset_status", job_id=job_id))
+    result["download_url"] = str(request.url_for("download_units_ts_dataset", download_token=token))
+    result.pop("status_url_path", None)
+    result.pop("download_url_path", None)
+    return result
+
+
+@router.get(
+    "/units-ts-datasets/export.jsonl",
+    response_class=StreamingResponse,
+    summary="Stream UniTS-compatible TS feature samples as JSONL",
+    description=(
+        "Streams one feature record per verified transition-state geometry mapping in the "
+        "specified project. Atom and edge feature orders match the UniTS export contract."
+    ),
+)
+async def export_units_ts_dataset_jsonl(
+    principal: OptionalPrincipal,
+    project_id: ProjectQueryId,
+) -> StreamingResponse:
+    """Stream UniTS feature records incrementally instead of building a complete NPY first."""
+
+    if principal is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required"
+        )
+    try:
+        await AuthorizationService.require_project_permission(
+            principal.user_id,
+            project_id,
+            ProjectPermission.ARTIFACT_DOWNLOAD,
+        )
+    except ProjectAccessDeniedError as error:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(error)) from error
+
+    return StreamingResponse(
+        iter_units_ts_dataset_jsonl(project_id),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "private, no-store",
+            "Content-Disposition": 'attachment; filename="units-ts-dataset.jsonl"',
+            "X-Accel-Buffering": "no",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.get(
+    "/mapped-reactions/transition-state-geometries/export.jsonl",
+    response_class=StreamingResponse,
+    summary="Stream mapped-reaction TS geometry and RDKit Mol records",
+    description=(
+        "Streams one JSON Lines record per verified transition-state geometry mapping in the "
+        "specified project. Each record uses mapped reaction SMILES as its key and contains "
+        "angstrom coordinates plus an RDKit-readable Mol block."
+    ),
+)
+async def export_mapped_reaction_transition_state_geometries(
+    principal: OptionalPrincipal,
+    project_id: ProjectQueryId,
+) -> StreamingResponse:
+    """Stream project-scoped mapped reaction, TS geometry, and RDKit Mol records."""
+
+    if principal is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required"
+        )
+    try:
+        await AuthorizationService.require_project_permission(
+            principal.user_id,
+            project_id,
+            ProjectPermission.ARTIFACT_DOWNLOAD,
+        )
+    except ProjectAccessDeniedError as error:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(error)) from error
+
+    return StreamingResponse(
+        iter_mapped_reaction_geometry_export(project_id),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "private, no-store",
+            "Content-Disposition": ('attachment; filename="mapped-reaction-ts-geometries.jsonl"'),
+            "X-Accel-Buffering": "no",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.get("/units-ts-datasets/{job_id}")
+async def get_units_ts_dataset_status(
+    job_id: UUID,
+    principal: OptionalPrincipal,
+) -> dict[str, Any]:
+    """Return the generation state for a dataset export job."""
+
+    if principal is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required"
+        )
+    try:
+        return await UnitsTsDatasetExportService.status(job_id, principal.user_id)
+    except UnitsDatasetExportNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+
+
+@router.get(
+    "/units-ts-datasets/download/{download_token}",
+    response_class=StreamingResponse,
+)
+async def download_units_ts_dataset(download_token: str) -> StreamingResponse:
+    """Stream a completed NPY dataset through its unguessable capability link."""
+
+    try:
+        download = await UnitsTsDatasetExportService.download(download_token)
+    except UnitsDatasetExportNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except UnitsDatasetExportPendingError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(error),
+            headers={"Retry-After": "2"},
+        ) from error
+    except UnitsDatasetExportExpiredError as error:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail=str(error)) from error
+    except UnitsDatasetExportUnavailableError as error:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
+
+    safe_filename = re.sub(r"[^A-Za-z0-9._-]", "_", download.filename) or "dataset.npy"
+    return StreamingResponse(
+        UnitsTsDatasetExportService.iter_download(download),
+        media_type="application/x-npy",
+        headers={
+            "Cache-Control": "private, no-store",
+            "Content-Disposition": f'attachment; filename="{safe_filename}"',
+            "Content-Length": str(download.size_bytes),
+            "X-Content-SHA256": download.content_sha256,
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 @router.get("/logical-reactions", response_model=LogicalReactionPage)
 async def list_logical_reactions(
     project_id: ProjectQueryId,
@@ -580,6 +780,16 @@ async def export_mapped_reaction_thermodynamics(
 @router.post(
     "/mapped-reactions/thermodynamics/export.csv",
     response_class=StreamingResponse,
+    summary="Stream project-scoped mapped-reaction thermodynamics as CSV",
+    description=(
+        "Filters mapped reactions and thermodynamic profiles in the database and streams CSV. "
+        "Every export row must have complete, visible source evidence: source calculation frames "
+        "must come from successful ingestion, or from a partial ingestion whose parse succeeded "
+        "and whose individual frame is complete. Incomplete or hidden source profiles are "
+        "excluded. This endpoint always applies that cleaned-source rule; it does not accept a "
+        "cleaned_only request field. Energy values are in kcal/mol and phase runtimes are "
+        "in seconds."
+    ),
 )
 async def export_filtered_mapped_reaction_thermodynamics(
     query: ReactionThermodynamicAnalyticsQuery,

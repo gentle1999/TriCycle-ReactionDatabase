@@ -27,7 +27,7 @@ def _candidate(
     geometry_id = uuid4()
     view = GeometryEnergyView(
         geometry_id=geometry_id,
-        policy_version="geometry-energy-view-v1",
+        policy_version="geometry-energy-view-v2",
         electronic_selection_status="selected",
         electronic_candidate_frame_ids=[],
         electronic_energy_hartree=enthalpy - 0.1,

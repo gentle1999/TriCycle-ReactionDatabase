@@ -813,3 +813,26 @@ export interface HealthStatus {
   postgresql_version: string;
   rdkit_extension_version: string;
 }
+
+export type UnitsTsDatasetExportState = "pending" | "processing" | "completed" | "failed" | "expired";
+
+export interface UnitsTsDatasetExportStatus {
+  job_id: string;
+  project_id: string;
+  status: UnitsTsDatasetExportState;
+  format: string;
+  sample_count: number;
+  skipped_count: number;
+  skip_reasons: Record<string, number>;
+  error_message: string | null;
+  size_bytes: number | null;
+  content_sha256: string | null;
+  requested_at: string | null;
+  completed_at: string | null;
+  expires_at: string;
+}
+
+export interface UnitsTsDatasetExportCreated extends UnitsTsDatasetExportStatus {
+  status_url: string;
+  download_url: string;
+}

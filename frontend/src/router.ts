@@ -15,6 +15,7 @@ import LoginView from "./views/LoginView.vue";
 import InvitationView from "./views/InvitationView.vue";
 
 const StatisticsView = () => import("./views/StatisticsView.vue");
+const ExportsView = () => import("./views/ExportsView.vue");
 const TopologyDetailView = () => import("./views/TopologyDetailView.vue");
 const FrameDetailView = () => import("./views/FrameDetailView.vue");
 const GeometryDetailView = () => import("./views/GeometryDetailView.vue");
@@ -25,7 +26,7 @@ const GeometryQueryHelpView = () => import("./views/GeometryQueryHelpView.vue");
 const ArtifactQueryHelpView = () => import("./views/ArtifactQueryHelpView.vue");
 const UploadView = () => import("./views/UploadView.vue");
 
-const protectedNames = new Set(["uploads", "account", "organizations", "projects", "project", "statistics", "nexusx"]);
+const protectedNames = new Set(["uploads", "account", "organizations", "projects", "project", "statistics", "exports", "nexusx"]);
 const projectScopedNames = new Set([
   "reactions",
   "reaction-detail",
@@ -37,6 +38,7 @@ const projectScopedNames = new Set([
   "artifacts",
   "artifact-detail",
   "statistics",
+  "exports",
 ]);
 const publicArtifactNames = new Set(["artifacts", "artifact-detail"]);
 const ACTIVE_PROJECT_STORAGE_KEY = "tricycle.activeProjectId";
@@ -66,6 +68,7 @@ export const router = createRouter({
     { path: "/geometries/:geometryId", name: "geometry-detail", component: GeometryDetailView, meta: { requiresAuth: true, title: "几何构象" } },
     { path: "/topologies/:topologyId", name: "topology-detail", component: TopologyDetailView, meta: { requiresAuth: true, title: "分子拓扑" } },
     { path: "/statistics", name: "statistics", component: StatisticsView, meta: { requiresAuth: true, title: "分布统计" } },
+    { path: "/exports", name: "exports", component: ExportsView, meta: { requiresAuth: true, title: "数据导出" } },
     // Keep the catalog consolidated, while individual frames have stable detail URLs.
     { path: "/calculations", redirect: { name: "artifacts" } },
     { path: "/calculations/:frameId", name: "calculation-detail", component: FrameDetailView, meta: { requiresAuth: true, title: "计算帧" } },

@@ -38,6 +38,7 @@ from tricycle_reaction_db.db.models.chemistry import (
     MolecularTopologyAbstraction,
     MolecularTopologyDerivation,
 )
+from tricycle_reaction_db.db.models.dataset_exports import UnitsTsDatasetExportJob
 from tricycle_reaction_db.db.models.identity import (
     AuditEvent,
     AuthSession,
@@ -144,6 +145,7 @@ __all__ = [
     "StorageGarbageCollectionState",
     "ThermochemistryResult",
     "TransitionStateEndpoint",
+    "UnitsTsDatasetExportJob",
     "TransitionStateInference",
     "UploadBatch",
     "UploadBatchItem",

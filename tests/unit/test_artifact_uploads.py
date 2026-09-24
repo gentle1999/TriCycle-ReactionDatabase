@@ -16,6 +16,7 @@ from sqlmodel import Session
 from tricycle_reaction_db.application.services import artifact_uploads as upload_module
 from tricycle_reaction_db.application.services._persistence import (
     _fast_pending_entity_count,
+    _fast_pending_logical_reaction,
     _queue_fast_pending_entity,
     _session_entity_for_identity,
     _truncate_fast_pending_entities,
@@ -51,7 +52,7 @@ from tricycle_reaction_db.application.services.reaction_geometry_reconciliation 
     ReconciliationBatchCache,
 )
 from tricycle_reaction_db.core.config import Settings
-from tricycle_reaction_db.db.models import MappedReactionNodeGeometry
+from tricycle_reaction_db.db.models import LogicalReaction, MappedReactionNodeGeometry
 from tricycle_reaction_db.domain.enums import (
     ArtifactKind,
 )
@@ -217,6 +218,35 @@ def test_fast_pending_checkpoint_discards_only_rows_after_the_checkpoint() -> No
     assert _fast_pending_entity_count(session) == 1
     assert _session_entity_for_identity(session, first) is first
     assert _session_entity_for_identity(session, second) is second
+
+
+def test_fast_pending_logical_reaction_index_tracks_file_rollback() -> None:
+    session = Session()
+    project_id = UUID("00000000-0000-7000-8000-000000000020")
+    first = LogicalReaction(
+        id=UUID("00000000-0000-7000-8000-000000000021"),
+        project_id=project_id,
+        reaction_key="first",
+        reaction_hash="1" * 64,
+    )
+    second = LogicalReaction(
+        id=UUID("00000000-0000-7000-8000-000000000022"),
+        project_id=project_id,
+        reaction_key="second",
+        reaction_hash="2" * 64,
+    )
+
+    _queue_fast_pending_entity(session, first)
+    checkpoint = _fast_pending_entity_count(session)
+    _queue_fast_pending_entity(session, second)
+
+    assert _fast_pending_logical_reaction(session, project_id, first.reaction_hash) is first
+    assert _fast_pending_logical_reaction(session, project_id, second.reaction_hash) is second
+
+    _truncate_fast_pending_entities(session, checkpoint)
+
+    assert _fast_pending_logical_reaction(session, project_id, first.reaction_hash) is first
+    assert _fast_pending_logical_reaction(session, project_id, second.reaction_hash) is None
 
 
 def test_inference_cache_key_keeps_strict_stereo_variants_distinct() -> None:

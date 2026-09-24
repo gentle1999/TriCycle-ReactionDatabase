@@ -350,6 +350,16 @@ class ThermodynamicProfileRefreshJobStatus(StrEnum):
     PROCESSING = "processing"
 
 
+class UnitsDatasetExportJobStatus(StrEnum):
+    """Durable state of a generated UniTS transition-state dataset."""
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    EXPIRED = "expired"
+
+
 class MappedReactionNodeRole(StrEnum):
     REACTANT = "reactant"
     REACTANT_COMPLEX = "reactant_complex"
@@ -417,6 +427,7 @@ __all__ = [
     "MappedReactionNodeRole",
     "ThermodynamicProfileSourceVisibility",
     "ThermodynamicProfileRefreshJobStatus",
+    "UnitsDatasetExportJobStatus",
     "SCFStatus",
     "SelectedEnergyKind",
     "ScientificArrayKind",

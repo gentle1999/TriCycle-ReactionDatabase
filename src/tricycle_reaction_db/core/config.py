@@ -118,6 +118,11 @@ class Settings(BaseSettings):
         gt=0.05,
         le=300.0,
     )
+    units_dataset_worker_poll_interval_seconds: float = Field(
+        default=2.0,
+        gt=0.05,
+        le=300.0,
+    )
     upload_client_lease_seconds: int = Field(default=900, ge=60, le=86_400)
     # Compatibility recovery for calculation ingestions created before the
     # durable UploadBatch queue. Current API, MCP, and local-import paths all

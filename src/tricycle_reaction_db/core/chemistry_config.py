@@ -39,9 +39,9 @@ GEOMETRY_MATCH_POLICY_VERSION: Final[str] = "geometry-internal-coordinate-match-
 REACTION_GEOMETRY_LINK_METHOD: Final[str] = "topology-identity"
 REACTION_GEOMETRY_LINK_POLICY_VERSION: Final[str] = "reaction-geometry-link-v1"
 REACTION_TS_GEOMETRY_LINK_METHOD: Final[str] = "source-atom-order"
-REACTION_TS_GEOMETRY_LINK_POLICY_VERSION: Final[str] = "reaction-ts-geometry-link-v1"
-GEOMETRY_ENERGY_POLICY_VERSION: Final[str] = "geometry-energy-view-v1"
-MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION: Final[str] = "mapped-reaction-thermodynamics-v3"
+REACTION_TS_GEOMETRY_LINK_POLICY_VERSION: Final[str] = "reaction-ts-geometry-link-v2"
+GEOMETRY_ENERGY_POLICY_VERSION: Final[str] = "geometry-energy-view-v2"
+MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION: Final[str] = "mapped-reaction-thermodynamics-v4"
 
 
 @dataclass(frozen=True, slots=True)

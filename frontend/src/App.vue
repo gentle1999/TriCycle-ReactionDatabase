@@ -13,7 +13,7 @@ import { internalRedirect, withoutAccessState } from "@/routeAccessState";
 import type { HealthStatus } from "@/types";
 import { useI18n } from "vue-i18n";
 
-type ViewName = "reactions" | "artifacts" | "geometry" | "statistics";
+type ViewName = "reactions" | "artifacts" | "geometry" | "statistics" | "exports";
 
 const route = useRoute();
 const router = useRouter();
@@ -49,6 +49,7 @@ const activeView = computed<ViewName>(() => {
   if (route.name === "geometries" || route.name === "geometry-detail") return "geometry";
   if (route.name === "topology-detail" || route.name === "calculation-detail") return "geometry";
   if (route.name === "statistics") return "statistics";
+  if (route.name === "exports") return "exports";
   return "reactions";
 });
 
@@ -67,6 +68,7 @@ const tabs = computed(() => [
   { id: "geometry" as const, label: t("app.navigation.geometry"), route: "geometries" },
   { id: "artifacts" as const, label: t("app.navigation.artifacts"), route: "artifacts" },
   { id: "statistics" as const, label: t("app.navigation.statistics"), route: "statistics" },
+  { id: "exports" as const, label: t("app.navigation.exports"), route: "exports" },
 ]);
 
 async function refreshHealth(): Promise<void> {

@@ -1,8 +1,9 @@
 import base64
 import json
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
@@ -50,7 +51,7 @@ async def _call(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     result = await mcp_server.call_tool(tool_name, arguments)
     content = result.content[0]
     assert isinstance(content, TextContent)
-    return json.loads(content.text)
+    return cast(dict[str, Any], json.loads(content.text))
 
 
 async def _call_as_development_user(
@@ -126,7 +127,7 @@ def _staged_submission(
 
 
 @pytest.mark.asyncio
-async def test_mcp_exposes_query_management_and_import_tools() -> None:
+async def test_mcp_exposes_query_management_import_and_export_tools() -> None:
     tools = await mcp_server.list_tools()
 
     assert {tool.name for tool in tools} == {
@@ -165,6 +166,16 @@ async def test_mcp_exposes_query_management_and_import_tools() -> None:
         "pause_import",
         "resume_import",
         "cancel_import",
+        "create_units_ts_dataset",
+        "get_units_ts_dataset_status",
+        "export_units_ts_dataset_jsonl",
+        "export_mapped_reaction_thermodynamics_csv",
+        "preview_artifact_content",
+        "download_artifact_content",
+        "download_artifacts_batch",
+        "preview_scientific_array",
+        "download_scientific_array_npy",
+        "export_mapped_reaction_transition_state_geometries",
         "open_calculation_log_workspace",
     }
 
@@ -182,6 +193,334 @@ async def test_mcp_control_tools_require_transport_authentication() -> None:
             "message": "authenticated MCP principal is required",
         },
     }
+
+    project_id = "00000000-0000-7000-8000-000000000799"
+    artifact_id = "00000000-0000-7000-8000-000000000798"
+    array_id = "00000000-0000-7000-8000-000000000797"
+    protected_tools: dict[str, dict[str, Any]] = {
+        "export_units_ts_dataset_jsonl": {"project_id": project_id},
+        "export_mapped_reaction_thermodynamics_csv": {"project_id": project_id},
+        "preview_artifact_content": {"artifact_id": artifact_id, "project_id": project_id},
+        "download_artifact_content": {"artifact_id": artifact_id, "project_id": project_id},
+        "download_artifacts_batch": {
+            "artifact_ids": [artifact_id],
+            "project_id": project_id,
+        },
+        "preview_scientific_array": {"array_id": array_id, "project_id": project_id},
+        "download_scientific_array_npy": {"array_id": array_id, "project_id": project_id},
+        "export_mapped_reaction_transition_state_geometries": {"project_id": project_id},
+    }
+    for tool_name, arguments in protected_tools.items():
+        tool_result = await _call(tool_name, arguments)
+        assert tool_result["error"]["code"] == "authentication_required"
+
+
+@pytest.mark.asyncio
+async def test_mcp_dataset_jsonl_export_is_project_scoped_and_paginated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id = UUID("00000000-0000-7000-8000-000000000796")
+    binding_ids = [
+        "00000000-0000-7000-8000-000000000795",
+        "00000000-0000-7000-8000-000000000794",
+    ]
+    observed: dict[str, Any] = {}
+
+    async def require_permission(
+        user_id: UUID,
+        requested_project_id: UUID,
+        permission: Any,
+    ) -> None:
+        observed["permission"] = (user_id, requested_project_id, permission)
+
+    async def export_records(
+        requested_project_id: UUID,
+        *,
+        after_binding_id: UUID | None,
+        max_records: int | None,
+    ) -> AsyncIterator[bytes]:
+        observed["page"] = (requested_project_id, after_binding_id, max_records)
+        for binding_id in binding_ids:
+            yield json.dumps({"geometry_binding_id": binding_id, "feature_schema": "test"}).encode()
+
+    monkeypatch.setattr(
+        mcp_module.AuthorizationService,
+        "require_project_permission",
+        staticmethod(require_permission),
+    )
+    monkeypatch.setattr(mcp_module, "iter_units_ts_dataset_jsonl", export_records)
+
+    result = await _call_as_development_user(
+        "export_units_ts_dataset_jsonl",
+        {"project_id": str(project_id), "limit": 1},
+    )
+
+    assert result["success"] is True
+    assert result["data"]["records"][0]["geometry_binding_id"] == binding_ids[0]
+    assert result["data"]["next_after_binding_id"] == binding_ids[0]
+    assert result["data"]["has_more"] is True
+    assert observed["permission"] == (
+        DEVELOPMENT_USER_ID,
+        project_id,
+        mcp_module.ProjectPermission.ARTIFACT_DOWNLOAD,
+    )
+    assert observed["page"] == (project_id, None, 2)
+
+
+@pytest.mark.asyncio
+async def test_mcp_thermodynamics_csv_export_has_bounded_offset_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id = UUID("00000000-0000-7000-8000-000000000793")
+    observed: dict[str, Any] = {}
+
+    async def require_permission(
+        user_id: UUID,
+        requested_project_id: UUID,
+        permission: Any,
+    ) -> None:
+        observed["permission"] = (user_id, requested_project_id, permission)
+
+    async def export_csv(
+        requested_project_id: UUID,
+        **options: Any,
+    ) -> AsyncIterator[str]:
+        observed["export"] = (requested_project_id, options)
+
+        async def rows() -> AsyncIterator[str]:
+            yield "mapped_reaction_id,value\n"
+            yield "reaction-1,1.0\n"
+            yield "reaction-2,2.0\n"
+
+        return rows()
+
+    monkeypatch.setattr(
+        mcp_module.AuthorizationService,
+        "require_project_permission",
+        staticmethod(require_permission),
+    )
+    monkeypatch.setattr(
+        mcp_module.ReactionThermodynamicAnalyticsService,
+        "export_csv",
+        staticmethod(export_csv),
+    )
+
+    result = await _call_as_development_user(
+        "export_mapped_reaction_thermodynamics_csv",
+        {"project_id": str(project_id), "limit": 1},
+    )
+
+    assert result["success"] is True
+    assert result["data"]["csv"] == "mapped_reaction_id,value\nreaction-1,1.0\n"
+    assert result["data"]["header_included"] is True
+    assert result["data"]["row_count"] == 1
+    assert result["data"]["next_offset"] == 1
+    assert result["data"]["has_more"] is True
+    assert observed["permission"] == (
+        DEVELOPMENT_USER_ID,
+        project_id,
+        mcp_module.ProjectPermission.ARTIFACT_READ,
+    )
+    assert observed["export"][1]["limit"] == 2
+
+
+@pytest.mark.asyncio
+async def test_mcp_artifact_and_scientific_array_content_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id = UUID("00000000-0000-7000-8000-000000000792")
+    artifact_id = UUID("00000000-0000-7000-8000-000000000791")
+    array_id = UUID("00000000-0000-7000-8000-000000000790")
+
+    async def require_permission(
+        user_id: UUID,
+        requested_project_id: UUID,
+        permission: Any,
+    ) -> None:
+        return None
+
+    async def preview_artifact(
+        requested_artifact_id: UUID,
+        *,
+        max_bytes: int,
+        user_id: UUID,
+        project_id: UUID,
+    ) -> dict[str, Any]:
+        return {
+            "id": requested_artifact_id,
+            "preview_text": "sample",
+            "preview_bytes": 6,
+            "truncated": False,
+        }
+
+    async def download_artifact(
+        requested_artifact_id: UUID,
+        *,
+        user_id: UUID,
+        project_id: UUID,
+    ) -> Any:
+        return mcp_module.ArtifactDownload(
+            id=requested_artifact_id,
+            original_filename="sample.txt",
+            media_type="text/plain",
+            size_bytes=7,
+            content_sha256="payload-hash",
+            bucket="bucket",
+            object_key="object-key",
+            version_id=None,
+        )
+
+    async def preview_array(
+        requested_array_id: UUID,
+        *,
+        max_elements: int,
+        project_id: UUID,
+    ) -> Any:
+        return SimpleNamespace(
+            array_id=requested_array_id,
+            kind="coordinates",
+            unit="angstrom",
+            dtype="float32",
+            shape=(2, 3),
+            total_elements=6,
+            values=[0.0, 1.0],
+            truncated=True,
+        )
+
+    async def load_array(
+        requested_array_id: UUID,
+        *,
+        max_bytes: int,
+        project_id: UUID,
+    ) -> Any:
+        return SimpleNamespace(
+            array_id=requested_array_id,
+            filename="coordinates.npy",
+            content=b"npy-payload",
+            payload_sha256="array-hash",
+            unit="angstrom",
+            dtype="float32",
+            shape=(2, 3),
+        )
+
+    monkeypatch.setattr(
+        mcp_module.AuthorizationService,
+        "require_project_permission",
+        staticmethod(require_permission),
+    )
+    monkeypatch.setattr(
+        mcp_module.ArtifactContentService,
+        "preview",
+        staticmethod(preview_artifact),
+    )
+    monkeypatch.setattr(
+        mcp_module.ArtifactContentService,
+        "download",
+        staticmethod(download_artifact),
+    )
+    monkeypatch.setattr(
+        mcp_module, "_read_artifact_payload", lambda download, max_bytes: b"payload"
+    )
+    monkeypatch.setattr(
+        mcp_module.ScientificArrayContentService,
+        "preview",
+        staticmethod(preview_array),
+    )
+    monkeypatch.setattr(
+        mcp_module.ScientificArrayContentService,
+        "load_npy",
+        staticmethod(load_array),
+    )
+
+    preview_result = await _call_as_development_user(
+        "preview_artifact_content",
+        {"artifact_id": str(artifact_id), "project_id": str(project_id)},
+    )
+    artifact_result = await _call_as_development_user(
+        "download_artifact_content",
+        {"artifact_id": str(artifact_id), "project_id": str(project_id)},
+    )
+    batch_result = await _call_as_development_user(
+        "download_artifacts_batch",
+        {"artifact_ids": [str(artifact_id)], "project_id": str(project_id)},
+    )
+    array_preview_result = await _call_as_development_user(
+        "preview_scientific_array",
+        {"array_id": str(array_id), "project_id": str(project_id)},
+    )
+    array_download_result = await _call_as_development_user(
+        "download_scientific_array_npy",
+        {"array_id": str(array_id), "project_id": str(project_id)},
+    )
+
+    assert preview_result["data"]["preview_text"] == "sample"
+    assert artifact_result["data"]["content_base64"] == base64.b64encode(b"payload").decode()
+    assert (
+        batch_result["data"]["files"][0]["content_base64"] == base64.b64encode(b"payload").decode()
+    )
+    assert array_preview_result["data"]["shape"] == [2, 3]
+    assert (
+        array_download_result["data"]["content_base64"] == base64.b64encode(b"npy-payload").decode()
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_transition_state_geometry_export_is_project_scoped_and_paginated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id = UUID("00000000-0000-7000-8000-000000000798")
+    first_binding_id = "00000000-0000-7000-8000-000000000797"
+    second_binding_id = "00000000-0000-7000-8000-000000000796"
+    observed: dict[str, Any] = {}
+
+    async def require_permission(
+        user_id: UUID,
+        requested_project_id: UUID,
+        permission: Any,
+    ) -> None:
+        observed["permission"] = (user_id, requested_project_id, permission)
+
+    async def export_records(
+        requested_project_id: UUID,
+        *,
+        after_binding_id: UUID | None,
+        max_records: int | None,
+    ) -> AsyncIterator[bytes]:
+        observed["page"] = (requested_project_id, after_binding_id, max_records)
+        for binding_id in (first_binding_id, second_binding_id):
+            yield json.dumps(
+                {
+                    "schema": "mapped-reaction-ts-geometry-v2",
+                    "key": "[CH3:1]>>[CH3:1]",
+                    "value": {
+                        "geometry": {"geometry_binding_id": binding_id},
+                        "rdkit_mol": {"format": "molblock", "value": ""},
+                    },
+                }
+            ).encode()
+
+    monkeypatch.setattr(
+        mcp_module.AuthorizationService,
+        "require_project_permission",
+        staticmethod(require_permission),
+    )
+    monkeypatch.setattr(mcp_module, "iter_mapped_reaction_geometry_export", export_records)
+
+    result = await _call_as_development_user(
+        "export_mapped_reaction_transition_state_geometries",
+        {"project_id": str(project_id), "limit": 1},
+    )
+
+    assert result["success"] is True
+    assert len(result["data"]["records"]) == 1
+    assert result["data"]["next_after_binding_id"] == first_binding_id
+    assert result["data"]["has_more"] is True
+    assert observed["permission"] == (
+        DEVELOPMENT_USER_ID,
+        project_id,
+        mcp_module.ProjectPermission.ARTIFACT_DOWNLOAD,
+    )
+    assert observed["page"] == (project_id, None, 2)
 
 
 @pytest.mark.asyncio
@@ -882,7 +1221,7 @@ async def test_mcp_rate_limit_backend_failure_returns_error_without_fallback() -
         async def check(self, _key: str) -> None:
             raise RateLimitBackendUnavailable
 
-    middleware._limiter = _UnavailableRateLimiter()  # type: ignore[assignment]
+    middleware._limiter = _UnavailableRateLimiter()
     context = SimpleNamespace(
         message=SimpleNamespace(name="compose_query", arguments={}),
         fastmcp_context=None,

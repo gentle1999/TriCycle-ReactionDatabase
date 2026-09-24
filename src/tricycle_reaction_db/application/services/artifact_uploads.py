@@ -2885,6 +2885,7 @@ _INFERENCE_CONTEXT_MUTABLE_FIELDS = (
     "in_memory_geometries_by_identity",
     "geometries_to_reconcile",
     "topologies_to_resolve_reactions",
+    "logical_reactions_to_resolve_mappings",
     "reaction_participants_by_topology",
     "mapped_reactions_by_id",
     "mapped_reactions_by_logical_reaction",

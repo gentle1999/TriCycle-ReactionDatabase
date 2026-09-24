@@ -38,6 +38,7 @@ from tricycle_reaction_db.db.models import (
     MappedReactionThermodynamicProfile,
 )
 from tricycle_reaction_db.db.session import session_factory
+from tricycle_reaction_db.domain.enums import ThermodynamicProfileSourceVisibility
 
 HISTOGRAM_BIN_COUNT = 12
 MAX_SCATTER_POINTS = 1_000
@@ -73,10 +74,17 @@ async def _profile_predicate(
     filter_expression: str | None = None,
     has_activation_gibbs_free_energy: bool | None = None,
     has_reaction_gibbs_free_energy: bool | None = None,
+    require_complete_source_evidence: bool = False,
 ) -> Any:
     profile = MappedReactionThermodynamicProfile
     mapped_visibility = mapped_reaction_id_is_visible(scope, col(MappedReaction.id))
     profile_visibility = thermodynamic_profile_is_visible(scope, profile)
+    if require_complete_source_evidence:
+        profile_visibility = and_(
+            profile_visibility,
+            col(profile.source_visibility_status) == ThermodynamicProfileSourceVisibility.VISIBLE,
+            col(profile.source_evidence_complete).is_(True),
+        )
     if (
         filter_expression is None
         and not has_activation_gibbs_free_energy
@@ -358,9 +366,15 @@ class ReactionThermodynamicAnalyticsService:
         filter_expression: str | None = None,
         has_activation_gibbs_free_energy: bool | None = None,
         has_reaction_gibbs_free_energy: bool | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> AsyncIterator[str]:
         """Capture request visibility before response body streaming begins."""
 
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be positive")
+        if offset < 0:
+            raise ValueError("offset must be non-negative")
         scope = await query_visibility_scope(project_id=project_id)
         async with session_factory() as session:
             predicate = await _profile_predicate(
@@ -369,11 +383,21 @@ class ReactionThermodynamicAnalyticsService:
                 filter_expression=filter_expression,
                 has_activation_gibbs_free_energy=has_activation_gibbs_free_energy,
                 has_reaction_gibbs_free_energy=has_reaction_gibbs_free_energy,
+                require_complete_source_evidence=True,
             )
-        return ReactionThermodynamicAnalyticsService._export_csv_rows(predicate)
+        return ReactionThermodynamicAnalyticsService._export_csv_rows(
+            predicate,
+            limit=limit,
+            offset=offset,
+        )
 
     @staticmethod
-    async def _export_csv_rows(predicate: Any) -> AsyncIterator[str]:
+    async def _export_csv_rows(
+        predicate: Any,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> AsyncIterator[str]:
         """Stream one CSV row for every visible materialized profile."""
 
         profile = MappedReactionThermodynamicProfile
@@ -404,6 +428,10 @@ class ReactionThermodynamicAnalyticsService:
             .where(predicate)
             .order_by(col(MappedReaction.id), col(profile.id))
         )
+        if limit is not None:
+            statement = statement.limit(limit)
+        if offset:
+            statement = statement.offset(offset)
 
         def encode(values: list[Any]) -> str:
             buffer = io.StringIO(newline="")

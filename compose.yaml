@@ -199,6 +199,22 @@ services:
         condition: service_completed_successfully
     stop_grace_period: 30s
 
+  units-ts-dataset-worker:
+    <<: *api-service
+    command:
+      - tricycle-units-ts-dataset-worker
+    environment:
+      TRICYCLE_QUERY_STATEMENT_TIMEOUT_MS: ${TRICYCLE_UNITS_DATASET_WORKER_STATEMENT_TIMEOUT_MS:-120000}
+    healthcheck:
+      disable: true
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      rustfs:
+        condition: service_healthy
+    stop_grace_period: 30s
+    restart: unless-stopped
+
   frontend:
     image: ${TRICYCLE_FRONTEND_IMAGE:-tricycle-reaction-database-frontend:local}
     build:

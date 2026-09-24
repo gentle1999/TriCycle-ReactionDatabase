@@ -1,5 +1,6 @@
 """NexusX commands for topology-first reaction creation."""
 
+import re
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from typing import cast
@@ -16,6 +17,7 @@ from tricycle_reaction_db.application.dtos import (
     LogicalReactionParticipantRecord,
     LogicalReactionRecord,
     MappedReactionRecord,
+    MolecularTopologyRecord,
     NormalizedTopologyRecord,
 )
 from tricycle_reaction_db.application.query_cost import enforce_structure_input_budget
@@ -82,6 +84,197 @@ class _ResolvedComponent:
     logical_topology: MolecularTopology | None = None
 
 
+def _mapped_reaction_smiles_from_components(
+    source_reaction_smiles: str,
+    mapped_smiles_by_template: dict[tuple[LogicalReactionParticipantSide, int], str],
+    *,
+    preserve_source_serialization: bool,
+    source_atom_maps_by_template: dict[tuple[LogicalReactionParticipantSide, int], list[int]]
+    | None = None,
+) -> str:
+    """Choose the mapped-reaction serialization for resolved components."""
+
+    if preserve_source_serialization:
+        if source_atom_maps_by_template is None:
+            return source_reaction_smiles
+        reaction_sides = source_reaction_smiles.split(">>")
+        if len(reaction_sides) != 2:
+            raise ValueError("source mapped reaction must contain exactly one '>>' separator")
+
+        def split_components(side_smiles: str) -> list[str]:
+            components: list[str] = []
+            start = 0
+            bracket_depth = 0
+            branch_depth = 0
+            for index, character in enumerate(side_smiles):
+                if character == "[":
+                    bracket_depth += 1
+                elif character == "]":
+                    bracket_depth -= 1
+                    if bracket_depth < 0:
+                        raise ValueError("source mapped reaction has unbalanced atom brackets")
+                elif bracket_depth == 0 and character == "(":
+                    branch_depth += 1
+                elif bracket_depth == 0 and character == ")":
+                    branch_depth -= 1
+                    if branch_depth < 0:
+                        raise ValueError("source mapped reaction has unbalanced branches")
+                elif character == "." and bracket_depth == 0 and branch_depth == 0:
+                    components.append(side_smiles[start:index])
+                    start = index + 1
+            if bracket_depth != 0 or branch_depth != 0:
+                raise ValueError("source mapped reaction has unbalanced SMILES delimiters")
+            components.append(side_smiles[start:])
+            if any(not component for component in components):
+                raise ValueError("source mapped reaction contains an empty component")
+            return components
+
+        def map_set(component_smiles: str) -> frozenset[int]:
+            maps = [int(value) for value in re.findall(r":([0-9]+)\]", component_smiles)]
+            if not maps or any(number <= 0 for number in maps) or len(set(maps)) != len(maps):
+                raise ValueError(
+                    "source mapped reaction components require unique positive atom maps"
+                )
+            return frozenset(maps)
+
+        ordered_sides: list[str] = []
+        for side, source_side in zip(
+            (LogicalReactionParticipantSide.REACTANT, LogicalReactionParticipantSide.PRODUCT),
+            reaction_sides,
+            strict=True,
+        ):
+            expected_by_maps: dict[frozenset[int], int] = {}
+            for (component_side, template_index), atom_maps in source_atom_maps_by_template.items():
+                if component_side is not side:
+                    continue
+                expected_maps = frozenset(int(number) for number in atom_maps)
+                if (
+                    not expected_maps
+                    or any(number <= 0 for number in expected_maps)
+                    or len(expected_maps) != len(atom_maps)
+                    or expected_maps in expected_by_maps
+                ):
+                    raise ValueError(
+                        "resolved source component atom-map sets must be unique and complete"
+                    )
+                expected_by_maps[expected_maps] = template_index
+
+            source_components = split_components(source_side)
+            if len(source_components) != len(expected_by_maps):
+                raise ValueError(
+                    "source reaction component count does not match resolved participants"
+                )
+            source_by_maps: dict[frozenset[int], str] = {}
+            for component_smiles in source_components:
+                component_maps = map_set(component_smiles)
+                if component_maps in source_by_maps:
+                    raise ValueError("source reaction contains duplicate component atom-map sets")
+                source_by_maps[component_maps] = component_smiles
+            if source_by_maps.keys() != expected_by_maps.keys():
+                raise ValueError(
+                    "source reaction component atom maps do not match resolved participants"
+                )
+            ordered_sides.append(
+                ".".join(
+                    source_by_maps[atom_maps]
+                    for atom_maps, _ in sorted(expected_by_maps.items(), key=lambda item: item[1])
+                )
+            )
+        return f"{ordered_sides[0]}>>{ordered_sides[1]}"
+    sides: dict[LogicalReactionParticipantSide, list[tuple[int, str]]] = {
+        LogicalReactionParticipantSide.REACTANT: [],
+        LogicalReactionParticipantSide.PRODUCT: [],
+    }
+    for (side, template_index), mapped_smiles in mapped_smiles_by_template.items():
+        sides[side].append((template_index, mapped_smiles))
+    reactants = ".".join(
+        smiles for _, smiles in sorted(sides[LogicalReactionParticipantSide.REACTANT])
+    )
+    products = ".".join(
+        smiles for _, smiles in sorted(sides[LogicalReactionParticipantSide.PRODUCT])
+    )
+    return f"{reactants}>>{products}"
+
+
+def _atom_maps_in_persisted_topology_order(
+    source_topology: MolecularTopologyRecord,
+    persisted_topology: MolecularTopology,
+    atom_map_numbers: list[int],
+) -> list[int]:
+    """Translate a map vector when graph identity reuses another atom ordering.
+
+    This matches one topology to the same topology only. It does not infer
+    correspondence between reaction sides; candidate projections are accepted
+    only when their fully atom-labelled serialization reproduces the source.
+    """
+
+    if not atom_map_numbers:
+        return []
+    source_mol = source_topology.mol
+    persisted_mol = persisted_topology.mol
+    if source_mol.GetNumAtoms() != persisted_mol.GetNumAtoms():
+        raise ValueError("reused topology atom count does not match its source projection")
+    if len(atom_map_numbers) != source_mol.GetNumAtoms():
+        raise ValueError("source atom-map count does not match its topology projection")
+
+    # Synthetic unique labels let this verification work even when the source
+    # reaction only maps a subset of atoms. They are not persisted.
+    source_labels = list(range(1, source_mol.GetNumAtoms() + 1))
+    source_labelled_smiles = mapped_smiles_for_topology(
+        cast(MolecularTopology, source_topology),
+        source_labels,
+    )
+
+    def translated_maps(match: tuple[int, ...]) -> list[int]:
+        translated = [0] * len(match)
+        for source_index, persisted_index in enumerate(match):
+            translated[persisted_index] = atom_map_numbers[source_index]
+        return translated
+
+    def matching_projection(match: tuple[int, ...]) -> list[int] | None:
+        candidate = translated_maps(match)
+        candidate_smiles = mapped_smiles_for_topology(persisted_topology, source_labels_for(match))
+        if candidate_smiles == source_labelled_smiles:
+            return candidate
+        return None
+
+    def source_labels_for(match: tuple[int, ...]) -> list[int]:
+        translated = [0] * len(match)
+        for source_index, persisted_index in enumerate(match):
+            translated[persisted_index] = source_labels[source_index]
+        return translated
+
+    if mapped_smiles_for_topology(persisted_topology, source_labels) == source_labelled_smiles:
+        return atom_map_numbers.copy()
+
+    first_matches = persisted_mol.GetSubstructMatches(
+        source_mol,
+        uniquify=False,
+        useChirality=True,
+        maxMatches=1,
+    )
+    if not first_matches:
+        raise ValueError("reused topology is not graph-isomorphic to its source projection")
+    for match in first_matches:
+        aligned = matching_projection(match)
+        if aligned is not None:
+            return aligned
+
+    matches = persisted_mol.GetSubstructMatches(
+        source_mol,
+        uniquify=False,
+        useChirality=True,
+        maxMatches=4096,
+    )
+    for match in matches[1:]:
+        aligned = matching_projection(match)
+        if aligned is not None:
+            return aligned
+    raise ValueError(
+        "could not verify source atom order against the reused molecular topology projection"
+    )
+
+
 def _resolve_components(
     session: Session,
     definition: rdChemReactions.ChemicalReaction | None,
@@ -133,7 +326,11 @@ def _resolve_components(
                     template_index=template_index,
                     formula=persisted.formula,
                     topology=persisted.topology,
-                    topology_atom_map_numbers=[int(number) for number in topology_atom_maps],
+                    topology_atom_map_numbers=_atom_maps_in_persisted_topology_order(
+                        normalized.topology,
+                        persisted.topology,
+                        [int(number) for number in topology_atom_maps],
+                    ),
                 )
             )
         component_keys = [(component.side, component.template_index) for component in components]
@@ -184,6 +381,12 @@ def _resolve_components(
                 normalized,
                 context=topology_context,
             )
+            if topology_atom_map_numbers:
+                topology_atom_map_numbers = _atom_maps_in_persisted_topology_order(
+                    normalized.topology,
+                    persisted.topology,
+                    topology_atom_map_numbers,
+                )
             if include_creation_metadata and existing is None:
                 topologies_created += 1
             components.append(
@@ -486,25 +689,22 @@ def _create_reaction(
         )
         for component in components
     }
-    canonical_sides: dict[LogicalReactionParticipantSide, list[tuple[int, str]]] = {
-        LogicalReactionParticipantSide.REACTANT: [],
-        LogicalReactionParticipantSide.PRODUCT: [],
-    }
-    for component_key, mapped_smiles in precomputed_mapped_smiles_by_template.items():
-        side, template_index = component_key
-        canonical_sides[side].append((template_index, mapped_smiles))
-    reactants = ".".join(
-        smiles for _, smiles in sorted(canonical_sides[LogicalReactionParticipantSide.REACTANT])
-    )
-    products = ".".join(
-        smiles for _, smiles in sorted(canonical_sides[LogicalReactionParticipantSide.PRODUCT])
-    )
-    canonical_smiles = f"{reactants}>>{products}"
-    mapping_hash = sha256(canonical_smiles.encode("utf-8")).hexdigest()
     source_atom_maps_by_template = {
         (component.side, component.template_index): component.topology_atom_map_numbers
         for component in components
     }
+    # MolOP's endpoint projection assigned atom maps directly from the source
+    # atom indices. Preserve each component's exact SMILES while ordering
+    # components by the logical participant slots selected above.
+    canonical_smiles = _mapped_reaction_smiles_from_components(
+        command.reaction,
+        precomputed_mapped_smiles_by_template,
+        preserve_source_serialization=precomputed_topology_records is not None,
+        source_atom_maps_by_template=(
+            source_atom_maps_by_template if precomputed_topology_records is not None else None
+        ),
+    )
+    mapping_hash = sha256(canonical_smiles.encode("utf-8")).hexdigest()
     topology_ids_by_template = {
         (component.side, component.template_index): _require_id(
             component.logical_topology or component.topology,
@@ -545,6 +745,9 @@ def _create_reaction(
         topology_ids_by_template=topology_ids_by_template,
         concrete_topology_ids_by_template=concrete_topology_ids_by_template,
         precomputed_mapped_smiles_by_template=precomputed_mapped_smiles_by_template,
+        source_mapped_reaction_smiles=(
+            canonical_smiles if precomputed_topology_records is not None else None
+        ),
         topology_context=topology_context,
     )
     # A logical reaction may have been created after other concrete topology
@@ -563,6 +766,13 @@ def _create_reaction(
             topology_context=topology_context,
             reconciliation_cache=reconciliation_cache,
             refresh_thermodynamics=not defer_thermodynamic_refresh,
+        )
+    else:
+        if topology_context is None:
+            raise ValueError("deferred Geometry reconciliation requires a topology context")
+        logical_reaction_id = _require_id(logical_reaction, label="LogicalReaction")
+        topology_context.logical_reactions_to_resolve_mappings[logical_reaction_id] = (
+            logical_reaction
         )
     reactant_node = resolve_endpoint_node(
         session,

@@ -31,6 +31,7 @@ from tricycle_reaction_db.application.dtos import (
 from tricycle_reaction_db.application.services import (
     atom_maps_from_source_order,
     finalize_parse_revision,
+    mapped_smiles_for_geometry,
     mapped_smiles_for_topology,
     persist_artifact_file,
     persist_atomic_population_series,
@@ -909,12 +910,18 @@ def seed_da_bench_fixture(
                     node_geometry,
                     MappedReactionNodeGeometryMappingRecord(
                         geometry_atom_map_numbers=topology_atom_maps,
-                        mapped_smiles=mapped_smiles_for_topology(
-                            authority_frame.geometry.topology,
-                            topology_atom_maps,
-                            include_stereochemistry=(
-                                node.role is not MappedReactionNodeRole.TRANSITION_STATE
-                            ),
+                        mapped_smiles=(
+                            mapped_smiles_for_geometry(
+                                authority_frame.geometry,
+                                topology_atom_maps,
+                                include_stereochemistry=False,
+                            )
+                            if node.role is MappedReactionNodeRole.TRANSITION_STATE
+                            else mapped_smiles_for_topology(
+                                authority_frame.geometry.topology,
+                                topology_atom_maps,
+                                include_stereochemistry=True,
+                            )
                         ),
                         mapping_method="manifest-explicit",
                         mapping_version="coordinate-map-v1",
