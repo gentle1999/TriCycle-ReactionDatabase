@@ -2904,7 +2904,6 @@ _INFERENCE_CONTEXT_MUTABLE_FIELDS = (
     "in_memory_geometries_by_identity",
     "geometries_to_reconcile",
     "topologies_to_resolve_reactions",
-    "source_atom_order_authoritative",
     "logical_reactions_to_resolve_mappings",
     "reaction_participants_by_topology",
     "mapped_reactions_by_id",
@@ -2918,6 +2917,7 @@ _INFERENCE_CONTEXT_MUTABLE_FIELDS = (
     "inferred_reaction_ids_by_key",
     "inferred_reaction_topology_records_by_key",
 )
+_INFERENCE_CONTEXT_SCALAR_FIELDS = ("source_atom_order_authoritative",)
 _RECONCILIATION_CACHE_MUTABLE_FIELDS = (
     "nodes_by_reaction",
     "nodes_by_key",
@@ -2960,7 +2960,7 @@ def _snapshot_inference_context(
         return None
     context_state = {
         name: _copy_inference_snapshot_value(getattr(topology_context, name))
-        for name in _INFERENCE_CONTEXT_MUTABLE_FIELDS
+        for name in (*_INFERENCE_CONTEXT_MUTABLE_FIELDS, *_INFERENCE_CONTEXT_SCALAR_FIELDS)
     }
     cache = topology_context.reconciliation_cache
     cache_state = (
@@ -2983,16 +2983,26 @@ def _restore_inference_context(
     context_state, cache_state, cache_hits = snapshot
     for name, saved in context_state.items():
         current = getattr(topology_context, name)
-        current.clear()
-        current.update(saved)
+        if isinstance(current, dict | set):
+            current.clear()
+            current.update(saved)
+        elif isinstance(current, list):
+            current[:] = saved
+        else:
+            setattr(topology_context, name, saved)
     topology_context.inferred_reaction_cache_hits = cache_hits
     cache = topology_context.reconciliation_cache
     if cache_state is None or not isinstance(cache, ReconciliationBatchCache):
         return
     for name, saved in cache_state.items():
         current = getattr(cache, name)
-        current.clear()
-        current.update(saved)
+        if isinstance(current, dict | set):
+            current.clear()
+            current.update(saved)
+        elif isinstance(current, list):
+            current[:] = saved
+        else:
+            setattr(cache, name, saved)
 
 
 def _persist_inference_batch(

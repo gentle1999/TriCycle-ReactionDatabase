@@ -160,6 +160,16 @@ def test_inference_context_snapshot_does_not_copy_pure_topology_preparation_cach
     )
 
 
+def test_inference_context_snapshot_restores_source_atom_order_authority_flag() -> None:
+    context = GeometryPersistenceContext(source_atom_order_authoritative=False)
+    snapshot = _snapshot_inference_context(context)
+
+    context.source_atom_order_authoritative = True
+    _restore_inference_context(context, snapshot)
+
+    assert context.source_atom_order_authoritative is False
+
+
 def test_fast_pending_identity_lookup_reuses_the_first_entity() -> None:
     session = Session()
     entity_id = UUID("00000000-0000-7000-8000-000000000010")
