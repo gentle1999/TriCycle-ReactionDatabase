@@ -4,8 +4,10 @@ from uuid import UUID
 import pytest
 
 from tricycle_reaction_db.application.services import (
+    molecular_geometry,
     molop_artifact_ingestion,
     reaction_mapping_resolution,
+    topology_abstraction,
 )
 from tricycle_reaction_db.application.services._persistence import (
     SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY,
@@ -76,3 +78,26 @@ def test_source_authoritative_reconciliation_skips_mapping_expansion(
     assert context.logical_reactions_to_resolve_mappings == {}
     assert context.topologies_to_resolve_reactions == set()
     assert SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY not in session.info
+
+
+def test_source_authoritative_topology_skips_abstraction_upstream_matching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    topology = SimpleNamespace()
+    context = GeometryPersistenceContext(
+        project_id=UUID("00000000-0000-7000-8000-000000000001"),
+        source_atom_order_authoritative=True,
+    )
+
+    def fail_if_matching_runs(*_args, **_kwargs):
+        raise AssertionError("source-order imports must skip topology graph matching")
+
+    monkeypatch.setattr(
+        topology_abstraction,
+        "ensure_topology_upstreams",
+        fail_if_matching_runs,
+    )
+
+    assert molecular_geometry._register_topology_upstreams(
+        _Session(), topology, context=context
+    ) == (topology,)

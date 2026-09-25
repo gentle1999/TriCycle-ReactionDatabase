@@ -6229,7 +6229,19 @@ class ArtifactUploadService:
                         LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
                         False,
                     )
+                    or geometry_context.source_atom_order_authoritative
+                    or any(
+                        isinstance(inferred, _SuccessfulInference)
+                        for _, parsed in parsed_files
+                        for inferred in parsed.inferences
+                    )
                 )
+                if legacy_bulk_import:
+                    # Set source authority before topology preload. The
+                    # per-inference scope below is too late: preload otherwise
+                    # searches the stereo-abstraction graph for an atom
+                    # correspondence before the raw TS maps are persisted.
+                    geometry_context.source_atom_order_authoritative = True
                 for _, parsed in parsed_files:
                     for inferred in parsed.inferences:
                         if not isinstance(inferred, _SuccessfulInference):
