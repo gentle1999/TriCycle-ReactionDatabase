@@ -1119,6 +1119,46 @@ def test_trusted_molgr_projection_is_stable_across_source_atom_order() -> None:
     _assert_source_mapping_matches_topology(reordered, first.topology.mol, second_mapping)
 
 
+def test_source_authoritative_topology_preserves_source_atom_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = Chem.AddHs(Chem.MolFromSmiles("CCCO"))
+    reordered = Chem.RenumberAtoms(source, list(reversed(range(source.GetNumAtoms()))))
+
+    def forbidden_canonical_projection(*_: object, **__: object) -> object:
+        raise AssertionError("source-authoritative topology must keep source atom indices")
+
+    monkeypatch.setattr(
+        normalization_module,
+        "_canonical_smiles_atom_order",
+        forbidden_canonical_projection,
+    )
+
+    records = []
+    for molecule in (source, reordered):
+        record, source_to_topology = normalize_topology_with_mapping(
+            molecule,
+            add_hydrogens=False,
+            reconstruction_method="molgr/cpp",
+            reconstruction_version="0.1.8",
+            reconstruction_metadata={
+                "topology_source_trusted": True,
+                "source_atom_map_numbers": list(range(1, molecule.GetNumAtoms() + 1)),
+            },
+            preserve_source_atom_order=True,
+        )
+        records.append(record)
+        assert source_to_topology == list(range(molecule.GetNumAtoms()))
+        assert _indexed_graph_signature(molecule) == _indexed_graph_signature(
+            record.topology.mol
+        )
+        assert record.topology_derivation.reconstruction_metadata[
+            "topology_atom_map_numbers"
+        ] == list(range(1, molecule.GetNumAtoms() + 1))
+
+    assert records[0].topology.graph_hash != records[1].topology.graph_hash
+
+
 def test_graph_only_normalization_adds_implicit_hydrogens_without_geometry() -> None:
     implicit = Chem.MolFromSmiles("C=C")
     explicit = Chem.AddHs(Chem.Mol(implicit))

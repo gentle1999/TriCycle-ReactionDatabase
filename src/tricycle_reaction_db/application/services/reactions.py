@@ -26,7 +26,6 @@ from tricycle_reaction_db.application.dtos.reactions import (
     WorkflowManifestRecord,
 )
 from tricycle_reaction_db.application.services._persistence import (
-    LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
     _acquire_identity_locks,
     _assert_record_matches,
     _attach_or_reuse_entity,
@@ -37,6 +36,12 @@ from tricycle_reaction_db.application.services._persistence import (
     _new_entity,
     _project_owner_predicate,
     _require_id,
+    source_atom_mapping_is_authoritative,
+)
+from tricycle_reaction_db.application.services.mapped_geometry_atom_order import (
+    mapped_reaction_atom_elements,
+    mapped_reaction_atom_signatures,
+    validate_geometry_atom_map_elements,
 )
 from tricycle_reaction_db.application.services.reaction_geometry_policy import (
     require_geometry_reaction_endpoint_eligibility,
@@ -798,6 +803,16 @@ def mapped_reaction_concrete_identity(
     return tuple(sorted(identities))
 
 
+def _has_conserved_mapped_reaction_elements(mapped_reaction: MappedReaction) -> bool:
+    """Reject persisted mapping rows whose atom labels change element/isotope."""
+
+    try:
+        mapped_reaction_atom_signatures(mapped_reaction.mapped_reaction_smiles)
+    except ValueError:
+        return False
+    return True
+
+
 def mapped_reaction_concrete_identity_for_templates(
     session: Session,
     reaction: LogicalReaction,
@@ -928,6 +943,8 @@ def find_mapped_reaction_by_concrete_identity(
             by_id.values(),
             key=lambda item: (item.mapping_hash, str(_require_id(item, label="MappedReaction"))),
         ):
+            if not _has_conserved_mapped_reaction_elements(candidate):
+                continue
             candidate_id = _require_id(candidate, label="MappedReaction")
             candidate_participants = (
                 topology_context.mapped_reaction_participants_by_reaction.get(candidate_id)
@@ -943,7 +960,11 @@ def find_mapped_reaction_by_concrete_identity(
             if candidate_identity is not None:
                 index.setdefault(candidate_identity, candidate)
         index_by_reaction[logical_reaction_id] = index
-    return index.get(identity)
+    candidate = index.get(identity)
+    if candidate is not None and not _has_conserved_mapped_reaction_elements(candidate):
+        index.pop(identity, None)
+        return None
+    return candidate
 
 
 def _register_mapped_reaction_concrete_identity(
@@ -975,7 +996,7 @@ def _register_mapped_reaction_concrete_identity(
         participants=participants,
         topology_context=topology_context,
     )
-    if identity is not None:
+    if identity is not None and _has_conserved_mapped_reaction_elements(mapped_reaction):
         index.setdefault(identity, mapped_reaction)
 
 
@@ -1440,7 +1461,7 @@ def persist_logical_reaction_participant(
                     "LogicalReactionParticipant identity resolved to different role: "
                     f"{participant.role!r} != {record.role!r}"
                 )
-        if not session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
+        if not source_atom_mapping_is_authoritative(session):
             from tricycle_reaction_db.application.services.reaction_topology_membership import (
                 ensure_logical_participant_concrete_memberships,
             )
@@ -1458,7 +1479,7 @@ def persist_logical_reaction_participant(
         **record.model_dump(),
     )
     _flush_new_entity(session, participant, label="LogicalReactionParticipant")
-    if not session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
+    if not source_atom_mapping_is_authoritative(session):
         from tricycle_reaction_db.application.services.reaction_topology_membership import (
             ensure_logical_participant_concrete_memberships,
         )
@@ -1537,6 +1558,10 @@ def persist_mapped_reaction(
 ) -> MappedReaction:
     """Insert or reuse one explicit mapped reaction under a logical reaction."""
 
+    # Validate the source reaction before any participant rows are persisted.
+    # This uses RDKit's reaction parser (rather than splitting on ``>``), so
+    # metal coordination arrows such as ``[n:1]->[Pd+2:2]`` remain intact.
+    mapped_reaction_atom_signatures(record.mapped_reaction_smiles)
     reaction_id = _require_id(reaction, label="LogicalReaction")
     project_id = reaction.project_id
     if not isinstance(project_id, UUID):
@@ -1645,8 +1670,8 @@ def persist_mapped_reaction(
         # row, also lock and check the concrete topology + atom-map identity.
         # This is the important idempotency barrier for mappings transferred
         # through the logical-topology DAG.
-        if concrete_topology_ids_by_template is not None and not session.info.get(
-            LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False
+        if concrete_topology_ids_by_template is not None and not (
+            source_atom_mapping_is_authoritative(session)
         ):
             concrete_identity = mapped_reaction_concrete_identity_for_templates(
                 session,
@@ -1708,7 +1733,7 @@ def persist_mapped_reaction(
                 concrete_topology=concrete_topologies_by_key[component_key],
                 identity_is_new=mapped_reaction_created,
             )
-        if not session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
+        if not source_atom_mapping_is_authoritative(session):
             _register_mapped_reaction_concrete_identity(
                 session,
                 mapped_reaction,
@@ -1897,7 +1922,7 @@ def persist_mapped_reaction_participant(
             "mapped participant concrete topology must share the mapped reaction project"
         )
     concrete_topology_id = _require_id(concrete_topology, label="MolecularTopology")
-    if not session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
+    if not source_atom_mapping_is_authoritative(session):
         from tricycle_reaction_db.application.services.reaction_topology_membership import (
             persist_logical_participant_concrete_topology,
         )
@@ -1927,8 +1952,23 @@ def persist_mapped_reaction_participant(
             raise ValueError("mapped participant resolved to different side")
         if assignment.template_index != template_index:
             raise ValueError("mapped participant resolved to different template_index")
-        if assignment.concrete_topology_id not in {None, concrete_topology_id}:
-            raise ValueError("mapped participant resolved to a different concrete topology")
+        if source_atom_mapping_is_authoritative(session):
+            # The raw TS source owns atom numbering. A previous participant
+            # row may have been written against a shared topology whose atom
+            # array used another source's order; rebind that row to the
+            # source-order concrete topology and its direct map vector.
+            if (
+                assignment.concrete_topology_id != concrete_topology_id
+                or assignment.atom_map_numbers != atom_map_numbers
+                or assignment.mapped_smiles != mapped_smiles
+            ):
+                assignment.concrete_topology = concrete_topology
+                assignment.concrete_topology_id = concrete_topology_id
+                assignment.atom_map_numbers = list(atom_map_numbers)
+                assignment.mapped_smiles = mapped_smiles
+                session.add(assignment)
+                session.flush()
+            return assignment
         if assignment.mapped_smiles != mapped_smiles:
             raise ValueError("mapped participant resolved to different mapped_smiles")
         if set(assignment.atom_map_numbers) != set(atom_map_numbers):
@@ -1937,6 +1977,14 @@ def persist_mapped_reaction_participant(
             assignment.concrete_topology_id = concrete_topology_id
             session.add(assignment)
             session.flush()
+        elif assignment.concrete_topology_id != concrete_topology_id:
+            # The same mapped reaction can be reached again through another
+            # normalized projection of a participant.  Keep the existing
+            # concrete-topology/map-vector pair when its fully mapped SMILES
+            # agrees; rebinding only the topology id would make that vector
+            # refer to a different atom order.  Source-authoritative imports
+            # intentionally use the rebinding branch above instead.
+            return assignment
         return assignment
     assignment = _new_entity(
         session,
@@ -2311,6 +2359,25 @@ def persist_mapped_reaction_node_geometry_mapping(
     )
     if not set(record.geometry_atom_map_numbers).issubset(logical_map_numbers):
         raise ValueError("coordinate mapping contains atom maps absent from the logical path")
+    if transition_state_mapping:
+        reaction_atom_elements = mapped_reaction_atom_elements(
+            mapped_reaction.mapped_reaction_smiles
+        )
+        if reaction_atom_elements.keys() != logical_map_numbers:
+            raise ValueError("mapped reaction atom maps do not match the logical reaction path")
+        if set(record.geometry_atom_map_numbers) != logical_map_numbers:
+            raise ValueError("TS Geometry mapping must cover every mapped reaction atom")
+        for atom, map_number in zip(
+            node_geometry.geometry.mol.GetAtoms(),
+            record.geometry_atom_map_numbers,
+            strict=True,
+        ):
+            expected_atomic_number = reaction_atom_elements[map_number]
+            if atom.GetAtomicNum() != expected_atomic_number:
+                raise ValueError(
+                    f"TS Geometry map {map_number} has atomic number {atom.GetAtomicNum()}, "
+                    f"but mapped reaction atom has atomic number {expected_atomic_number}"
+                )
     participant = node_geometry.mapped_reaction_participant
     if participant is not None and not _reaction_mapping_isomorphic(
         expected_atom_map_numbers=participant.atom_map_numbers,
@@ -2353,6 +2420,27 @@ def persist_mapped_reaction_node_geometry_mapping(
             )
         )
         if not mapping_matches:
+            if transition_state_mapping:
+                try:
+                    validate_geometry_atom_map_elements(
+                        node_geometry.geometry.mol,
+                        binding.geometry_atom_map_numbers,
+                        mapped_reaction.mapped_reaction_smiles,
+                    )
+                except ValueError:
+                    # A raw TS source may provide the authoritative vector for
+                    # a binding that was previously written with a
+                    # nonconserving map assignment. Replace only when the
+                    # stored vector fails against this reaction; a different
+                    # but element-valid assignment remains an explicit
+                    # conflict for review.
+                    binding.geometry_atom_map_numbers = list(record.geometry_atom_map_numbers)
+                    binding.mapped_smiles = record.mapped_smiles
+                    binding.mapping_method = record.mapping_method
+                    binding.mapping_version = record.mapping_version
+                    binding.verified = record.verified
+                    session.add(binding)
+                    return binding
             raise ValueError("node Geometry has an incompatible reaction mapping")
         if transition_state_mapping:
             # A legacy TS binding may have serialized endpoint-irrelevant

@@ -99,10 +99,15 @@ Each line is one JSON object with this shape:
 
 Both `atoms` and the Mol block are ordered by atom-map number, so map `n` is
 always at array/Mol atom index `n - 1`. The Mol block contains the same 3D
-conformer and can be reconstructed with `rdkit.Chem.MolFromMolBlock`. A mapped
-reaction can have multiple bound TS geometries, so its key may appear on
-multiple JSONL lines. Only records with a
-verified mapping and exactly one finite 3D conformer are emitted.
+conformer; read it with `Chem.MolFromMolBlock(block, removeHs=False,
+sanitize=False)` to preserve the stored graph and atom-map labels. Some
+metal/aromatic geometries cannot be kekulized by RDKit, so the exporter retains
+their aromatic-bond representation instead of failing the JSONL stream;
+sanitization may still fail for those structures. A mapped reaction can have
+multiple bound TS geometries, so its key may appear on multiple JSONL lines.
+Only records with a verified mapping, conserved map-to-element identities, and
+exactly one finite 3D conformer are emitted. Inconsistent legacy mappings are
+skipped and logged instead of being exported under the wrong reaction atom.
 
 Use JSONL when the consumer needs incremental processing. Keep NPY for the
 upstream UniTS-compatible feature arrays; changing that existing contract to
@@ -143,6 +148,10 @@ The upstream MIT notice is preserved in [`licenses/UniTS-MIT.txt`](../licenses/U
 
 Reactive atom indices are inferred from mapped bond, atom, and stereochemistry
 changes between the mapped reaction sides and use the exported atom-map order.
+Mapped RXN SMILES are parsed with RDKit's `ReactionFromSmarts(useSmiles=True)`
+so metal-coordination `->` and `<-` bonds remain part of their reaction
+templates; the dative-bond donor direction is included when comparing bond
+changes.
 Samples without verified atom
 mapping, valid 3D coordinates, supported UniTS charge/multiplicity, or an
 inferable reaction center are skipped. Their aggregated reasons appear in

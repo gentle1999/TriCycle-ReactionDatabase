@@ -74,6 +74,8 @@ from tricycle_reaction_db.application.services._persistence import (
     _require_id,
     _set_fast_pending_entities,
     _truncate_fast_pending_entities,
+    source_atom_mapping_is_authoritative,
+    source_atom_order_authoritative,
 )
 from tricycle_reaction_db.application.services.artifact_content import (
     detect_artifact_media_type,
@@ -2384,6 +2386,7 @@ def _persist_transition_state_endpoint(
         topology_record, source_to_topology = _normalize_transition_state_endpoint_topology(
             endpoint,
             direction,
+            source_atom_order_identity=str(frame_id),
         )
         prepared = _PreparedEndpointTopology(
             record=topology_record,
@@ -2432,11 +2435,14 @@ def _persist_transition_state_endpoint(
 def _normalize_transition_state_endpoint_topology(
     endpoint: Chem.Mol,
     direction: TransitionStateEndpointDirection,
+    *,
+    source_atom_order_identity: str | None = None,
 ) -> tuple[Any, list[int]]:
     validation = endpoint_provenance(endpoint)
     return normalize_topology_with_mapping(
         endpoint,
         add_hydrogens=False,
+        preserve_source_atom_order=True,
         reconstruction_method=(
             validation["method"]
             if validation["validation_status"] == "unverified"
@@ -2449,6 +2455,11 @@ def _normalize_transition_state_endpoint_topology(
             "coordinate_policy": "source-cartesian-no-independent-normalization",
             "direction": direction.value,
             "topology_source_trusted": True,
+            **(
+                {"source_atom_order_identity": source_atom_order_identity}
+                if source_atom_order_identity is not None
+                else {}
+            ),
         },
     )
 
@@ -2565,7 +2576,7 @@ def _resolve_and_bind_transition_state_reaction(
         topology_context is None if refresh_thermodynamics is None else refresh_thermodynamics
     )
 
-    legacy_bulk_import = bool(session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False))
+    legacy_bulk_import = source_atom_mapping_is_authoritative(session)
     prepared_records = prepared_topology_records
     cache_key: str | None
     cached_reaction_ids: tuple[UUID, UUID] | None
@@ -2627,7 +2638,9 @@ def _resolve_and_bind_transition_state_reaction(
                 calculation_frame.frame_role
             ),
             defer_geometry_reconciliation=(
-                topology_context is not None and topology_context.reconciliation_cache is not None
+                topology_context is not None
+                and topology_context.reconciliation_cache is not None
+                and not source_atom_mapping_is_authoritative(session)
             ),
             topology_context=topology_context,
             include_creation_metadata=topology_context is None,
@@ -2839,7 +2852,7 @@ def _persist_one_new_inference(
     context_snapshot = _snapshot_inference_context(topology_context)
     pending_snapshot = list(session.info.get("_fast_pending_entities", ()))
     try:
-        with session.begin_nested():
+        with session.begin_nested(), source_atom_order_authoritative(session):
             _persist_successful_inference(
                 session,
                 ingestion=task.deferred.ingestion,
@@ -4118,6 +4131,52 @@ def _run_preload_molecular_geometry_context(
         typed_session.info["tricycle_fast_insert"] = previous_fast_insert
 
 
+def _source_atom_order_identity(inferred: _SuccessfulInference) -> str:
+    """Hash raw mapped-reaction and endpoint index order for topology reuse."""
+
+    def endpoint_payload(molecule: Chem.Mol) -> dict[str, Any]:
+        atoms = [
+            (
+                atom.GetAtomicNum(),
+                atom.GetIsotope(),
+                atom.GetFormalCharge(),
+                atom.GetNumRadicalElectrons(),
+                int(atom.GetChiralTag()),
+                atom.GetIsAromatic(),
+                atom.GetAtomMapNum(),
+            )
+            for atom in molecule.GetAtoms()
+        ]
+        bonds = [
+            (
+                bond.GetBeginAtomIdx(),
+                bond.GetEndAtomIdx(),
+                str(bond.GetBondType()),
+                bond.GetIsAromatic(),
+                int(bond.GetStereo()),
+                tuple(int(index) for index in bond.GetStereoAtoms()),
+                int(bond.GetBondDir()),
+            )
+            for bond in molecule.GetBonds()
+        ]
+        coordinates: list[tuple[float, float, float]] = []
+        if molecule.GetNumConformers():
+            conformer = molecule.GetConformer()
+            for index in range(molecule.GetNumAtoms()):
+                position = conformer.GetAtomPosition(index)
+                coordinates.append((float(position.x), float(position.y), float(position.z)))
+        return {"atoms": atoms, "bonds": bonds, "coordinates": coordinates}
+
+    payload = {
+        "mapped_reaction_smiles": inferred.reaction_smiles,
+        "negative_endpoint": endpoint_payload(inferred.negative_endpoint),
+        "positive_endpoint": endpoint_payload(inferred.positive_endpoint),
+    }
+    return sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def _prepare_inference_topology_records(
     inferred: _SuccessfulInference,
     *,
@@ -4136,13 +4195,16 @@ def _prepare_inference_topology_records(
     # perform a second coordinate inference here.
     negative_endpoint = inferred.negative_endpoint
     positive_endpoint = inferred.positive_endpoint
+    source_atom_order_identity = _source_atom_order_identity(inferred)
     normalized_endpoints: list[_PreparedEndpointTopology] = []
     for endpoint, direction in (
         (negative_endpoint, TransitionStateEndpointDirection.NEGATIVE),
         (positive_endpoint, TransitionStateEndpointDirection.POSITIVE),
     ):
         record, source_to_topology = _normalize_transition_state_endpoint_topology(
-            endpoint, direction
+            endpoint,
+            direction,
+            source_atom_order_identity=source_atom_order_identity,
         )
         normalized_endpoints.append(
             _PreparedEndpointTopology(
@@ -4186,11 +4248,13 @@ def _prepare_inference_topology_records(
                     normalize_topology(
                         fragment,
                         add_hydrogens=False,
+                        preserve_source_atom_order=True,
                         reconstruction_method="molgr/possible_pre_post_ts",
                         reconstruction_version=MOLOP_VERSION,
                         reconstruction_metadata={
                             "coordinate_frame": "calculation_frame.observed_coordinates",
                             "topology_source_trusted": True,
+                            "source_atom_order_identity": source_atom_order_identity,
                             "source_fragment": True,
                             "source_atom_map_numbers": [
                                 atom.GetAtomMapNum() for atom in fragment.GetAtoms()

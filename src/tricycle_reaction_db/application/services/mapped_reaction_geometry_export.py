@@ -9,10 +9,12 @@ from collections.abc import AsyncIterator
 from uuid import UUID
 
 from rdkit import Chem
+from rdkit.Chem.rdchem import KekulizeException
 from sqlmodel import col, select
 
 from tricycle_reaction_db.application.services.mapped_geometry_atom_order import (
     molecule_in_atom_map_order,
+    validate_geometry_atom_map_elements,
 )
 from tricycle_reaction_db.db.models import (
     Geometry,
@@ -49,6 +51,19 @@ def _jsonl_record(
             error,
         )
         return None
+    try:
+        validate_geometry_atom_map_elements(
+            molecule,
+            atom_maps,
+            mapped_reaction.mapped_reaction_smiles,
+        )
+    except ValueError as error:
+        logger.error(
+            "Skipping TS geometry %s with atom-map elements inconsistent with mapped reaction: %s",
+            geometry.id,
+            error,
+        )
+        return None
     if molecule.GetNumConformers() != 1 or not molecule.GetConformer().Is3D():
         logger.warning("Skipping TS geometry %s without exactly one 3D conformer", geometry.id)
         return None
@@ -72,7 +87,17 @@ def _jsonl_record(
             }
         )
 
-    mol_block = Chem.MolToMolBlock(molecule)
+    try:
+        mol_block = Chem.MolToMolBlock(molecule)
+    except KekulizeException:
+        # Some valid stored metal/aromatic geometries cannot be kekulized by
+        # RDKit's V2000 writer. Keep aromatic bonds intact and avoid aborting
+        # the complete JSONL stream for one such geometry.
+        logger.warning(
+            "Could not kekulize TS geometry %s for Mol block export; preserving aromatic bonds",
+            geometry.id,
+        )
+        mol_block = Chem.MolToMolBlock(molecule, kekulize=False)
     record = {
         "schema": "mapped-reaction-ts-geometry-v2",
         "key": mapped_reaction.mapped_reaction_smiles,

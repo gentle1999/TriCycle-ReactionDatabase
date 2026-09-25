@@ -538,6 +538,7 @@ def _source_order_graph_signature(
     mol: Chem.Mol,
     *,
     include_stereo_metadata: bool = False,
+    preserve_bond_direction: bool = False,
 ) -> dict[str, object]:
     """Return a serialization fallback when canonical SMILES is unavailable."""
 
@@ -557,8 +558,14 @@ def _source_order_graph_signature(
         ],
         "bonds": [
             [
-                min(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()),
-                max(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()),
+                *(
+                    (bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+                    if preserve_bond_direction
+                    else (
+                        min(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()),
+                        max(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()),
+                    )
+                ),
                 str(bond.GetBondType()),
                 bond.GetIsAromatic(),
                 int(bond.GetStereo()),
@@ -1903,6 +1910,7 @@ def _normalized_topology_records(
     reconstruction_method: str,
     reconstruction_version: str,
     reconstruction_metadata: dict[str, Any] | None,
+    preserve_source_atom_order: bool = False,
 ) -> tuple[NormalizedTopologyRecord, list[int]]:
     suspicious_fallback = (reconstruction_metadata or {}).get(
         "molgr_status"
@@ -2001,7 +2009,11 @@ def _normalized_topology_records(
     stable_topology_projection = False
     source_order_topology = topology_mol
     source_order_mapping = list(source_to_topology)
-    if explicit_graph_smiles is not None and stereo_projection_error is None:
+    if (
+        not preserve_source_atom_order
+        and explicit_graph_smiles is not None
+        and stereo_projection_error is None
+    ):
         smiles_atom_order = _canonical_smiles_atom_order(topology_mol)
         if smiles_atom_order is not None:
             source_order_smiles = explicit_graph_smiles
@@ -2096,12 +2108,16 @@ def _normalized_topology_records(
     )
     stereo_agnostic_graph_hash_value = stereo_agnostic_graph_hash(topology_mol)
     identity_schema_version = (
-        TOPOLOGY_IDENTITY_VERSION
-        if standardized_graph_smiles is not None and stable_topology_projection
+        "topology-source-map-order-identity-v1"
+        if preserve_source_atom_order
         else (
-            TOPOLOGY_SOURCE_ORDER_STEREO_IDENTITY_VERSION
-            if stereo_projection_error is not None
-            else "topology-source-order-identity-v1"
+            TOPOLOGY_IDENTITY_VERSION
+            if standardized_graph_smiles is not None and stable_topology_projection
+            else (
+                TOPOLOGY_SOURCE_ORDER_STEREO_IDENTITY_VERSION
+                if stereo_projection_error is not None
+                else "topology-source-order-identity-v1"
+            )
         )
     )
     graph_hash = _digest(
@@ -2114,8 +2130,28 @@ def _normalized_topology_records(
                 else {
                     "source_order_graph": _source_order_graph_signature(
                         topology_mol,
-                        include_stereo_metadata=stereo_projection_error is not None,
-                    )
+                        include_stereo_metadata=(
+                            stereo_projection_error is not None or preserve_source_atom_order
+                        ),
+                        preserve_bond_direction=preserve_source_atom_order,
+                    ),
+                    **(
+                        {
+                            "source_atom_order_identity": str(
+                                (reconstruction_metadata or {})[
+                                    "source_atom_order_identity"
+                                ]
+                            )
+                        }
+                        if preserve_source_atom_order
+                        and isinstance(
+                            (reconstruction_metadata or {}).get(
+                                "source_atom_order_identity"
+                            ),
+                            str,
+                        )
+                        else {}
+                    ),
                 }
             ),
         }
@@ -2213,6 +2249,7 @@ def normalize_topology(
     reconstruction_method: str,
     reconstruction_version: str,
     reconstruction_metadata: dict[str, Any] | None = None,
+    preserve_source_atom_order: bool = False,
 ) -> NormalizedTopologyRecord:
     """Build graph identity without inventing a Geometry."""
 
@@ -2222,6 +2259,7 @@ def normalize_topology(
         reconstruction_method=reconstruction_method,
         reconstruction_version=reconstruction_version,
         reconstruction_metadata=reconstruction_metadata,
+        preserve_source_atom_order=preserve_source_atom_order,
     )
     return record
 
@@ -2233,6 +2271,7 @@ def normalize_topology_with_mapping(
     reconstruction_method: str,
     reconstruction_version: str,
     reconstruction_metadata: dict[str, Any] | None = None,
+    preserve_source_atom_order: bool = False,
 ) -> tuple[NormalizedTopologyRecord, list[int]]:
     """Build graph identity and source-to-canonical atom mapping.
 
@@ -2266,6 +2305,7 @@ def normalize_topology_with_mapping(
         reconstruction_method=reconstruction_method,
         reconstruction_version=reconstruction_version,
         reconstruction_metadata=reconstruction_metadata,
+        preserve_source_atom_order=preserve_source_atom_order,
     )
 
 

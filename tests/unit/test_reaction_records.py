@@ -8,6 +8,8 @@ from pydantic import ValidationError
 from rdkit import Chem
 from sqlmodel import Session
 
+import tricycle_reaction_db.application.services.reaction_mapping_resolution as mapping_resolution
+import tricycle_reaction_db.application.services.reaction_topology_membership as topology_membership
 import tricycle_reaction_db.application.services.reactions as reaction_persistence
 from tricycle_reaction_db.application.dtos import (
     CreateReactionCommand,
@@ -15,6 +17,7 @@ from tricycle_reaction_db.application.dtos import (
     LogicalReactionRecord,
     ManifestArtifactBindingRecord,
     MappedReactionNodeGeometryMappingRecord,
+    MappedReactionRecord,
     WorkflowManifestRecord,
 )
 from tricycle_reaction_db.application.services._persistence import (
@@ -24,6 +27,10 @@ from tricycle_reaction_db.application.services._persistence import (
 from tricycle_reaction_db.application.services.reaction_commands import (
     _atom_maps_in_persisted_topology_order,
     _mapped_reaction_smiles_from_components,
+)
+from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
+    _target_ts_geometry_atom_maps,
+    _validated_target_ts_geometry_atom_maps,
 )
 from tricycle_reaction_db.application.services.reactions import (
     _canonical_mapped_reaction_smiles,
@@ -38,10 +45,14 @@ from tricycle_reaction_db.application.services.reactions import (
     mapped_smiles_for_topology,
     persist_logical_reaction,
     persist_logical_reaction_participant,
+    persist_mapped_reaction,
     persist_mapped_reaction_node_geometry_mapping,
+    persist_mapped_reaction_participant,
 )
 from tricycle_reaction_db.db.models import (
     Geometry,
+    LogicalReaction,
+    LogicalReactionParticipant,
     MappedReaction,
     MappedReactionParticipant,
     MolecularTopology,
@@ -51,6 +62,7 @@ from tricycle_reaction_db.domain.enums import (
     LogicalReactionParticipantRole,
     LogicalReactionParticipantSide,
     ManifestArtifactRole,
+    MappedReactionKind,
     MappedReactionNodeRole,
     WorkflowManifestStatus,
 )
@@ -284,6 +296,63 @@ def test_atom_maps_are_translated_to_reused_topology_atom_order() -> None:
     } == source_atom_properties
 
 
+def test_atom_maps_align_when_reused_topology_has_a_different_stereo_projection() -> None:
+    parsed_source = Chem.MolFromSmiles("C[C@](F)(Cl)Br")
+    source_mol = Chem.AddHs(parsed_source) if parsed_source is not None else None
+    assert source_mol is not None
+    for index, atom in enumerate(source_mol.GetAtoms(), start=1):
+        atom.SetAtomMapNum(index)
+    normalized, source_to_topology = normalize_topology_with_mapping(
+        source_mol,
+        add_hydrogens=False,
+        reconstruction_method="unit-test/source-order",
+        reconstruction_version="1",
+    )
+    source_maps = [0] * normalized.topology.atom_count
+    for source_index, topology_index in enumerate(source_to_topology):
+        source_maps[topology_index] = source_mol.GetAtomWithIdx(source_index).GetAtomMapNum()
+
+    reordered_mol = Chem.RenumberAtoms(
+        normalized.topology.mol,
+        list(reversed(range(normalized.topology.atom_count))),
+    )
+    chiral_atom = next(
+        atom
+        for atom in reordered_mol.GetAtoms()
+        if atom.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
+    )
+    chiral_atom.SetChiralTag(
+        Chem.ChiralType.CHI_TETRAHEDRAL_CCW
+        if chiral_atom.GetChiralTag() == Chem.ChiralType.CHI_TETRAHEDRAL_CW
+        else Chem.ChiralType.CHI_TETRAHEDRAL_CW
+    )
+    persisted_topology = cast(
+        MolecularTopology,
+        SimpleNamespace(
+            mol=reordered_mol,
+            atom_count=reordered_mol.GetNumAtoms(),
+            stereo_status=normalized.topology.stereo_status,
+        ),
+    )
+
+    aligned_maps = _atom_maps_in_persisted_topology_order(
+        normalized.topology,
+        persisted_topology,
+        source_maps,
+    )
+
+    assert mapped_smiles_for_topology(
+        persisted_topology,
+        aligned_maps,
+        include_stereochemistry=False,
+    ) == mapped_smiles_for_topology(
+        cast(MolecularTopology, normalized.topology),
+        source_maps,
+        include_stereochemistry=False,
+    )
+    assert sorted(aligned_maps) == sorted(source_maps)
+
+
 @pytest.mark.parametrize(
     ("source_smiles", "expected_maps", "message"),
     [
@@ -322,6 +391,23 @@ def test_source_order_mapped_reaction_serialization_validates_bindings(
         _validate_source_mapped_reaction_smiles(
             source_smiles,
             expected_atom_maps_by_side=expected_maps,
+        )
+
+
+def test_mapped_reaction_persistence_rejects_nonconserving_maps_before_writes() -> None:
+    record = MappedReactionRecord(
+        mapped_reaction_key="mapping:invalid",
+        label="invalid mapping",
+        mapped_reaction_kind=MappedReactionKind.CURATED,
+        mapped_reaction_smiles="[C:1][O:2]>>[O:1][C:2]",
+        mapping_hash="0" * 64,
+    )
+
+    with pytest.raises(ValueError, match="change elements"):
+        persist_mapped_reaction(
+            cast(Session, object()),
+            cast(LogicalReaction, object()),
+            record,
         )
 
 
@@ -448,7 +534,10 @@ def test_ts_mapping_smiles_uses_geometry_atom_order_not_reused_topology_order(
     )
     node = SimpleNamespace(
         role=MappedReactionNodeRole.TRANSITION_STATE,
-        mapped_reaction=SimpleNamespace(id=UUID("00000000-0000-7000-8000-000000000090")),
+        mapped_reaction=SimpleNamespace(
+            id=UUID("00000000-0000-7000-8000-000000000090"),
+            mapped_reaction_smiles="[C:1][O:2]>>[C:1][O:2]",
+        ),
     )
     node_geometry = SimpleNamespace(
         id=UUID("00000000-0000-7000-8000-000000000091"),
@@ -461,6 +550,14 @@ def test_ts_mapping_smiles_uses_geometry_atom_order_not_reused_topology_order(
         reaction_persistence,
         "_logical_map_numbers_for_reaction",
         lambda *_args, **_kwargs: frozenset(geometry_maps),
+    )
+    monkeypatch.setattr(
+        reaction_persistence,
+        "mapped_reaction_atom_elements",
+        lambda _smiles: {
+            map_number: geometry_mol.GetAtomWithIdx(index).GetAtomicNum()
+            for index, map_number in enumerate(geometry_maps)
+        },
     )
     monkeypatch.setattr(
         reaction_persistence,
@@ -547,7 +644,10 @@ def test_ts_mapping_rejects_symmetric_map_swap_on_same_geometry(
 
     node = SimpleNamespace(
         role=MappedReactionNodeRole.TRANSITION_STATE,
-        mapped_reaction=SimpleNamespace(id=UUID("00000000-0000-7000-8000-000000000092")),
+        mapped_reaction=SimpleNamespace(
+            id=UUID("00000000-0000-7000-8000-000000000092"),
+            mapped_reaction_smiles=("[C:1].[H:2].[H:3].[H:4].[H:5]>>[C:1].[H:2].[H:3].[H:4].[H:5]"),
+        ),
     )
     node_geometry = SimpleNamespace(
         id=UUID("00000000-0000-7000-8000-000000000093"),
@@ -566,6 +666,11 @@ def test_ts_mapping_rejects_symmetric_map_swap_on_same_geometry(
         reaction_persistence,
         "_logical_map_numbers_for_reaction",
         lambda *_args, **_kwargs: frozenset(old_maps),
+    )
+    monkeypatch.setattr(
+        reaction_persistence,
+        "mapped_reaction_atom_elements",
+        lambda _smiles: {1: 6, 2: 1, 3: 1, 4: 1, 5: 1},
     )
     monkeypatch.setattr(reaction_persistence, "_acquire_identity_locks", lambda *_args: None)
     monkeypatch.setattr(
@@ -587,6 +692,287 @@ def test_ts_mapping_rejects_symmetric_map_swap_on_same_geometry(
             cast(reaction_persistence.MappedReactionNodeGeometry, node_geometry),
             record,
         )
+
+
+def test_ts_mapping_rejects_geometry_element_mismatch_with_reaction_map(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    molecule = Chem.MolFromSmiles("[OH2:1].[CH4:2]")
+    assert molecule is not None
+    topology = SimpleNamespace(
+        mol=molecule,
+        atom_count=molecule.GetNumAtoms(),
+        stereo_status=None,
+    )
+    geometry = SimpleNamespace(mol=molecule, atom_count=molecule.GetNumAtoms(), topology=topology)
+    geometry_maps = [2, 1]
+    mapped_smiles = mapped_smiles_for_geometry(
+        cast(Geometry, geometry),
+        geometry_maps,
+        include_stereochemistry=False,
+    )
+    node = SimpleNamespace(
+        role=MappedReactionNodeRole.TRANSITION_STATE,
+        mapped_reaction=SimpleNamespace(
+            id=UUID("00000000-0000-7000-8000-000000000094"),
+            mapped_reaction_smiles="[O:1].[C:2]>>[O:1].[C:2]",
+        ),
+    )
+    node_geometry = SimpleNamespace(
+        id=UUID("00000000-0000-7000-8000-000000000095"),
+        mapped_reaction_node=node,
+        geometry=geometry,
+        mapped_reaction_participant=None,
+    )
+    session = Session()
+    monkeypatch.setattr(
+        reaction_persistence,
+        "_logical_map_numbers_for_reaction",
+        lambda *_args, **_kwargs: frozenset({1, 2}),
+    )
+    monkeypatch.setattr(
+        reaction_persistence,
+        "_acquire_identity_locks",
+        lambda *_args: None,
+    )
+
+    record = MappedReactionNodeGeometryMappingRecord(
+        geometry_atom_map_numbers=geometry_maps,
+        mapped_smiles=mapped_smiles,
+        mapping_method="source-atom-order",
+        mapping_version="test-v1",
+        verified=True,
+    )
+    with pytest.raises(ValueError, match="TS Geometry map 2"):
+        persist_mapped_reaction_node_geometry_mapping(
+            session,
+            cast(reaction_persistence.MappedReactionNodeGeometry, node_geometry),
+            record,
+            identity_is_new=True,
+        )
+
+
+def test_persisted_ts_geometry_mapping_repairs_nonconserving_vector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    molecule = Chem.MolFromSmiles("CO")
+    assert molecule is not None
+    topology = SimpleNamespace(stereo_status=None)
+    geometry = SimpleNamespace(mol=molecule, atom_count=2, topology=topology)
+    reaction_smiles = "[CH3:1][OH:2]>>[CH2:1]=[O:2]"
+    reaction = SimpleNamespace(mapped_reaction_smiles=reaction_smiles)
+    node = SimpleNamespace(role=MappedReactionNodeRole.TRANSITION_STATE, mapped_reaction=reaction)
+    node_geometry = SimpleNamespace(
+        id=UUID("00000000-0000-7000-8000-00000000009f"),
+        mapped_reaction_node=node,
+        geometry=geometry,
+        mapped_reaction_participant=None,
+    )
+    existing = SimpleNamespace(
+        geometry_atom_map_numbers=[2, 1],
+        mapped_smiles=mapped_smiles_for_geometry(
+            cast(Geometry, geometry),
+            [2, 1],
+            include_stereochemistry=False,
+        ),
+        mapping_method="unresolved-map-transfer",
+        mapping_version="old-v1",
+        verified=False,
+    )
+    session = SimpleNamespace(
+        exec=lambda _statement: SimpleNamespace(first=lambda: existing),
+        add=lambda _entity: None,
+    )
+    monkeypatch.setattr(
+        reaction_persistence,
+        "_logical_map_numbers_for_reaction",
+        lambda *_args, **_kwargs: frozenset({1, 2}),
+    )
+    monkeypatch.setattr(
+        reaction_persistence,
+        "_acquire_identity_locks",
+        lambda *_args: None,
+    )
+    record = MappedReactionNodeGeometryMappingRecord(
+        geometry_atom_map_numbers=[1, 2],
+        mapped_smiles=mapped_smiles_for_geometry(
+            cast(Geometry, geometry),
+            [1, 2],
+            include_stereochemistry=False,
+        ),
+        mapping_method="reaction-ts-geometry-link",
+        mapping_version="reaction-ts-geometry-link-v1",
+        verified=True,
+    )
+
+    repaired = reaction_persistence.persist_mapped_reaction_node_geometry_mapping(
+        cast(Session, session),
+        cast(reaction_persistence.MappedReactionNodeGeometry, node_geometry),
+        record,
+    )
+
+    assert repaired is existing
+    assert existing.geometry_atom_map_numbers == [1, 2]
+    assert existing.verified is True
+
+
+def test_shared_ts_geometry_maps_are_rebased_between_mapping_variants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    topology_id = UUID("00000000-0000-7000-8000-000000000096")
+    logical_participant_id = UUID("00000000-0000-7000-8000-000000000097")
+    side_ids = (
+        LogicalReactionParticipantSide.REACTANT,
+        LogicalReactionParticipantSide.PRODUCT,
+    )
+    source_participants = [
+        SimpleNamespace(
+            side=side,
+            template_index=0,
+            logical_reaction_participant_id=logical_participant_id,
+            concrete_topology_id=topology_id,
+            atom_map_numbers=[1, 2],
+        )
+        for side in side_ids
+    ]
+    target_participants = [
+        SimpleNamespace(
+            side=side,
+            template_index=0,
+            logical_reaction_participant_id=logical_participant_id,
+            concrete_topology_id=topology_id,
+            atom_map_numbers=[2, 1],
+        )
+        for side in side_ids
+    ]
+    session = Session()
+    monkeypatch.setattr(
+        session,
+        "get",
+        lambda _model, _topology_id: SimpleNamespace(atom_count=2),
+    )
+
+    assert _target_ts_geometry_atom_maps(
+        session,
+        source_participants=source_participants,
+        target_participants=target_participants,
+        source_geometry_atom_maps=[1, 2],
+    ) == [2, 1]
+
+
+def test_shared_ts_geometry_is_not_rebased_when_reaction_sides_disagree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    topology_id = UUID("00000000-0000-7000-8000-000000000098")
+    logical_participant_id = UUID("00000000-0000-7000-8000-000000000099")
+    source_participants = [
+        SimpleNamespace(
+            side=side,
+            template_index=0,
+            logical_reaction_participant_id=logical_participant_id,
+            concrete_topology_id=topology_id,
+            atom_map_numbers=[1, 2],
+        )
+        for side in (
+            LogicalReactionParticipantSide.REACTANT,
+            LogicalReactionParticipantSide.PRODUCT,
+        )
+    ]
+    target_participants = [
+        SimpleNamespace(
+            side=LogicalReactionParticipantSide.REACTANT,
+            template_index=0,
+            logical_reaction_participant_id=logical_participant_id,
+            concrete_topology_id=topology_id,
+            atom_map_numbers=[2, 1],
+        ),
+        SimpleNamespace(
+            side=LogicalReactionParticipantSide.PRODUCT,
+            template_index=0,
+            logical_reaction_participant_id=logical_participant_id,
+            concrete_topology_id=topology_id,
+            atom_map_numbers=[1, 2],
+        ),
+    ]
+    session = Session()
+    monkeypatch.setattr(
+        session,
+        "get",
+        lambda _model, _topology_id: SimpleNamespace(atom_count=2),
+    )
+
+    assert (
+        _target_ts_geometry_atom_maps(
+            session,
+            source_participants=source_participants,
+            target_participants=target_participants,
+            source_geometry_atom_maps=[1, 2],
+        )
+        is None
+    )
+
+
+def test_shared_ts_geometry_skips_element_incompatible_sibling_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    topology_id = UUID("00000000-0000-7000-8000-00000000009a")
+    logical_participant_id = UUID("00000000-0000-7000-8000-00000000009b")
+    source_participants = [
+        SimpleNamespace(
+            side=side,
+            template_index=0,
+            logical_reaction_participant_id=logical_participant_id,
+            concrete_topology_id=topology_id,
+            atom_map_numbers=[1, 2],
+        )
+        for side in (
+            LogicalReactionParticipantSide.REACTANT,
+            LogicalReactionParticipantSide.PRODUCT,
+        )
+    ]
+    target_participants = [
+        SimpleNamespace(
+            side=side,
+            template_index=0,
+            logical_reaction_participant_id=logical_participant_id,
+            concrete_topology_id=topology_id,
+            atom_map_numbers=[2, 1],
+        )
+        for side in (
+            LogicalReactionParticipantSide.REACTANT,
+            LogicalReactionParticipantSide.PRODUCT,
+        )
+    ]
+    session = Session()
+    monkeypatch.setattr(
+        session,
+        "get",
+        lambda _model, _topology_id: SimpleNamespace(atom_count=2),
+    )
+    molecule = Chem.MolFromSmiles("CO")
+    assert molecule is not None
+    geometry = SimpleNamespace(id=UUID("00000000-0000-7000-8000-00000000009c"), mol=molecule)
+    reaction = "[CH3:1][OH:2]>>[CH2:1]=[O:2]"
+    source_mapping = SimpleNamespace(geometry_atom_map_numbers=[1, 2])
+
+    assert (
+        _validated_target_ts_geometry_atom_maps(
+            session,
+            source_mapped_reaction=SimpleNamespace(
+                id=UUID("00000000-0000-7000-8000-00000000009d"),
+                mapped_reaction_smiles=reaction,
+            ),
+            target_mapped_reaction=SimpleNamespace(
+                id=UUID("00000000-0000-7000-8000-00000000009e"),
+                mapped_reaction_smiles=reaction,
+            ),
+            source_participants=source_participants,
+            target_participants=target_participants,
+            source_mapping=source_mapping,
+            geometry=geometry,
+        )
+        is None
+    )
 
 
 def test_mapped_reaction_uses_rdkit_reaction_parser_with_agents() -> None:
@@ -738,6 +1124,70 @@ def test_concrete_mapping_identity_collapses_symmetric_atom_assignments() -> Non
         participants=(participant((2, 3, 1)),),
     )
     assert first_identity == second_identity
+
+
+def test_concrete_identity_lookup_does_not_reuse_invalid_persisted_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logical_reaction_id = UUID("00000000-0000-0000-0000-000000000011")
+    project_id = UUID("00000000-0000-0000-0000-000000000012")
+    candidate = cast(
+        MappedReaction,
+        SimpleNamespace(
+            id=UUID("00000000-0000-0000-0000-000000000013"),
+            logical_reaction_id=logical_reaction_id,
+            project_id=project_id,
+            mapping_hash="invalid-mapping",
+            mapped_reaction_smiles="[CH3:1]>>[OH:1]",
+        ),
+    )
+
+    class _Result:
+        def first(self) -> object:
+            return project_id
+
+        def all(self) -> tuple[MappedReaction, ...]:
+            return (candidate,)
+
+    class _Session:
+        info: dict[str, object] = {}
+        new: tuple[object, ...] = ()
+
+        def exec(self, _statement: object) -> _Result:
+            return _Result()
+
+    identity = (("reactant", 0, UUID("00000000-0000-0000-0000-000000000014"), "{}"),)
+    session = _Session()
+    monkeypatch.setattr(
+        reaction_persistence,
+        "mapped_reaction_concrete_identity",
+        lambda *_args, **_kwargs: identity,
+    )
+    found = reaction_persistence.find_mapped_reaction_by_concrete_identity(
+        cast(Session, session),
+        logical_reaction_id,
+        identity,
+        project_id=project_id,
+    )
+
+    assert found is None
+
+
+def test_invalid_mapping_is_not_used_as_a_concrete_topology_transfer_seed() -> None:
+    mapped_reaction = cast(
+        MappedReaction,
+        SimpleNamespace(
+            project_id=UUID("00000000-0000-0000-0000-000000000015"),
+            logical_reaction_id=UUID("00000000-0000-0000-0000-000000000016"),
+            mapped_reaction_smiles="[CH3:1]>>[OH:1]",
+        ),
+    )
+
+    assert not mapping_resolution._complete_mapped_reaction(
+        cast(Session, SimpleNamespace()),
+        mapped_reaction,
+        (),
+    )
 
 
 def test_canonical_mapped_topology_handles_highly_symmetric_topology() -> None:
@@ -1051,6 +1501,86 @@ def test_mapping_assignment_preserves_molop_source_atom_order() -> None:
         isomericSmiles=True,
         allHsExplicit=True,
     )
+
+
+def test_mapped_participant_reuses_existing_concrete_topology_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id = UUID("00000000-0000-0000-0000-000000000021")
+    reaction_id = UUID("00000000-0000-0000-0000-000000000022")
+    mapped_reaction = SimpleNamespace(
+        id=UUID("00000000-0000-0000-0000-000000000023"),
+        logical_reaction_id=reaction_id,
+        project_id=project_id,
+    )
+    logical_reaction = SimpleNamespace(id=reaction_id, project_id=project_id)
+    logical_participant = SimpleNamespace(
+        id=UUID("00000000-0000-0000-0000-000000000024"),
+        logical_reaction_id=reaction_id,
+        logical_reaction=logical_reaction,
+        side=LogicalReactionParticipantSide.REACTANT,
+        topology=SimpleNamespace(project_id=project_id),
+    )
+    original_mol = Chem.MolFromSmiles("CO")
+    assert original_mol is not None
+    reordered_mol = Chem.RenumberAtoms(original_mol, [1, 0])
+    original_topology = SimpleNamespace(
+        id=UUID("00000000-0000-0000-0000-000000000025"),
+        project_id=project_id,
+        mol=original_mol,
+        atom_count=original_mol.GetNumAtoms(),
+        stereo_status=None,
+    )
+    reordered_topology = SimpleNamespace(
+        id=UUID("00000000-0000-0000-0000-000000000026"),
+        project_id=project_id,
+        mol=reordered_mol,
+        atom_count=reordered_mol.GetNumAtoms(),
+        stereo_status=None,
+    )
+    original_maps = [1, 2]
+    reordered_maps = [2, 1]
+    mapped_smiles = mapped_smiles_for_topology(original_topology, original_maps)
+    assert mapped_smiles_for_topology(reordered_topology, reordered_maps) == mapped_smiles
+    existing_assignment = SimpleNamespace(
+        side=LogicalReactionParticipantSide.REACTANT,
+        template_index=0,
+        concrete_topology=original_topology,
+        concrete_topology_id=original_topology.id,
+        atom_map_numbers=original_maps,
+        mapped_smiles=mapped_smiles,
+    )
+    session = Session()
+    added: list[object] = []
+    monkeypatch.setattr(
+        topology_membership,
+        "persist_logical_participant_concrete_topology",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(reaction_persistence, "_acquire_identity_locks", lambda *_args: None)
+    monkeypatch.setattr(
+        session,
+        "exec",
+        lambda _statement: SimpleNamespace(first=lambda: existing_assignment),
+    )
+    monkeypatch.setattr(session, "add", added.append)
+    monkeypatch.setattr(session, "flush", lambda: None)
+
+    reused = persist_mapped_reaction_participant(
+        cast(Session, session),
+        cast(MappedReaction, mapped_reaction),
+        cast(LogicalReactionParticipant, logical_participant),
+        template_index=0,
+        atom_map_numbers=reordered_maps,
+        mapped_smiles=mapped_smiles,
+        concrete_topology=cast(MolecularTopology, reordered_topology),
+    )
+
+    assert reused is existing_assignment
+    assert existing_assignment.concrete_topology_id == original_topology.id
+    assert existing_assignment.atom_map_numbers == original_maps
+    assert existing_assignment.mapped_smiles == mapped_smiles
+    assert added == []
 
 
 @pytest.mark.parametrize("element", ["As", "Se", "Te"])

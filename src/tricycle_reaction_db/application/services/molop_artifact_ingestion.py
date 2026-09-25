@@ -19,13 +19,13 @@ from tricycle_reaction_db.application.dtos import (
     ParseRevisionCompletionRecord,
 )
 from tricycle_reaction_db.application.services._persistence import (
-    LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
     _attach_or_reuse_entity,
     _attach_pending_entities,
     _fast_pending_entity_count,
     _flush_if_needed,
     _set_fast_pending_entities,
     _truncate_fast_pending_entities,
+    source_atom_mapping_is_authoritative,
 )
 from tricycle_reaction_db.application.services.calculations import (
     finalize_parse_revision,
@@ -937,7 +937,7 @@ def reconcile_molop_geometry_context(
                     cache=reconciliation_cache,
                     refresh_thermodynamics=refresh_thermodynamics,
                 )
-        if not session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
+        if not source_atom_mapping_is_authoritative(session):
             # A mapped reaction may have been created after its endpoint
             # Geometry rows were persisted by an earlier ingestion microbatch.
             # The normal Geometry pass cannot discover that ordering, so

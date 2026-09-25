@@ -10,7 +10,7 @@ import logging
 import secrets
 import tempfile
 from collections import Counter
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -31,6 +31,8 @@ from tricycle_reaction_db.application.services.authorization import (
 )
 from tricycle_reaction_db.application.services.mapped_geometry_atom_order import (
     molecule_in_atom_map_order,
+    parse_mapped_reaction_smiles,
+    validate_geometry_atom_map_elements,
 )
 from tricycle_reaction_db.db.models import (
     Geometry,
@@ -265,8 +267,8 @@ def _status_payload(job: UnitsTsDatasetExportJob) -> dict[str, Any]:
 
 def _bond_signature(
     molecule: Chem.Mol,
-) -> dict[tuple[int, int], tuple[int, bool, int, int, int, int, int]]:
-    signatures: dict[tuple[int, int], tuple[int, bool, int, int, int, int, int]] = {}
+) -> dict[tuple[int, int], tuple[str, bool, int, int, int, int, int]]:
+    signatures: dict[tuple[int, int], tuple[str, bool, int, int, int, int, int]] = {}
     for bond in molecule.GetBonds():  # type: ignore[no-untyped-call]
         left = bond.GetBeginAtom().GetAtomMapNum()
         right = bond.GetEndAtom().GetAtomMapNum()
@@ -295,8 +297,11 @@ def _bond_signature(
         if len(stereo_atoms) == 2 and left > right:
             stereo_atoms = (stereo_atoms[1], stereo_atoms[0])
         stereo_left, stereo_right = stereo_atoms if len(stereo_atoms) == 2 else (0, 0)
+        bond_type = str(bond.GetBondType())
+        if bond_type.startswith("DATIVE"):
+            bond_type = f"{bond_type}:{'forward' if left < right else 'reverse'}"
         signatures[pair] = (
-            int(BOND_TYPE_LST.index(bond.GetBondType())),
+            bond_type,
             bond.GetIsAromatic(),
             int(bond.GetStereo()),
             direction_value,
@@ -308,19 +313,15 @@ def _bond_signature(
 
 
 def _mapped_side_signatures(
-    side_smiles: str,
+    templates: Iterable[Chem.Mol],
 ) -> tuple[
-    dict[tuple[int, int], tuple[int, bool, int, int, int, int, int]],
+    dict[tuple[int, int], tuple[str, bool, int, int, int, int, int]],
     dict[int, tuple[int, int, int, int, bool, str]],
 ]:
-    bonds: dict[tuple[int, int], tuple[int, bool, int, int, int, int, int]] = {}
+    bonds: dict[tuple[int, int], tuple[str, bool, int, int, int, int, int]] = {}
     atoms: dict[int, tuple[int, int, int, int, bool, str]] = {}
-    if not side_smiles:
-        return bonds, atoms
-    for component in side_smiles.split("."):
-        molecule = Chem.MolFromSmiles(component, sanitize=False)
-        if molecule is None:
-            raise ValueError("reaction side cannot be parsed by RDKit")
+    for template in templates:
+        molecule = Chem.Mol(template)
         molecule.UpdatePropertyCache(strict=False)
         Chem.AssignStereochemistry(molecule, cleanIt=True, force=True)
         for atom in molecule.GetAtoms():  # type: ignore[no-untyped-call]
@@ -345,15 +346,9 @@ def _mapped_side_signatures(
 def reaction_center_atom_maps(mapped_reaction_smiles: str) -> frozenset[int]:
     """Infer mapped reaction-center atoms from bond and atom changes."""
 
-    sides = mapped_reaction_smiles.split(">")
-    if len(sides) == 2:
-        reactant_side, product_side = sides
-    elif len(sides) == 3:
-        reactant_side, _agents, product_side = sides
-    else:
-        raise ValueError("mapped reaction SMILES must contain one or two '>' separators")
-    reactant_bonds, reactant_atoms = _mapped_side_signatures(reactant_side)
-    product_bonds, product_atoms = _mapped_side_signatures(product_side)
+    reaction = parse_mapped_reaction_smiles(mapped_reaction_smiles)
+    reactant_bonds, reactant_atoms = _mapped_side_signatures(reaction.GetReactants())
+    product_bonds, product_atoms = _mapped_side_signatures(reaction.GetProducts())
     if not reactant_atoms or not product_atoms:
         raise ValueError("mapped reactant and product atoms are required")
 
@@ -429,6 +424,11 @@ def make_units_ts_sample(
     molecule, ordered_atom_map_numbers = molecule_in_atom_map_order(
         geometry.mol,
         geometry_atom_map_numbers,
+    )
+    validate_geometry_atom_map_elements(
+        molecule,
+        ordered_atom_map_numbers,
+        mapped_reaction.mapped_reaction_smiles,
     )
     if molecule.GetNumConformers() != 1 or not molecule.GetConformer().Is3D():
         raise ValueError("TS geometry must contain one 3D conformer")

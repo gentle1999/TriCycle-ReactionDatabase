@@ -5,27 +5,20 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
 from sqlalchemy import delete, text
 from sqlmodel import col, select
 
-from tricycle_reaction_db.application.services.artifact_upload_types import (
-    _FailedInference,
-    _SuccessfulInference,
-)
-from tricycle_reaction_db.application.services.artifact_uploads import (
-    _parse_calculation_output,
-    _persist_transition_state_endpoints,
-    _prepare_inference_topology_records,
-    _resolve_and_bind_transition_state_reaction,
-    infer_transition_states_from_calculation_output,
+from tricycle_reaction_db.application.services.mapped_geometry_atom_order import (
+    mapped_reaction_atom_signatures,
 )
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
     ArtifactIngestion,
     CalculationFrame,
+    Geometry,
     LogicalReaction,
     MappedReaction,
     ParseRevision,
@@ -40,12 +33,19 @@ from tricycle_reaction_db.domain.enums import (
 )
 from tricycle_reaction_db.storage.rustfs import RustFSObjectStore, RustFSSettings
 
+if TYPE_CHECKING:
+    from tricycle_reaction_db.application.services.artifact_upload_types import (
+        _FailedInference,
+        _SuccessfulInference,
+    )
+
 
 @dataclass(slots=True)
 class BackfillResult:
     scanned: int = 0
     completed: int = 0
     skipped: int = 0
+    invalid_mapped_reactions: int = 0
     relinked_reactions: int = 0
     removed_reactions: int = 0
     unavailable: int = 0
@@ -123,6 +123,10 @@ def _remove_unreferenced_reaction(
 def _reinference_settings(inferred: _SuccessfulInference | _FailedInference) -> dict[str, Any]:
     """Record the MolOP endpoint policy used for an endpoint re-inference."""
 
+    from tricycle_reaction_db.application.services.artifact_upload_types import (
+        _SuccessfulInference,
+    )
+
     settings: dict[str, Any] = {
         "endpoint_selection": "molop.possible_pre_post_ts",
     }
@@ -148,6 +152,11 @@ def _source_inference_for(
     fallback: TransitionStateInference,
 ) -> _SuccessfulInference | _FailedInference:
     """Return the re-evaluated TS result, including an explicit absent-frame error."""
+
+    from tricycle_reaction_db.application.services.artifact_upload_types import (
+        _FailedInference,
+        _SuccessfulInference,
+    )
 
     inferred = next(
         (item for item in source_inferences if item.file_frame_index == file_frame_index),
@@ -225,7 +234,23 @@ def _mark_reinference_succeeded(
 ) -> int:
     """Replace endpoint evidence and reaction links with a new TS outcome."""
 
+    from tricycle_reaction_db.application.services._persistence import (
+        source_atom_order_authoritative,
+    )
+    from tricycle_reaction_db.application.services.artifact_uploads import (
+        _persist_transition_state_endpoints,
+        _prepare_inference_topology_records,
+        _resolve_and_bind_transition_state_reaction,
+    )
+    from tricycle_reaction_db.application.services.molecular_geometry import (
+        GeometryPersistenceContext,
+    )
+
     frame = _calculation_frame_for_reinference(session, inference=inference)
+    geometry = session.get(Geometry, frame.geometry_id)
+    if geometry is None or geometry.project_id is None:
+        raise RuntimeError("TS re-inference frame is missing its project-owned Geometry")
+    topology_context = GeometryPersistenceContext(project_id=geometry.project_id)
     old_logical_reaction_id = inference.logical_reaction_id
     old_mapped_reaction_id = inference.mapped_reaction_id
     if inference.calculation_frame_id is not None:
@@ -236,18 +261,21 @@ def _mark_reinference_succeeded(
         )
         session.flush()
     prepared_topology_records = _prepare_inference_topology_records(inferred)
-    logical_reaction_id, mapped_reaction_id = _resolve_and_bind_transition_state_reaction(
-        session,
-        inferred=inferred,
-        calculation_frame=frame,
-        prepared_topology_records=prepared_topology_records,
-    )
-    _persist_transition_state_endpoints(
-        session,
-        calculation_frame=frame,
-        inferred=inferred,
-        prepared_topology_records=prepared_topology_records,
-    )
+    with source_atom_order_authoritative(session):
+        logical_reaction_id, mapped_reaction_id = _resolve_and_bind_transition_state_reaction(
+            session,
+            inferred=inferred,
+            calculation_frame=frame,
+            topology_context=topology_context,
+            prepared_topology_records=prepared_topology_records,
+        )
+        _persist_transition_state_endpoints(
+            session,
+            calculation_frame=frame,
+            inferred=inferred,
+            topology_context=topology_context,
+            prepared_topology_records=prepared_topology_records,
+        )
     inference.imaginary_mode_index = inferred.imaginary_mode_index
     inference.imaginary_frequency_cm1 = inferred.imaginary_frequency_cm1
     inference.status = TransitionStateInferenceStatus.SUCCEEDED
@@ -304,18 +332,98 @@ def _refresh_latest_ingestion_status(
     session.add(ingestion)
 
 
-def _reinfer_all(
+async def _invalid_mapped_reaction_ids(session: Any) -> set[UUID]:
+    """Return persisted reactions that fail RDKit map/element/isotope conservation."""
+
+    invalid_ids: set[UUID] = set()
+    rows = (
+        await session.exec(
+            select(MappedReaction.id, MappedReaction.mapped_reaction_smiles).order_by(
+                col(MappedReaction.id)
+            )
+        )
+    ).all()
+    for row_index, (mapped_reaction_id, mapped_reaction_smiles) in enumerate(rows, start=1):
+        if row_index % 5_000 == 0:
+            print(f"checked {row_index} mapped reactions", flush=True)
+        if mapped_reaction_id is None:
+            continue
+        try:
+            mapped_reaction_atom_signatures(mapped_reaction_smiles)
+        except ValueError:
+            invalid_ids.add(mapped_reaction_id)
+    return invalid_ids
+
+
+def _preflight_reinference(
+    session: Any,
+    *,
+    inference: TransitionStateInference,
+    inferred: _SuccessfulInference,
+) -> None:
+    """Exercise the existing repair path inside a savepoint, then roll it back."""
+
+    savepoint = session.begin_nested()
+    try:
+        _mark_reinference_succeeded(
+            session,
+            inference=inference,
+            inferred=inferred,
+        )
+        if inference.mapped_reaction_id is None:
+            raise RuntimeError("re-inference preflight did not bind a mapped reaction")
+        mapped_reaction = session.get(MappedReaction, inference.mapped_reaction_id)
+        if mapped_reaction is None:
+            raise RuntimeError("re-inference preflight created no mapped reaction")
+        mapped_reaction_atom_signatures(mapped_reaction.mapped_reaction_smiles)
+    finally:
+        if savepoint.is_active:
+            savepoint.rollback()
+
+
+async def _reinfer_all(
     session: Any,
     *,
     limit: int | None,
     inference_id: UUID | None,
+    invalid_mappings_only: bool,
+    invalid_mapped_reaction_ids: set[UUID] | None,
     dry_run: bool,
     statement_timeout_ms: int,
 ) -> BackfillResult:
     """Re-evaluate every persisted TS inference from its immutable raw artifact."""
 
     result = BackfillResult()
-    session.exec(text(f"SET LOCAL statement_timeout = {statement_timeout_ms}"))
+    await session.exec(text(f"SET LOCAL statement_timeout = {statement_timeout_ms}"))
+    if invalid_mappings_only and invalid_mapped_reaction_ids is None:
+        raise ValueError("invalid-mapping repair requires its RDKit pre-scan result")
+    if not invalid_mappings_only and invalid_mapped_reaction_ids is not None:
+        raise ValueError("unexpected invalid mapped-reaction pre-scan result")
+    from tricycle_reaction_db.application.services.artifact_upload_types import (
+        _SuccessfulInference,
+    )
+    from tricycle_reaction_db.application.services.artifact_uploads import (
+        infer_transition_states_from_calculation_output,
+    )
+
+    if invalid_mapped_reaction_ids is not None:
+        result.invalid_mapped_reactions = len(invalid_mapped_reaction_ids)
+        if invalid_mapped_reaction_ids:
+            linked_inferences = await session.exec(
+                select(TransitionStateInference.mapped_reaction_id).where(
+                    col(TransitionStateInference.mapped_reaction_id).in_(
+                        invalid_mapped_reaction_ids
+                    )
+                )
+            )
+            linked_reaction_ids = set(linked_inferences.all())
+            unlinked_reaction_ids = invalid_mapped_reaction_ids - linked_reaction_ids
+            if unlinked_reaction_ids:
+                result.unavailable += len(unlinked_reaction_ids)
+                print(
+                    "unavailable mapped reactions without TS inference: "
+                    f"{len(unlinked_reaction_ids)}"
+                )
     statement = (
         select(TransitionStateInference, ArtifactFile)
         .join(
@@ -327,6 +435,13 @@ def _reinfer_all(
     )
     if inference_id is not None:
         statement = statement.where(col(TransitionStateInference.id) == inference_id)
+    if invalid_mapped_reaction_ids is not None:
+        if invalid_mapped_reaction_ids:
+            statement = statement.where(
+                col(TransitionStateInference.mapped_reaction_id).in_(invalid_mapped_reaction_ids)
+            )
+        else:
+            return result
     if limit is not None:
         statement = statement.limit(limit)
 
@@ -336,17 +451,28 @@ def _reinfer_all(
     parsed: Any | None = None
     touched_ingestions: set[tuple[UUID, UUID]] = set()
     try:
-        for inference, artifact in session.exec(statement).all():
+        inference_rows = (await session.exec(statement)).all()
+        for inference, artifact in inference_rows:
             result.scanned += 1
+            inference_id_value = inference.id
             cache_key = (artifact.bucket, artifact.object_key)
             try:
                 if cache_key != cached_key:
+                    if invalid_mappings_only:
+                        print(
+                            "reparsing source for invalid mapped reaction "
+                            f"{result.scanned}/{result.invalid_mapped_reactions}: "
+                            f"{inference_id_value}",
+                            flush=True,
+                        )
                     store = stores.setdefault(
                         artifact.bucket,
                         RustFSObjectStore(settings.model_copy(update={"bucket": artifact.bucket})),
                     )
-                    parsed = infer_transition_states_from_calculation_output(
-                        store.get_bytes(artifact.object_key),
+                    payload = await asyncio.to_thread(store.get_bytes, artifact.object_key)
+                    parsed = await asyncio.to_thread(
+                        infer_transition_states_from_calculation_output,
+                        payload,
                         artifact.original_filename,
                     )
                     cached_key = cache_key
@@ -358,39 +484,74 @@ def _reinfer_all(
                     fallback=inference,
                 )
                 prior_status = inference.status
-                if not dry_run:
-                    with session.begin_nested():
-                        if isinstance(inferred, _SuccessfulInference):
-                            result.removed_reactions += _mark_reinference_succeeded(
-                                session,
+                if invalid_mappings_only and not isinstance(inferred, _SuccessfulInference):
+                    raise SourceReparseMismatch(
+                        "invalid mapped reaction no longer reproduces a successful TS inference"
+                    )
+                if dry_run and isinstance(inferred, _SuccessfulInference):
+                    await session.run_sync(
+                        lambda sync_session, inference=inference, inferred=inferred: (
+                            _preflight_reinference(
+                                sync_session,
                                 inference=inference,
                                 inferred=inferred,
                             )
-                            if prior_status is TransitionStateInferenceStatus.FAILED:
-                                result.recovered += 1
-                        else:
-                            result.removed_reactions += _mark_reinference_failed(
-                                session,
-                                inference=inference,
-                                inferred=inferred,
-                            )
-                            if prior_status is TransitionStateInferenceStatus.SUCCEEDED:
-                                result.invalidated += 1
+                        ),
+                    )
+                    print(f"preflight passed inference={inference_id_value}", flush=True)
+                elif not dry_run:
+
+                    def persist_reinference(
+                        sync_session: Any,
+                        *,
+                        inference: TransitionStateInference = inference,
+                        inferred: _SuccessfulInference | _FailedInference = inferred,
+                        prior_status: TransitionStateInferenceStatus = prior_status,
+                    ) -> tuple[int, bool, bool]:
+                        with sync_session.begin_nested():
+                            if isinstance(inferred, _SuccessfulInference):
+                                removed_reactions = _mark_reinference_succeeded(
+                                    sync_session,
+                                    inference=inference,
+                                    inferred=inferred,
+                                )
+                                recovered = prior_status is TransitionStateInferenceStatus.FAILED
+                                invalidated = False
+                            else:
+                                removed_reactions = _mark_reinference_failed(
+                                    sync_session,
+                                    inference=inference,
+                                    inferred=inferred,
+                                )
+                                recovered = False
+                                invalidated = (
+                                    prior_status is TransitionStateInferenceStatus.SUCCEEDED
+                                )
+                        return removed_reactions, recovered, invalidated
+
+                    removed, recovered, invalidated = await session.run_sync(persist_reinference)
+                    result.removed_reactions += removed
+                    result.recovered += recovered
+                    result.invalidated += invalidated
                     touched_ingestions.add(
                         (inference.artifact_ingestion_id, inference.parse_revision_id)
                     )
                 result.completed += 1
             except Exception as error:
                 result.failed += 1
-                print(f"failed inference={inference.id}: {type(error).__name__}: {error}")
+                print(f"failed inference={inference_id_value}: {type(error).__name__}: {error}")
         if not dry_run:
-            for ingestion_id, parse_revision_id in touched_ingestions:
-                _refresh_latest_ingestion_status(
-                    session,
-                    ingestion_id=ingestion_id,
-                    parse_revision_id=parse_revision_id,
-                )
-            session.flush()
+
+            def refresh_ingestions(sync_session: Any) -> None:
+                for ingestion_id, parse_revision_id in touched_ingestions:
+                    _refresh_latest_ingestion_status(
+                        sync_session,
+                        ingestion_id=ingestion_id,
+                        parse_revision_id=parse_revision_id,
+                    )
+
+            await session.run_sync(refresh_ingestions)
+            await session.flush()
     finally:
         for store in stores.values():
             store.close()
@@ -405,6 +566,19 @@ def _backfill(
     replace: bool,
     statement_timeout_ms: int,
 ) -> BackfillResult:
+    from tricycle_reaction_db.application.services.artifact_upload_types import (
+        _SuccessfulInference,
+    )
+    from tricycle_reaction_db.application.services.artifact_uploads import (
+        _parse_calculation_output,
+        _persist_transition_state_endpoints,
+        _prepare_inference_topology_records,
+        _resolve_and_bind_transition_state_reaction,
+    )
+    from tricycle_reaction_db.application.services.molecular_geometry import (
+        GeometryPersistenceContext,
+    )
+
     result = BackfillResult()
     session.exec(text(f"SET LOCAL statement_timeout = {statement_timeout_ms}"))
     statement = (
@@ -465,6 +639,10 @@ def _backfill(
                 frame = session.get(CalculationFrame, frame_id)
                 if frame is None:
                     raise RuntimeError("TS inference references a missing CalculationFrame")
+                geometry = session.get(Geometry, frame.geometry_id)
+                if geometry is None or geometry.project_id is None:
+                    raise RuntimeError("TS inference frame is missing its project-owned Geometry")
+                topology_context = GeometryPersistenceContext(project_id=geometry.project_id)
                 if not dry_run:
                     with session.begin_nested():
                         if replace:
@@ -479,6 +657,7 @@ def _backfill(
                             session,
                             calculation_frame=frame,
                             inferred=inferred,
+                            topology_context=topology_context,
                             prepared_topology_records=prepared_topology_records,
                         )
                         old_logical_reaction_id = inference.logical_reaction_id
@@ -488,6 +667,7 @@ def _backfill(
                                 session,
                                 inferred=inferred,
                                 calculation_frame=frame,
+                                topology_context=topology_context,
                                 prepared_topology_records=prepared_topology_records,
                             )
                         )
@@ -574,6 +754,21 @@ async def main() -> None:
             "their endpoint and reaction evidence"
         ),
     )
+    parser.add_argument(
+        "--invalid-mappings-only",
+        action="store_true",
+        help=(
+            "restrict --reinfer-all to persisted reactions that fail RDKit atom-map "
+            "element/isotope conservation; --dry-run exercises each repair in a rolled-back "
+            "savepoint"
+        ),
+    )
+    parser.add_argument(
+        "--graph-match-timeout-seconds",
+        type=float,
+        default=None,
+        help="maintenance-only RDKit graph-match timeout override (maximum 300 seconds)",
+    )
     args = parser.parse_args()
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be positive")
@@ -583,19 +778,37 @@ async def main() -> None:
         )
     if args.reinfer_all and not args.replace:
         parser.error("--reinfer-all requires --replace")
+    if args.invalid_mappings_only and not args.reinfer_all:
+        parser.error("--invalid-mappings-only requires --reinfer-all")
+    if args.invalid_mappings_only and (args.inference_id is not None or args.limit is not None):
+        parser.error("--invalid-mappings-only cannot be combined with --inference-id or --limit")
+    if args.graph_match_timeout_seconds is not None and not (
+        0 < args.graph_match_timeout_seconds <= 300
+    ):
+        parser.error("--graph-match-timeout-seconds must be greater than 0 and at most 300")
+    if args.graph_match_timeout_seconds is not None:
+        from tricycle_reaction_db.core.config import get_settings
+
+        get_settings().molecular_graph_match_timeout_seconds = args.graph_match_timeout_seconds
 
     async with session_factory() as session:
-        result = await session.run_sync(
-            lambda sync_session: (
-                _reinfer_all(
-                    sync_session,
-                    limit=args.limit,
-                    inference_id=args.inference_id,
-                    dry_run=args.dry_run,
-                    statement_timeout_ms=args.statement_timeout_ms,
-                )
-                if args.reinfer_all
-                else _backfill(
+        invalid_mapped_reaction_ids: set[UUID] | None = None
+        if args.invalid_mappings_only:
+            await session.exec(text(f"SET LOCAL statement_timeout = {args.statement_timeout_ms}"))
+            invalid_mapped_reaction_ids = await _invalid_mapped_reaction_ids(session)
+        if args.reinfer_all:
+            result = await _reinfer_all(
+                session,
+                limit=args.limit,
+                inference_id=args.inference_id,
+                invalid_mappings_only=args.invalid_mappings_only,
+                invalid_mapped_reaction_ids=invalid_mapped_reaction_ids,
+                dry_run=args.dry_run,
+                statement_timeout_ms=args.statement_timeout_ms,
+            )
+        else:
+            result = await session.run_sync(
+                lambda sync_session: _backfill(
                     sync_session,
                     limit=args.limit,
                     dry_run=args.dry_run,
@@ -603,8 +816,7 @@ async def main() -> None:
                     statement_timeout_ms=args.statement_timeout_ms,
                 )
             )
-        )
-        if args.dry_run:
+        if args.dry_run or (args.invalid_mappings_only and (result.failed or result.unavailable)):
             await session.rollback()
         else:
             await session.commit()
@@ -615,11 +827,14 @@ async def main() -> None:
     )
     print(
         f"{operation}: "
+        f"invalid_mapped_reactions={result.invalid_mapped_reactions} "
         f"scanned={result.scanned} completed={result.completed} "
         f"skipped={result.skipped} relinked_reactions={result.relinked_reactions} "
         f"removed_reactions={result.removed_reactions} unavailable={result.unavailable} "
         f"recovered={result.recovered} invalidated={result.invalidated} failed={result.failed}"
     )
+    if args.invalid_mappings_only and (result.failed or result.unavailable):
+        raise SystemExit(1)
     if result.failed:
         raise SystemExit(1)
 

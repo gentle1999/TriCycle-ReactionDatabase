@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, cast
 from uuid import UUID
@@ -17,9 +19,12 @@ from tricycle_reaction_db.application.dtos import (
     MappedReactionNodeRecord,
 )
 from tricycle_reaction_db.application.services._persistence import (
-    LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
     _acquire_identity_locks,
     _require_id,
+    source_atom_mapping_is_authoritative,
+)
+from tricycle_reaction_db.application.services.mapped_geometry_atom_order import (
+    validate_geometry_atom_map_elements,
 )
 from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics_persistence import (
     mark_mapped_reactions_thermodynamics_dirty,
@@ -70,6 +75,8 @@ from tricycle_reaction_db.domain.enums import (
     OptimizationStatus,
 )
 from tricycle_reaction_db.domain.reaction_frames import is_transition_state_frame_eligible
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -444,6 +451,11 @@ def _ensure_mapping(
         # record binds source atom identity to TS coordinates; TS E/Z must not
         # constrain endpoint mappings and metal-controlled E/Z may not have a
         # lossless SMILES representation.
+        validate_geometry_atom_map_elements(
+            node_geometry.geometry.mol,
+            coordinate_atom_maps,
+            node_geometry.mapped_reaction_node.mapped_reaction.mapped_reaction_smiles,
+        )
         mapped_smiles = mapped_smiles_for_geometry(
             node_geometry.geometry,
             coordinate_atom_maps,
@@ -480,6 +492,25 @@ def _ensure_mapping(
             )
         )
         if not mapping_matches:
+            if transition_state_mapping:
+                try:
+                    validate_geometry_atom_map_elements(
+                        node_geometry.geometry.mol,
+                        existing.geometry_atom_map_numbers,
+                        node_geometry.mapped_reaction_node.mapped_reaction.mapped_reaction_smiles,
+                    )
+                except ValueError:
+                    # A current source-derived vector may repair an invalid
+                    # historical row. A different mapping that still
+                    # conserves elements remains an explicit identity conflict.
+                    existing.geometry_atom_map_numbers = coordinate_atom_maps
+                    existing.mapped_smiles = mapped_smiles
+                    existing.mapping_method = mapping_method
+                    existing.mapping_version = mapping_version
+                    existing.verified = True
+                    session.add(existing)
+                    cache.mappings_by_node_geometry_id[node_geometry_id] = existing
+                    return existing
             raise ValueError("existing node Geometry has an incompatible reaction mapping")
         if transition_state_mapping and (
             existing.mapped_smiles != existing_mapped_smiles
@@ -666,6 +697,139 @@ def _concrete_participant_topology_id(
     return logical_participant.topology_id
 
 
+def _target_ts_geometry_atom_maps(
+    session: Session,
+    *,
+    source_participants: Iterable[MappedReactionParticipant],
+    target_participants: Iterable[MappedReactionParticipant],
+    source_geometry_atom_maps: Iterable[int],
+) -> list[int] | None:
+    """Rebase source TS maps when paired participants share the same atom order."""
+
+    source_by_key = {
+        (participant.side, participant.template_index): participant
+        for participant in source_participants
+    }
+    target_by_key = {
+        (participant.side, participant.template_index): participant
+        for participant in target_participants
+    }
+    if not source_by_key or source_by_key.keys() != target_by_key.keys():
+        return None
+
+    source_to_target: dict[int, int] = {}
+    target_to_source: dict[int, int] = {}
+    source_reaction_maps: set[int] = set()
+    for key, source_participant in source_by_key.items():
+        target_participant = target_by_key[key]
+        if (
+            source_participant.logical_reaction_participant_id
+            != target_participant.logical_reaction_participant_id
+        ):
+            return None
+        source_topology_id = _concrete_participant_topology_id(session, source_participant)
+        target_topology_id = _concrete_participant_topology_id(session, target_participant)
+        if source_topology_id != target_topology_id:
+            return None
+        topology = session.get(MolecularTopology, source_topology_id)
+        if topology is None:
+            topology = next(
+                (
+                    entity
+                    for entity in (
+                        *tuple(session.new),
+                        *tuple(session.info.get("_fast_pending_entities", ())),
+                    )
+                    if isinstance(entity, MolecularTopology) and entity.id == source_topology_id
+                ),
+                None,
+            )
+        if topology is None:
+            return None
+        source_maps = list(source_participant.atom_map_numbers)
+        target_maps = list(target_participant.atom_map_numbers)
+        if (
+            len(source_maps) != topology.atom_count
+            or len(target_maps) != topology.atom_count
+            or any(number <= 0 for number in (*source_maps, *target_maps))
+            or len(set(source_maps)) != len(source_maps)
+            or len(set(target_maps)) != len(target_maps)
+        ):
+            return None
+        source_reaction_maps.update(source_maps)
+        for source_map, target_map in zip(source_maps, target_maps, strict=True):
+            previous_target = source_to_target.setdefault(source_map, target_map)
+            previous_source = target_to_source.setdefault(target_map, source_map)
+            if previous_target != target_map or previous_source != source_map:
+                return None
+
+    source_geometry_atom_maps = list(source_geometry_atom_maps)
+    if set(source_geometry_atom_maps) != source_reaction_maps:
+        return None
+    return [source_to_target[map_number] for map_number in source_geometry_atom_maps]
+
+
+def _validated_target_ts_geometry_atom_maps(
+    session: Session,
+    *,
+    source_mapped_reaction: MappedReaction,
+    target_mapped_reaction: MappedReaction,
+    source_participants: Iterable[MappedReactionParticipant],
+    target_participants: Iterable[MappedReactionParticipant],
+    source_mapping: MappedReactionNodeGeometryMapping,
+    geometry: Geometry,
+) -> list[int] | None:
+    """Transfer TS maps only when both stored reactions conserve source elements.
+
+    A stale or malformed sibling mapping must not make a valid raw-source
+    inference fail while its TS geometry is being bound. Check the source
+    vector against its own reaction before translating it, then check the
+    translated vector against the target reaction before creating any target
+    geometry rows.
+    """
+
+    try:
+        validate_geometry_atom_map_elements(
+            geometry.mol,
+            source_mapping.geometry_atom_map_numbers,
+            source_mapped_reaction.mapped_reaction_smiles,
+        )
+    except ValueError as error:
+        logger.warning(
+            "Not sharing invalid TS atom mapping for Geometry %s from mapped reaction %s: %s",
+            geometry.id,
+            source_mapped_reaction.id,
+            error,
+        )
+        return None
+
+    target_geometry_atom_maps = _target_ts_geometry_atom_maps(
+        session,
+        source_participants=source_participants,
+        target_participants=target_participants,
+        source_geometry_atom_maps=source_mapping.geometry_atom_map_numbers,
+    )
+    if target_geometry_atom_maps is None:
+        return None
+    try:
+        validate_geometry_atom_map_elements(
+            geometry.mol,
+            target_geometry_atom_maps,
+            target_mapped_reaction.mapped_reaction_smiles,
+        )
+    except ValueError as error:
+        logger.warning(
+            "Not sharing TS Geometry %s from mapped reaction %s to %s: "
+            "transferred atom mapping is incompatible: %s",
+            geometry.id,
+            source_mapped_reaction.id,
+            target_mapped_reaction.id,
+            error,
+        )
+        return None
+    return target_geometry_atom_maps
+
+
 def share_mapped_reaction_evidence(
     session: Session,
     *,
@@ -736,6 +900,20 @@ def share_mapped_reaction_evidence(
             col(MappedReactionNodeGeometry.coordinate_index),
         )
     ).all()
+    source_participants = tuple(
+        session.exec(
+            select(MappedReactionParticipant).where(
+                MappedReactionParticipant.mapped_reaction_id == source_id,
+            )
+        ).all()
+    ) + tuple(
+        entity
+        for entity in (
+            *tuple(session.new),
+            *tuple(session.info.get("_fast_pending_entities", ())),
+        )
+        if isinstance(entity, MappedReactionParticipant) and entity.mapped_reaction_id == source_id
+    )
     source_transition_state_exists = bool(
         session.exec(
             select(MappedReactionNode.id)
@@ -821,6 +999,33 @@ def share_mapped_reaction_evidence(
 
         if source_node.role is not MappedReactionNodeRole.TRANSITION_STATE:
             continue
+
+        source_mapping = session.exec(
+            select(MappedReactionNodeGeometryMapping).where(
+                MappedReactionNodeGeometryMapping.mapped_reaction_node_geometry_id
+                == _require_id(source_binding, label="source MappedReactionNodeGeometry")
+            )
+        ).first()
+        if source_mapping is None:
+            continue
+        target_geometry_atom_maps = _validated_target_ts_geometry_atom_maps(
+            session,
+            source_mapped_reaction=source_mapped_reaction,
+            target_mapped_reaction=target_mapped_reaction,
+            source_participants=source_participants,
+            target_participants=target_participants.values(),
+            source_mapping=source_mapping,
+            geometry=geometry,
+        )
+        if target_geometry_atom_maps is None:
+            logger.info(
+                "Not sharing TS Geometry %s between mapped reactions %s and %s: "
+                "participant atom correspondence is not unique",
+                geometry.id,
+                source_id,
+                target_id,
+            )
+            continue
         target_node = _target_node_for_source_node(
             session,
             source_node=source_node,
@@ -839,20 +1044,53 @@ def share_mapped_reaction_evidence(
             # The source TS binding already passed thermodynamic eligibility.
             thermodynamic_property_verified=True,
         )
-        source_mapping = session.exec(
-            select(MappedReactionNodeGeometryMapping).where(
-                MappedReactionNodeGeometryMapping.mapped_reaction_node_geometry_id
-                == _require_id(source_binding, label="source MappedReactionNodeGeometry")
-            )
-        ).first()
-        if source_mapping is not None:
-            _ensure_mapping(
-                session,
-                node_geometry=node_geometry,
-                coordinate_atom_maps=list(source_mapping.geometry_atom_map_numbers),
-                mapped_smiles=source_mapping.mapped_smiles,
-                cache=cache,
-            )
+        node_geometry_id = _require_id(node_geometry, label="target MappedReactionNodeGeometry")
+        existing_mapping = (
+            cache.mappings_by_node_geometry_id.get(node_geometry_id)
+            if cache is not None and node_geometry_id in cache.loaded_mappings
+            else session.exec(
+                select(MappedReactionNodeGeometryMapping).where(
+                    MappedReactionNodeGeometryMapping.mapped_reaction_node_geometry_id
+                    == node_geometry_id,
+                )
+            ).first()
+        )
+        if (
+            existing_mapping is not None
+            and existing_mapping.geometry_atom_map_numbers != target_geometry_atom_maps
+        ):
+            try:
+                validate_geometry_atom_map_elements(
+                    geometry.mol,
+                    existing_mapping.geometry_atom_map_numbers,
+                    target_mapped_reaction.mapped_reaction_smiles,
+                )
+            except ValueError:
+                logger.warning(
+                    "Replacing invalid TS atom mapping for Geometry %s on mapped reaction %s "
+                    "with source-derived evidence",
+                    geometry.id,
+                    target_id,
+                )
+            else:
+                logger.warning(
+                    "Not replacing element-valid TS atom mapping for Geometry %s on mapped "
+                    "reaction %s; the stored vector differs from the transferred source mapping",
+                    geometry.id,
+                    target_id,
+                )
+                continue
+        _ensure_mapping(
+            session,
+            node_geometry=node_geometry,
+            coordinate_atom_maps=target_geometry_atom_maps,
+            mapped_smiles=mapped_smiles_for_geometry(
+                geometry,
+                target_geometry_atom_maps,
+                include_stereochemistry=False,
+            ),
+            cache=cache,
+        )
         geometry_id = _require_id(geometry, label="Geometry")
         copied_geometry_ids.add(geometry_id)
 
@@ -1104,7 +1342,7 @@ def reconcile_geometry_with_reactions(
         if mapped_reaction is not None:
             affected_reactions[participant.mapped_reaction_id] = mapped_reaction
 
-    if not session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
+    if not source_atom_mapping_is_authoritative(session):
         # A Geometry may be the source-compatible concrete member for a mapped
         # participant whose strict topology was reconstructed only from a TS
         # endpoint.  Such a mapping has no exact participant binding by design,
@@ -1678,7 +1916,7 @@ def bind_transition_state_frame(
     mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
     if cache is not None:
         cache.affected_reactions_by_id[mapped_reaction_id] = mapped_reaction
-    if not session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
+    if not source_atom_mapping_is_authoritative(session):
         sibling_reactions = session.exec(
             select(MappedReaction).where(
                 MappedReaction.logical_reaction_id == mapped_reaction.logical_reaction_id,

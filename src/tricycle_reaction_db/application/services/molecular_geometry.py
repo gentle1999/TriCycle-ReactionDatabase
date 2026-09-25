@@ -20,13 +20,13 @@ from tricycle_reaction_db.application.dtos.chemistry import (
     NormalizedTopologyRecord,
 )
 from tricycle_reaction_db.application.services._persistence import (
-    LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
     _acquire_identity_locks,
     _assert_record_matches,
     _flush_shared_entity,
     _new_entity,
     _project_owner_predicate,
     _require_id,
+    source_atom_mapping_is_authoritative,
 )
 from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
     reconcile_geometry_with_reactions,
@@ -691,7 +691,7 @@ def _register_topology_upstreams(
 
 
 def _legacy_bulk_import_enabled(session: Session) -> bool:
-    return bool(session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False))
+    return source_atom_mapping_is_authoritative(session)
 
 
 def _preload_molecular_topologies(

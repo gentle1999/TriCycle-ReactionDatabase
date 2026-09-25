@@ -13,6 +13,9 @@ from tricycle_reaction_db.application.services._persistence import (
     _attach_pending_entities,
     _require_id,
 )
+from tricycle_reaction_db.application.services.mapped_geometry_atom_order import (
+    mapped_reaction_atom_signatures,
+)
 from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
     ReconciliationBatchCache,
     reconcile_mapped_reaction_with_geometries,
@@ -416,6 +419,10 @@ def _complete_mapped_reaction(
 ) -> bool:
     """Return whether one mapped reaction is safe to use as a transfer seed."""
 
+    try:
+        mapped_reaction_atom_signatures(mapped_reaction.mapped_reaction_smiles)
+    except ValueError:
+        return False
     project_id = _require_project_owner(mapped_reaction, label="MappedReaction")
     logical_participants = _logical_participants_for_reaction(
         session,

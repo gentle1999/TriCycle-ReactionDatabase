@@ -3,7 +3,8 @@
 import json
 import os
 import secrets
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from hashlib import sha256
 from math import isnan
@@ -25,6 +26,31 @@ from sqlmodel import Session
 from tricycle_reaction_db.db.models import LogicalReaction
 
 LEGACY_BULK_IMPORT_SESSION_INFO_KEY = "tricycle_legacy_bulk_import"
+SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY = "tricycle_source_atom_order_authoritative"
+
+
+def source_atom_mapping_is_authoritative(session: Session) -> bool:
+    """Whether source atom indices are the authoritative mapping evidence."""
+
+    return bool(
+        session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False)
+        or session.info.get(SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY, False)
+    )
+
+
+@contextmanager
+def source_atom_order_authoritative(session: Session) -> Iterator[None]:
+    """Scope source-index preservation to one raw TS inference persistence."""
+
+    previous = session.info.get(SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY)
+    session.info[SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY] = True
+    try:
+        yield
+    finally:
+        if previous is None:
+            session.info.pop(SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY, None)
+        else:
+            session.info[SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY] = previous
 
 _FAST_INSERT_SAFE_LOCK_NAMES = frozenset(
     {

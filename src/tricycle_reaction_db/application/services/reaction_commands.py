@@ -3,7 +3,7 @@
 import re
 from dataclasses import dataclass, replace
 from hashlib import sha256
-from typing import cast
+from typing import Any, cast
 from uuid import UUID
 
 from nexusx import UseCaseService, mutation  # type: ignore[import-untyped]
@@ -23,8 +23,10 @@ from tricycle_reaction_db.application.dtos import (
 from tricycle_reaction_db.application.query_cost import enforce_structure_input_budget
 from tricycle_reaction_db.application.services._persistence import (
     LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
+    SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY,
     _project_owner_predicate,
     _require_id,
+    source_atom_mapping_is_authoritative,
 )
 from tricycle_reaction_db.application.services.audit import AuditService
 from tricycle_reaction_db.application.services.authentication import current_principal
@@ -201,11 +203,12 @@ def _atom_maps_in_persisted_topology_order(
     persisted_topology: MolecularTopology,
     atom_map_numbers: list[int],
 ) -> list[int]:
-    """Translate a map vector when graph identity reuses another atom ordering.
+    """Translate maps across graph-identical projections with different atom order.
 
-    This matches one topology to the same topology only. It does not infer
-    correspondence between reaction sides; candidate projections are accepted
-    only when their fully atom-labelled serialization reproduces the source.
+    Stereo is ignored only while finding this within-topology atom-order
+    correspondence; unique temporary atom labels must still reproduce the
+    source connectivity, bond orders, charges, and isotopes exactly. This does
+    not infer correspondence between reaction sides.
     """
 
     if not atom_map_numbers:
@@ -223,6 +226,7 @@ def _atom_maps_in_persisted_topology_order(
     source_labelled_smiles = mapped_smiles_for_topology(
         cast(MolecularTopology, source_topology),
         source_labels,
+        include_stereochemistry=False,
     )
 
     def translated_maps(match: tuple[int, ...]) -> list[int]:
@@ -233,7 +237,11 @@ def _atom_maps_in_persisted_topology_order(
 
     def matching_projection(match: tuple[int, ...]) -> list[int] | None:
         candidate = translated_maps(match)
-        candidate_smiles = mapped_smiles_for_topology(persisted_topology, source_labels_for(match))
+        candidate_smiles = mapped_smiles_for_topology(
+            persisted_topology,
+            source_labels_for(match),
+            include_stereochemistry=False,
+        )
         if candidate_smiles == source_labelled_smiles:
             return candidate
         return None
@@ -244,13 +252,20 @@ def _atom_maps_in_persisted_topology_order(
             translated[persisted_index] = source_labels[source_index]
         return translated
 
-    if mapped_smiles_for_topology(persisted_topology, source_labels) == source_labelled_smiles:
+    if (
+        mapped_smiles_for_topology(
+            persisted_topology,
+            source_labels,
+            include_stereochemistry=False,
+        )
+        == source_labelled_smiles
+    ):
         return atom_map_numbers.copy()
 
     first_matches = persisted_mol.GetSubstructMatches(
         source_mol,
         uniquify=False,
-        useChirality=True,
+        useChirality=False,
         maxMatches=1,
     )
     if not first_matches:
@@ -263,7 +278,7 @@ def _atom_maps_in_persisted_topology_order(
     matches = persisted_mol.GetSubstructMatches(
         source_mol,
         uniquify=False,
-        useChirality=True,
+        useChirality=False,
         maxMatches=4096,
     )
     for match in matches[1:]:
@@ -273,6 +288,38 @@ def _atom_maps_in_persisted_topology_order(
     raise ValueError(
         "could not verify source atom order against the reused molecular topology projection"
     )
+
+
+def _ordered_molecular_graph_signature(mol: Any) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    """Describe atom and bond properties in their existing index order."""
+
+    atoms = tuple(
+        (
+            atom.GetAtomicNum(),
+            atom.GetIsotope(),
+            atom.GetFormalCharge(),
+            atom.GetNumRadicalElectrons(),
+            int(atom.GetChiralTag()),
+            atom.GetIsAromatic(),
+            atom.GetNoImplicit(),
+            atom.GetNumExplicitHs(),
+        )
+        for atom in mol.GetAtoms()
+    )
+    bonds = tuple(
+        sorted(
+            (
+                bond.GetBeginAtomIdx(),
+                bond.GetEndAtomIdx(),
+                str(bond.GetBondType()),
+                bond.GetIsAromatic(),
+                int(bond.GetStereo()),
+                tuple(int(index) for index in bond.GetStereoAtoms()),
+            )
+            for bond in mol.GetBonds()
+        )
+    )
+    return atoms, bonds
 
 
 def _resolve_components(
@@ -318,19 +365,55 @@ def _resolve_components(
                 normalized,
                 context=topology_context,
             )
+            logical_topology = None
+            if session.info.get(SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY, False):
+                logical_record = normalize_topology(
+                    normalized.topology.mol,
+                    add_hydrogens=False,
+                    reconstruction_method=normalized.topology_derivation.reconstruction_method,
+                    reconstruction_version=normalized.topology_derivation.reconstruction_version,
+                    reconstruction_metadata=(
+                        normalized.topology_derivation.reconstruction_metadata
+                    ),
+                )
+                logical_topology = persist_molecular_topology(
+                    session,
+                    logical_record,
+                    context=topology_context,
+                ).topology
             if include_creation_metadata and existing is None:
                 topologies_created += 1
+            if session.info.get(SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY, False):
+                source_mol = normalized.topology.mol
+                persisted_mol = persisted.topology.mol
+                if _ordered_molecular_graph_signature(source_mol) != (
+                    _ordered_molecular_graph_signature(persisted_mol)
+                ):
+                    raise ValueError(
+                        "source-index-preserving topology identity collision: "
+                        f"requested={normalized.topology.identity_schema_version}/"
+                        f"{normalized.topology.graph_hash}, "
+                        f"resolved={persisted.topology.identity_schema_version}/"
+                        f"{persisted.topology.graph_hash}, "
+                        "the source-index identity did not distinguish their atom orders"
+                    )
+                topology_atom_maps_in_persisted_order = [
+                    int(number) for number in topology_atom_maps
+                ]
+            else:
+                topology_atom_maps_in_persisted_order = _atom_maps_in_persisted_topology_order(
+                    normalized.topology,
+                    persisted.topology,
+                    [int(number) for number in topology_atom_maps],
+                )
             components.append(
                 _ResolvedComponent(
                     side=side,
                     template_index=template_index,
                     formula=persisted.formula,
                     topology=persisted.topology,
-                    topology_atom_map_numbers=_atom_maps_in_persisted_topology_order(
-                        normalized.topology,
-                        persisted.topology,
-                        [int(number) for number in topology_atom_maps],
-                    ),
+                    topology_atom_map_numbers=topology_atom_maps_in_persisted_order,
+                    logical_topology=logical_topology,
                 )
             )
         component_keys = [(component.side, component.template_index) for component in components]
@@ -600,7 +683,15 @@ def _create_reaction(
         precomputed_topology_records=precomputed_topology_records,
     )
     mapping_complete = _has_complete_mapping(components)
-    if session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
+    if session.info.get(SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY, False):
+        # Raw MolOP endpoint indices determine mapping identity. Keep the
+        # separately normalized canonical topology only for logical reaction
+        # identity; concrete participant maps remain in source atom order.
+        logical_components = [
+            replace(component, logical_topology=component.logical_topology or component.topology)
+            for component in components
+        ]
+    elif session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
         # The previous batch importer used the MolGR endpoint topologies as
         # the logical reaction identities. Keep its hot path for durable
         # reparses; stereo abstraction/membership expansion remains enabled
@@ -656,7 +747,7 @@ def _create_reaction(
             ),
             candidate_topologies=(
                 ()
-                if session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False)
+                if source_atom_mapping_is_authoritative(session)
                 else (component.topology,)
             ),
         )
@@ -755,7 +846,9 @@ def _create_reaction(
     # whenever the caller is not deferring the batch barrier.  The deferred
     # path performs the same reaction-level pass after all pending rows are
     # flushed, because fast insertion deliberately hides them from SQL reads.
-    if not defer_geometry_reconciliation:
+    if not defer_geometry_reconciliation and not session.info.get(
+        SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY, False
+    ):
         from tricycle_reaction_db.application.services.reaction_mapping_resolution import (
             ensure_mapped_reactions_for_logical_reaction,
         )
@@ -795,7 +888,7 @@ def _create_reaction(
             raise ValueError("deferred Geometry reconciliation requires a topology context")
         mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
         topology_context.mapped_reactions_to_reconcile[mapped_reaction_id] = mapped_reaction
-    else:
+    elif not session.info.get(SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY, False):
         reconcile_mapped_reaction_with_geometries(
             session,
             mapped_reaction,
