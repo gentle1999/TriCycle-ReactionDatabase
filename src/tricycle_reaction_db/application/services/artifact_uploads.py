@@ -2672,6 +2672,12 @@ def _resolve_and_bind_transition_state_reaction(
         logical_reaction_id, mapped_reaction_id = cached_reaction_ids
         if topology_context is not None:
             topology_context.inferred_reaction_cache_hits += 1
+    if topology_context is not None and legacy_bulk_import:
+        # The source-order authority scope ends with this inference savepoint,
+        # while topology and geometry reconciliation happens at the batch
+        # barrier. Preserve the authority on that file context so the later
+        # phase cannot infer another atom correspondence from graph matching.
+        topology_context.source_atom_order_authoritative = True
     mapped_reaction = (
         topology_context.mapped_reactions_by_id.get(mapped_reaction_id)
         if topology_context is not None
@@ -2898,6 +2904,7 @@ _INFERENCE_CONTEXT_MUTABLE_FIELDS = (
     "in_memory_geometries_by_identity",
     "geometries_to_reconcile",
     "topologies_to_resolve_reactions",
+    "source_atom_order_authoritative",
     "logical_reactions_to_resolve_mappings",
     "reaction_participants_by_topology",
     "mapped_reactions_by_id",

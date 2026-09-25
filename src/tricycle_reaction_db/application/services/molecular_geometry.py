@@ -167,6 +167,10 @@ class GeometryPersistenceContext:
     # existing reaction lookup.
     mapped_reactions_to_reconcile: dict[UUID, MappedReaction] = field(default_factory=dict)
     topologies_to_resolve_reactions: set[UUID] = field(default_factory=set)
+    # A TS inference binds atom maps directly to its source atom indices.
+    # Keep that authority across the later file-level reconciliation barrier,
+    # which runs after the per-inference Session flag has been cleared.
+    source_atom_order_authoritative: bool = False
     # Batch reaction creation can defer expansion until every topology and
     # participant row is visible to SQL. Keep those logical reactions for the
     # same reconciliation barrier that resolves newly persisted topologies.

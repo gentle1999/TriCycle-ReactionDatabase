@@ -863,10 +863,13 @@ def _create_reaction(
     else:
         if topology_context is None:
             raise ValueError("deferred Geometry reconciliation requires a topology context")
-        logical_reaction_id = _require_id(logical_reaction, label="LogicalReaction")
-        topology_context.logical_reactions_to_resolve_mappings[logical_reaction_id] = (
-            logical_reaction
-        )
+        if source_atom_mapping_is_authoritative(session):
+            topology_context.source_atom_order_authoritative = True
+        else:
+            logical_reaction_id = _require_id(logical_reaction, label="LogicalReaction")
+            topology_context.logical_reactions_to_resolve_mappings[logical_reaction_id] = (
+                logical_reaction
+            )
     reactant_node = resolve_endpoint_node(
         session,
         mapped_reaction,
