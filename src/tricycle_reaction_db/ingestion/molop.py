@@ -1,5 +1,7 @@
 """Stable adapter from public MolOP frame fields to ingestion DTOs."""
 
+import logging
+from importlib import import_module
 from importlib.metadata import version
 from typing import Any, Literal
 
@@ -17,9 +19,128 @@ from tricycle_reaction_db.ingestion.normalization import (
     normalize_molgr_stereochemistry,
 )
 
+logger = logging.getLogger(__name__)
 MOLOP_VERSION = version("molop")
 MOLGR_VERSION = version("molgr")
 MOLECULAR_GRAPH_RECONSTRUCTION_FAILURE_POLICY: Literal["return_suspicious"] = "return_suspicious"
+
+
+def _install_molop_gaussian_ingestion_compatibility() -> None:
+    """Keep usable source-order frames when optional MolOP fields are malformed.
+
+    MolOP 0.2.20 can reject an otherwise readable Gaussian log while building
+    file-level orientation metadata from mismatched input/output atom arrays,
+    or while validating optional orbital-symmetry/force arrays. Those values
+    are not needed to establish a frame's atom order. Per-frame coordinates and
+    their source indices remain untouched.
+    """
+
+    file_parser = import_module("molop.io.logic.gaussian.log.parsers.G16LogFileParser")
+    original_transform = getattr(
+        file_parser,
+        "extract_g16_standard_orientation_transformation_matrix",
+        None,
+    )
+    if callable(original_transform) and not getattr(
+        original_transform, "_tricycle_safe_shape", False
+    ):
+
+        def safe_transform(context: Any) -> Any:
+            try:
+                return original_transform(context)
+            except ValueError as error:
+                if not str(error).startswith("Shape mismatch: P="):
+                    raise
+                # This is only file-level metadata. Frame-level input and
+                # standard coordinates are parsed independently and retain
+                # their original atom order.
+                logger.warning(
+                    "Skipping MolOP file-level orientation transform with mismatched arrays: %s",
+                    error,
+                )
+                return None
+
+        safe_transform._tricycle_safe_shape = True  # type: ignore[attr-defined]
+        file_parser.extract_g16_standard_orientation_transformation_matrix = safe_transform
+
+    frame_parser = import_module("molop.io.logic.gaussian.log.frame_parsers.G16LogFileFrameParser")
+    mixin = getattr(frame_parser, "G16LogFileFrameParserMixin", None)
+    if mixin is None:
+        return
+
+    original_population = getattr(mixin, "_run_population_phase", None)
+    if callable(original_population) and not getattr(
+        original_population, "_tricycle_optional_shape", False
+    ):
+
+        def safe_population(self: Any, state: Any, result: Any) -> Any:
+            phase = original_population(self, state, result)
+            fields = getattr(result, "fields", None)
+            orbitals = fields.get("molecular_orbitals") if isinstance(fields, dict) else None
+            if not isinstance(orbitals, dict):
+                return phase
+
+            cleaned_orbitals = dict(orbitals)
+            discarded: list[str] = []
+            for spin in ("alpha", "beta"):
+                symmetries_key = f"{spin}_symmetries"
+                energies_key = f"{spin}_energies"
+                symmetries = cleaned_orbitals.get(symmetries_key)
+                energies = cleaned_orbitals.get(energies_key)
+                if symmetries and energies is not None and len(symmetries) != len(energies):
+                    cleaned_orbitals.pop(symmetries_key, None)
+                    discarded.append(spin)
+
+            if discarded:
+                fields["molecular_orbitals"] = cleaned_orbitals
+                logger.warning(
+                    "Dropping MolOP orbital symmetry labels with mismatched energy lengths: %s",
+                    ", ".join(discarded),
+                )
+            return phase
+
+        safe_population._tricycle_optional_shape = True  # type: ignore[attr-defined]
+        mixin._run_population_phase = safe_population
+
+    original_forces = getattr(mixin, "_run_forces_phase", None)
+    if callable(original_forces) and not getattr(
+        original_forces, "_tricycle_optional_shape", False
+    ):
+
+        def safe_forces(self: Any, state: Any, result: Any) -> Any:
+            phase = original_forces(self, state, result)
+            fields = getattr(result, "fields", None)
+            if not isinstance(fields, dict):
+                return phase
+            forces = fields.get("forces")
+            atoms = fields.get("atoms")
+            if forces is None or not isinstance(atoms, (list, tuple)):
+                return phase
+            magnitude = getattr(forces, "m", forces)
+            shape = getattr(magnitude, "shape", None)
+            if shape is None:
+                return phase
+            actual_shape = tuple(shape)
+            expected_shape = (len(atoms), 3)
+            if actual_shape != expected_shape:
+                for key in (
+                    "forces",
+                    "forces_axis_order",
+                    "forces_atom_order",
+                    "forces_orientation",
+                    "force_source_field",
+                    "force_transformation",
+                ):
+                    fields.pop(key, None)
+                logger.warning(
+                    "Dropping MolOP force array with shape %s for %s source-order atoms",
+                    actual_shape,
+                    len(atoms),
+                )
+            return phase
+
+        safe_forces._tricycle_optional_shape = True  # type: ignore[attr-defined]
+        mixin._run_forces_phase = safe_forces
 
 
 def configure_molecular_graph_reconstruction(*, allow_native_parallel: bool = False) -> None:
@@ -33,6 +154,7 @@ def configure_molecular_graph_reconstruction(*, allow_native_parallel: bool = Fa
     # ProcessPoolExecutor pickles normalized records and endpoint MOLs. RDKit's
     # default pickle omits atom properties, including MolGR metal spin evidence.
     Chem.SetDefaultPickleProperties(Chem.PropertyPickleOptions.AllProps)
+    _install_molop_gaussian_ingestion_compatibility()
     molopconfig.reconstruction_failure_policy = MOLECULAR_GRAPH_RECONSTRUCTION_FAILURE_POLICY
     molopconfig.apply_molgr_reconstruction_policy()
     cpp_backend = MOLGR_CONFIG.cpp_backend
