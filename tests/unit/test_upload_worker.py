@@ -96,6 +96,9 @@ async def test_streaming_worker_refills_parser_dispatcher_and_flushes_one_tail_m
     persistence_calls: list[list[UUID]] = []
     authority_calls: list[bool] = []
     finalized_calls: list[list[UUID]] = []
+    active_during_clear: list[set[UUID]] = []
+    clearing_artifact_ids: set[UUID] = set()
+    clear_observed_by_heartbeat = asyncio.Event()
     claim_offset = 0
 
     async def claim_stream_jobs(*, limit: int, prefer_processing: bool) -> list[object]:
@@ -114,8 +117,23 @@ async def test_streaming_worker_refills_parser_dispatcher_and_flushes_one_tail_m
         project_write_locks: dict[UUID, asyncio.Lock],
     ) -> dict[UUID, Exception]:
         del project_write_locks
-        clear_calls.append([job.artifact_file_id for job in claimed])  # type: ignore[attr-defined]
+        claimed_ids = {job.artifact_file_id for job in claimed}  # type: ignore[attr-defined]
+        clear_observed_by_heartbeat.clear()
+        clearing_artifact_ids.update(claimed_ids)
+        clear_calls.append(list(claimed_ids))
+        await asyncio.wait_for(clear_observed_by_heartbeat.wait(), timeout=1)
+        clearing_artifact_ids.clear()
         return {}
+
+    async def observe_lease_jobs(
+        active_jobs: dict[UUID, object],
+        finished: asyncio.Event,
+    ) -> None:
+        while not finished.is_set():
+            await asyncio.sleep(0)
+            if clearing_artifact_ids:
+                active_during_clear.append(set(active_jobs).intersection(clearing_artifact_ids))
+                clear_observed_by_heartbeat.set()
 
     async def parse_staged_artifact(artifact_id: UUID) -> ParsedArtifactTask:
         parsed_calls.append(artifact_id)
@@ -152,6 +170,11 @@ async def test_streaming_worker_refills_parser_dispatcher_and_flushes_one_tail_m
         return len(claimed)
 
     monkeypatch.setattr(worker_module, "molop_process_worker_count", lambda: 2)
+    monkeypatch.setattr(
+        UploadBatchWorker,
+        "_renew_stream_leases",
+        staticmethod(observe_lease_jobs),
+    )
     monkeypatch.setattr(UploadBatchWorker, "_stream_prefetch_limit", staticmethod(lambda: 4))
     monkeypatch.setattr(
         UploadBatchWorker,
@@ -176,6 +199,8 @@ async def test_streaming_worker_refills_parser_dispatcher_and_flushes_one_tail_m
     assert had_work is True
     assert claim_limits == [2, 2, 2]
     assert len(clear_calls) == 2
+    assert active_during_clear
+    assert all(not active_ids for active_ids in active_during_clear)
     assert parsed_calls == [job.artifact_file_id for job in jobs]
     assert persistence_calls == [
         [job.artifact_file_id for job in jobs[:2]],

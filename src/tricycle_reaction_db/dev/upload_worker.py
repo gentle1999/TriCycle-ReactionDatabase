@@ -374,14 +374,16 @@ class UploadBatchWorker:
                     prefer_processing = not prefer_processing
                     if jobs:
                         had_work = True
-                        for job in jobs:
-                            active_jobs[job.artifact_file_id] = job
                         self._mark_statistics_dirty(job.project_id for job in jobs)
                         clear_errors = await self._clear_claimed_parse_state(
                             jobs,
                             project_write_locks=project_write_locks,
                         )
                         for job in jobs:
+                            # Clearing old parse state updates these ingestion
+                            # rows too, so expose the jobs to lease renewal
+                            # only after that transaction has committed.
+                            active_jobs[job.artifact_file_id] = job
                             parser_tasks.add(
                                 asyncio.create_task(
                                     parse_and_enqueue(
