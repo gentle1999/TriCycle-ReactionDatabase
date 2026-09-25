@@ -660,10 +660,9 @@ def _register_topology_upstreams(
     """Resolve and persist marked abstraction upstreams for one topology."""
 
     if context is not None and context.source_atom_order_authoritative:
-        # Raw TS endpoints already carry their authoritative source atom
-        # sequence. Discovering a stereo-abstraction upstream here would run
-        # a second graph correspondence search during import and does not
-        # contribute to the mapped reaction or Geometry atom mapping.
+        # Source-order-authoritative imports must not discover unrelated
+        # stereo-abstraction links by running another graph correspondence
+        # search during Geometry preload.
         return (topology,)
 
     from tricycle_reaction_db.application.services.topology_abstraction import (

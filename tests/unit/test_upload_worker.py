@@ -30,6 +30,7 @@ def _job(
     batch_id: int,
     item_id: int,
     artifact_id: int,
+    source_atom_order_authoritative: bool = False,
 ) -> UploadProcessingJob:
     return UploadProcessingJob(
         project_id=project_id,
@@ -39,6 +40,7 @@ def _job(
         artifact_file_id=UUID(f"00000000-0000-7000-0003-{artifact_id:012d}"),
         user_id=USER_ID,
         lease_id=UUID(f"00000000-0000-7000-0004-{item_id:012d}"),
+        source_atom_order_authoritative=source_atom_order_authoritative,
     )
 
 
@@ -71,8 +73,20 @@ async def test_streaming_worker_refills_parser_dispatcher_and_flushes_one_tail_m
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     jobs = [
-        _job(project_id=PROJECT_A, batch_id=10, item_id=10, artifact_id=101),
-        _job(project_id=PROJECT_A, batch_id=11, item_id=11, artifact_id=102),
+        _job(
+            project_id=PROJECT_A,
+            batch_id=10,
+            item_id=10,
+            artifact_id=101,
+            source_atom_order_authoritative=True,
+        ),
+        _job(
+            project_id=PROJECT_A,
+            batch_id=11,
+            item_id=11,
+            artifact_id=102,
+            source_atom_order_authoritative=True,
+        ),
         _job(project_id=PROJECT_A, batch_id=12, item_id=12, artifact_id=103),
         _job(project_id=PROJECT_A, batch_id=13, item_id=13, artifact_id=104),
     ]
@@ -80,6 +94,7 @@ async def test_streaming_worker_refills_parser_dispatcher_and_flushes_one_tail_m
     clear_calls: list[list[UUID]] = []
     parsed_calls: list[UUID] = []
     persistence_calls: list[list[UUID]] = []
+    authority_calls: list[bool] = []
     finalized_calls: list[list[UUID]] = []
     claim_offset = 0
 
@@ -117,6 +132,7 @@ async def test_streaming_worker_refills_parser_dispatcher_and_flushes_one_tail_m
         user_id: UUID,
         worker_lease_by_artifact_id: object,
         defer_thermodynamic_refresh: bool,
+        source_atom_order_authoritative: bool,
     ) -> dict[UUID, object]:
         assert project_id == PROJECT_A
         assert user_id == USER_ID
@@ -124,6 +140,7 @@ async def test_streaming_worker_refills_parser_dispatcher_and_flushes_one_tail_m
         assert defer_thermodynamic_refresh is True
         artifact_ids = [task.artifact_id for task in tasks]
         persistence_calls.append(artifact_ids)
+        authority_calls.append(source_atom_order_authoritative)
         return {artifact_id: object() for artifact_id in artifact_ids}
 
     async def finish_processing_batch(
@@ -160,8 +177,15 @@ async def test_streaming_worker_refills_parser_dispatcher_and_flushes_one_tail_m
     assert claim_limits == [2, 2, 2]
     assert len(clear_calls) == 2
     assert parsed_calls == [job.artifact_file_id for job in jobs]
-    assert persistence_calls == [[job.artifact_file_id for job in jobs]]
-    assert finalized_calls == [[job.artifact_file_id for job in jobs]]
+    assert persistence_calls == [
+        [job.artifact_file_id for job in jobs[:2]],
+        [job.artifact_file_id for job in jobs[2:]],
+    ]
+    assert authority_calls == [True, False]
+    assert finalized_calls == [
+        [job.artifact_file_id for job in jobs[:2]],
+        [job.artifact_file_id for job in jobs[2:]],
+    ]
 
 
 @pytest.mark.asyncio

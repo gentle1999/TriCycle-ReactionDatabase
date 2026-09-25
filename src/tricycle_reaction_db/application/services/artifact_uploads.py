@@ -4859,6 +4859,7 @@ class ArtifactUploadService:
         persistence_batch_files: int | None = None,
         persistence_frame_limit: int | None = None,
         defer_thermodynamic_refresh: bool = True,
+        source_atom_order_authoritative: bool = False,
     ) -> dict[UUID, ArtifactUploadResult | Exception]:
         """Isolate failed writes without reparsing or replaying committed files.
 
@@ -4883,6 +4884,7 @@ class ArtifactUploadService:
                     persistence_batch_files=persistence_batch_files,
                     persistence_frame_limit=persistence_frame_limit,
                     defer_thermodynamic_refresh=defer_thermodynamic_refresh,
+                    source_atom_order_authoritative=source_atom_order_authoritative,
                     _completed_results=results,
                 )
                 results.update(outcomes)
@@ -4950,6 +4952,7 @@ class ArtifactUploadService:
         persistence_batch_files: int | None = None,
         persistence_frame_limit: int | None = None,
         defer_thermodynamic_refresh: bool = True,
+        source_atom_order_authoritative: bool = False,
         _completed_results: dict[UUID, ArtifactUploadResult | Exception],
     ) -> dict[UUID, ArtifactUploadResult | Exception]:
         """Persist parser results through one bounded SQLAlchemy consumer."""
@@ -4993,6 +4996,7 @@ class ArtifactUploadService:
                 persistence_frame_limit or get_settings().upload_worker_persistence_frame_limit
             ),
             defer_thermodynamic_refresh=defer_thermodynamic_refresh,
+            _source_atom_order_authoritative=source_atom_order_authoritative,
             _preparsed_tasks=preparsed_by_index,
             _prepared_uploads=prepared,
             on_file_committed=record_commit,
@@ -5836,6 +5840,7 @@ class ArtifactUploadService:
         force_reparse: bool = False,
         previous_results_cleared: bool = False,
         defer_thermodynamic_refresh: bool = True,
+        _source_atom_order_authoritative: bool = False,
         _preparsed_tasks: Mapping[int, ParsedArtifactTask] | None = None,
         _prepared_uploads: Mapping[int, _PreparedCalculationUpload] | None = None,
         _defer_abort_recovery: bool = False,
@@ -6229,6 +6234,7 @@ class ArtifactUploadService:
                         LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
                         False,
                     )
+                    or _source_atom_order_authoritative
                     or geometry_context.source_atom_order_authoritative
                     or any(
                         isinstance(inferred, _SuccessfulInference)
@@ -6239,8 +6245,8 @@ class ArtifactUploadService:
                 if legacy_bulk_import:
                     # Set source authority before topology preload. The
                     # per-inference scope below is too late: preload otherwise
-                    # searches the stereo-abstraction graph for an atom
-                    # correspondence before the raw TS maps are persisted.
+                    # searches the stereo-abstraction graph before the source
+                    # atom order has been applied to the TS reaction.
                     geometry_context.source_atom_order_authoritative = True
                 for _, parsed in parsed_files:
                     for inferred in parsed.inferences:

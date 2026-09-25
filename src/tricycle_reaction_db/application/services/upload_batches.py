@@ -125,6 +125,7 @@ class UploadProcessingJob:
     user_id: UUID
     lease_id: UUID
     lease_expires_at: datetime | None = None
+    source_atom_order_authoritative: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +158,19 @@ def _required_datetime(value: datetime | None, label: str) -> datetime:
     if value is None:
         raise RuntimeError(f"persisted {label} is missing its timestamp")
     return value
+
+
+def _source_metadata_has_authoritative_atom_order(metadata: Mapping[str, object]) -> bool:
+    """Recognize explicit source-order batches and the local artifact importer."""
+
+    return (
+        metadata.get("source_atom_order_authoritative") is True
+        or metadata.get("source") == "tricycle-import-artifacts"
+    )
+
+
+def _batch_source_atom_order_is_authoritative(batch: UploadBatch) -> bool:
+    return _source_metadata_has_authoritative_atom_order(batch.shared_metadata)
 
 
 def _upload_media_type(upload: ArtifactUploadPayload, filename: str, declared: str) -> str:
@@ -727,10 +741,27 @@ class UploadBatchService:
             if ingestion is not None and ingestion.status is not ArtifactIngestionStatus.PROCESSING:
                 _queue_ingestion_for_reparse(ingestion, queued_at=now)
                 session.add(ingestion)
+            source_batches = (
+                await session.exec(
+                    select(UploadBatch)
+                    .join(UploadBatchItem, col(UploadBatchItem.batch_id) == col(UploadBatch.id))
+                    .where(col(UploadBatchItem.artifact_file_id) == artifact_id)
+                    .order_by(col(UploadBatch.created_at).desc())
+                )
+            ).all()
+            source_metadata = next(
+                (
+                    dict(source_batch.shared_metadata)
+                    for source_batch in source_batches
+                    if _batch_source_atom_order_is_authoritative(source_batch)
+                ),
+                {},
+            )
             batch = UploadBatch(
                 project_id=artifact.project_id,
                 created_by_user_id=user_id,
                 artifact_kind=artifact.artifact_kind,
+                shared_metadata=source_metadata,
                 status=UploadBatchStatus.ACTIVE,
                 total_count=1,
                 total_bytes=artifact.size_bytes,
@@ -2003,6 +2034,19 @@ class UploadBatchService:
             artifact_ids = {
                 item.artifact_file_id for item, _batch in rows if item.artifact_file_id is not None
             }
+            source_batch_rows = (
+                await session.exec(
+                    select(UploadBatchItem.artifact_file_id, UploadBatch.shared_metadata)
+                    .join(UploadBatch, col(UploadBatch.id) == col(UploadBatchItem.batch_id))
+                    .where(col(UploadBatchItem.artifact_file_id).in_(artifact_ids))
+                )
+            ).all()
+            source_authoritative_artifact_ids = {
+                artifact_id
+                for artifact_id, metadata in source_batch_rows
+                if artifact_id is not None
+                and _source_metadata_has_authoritative_atom_order(metadata)
+            }
             await session.exec(
                 select(ArtifactIngestion)
                 .where(col(ArtifactIngestion.artifact_file_id).in_(artifact_ids))
@@ -2068,6 +2112,10 @@ class UploadBatchService:
                         user_id=batch.created_by_user_id,
                         lease_id=lease_id,
                         lease_expires_at=lease_expires_at,
+                        source_atom_order_authoritative=(
+                            item.artifact_file_id in source_authoritative_artifact_ids
+                            or _batch_source_atom_order_is_authoritative(batch)
+                        ),
                     )
                 )
 

@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -13,6 +14,7 @@ from tricycle_reaction_db.application.dtos import (
 )
 from tricycle_reaction_db.application.services.upload_batches import (
     UploadBatchService,
+    _batch_source_atom_order_is_authoritative,
     _queue_ingestion_for_reparse,
 )
 from tricycle_reaction_db.db.models import ArtifactIngestion
@@ -32,6 +34,19 @@ ARTIFACT_ID = UUID("00000000-0000-7000-8000-000000000704")
 SECOND_CLIENT_FILE_ID = UUID("00000000-0000-7000-8000-000000000705")
 SECOND_ARTIFACT_ID = UUID("00000000-0000-7000-8000-000000000706")
 NOW = datetime(2026, 8, 20, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        ({"source_atom_order_authoritative": True}, True),
+        ({"source": "tricycle-import-artifacts"}, True),
+        ({"source": "browser-upload"}, False),
+    ],
+)
+def test_import_batch_source_order_authority(metadata: dict[str, object], expected: bool) -> None:
+    batch = SimpleNamespace(shared_metadata=metadata)
+    assert _batch_source_atom_order_is_authoritative(batch) is expected
 
 
 def test_queue_reparse_publishes_an_empty_pending_ingestion() -> None:

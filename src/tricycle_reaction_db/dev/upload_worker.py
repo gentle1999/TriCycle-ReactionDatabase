@@ -185,8 +185,8 @@ class UploadBatchWorker:
             maxsize=prefetch_limit
         )
         active_jobs: dict[UUID, WorkerJob] = {}
-        grouped_results: dict[tuple[UUID, UUID], list[QueuedParseResult]] = {}
-        grouped_frames: dict[tuple[UUID, UUID], int] = {}
+        grouped_results: dict[tuple[UUID, UUID, bool], list[QueuedParseResult]] = {}
+        grouped_frames: dict[tuple[UUID, UUID, bool], int] = {}
         project_write_locks: dict[UUID, asyncio.Lock] = {}
         settings = get_settings()
         persistence_file_limit = settings.upload_worker_persistence_batch_files
@@ -208,7 +208,7 @@ class UploadBatchWorker:
             source_count = getattr(parsed, "source_frame_count", 0)
             return max(1, len(records) or int(source_count or 0))
 
-        async def flush_group(key: tuple[UUID, UUID]) -> None:
+        async def flush_group(key: tuple[UUID, UUID, bool]) -> None:
             nonlocal buffered_result_count
             entries = grouped_results.pop(key, [])
             grouped_frames.pop(key, None)
@@ -217,7 +217,7 @@ class UploadBatchWorker:
             buffered_result_count = max(0, buffered_result_count - len(entries))
             jobs = [job for job, _task in entries]
             tasks = [task for _job, task in entries]
-            project_id, user_id = key
+            project_id, user_id, source_atom_order_authoritative = key
             leases = {job.artifact_file_id: job.lease_id for job in jobs}
             async with project_write_locks.setdefault(project_id, asyncio.Lock()):
                 try:
@@ -227,6 +227,7 @@ class UploadBatchWorker:
                         user_id=user_id,
                         worker_lease_by_artifact_id=leases,
                         defer_thermodynamic_refresh=True,
+                        source_atom_order_authoritative=source_atom_order_authoritative,
                     )
                 except Exception as error:
                     logger.exception(
@@ -293,7 +294,11 @@ class UploadBatchWorker:
                     if entry is None:
                         break
                     job, task = entry
-                    key = (job.project_id, job.user_id)
+                    key = (
+                        job.project_id,
+                        job.user_id,
+                        bool(getattr(job, "source_atom_order_authoritative", False)),
+                    )
                     grouped_results.setdefault(key, []).append(entry)
                     grouped_frames[key] = grouped_frames.get(key, 0) + frame_count(task)
                     buffered_result_count += 1
