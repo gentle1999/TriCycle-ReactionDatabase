@@ -36,9 +36,6 @@ from tricycle_reaction_db.application.services.reaction_geometry_policy import (
     geometry_has_no_imaginary_frequency_predicate,
     geometry_has_thermodynamic_property_predicate,
 )
-from tricycle_reaction_db.application.services.topology_compatibility import (
-    source_geometry_compatible_topology,
-)
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
@@ -47,7 +44,6 @@ from tricycle_reaction_db.db.models import (
     CalculationProtocol,
     CalculationSegment,
     Geometry,
-    LogicalParticipantConcreteTopology,
     LogicalReactionParticipant,
     MappedReaction,
     MappedReactionEdge,
@@ -57,7 +53,6 @@ from tricycle_reaction_db.db.models import (
     MappedReactionThermodynamicProfile,
     MappedReactionThermodynamicProfileRefreshJob,
     MappedReactionThermodynamicProfileSource,
-    MolecularTopology,
     ParseRevision,
     ThermochemistryResult,
 )
@@ -119,151 +114,6 @@ class _ProfileSourceReference:
 
     calculation_frame_id: UUID
     allow_partial_ingestion: bool
-
-
-@dataclass(frozen=True, slots=True)
-class _TopologyCompatibilityMetadata:
-    """Scalar topology identity used before the expensive RDKit fallback."""
-
-    topology_id: UUID
-    formula_id: UUID
-    atom_count: int
-    formal_charge: int
-    fragment_count: int
-    stereo_agnostic_graph_hash: str | None
-
-
-def _graph_hash_proves_endpoint_compatibility(
-    endpoint: _TopologyCompatibilityMetadata,
-    candidate: _TopologyCompatibilityMetadata,
-) -> bool:
-    """Use canonical graph identity instead of re-matching an identical DAG graph.
-
-    The stored hash includes atom/isotope identity, charge, bond order,
-    connectivity, and hydrogen/radical state; it excludes only atom/bond
-    stereochemistry and atom-map labels. Equal hashes therefore prove the
-    stricter graph identity required by the source-geometry compatibility
-    predicate, whose projection drops at least those stereo distinctions.
-    """
-
-    return (
-        endpoint.stereo_agnostic_graph_hash is not None
-        and endpoint.stereo_agnostic_graph_hash == candidate.stereo_agnostic_graph_hash
-    )
-
-
-def _load_topology_compatibility_metadata(
-    session: Session,
-    topology_ids: Sequence[UUID],
-    *,
-    project_id: UUID,
-) -> dict[UUID, _TopologyCompatibilityMetadata]:
-    """Load only scalar topology identity; never deserialize ``mol`` here."""
-
-    if not topology_ids:
-        return {}
-    rows = session.exec(
-        cast(
-            Any,
-            sa_select(
-                col(MolecularTopology.id),
-                col(MolecularTopology.formula_id),
-                col(MolecularTopology.atom_count),
-                col(MolecularTopology.formal_charge),
-                col(MolecularTopology.fragment_count),
-                col(MolecularTopology.stereo_agnostic_graph_hash),
-            ),
-        ).where(
-            col(MolecularTopology.project_id) == project_id,
-            col(MolecularTopology.id).in_(topology_ids),
-        )
-    ).all()
-    metadata: dict[UUID, _TopologyCompatibilityMetadata] = {}
-    for row in rows:
-        topology_id = cast(UUID | None, row[0])
-        formula_id = cast(UUID | None, row[1])
-        if not isinstance(topology_id, UUID) or not isinstance(formula_id, UUID):
-            continue
-        metadata[topology_id] = _TopologyCompatibilityMetadata(
-            topology_id=topology_id,
-            formula_id=formula_id,
-            atom_count=int(row[2]),
-            formal_charge=int(row[3]),
-            fragment_count=int(row[4]),
-            stereo_agnostic_graph_hash=(str(row[5]) if row[5] is not None else None),
-        )
-    return metadata
-
-
-def _load_topology_molecules(
-    session: Session,
-    topology_ids: Sequence[UUID],
-    *,
-    project_id: UUID,
-) -> dict[UUID, Any]:
-    """Deserialize molecules only for the bounded compatibility candidate set."""
-
-    if not topology_ids:
-        return {}
-    rows = session.exec(
-        cast(
-            Any,
-            sa_select(
-                col(MolecularTopology.id),
-                col(MolecularTopology.mol),
-            ),
-        ).where(
-            col(MolecularTopology.project_id) == project_id,
-            col(MolecularTopology.id).in_(topology_ids),
-        )
-    ).all()
-    return {
-        topology_id: molecule
-        for topology_id, molecule in rows
-        if isinstance(topology_id, UUID) and molecule is not None
-    }
-
-
-def _eligible_endpoint_candidate_geometries_statement(
-    *,
-    project_id: UUID,
-    eligible_geometry_ids: Any,
-    candidate_metadata_predicates: Sequence[Any],
-) -> Any:
-    """Select only eligible Geometry under hash-qualified DAG nodes.
-
-    Keep the topology identity/hash and source-qualification predicates in
-    the same query. This avoids materializing every eligible Geometry in a
-    large endpoint component before applying the inexpensive topology filters.
-    """
-
-    return (
-        cast(
-            Any,
-            sa_select(
-                col(MolecularTopology.id),
-                col(MolecularTopology.formula_id),
-                col(MolecularTopology.atom_count),
-                col(MolecularTopology.formal_charge),
-                col(MolecularTopology.fragment_count),
-                col(MolecularTopology.stereo_agnostic_graph_hash),
-                Geometry,
-            ),
-        )
-        .join(
-            MolecularTopology,
-            col(Geometry.topology_id) == col(MolecularTopology.id),
-        )
-        .options(load_only(cast(Any, Geometry.id), cast(Any, Geometry.topology_id)))
-        .where(
-            col(Geometry.project_id) == project_id,
-            col(MolecularTopology.project_id) == project_id,
-            col(Geometry.id).in_(eligible_geometry_ids),
-            geometry_has_thermodynamic_property_predicate(col(Geometry.id)),
-            geometry_has_no_imaginary_frequency_predicate(col(Geometry.id)),
-            or_(*candidate_metadata_predicates),
-        )
-    )
 
 
 def _index_calculation_source_rows(
@@ -362,80 +212,30 @@ def _endpoint_geometries_by_participant(
     *,
     project_id: UUID,
 ) -> dict[UUID, tuple[Geometry, ...]]:
-    """Load eligible endpoint geometries, including audited concrete members.
+    """Load qualified endpoint geometries from each participant's exact topology.
 
-    A mapped reaction can be created from a displaced TS endpoint before the
-    corresponding standalone reactant/ene optimization is reconciled.  The TS
-    endpoint's strict topology is then a valid reaction fact but has no
-    endpoint ``Geometry`` of its own.  The logical participant membership table
-    is the explicit bridge to already imported concrete members; this helper
-    uses it only when the strict topology has no eligible Geometry.
-
-    The returned mapping intentionally contains either all eligible geometries
-    under the strict topology or, when that set is empty, all eligible
-    geometries under the participant's concrete members.  It never crosses a
-    logical participant or project boundary.
+    A logical participant can contain multiple concrete topologies (including
+    stereoisomers). They are not interchangeable profile sources: if this
+    mapped participant's concrete topology has no qualified geometry, its
+    endpoint contributes no geometry. TS geometries remain handled separately.
     """
 
-    if not participant_rows:
-        return {}
     participant_ids: list[UUID] = []
-    logical_participant_ids: set[UUID] = set()
-    strict_topology_ids: dict[UUID, UUID] = {}
+    topology_ids_by_participant: dict[UUID, UUID] = {}
+    participant_ids_by_topology: dict[UUID, list[UUID]] = {}
     for mapped_participant, logical_participant in participant_rows:
         participant_id = _require_id(mapped_participant, label="MappedReactionParticipant")
-        logical_participant_id = _require_id(
-            logical_participant,
-            label="LogicalReactionParticipant",
-        )
-        strict_topology_id = (
-            mapped_participant.concrete_topology_id or logical_participant.topology_id
-        )
-        if not isinstance(strict_topology_id, UUID):
+        topology_id = mapped_participant.concrete_topology_id or logical_participant.topology_id
+        if not isinstance(topology_id, UUID):
             continue
         participant_ids.append(participant_id)
-        logical_participant_ids.add(logical_participant_id)
-        strict_topology_ids[participant_id] = strict_topology_id
+        topology_ids_by_participant[participant_id] = topology_id
+        participant_ids_by_topology.setdefault(topology_id, []).append(participant_id)
 
-    concrete_topology_ids_by_logical: dict[UUID, set[UUID]] = {
-        logical_participant_id: set() for logical_participant_id in logical_participant_ids
-    }
-    if logical_participant_ids:
-        memberships = session.exec(
-            select(LogicalParticipantConcreteTopology).where(
-                col(LogicalParticipantConcreteTopology.logical_reaction_participant_id).in_(
-                    logical_participant_ids
-                )
-            )
-        ).all()
-        for membership in memberships:
-            logical_participant_id = membership.logical_reaction_participant_id
-            concrete_topology_id = membership.concrete_topology_id
-            if isinstance(logical_participant_id, UUID) and isinstance(concrete_topology_id, UUID):
-                concrete_topology_ids_by_logical.setdefault(logical_participant_id, set()).add(
-                    concrete_topology_id
-                )
+    if not participant_ids:
+        return {}
 
-    allowed_topology_ids_by_participant: dict[UUID, set[UUID]] = {}
-    logical_id_by_participant = {
-        _require_id(mapped_participant, label="MappedReactionParticipant"): _require_id(
-            logical_participant, label="LogicalReactionParticipant"
-        )
-        for mapped_participant, logical_participant in participant_rows
-    }
-    all_topology_ids: set[UUID] = set()
-    for participant_id in participant_ids:
-        strict_topology_id = strict_topology_ids[participant_id]
-        logical_participant_id = logical_id_by_participant[participant_id]
-        allowed = {
-            strict_topology_id,
-            *concrete_topology_ids_by_logical.get(logical_participant_id, set()),
-        }
-        allowed_topology_ids_by_participant[participant_id] = allowed
-        all_topology_ids.update(allowed)
-
-    if not all_topology_ids:
-        return dict.fromkeys(participant_ids, ())
+    exact_topology_ids = set(topology_ids_by_participant.values())
     eligible_geometry_ids = select(col(CalculationFrame.geometry_id)).where(
         col(CalculationFrame.optimization_status) == OptimizationStatus.CONVERGED,
     )
@@ -444,255 +244,36 @@ def _endpoint_geometries_by_participant(
         .options(load_only(cast(Any, Geometry.id), cast(Any, Geometry.topology_id)))
         .where(
             col(Geometry.project_id) == project_id,
-            col(Geometry.topology_id).in_(all_topology_ids),
+            col(Geometry.topology_id).in_(exact_topology_ids),
             col(Geometry.id).in_(eligible_geometry_ids),
             geometry_has_thermodynamic_property_predicate(col(Geometry.id)),
             geometry_has_no_imaginary_frequency_predicate(col(Geometry.id)),
         )
     ).all()
-    geometries_by_topology: dict[UUID, list[Geometry]] = {}
+
+    geometries_by_participant: dict[UUID, list[Geometry]] = {
+        participant_id: [] for participant_id in participant_ids
+    }
     for geometry in geometries:
         topology_id = geometry.topology_id
-        if isinstance(topology_id, UUID):
-            geometries_by_topology.setdefault(topology_id, []).append(geometry)
-
-    # A displaced TS endpoint can have a topology that differs from the
-    # isolated endpoint geometry by one retained bond/electronic assignment.
-    # Preserve that audited compatibility fallback, but never search every
-    # topology in the project. The candidate component must remain scoped to
-    # its own endpoint root, even when this persistence batch contains many
-    # unrelated reactions.
-    endpoint_compatible_topology_ids_by_participant: dict[UUID, set[UUID]] = {}
-    # Import lazily: topology_abstraction depends on the molecular-geometry
-    # persistence layer, whose reconciliation hooks import this module.
-    from tricycle_reaction_db.application.services.topology_abstraction import (
-        topology_dag_components_by_root,
-    )
-
-    strict_metadata = _load_topology_compatibility_metadata(
-        session,
-        tuple(set(strict_topology_ids.values())),
-        project_id=project_id,
-    )
-    dag_components_by_root = topology_dag_components_by_root(
-        session,
-        tuple(strict_metadata),
-        project_id=project_id,
-    )
-    endpoint_compatible_search_specs: dict[UUID, _TopologyCompatibilityMetadata] = {}
-    for participant_id in participant_ids:
-        strict_topology_id = strict_topology_ids[participant_id]
-        if geometries_by_topology.get(strict_topology_id):
+        geometry_id = geometry.id
+        if not isinstance(topology_id, UUID) or geometry_id is None:
             continue
-        member_ids = allowed_topology_ids_by_participant[participant_id] - {strict_topology_id}
-        if any(geometries_by_topology.get(topology_id) for topology_id in member_ids):
-            continue
-        strict_metadata_row = strict_metadata.get(strict_topology_id)
-        if strict_metadata_row is not None:
-            endpoint_compatible_search_specs[participant_id] = strict_metadata_row
+        # Keep the invariant in Python as well as SQL, so a future query change
+        # cannot silently reintroduce cross-topology endpoint selection.
+        for participant_id in participant_ids_by_topology.get(topology_id, ()):
+            if topology_ids_by_participant[participant_id] == topology_id:
+                geometries_by_participant[participant_id].append(geometry)
 
-    if endpoint_compatible_search_specs:
-        candidate_scope_by_participant: dict[UUID, set[UUID]] = {}
-        for participant_id, strict_topology in endpoint_compatible_search_specs.items():
-            component_ids = set(dag_components_by_root.get(strict_topology.topology_id, ()))
-            candidate_ids = component_ids - allowed_topology_ids_by_participant[participant_id]
-            if candidate_ids:
-                candidate_scope_by_participant[participant_id] = candidate_ids
-
-        # Apply the indexed stereo-agnostic hash and cheap identity columns in
-        # the same SQL query that checks Geometry eligibility. The scoped ID
-        # predicate preserves each endpoint's DAG boundary, while the database
-        # avoids materializing unrelated Geometry rows from a large component.
-        candidate_metadata_predicates: list[Any] = []
-        for participant_id, candidate_ids in candidate_scope_by_participant.items():
-            strict_topology = endpoint_compatible_search_specs[participant_id]
-            terms: list[Any] = [
-                col(MolecularTopology.id).in_(candidate_ids),
-                col(MolecularTopology.formula_id) == strict_topology.formula_id,
-                col(MolecularTopology.atom_count) == strict_topology.atom_count,
-                col(MolecularTopology.formal_charge) == strict_topology.formal_charge,
-                col(MolecularTopology.fragment_count) == strict_topology.fragment_count,
-            ]
-            if strict_topology.stereo_agnostic_graph_hash is not None:
-                terms.append(
-                    col(MolecularTopology.stereo_agnostic_graph_hash)
-                    == strict_topology.stereo_agnostic_graph_hash
-                )
-            candidate_metadata_predicates.append(and_(*terms))
-
-        # Candidate topologies without a converged, thermochemistry-bearing,
-        # non-imaginary Geometry cannot contribute to an endpoint profile. Do
-        # that qualification in SQL before loading topology MOL blobs.
-        candidate_metadata_by_id: dict[UUID, _TopologyCompatibilityMetadata] = {}
-        candidate_geometries_by_topology: dict[UUID, list[Geometry]] = {}
-        if candidate_metadata_predicates:
-            candidate_rows = session.exec(
-                _eligible_endpoint_candidate_geometries_statement(
-                    project_id=project_id,
-                    eligible_geometry_ids=eligible_geometry_ids,
-                    candidate_metadata_predicates=candidate_metadata_predicates,
-                )
-            ).all()
-            for row in candidate_rows:
-                candidate_topology_id = cast(UUID | None, row[0])
-                formula_id = cast(UUID | None, row[1])
-                if not isinstance(candidate_topology_id, UUID) or not isinstance(formula_id, UUID):
-                    continue
-                candidate_metadata_by_id.setdefault(
-                    candidate_topology_id,
-                    _TopologyCompatibilityMetadata(
-                        topology_id=candidate_topology_id,
-                        formula_id=formula_id,
-                        atom_count=int(row[2]),
-                        formal_charge=int(row[3]),
-                        fragment_count=int(row[4]),
-                        stereo_agnostic_graph_hash=(str(row[5]) if row[5] is not None else None),
-                    ),
-                )
-                geometry = cast(Geometry, row[6])
-                geometry_topology_id = geometry.topology_id
-                if isinstance(geometry_topology_id, UUID):
-                    candidate_geometries_by_topology.setdefault(
-                        geometry_topology_id,
-                        [],
-                    ).append(geometry)
-
-        eligible_candidate_ids = set(candidate_geometries_by_topology)
-        candidate_ids_by_participant: dict[UUID, set[UUID]] = {}
-        for participant_id, strict_topology in endpoint_compatible_search_specs.items():
-            matching_ids = {
-                topology_id
-                for topology_id in candidate_scope_by_participant.get(participant_id, set())
-                if topology_id in eligible_candidate_ids
-                and (candidate := candidate_metadata_by_id.get(topology_id)) is not None
-                and candidate.formula_id == strict_topology.formula_id
-                and candidate.atom_count == strict_topology.atom_count
-                and candidate.formal_charge == strict_topology.formal_charge
-                and candidate.fragment_count == strict_topology.fragment_count
-                and (
-                    strict_topology.stereo_agnostic_graph_hash is None
-                    or candidate.stereo_agnostic_graph_hash
-                    == strict_topology.stereo_agnostic_graph_hash
-                )
-            }
-            if matching_ids:
-                candidate_ids_by_participant[participant_id] = matching_ids
-
-        # No eligible Geometry means no possible profile source, so avoid even
-        # loading the endpoint MOL for participants with no surviving matches.
-        participants_with_candidates = {
-            participant_id
-            for participant_id, candidate_ids in candidate_ids_by_participant.items()
-            if candidate_ids
-        }
-        compatible_candidate_ids_by_participant: dict[UUID, set[UUID]] = {}
-        candidates_requiring_graph_match: dict[UUID, set[UUID]] = {}
-        for participant_id in participants_with_candidates:
-            strict_topology = endpoint_compatible_search_specs[participant_id]
-            candidate_ids = candidate_ids_by_participant[participant_id]
-            hash_proven_ids = {
-                topology_id
-                for topology_id in candidate_ids
-                if _graph_hash_proves_endpoint_compatibility(
-                    strict_topology,
-                    candidate_metadata_by_id[topology_id],
-                )
-            }
-            if hash_proven_ids:
-                compatible_candidate_ids_by_participant[participant_id] = hash_proven_ids
-            unresolved_ids = candidate_ids - hash_proven_ids
-            if unresolved_ids:
-                candidates_requiring_graph_match[participant_id] = unresolved_ids
-
-        # A persisted canonical hash is sufficient to establish graph
-        # compatibility after dropping stereo, so only legacy/null-hash rows
-        # need to deserialize molecules and invoke the bounded RDKit matcher.
-        topology_molecules = (
-            _load_topology_molecules(
-                session,
-                tuple(
-                    {
-                        endpoint_compatible_search_specs[participant_id].topology_id
-                        for participant_id in candidates_requiring_graph_match
-                    }
-                    | {
-                        topology_id
-                        for candidate_ids in candidates_requiring_graph_match.values()
-                        for topology_id in candidate_ids
-                    }
-                ),
-                project_id=project_id,
-            )
-            if candidates_requiring_graph_match
-            else {}
-        )
-        compatibility_cache: dict[tuple[UUID, UUID], bool] = {}
-        for participant_id, candidate_ids in candidates_requiring_graph_match.items():
-            strict_topology = endpoint_compatible_search_specs[participant_id]
-            endpoint_molecule = topology_molecules.get(strict_topology.topology_id)
-            if endpoint_molecule is None:
-                continue
-            compatible_ids = compatible_candidate_ids_by_participant.setdefault(
-                participant_id,
-                set(),
-            )
-            for candidate_id in candidate_ids:
-                cache_key = (strict_topology.topology_id, candidate_id)
-                compatible = compatibility_cache.get(cache_key)
-                if compatible is None:
-                    source_molecule = topology_molecules.get(candidate_id)
-                    compatible = bool(
-                        source_molecule is not None
-                        and source_geometry_compatible_topology(
-                            endpoint_molecule,
-                            source_molecule,
-                        )
-                    )
-                    compatibility_cache[cache_key] = compatible
-                if compatible:
-                    compatible_ids.add(candidate_id)
-
-        endpoint_compatible_candidate_ids = {
-            topology_id
-            for candidate_ids in compatible_candidate_ids_by_participant.values()
-            for topology_id in candidate_ids
-        }
-        for topology_id in endpoint_compatible_candidate_ids:
-            geometries_by_topology[topology_id] = candidate_geometries_by_topology[topology_id]
-        for participant_id, topology_ids in compatible_candidate_ids_by_participant.items():
-            # More than one eligible endpoint-compatible topology is
-            # ambiguous and remains unresolved instead of guessing.
-            if len(topology_ids) == 1:
-                endpoint_compatible_topology_ids_by_participant[participant_id] = topology_ids
-
-    result: dict[UUID, tuple[Geometry, ...]] = {}
-    for participant_id in participant_ids:
-        strict_topology_id = strict_topology_ids[participant_id]
-        strict_geometries = geometries_by_topology.get(strict_topology_id, [])
-        selected = strict_geometries or [
-            geometry
-            for topology_id in sorted(allowed_topology_ids_by_participant[participant_id], key=str)
-            if topology_id != strict_topology_id
-            for geometry in geometries_by_topology.get(topology_id, [])
-        ]
-        if not selected:
-            selected = [
-                geometry
-                for topology_id in sorted(
-                    endpoint_compatible_topology_ids_by_participant.get(participant_id, set()),
-                    key=str,
-                )
-                for geometry in geometries_by_topology.get(topology_id, [])
-            ]
-        result[participant_id] = tuple(
+    return {
+        participant_id: tuple(
             sorted(
-                {
-                    geometry.id: geometry for geometry in selected if geometry.id is not None
-                }.values(),
+                {geometry.id: geometry for geometry in participant_geometries}.values(),
                 key=lambda geometry: str(geometry.id),
             )
         )
-    return result
+        for participant_id, participant_geometries in geometries_by_participant.items()
+    }
 
 
 def _load_mapped_reaction_thermodynamics_input(
@@ -842,23 +423,9 @@ def _build_mapped_reaction_thermodynamics(
 
     requirements: list[EndpointComponentRequirement] = []
     expected_roles: dict[UUID, MappedReactionNodeRole] = {}
-    endpoint_topology_ids_by_participant: dict[UUID, set[UUID]] = {}
-    for participant_id, geometries in (endpoint_geometries_by_participant or {}).items():
-        endpoint_topology_ids_by_participant[participant_id] = {
-            geometry.topology_id
-            for geometry in geometries
-            if isinstance(geometry.topology_id, UUID)
-        }
-    for _, binding, geometry in binding_rows:
-        binding_participant_id = binding.mapped_reaction_participant_id
-        if binding_participant_id is not None and isinstance(geometry.topology_id, UUID):
-            endpoint_topology_ids_by_participant.setdefault(binding_participant_id, set()).add(
-                geometry.topology_id
-            )
     for mapped_participant, logical_participant in participant_rows:
         participant_id = _require_id(mapped_participant, label="MappedReactionParticipant")
         side = mapped_participant.side.value
-        allowed_topology_ids = endpoint_topology_ids_by_participant.get(participant_id)
         requirements.append(
             EndpointComponentRequirement(
                 side=side,
@@ -867,9 +434,6 @@ def _build_mapped_reaction_thermodynamics(
                     mapped_participant.concrete_topology_id or logical_participant.topology_id
                 ),
                 stoichiometric_coefficient=logical_participant.stoichiometric_coefficient,
-                allowed_topology_ids=(
-                    frozenset(allowed_topology_ids) if allowed_topology_ids else None
-                ),
             )
         )
         expected_roles[participant_id] = (

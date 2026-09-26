@@ -50,6 +50,7 @@ def test_profile_range_filter_keeps_all_conditions_in_one_exists() -> None:
     compiled = _sql(statement)
 
     assert compiled.count("FROM mapped_reaction_thermodynamic_profile") == 1
+    assert "mapped_reaction_thermodynamic_profile.policy_version =" in compiled.lower()
     assert "activation_gibbs_free_energy_kcal_mol >=" in compiled
     assert "activation_gibbs_free_energy_kcal_mol <=" in compiled
     assert "reaction_gibbs_free_energy_kcal_mol >=" in compiled
@@ -96,6 +97,7 @@ def test_restricted_profile_visibility_requires_successful_source_provenance() -
 
     assert "artifact_ingestion.status" in compiled
     assert "parse_revision.status" in compiled
+    assert "mapped_reaction_thermodynamic_profile.policy_version =" in compiled.lower()
     assert compiled.count("selection ?") >= 4
     assert "AS thermodynamic_profile_reactants(selection)" in compiled
     assert "AS thermodynamic_profile_transition_state(selection)" in compiled

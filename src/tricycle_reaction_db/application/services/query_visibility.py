@@ -24,6 +24,9 @@ from tricycle_reaction_db.application.services.authorization import (
 from tricycle_reaction_db.application.services.reaction_geometry_policy import (
     geometry_has_thermodynamic_property_predicate,
 )
+from tricycle_reaction_db.core.chemistry_config import (
+    MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION,
+)
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
     ArtifactIngestion,
@@ -1263,8 +1266,11 @@ def thermodynamic_profile_is_visible(
 ) -> Any:
     """Return a fail-closed source authorization predicate for one profile."""
 
+    current_policy = (
+        col(profile.policy_version) == MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION
+    )
     if scope.unrestricted:
-        return true()
+        return current_policy
     if scope.uses_project_owned_fast_path:
         # Keep the parent check correlated to the profile row.  The previous
         # ``profile.mapped_reaction_id IN (SELECT mapped_reaction.id ...)``
@@ -1356,6 +1362,7 @@ def thermodynamic_profile_is_visible(
             ),
         )
     return and_(
+        current_policy,
         # The profile has no independent project column.  Its parent is the
         # ownership boundary, so keep this predicate safe even when a caller
         # uses it outside a query that already joins a visible MappedReaction.

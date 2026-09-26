@@ -30,12 +30,6 @@ class EndpointComponentRequirement:
     mapped_reaction_participant_id: UUID
     topology_id: UUID
     stoichiometric_coefficient: int
-    # A strict mapped participant normally accepts only its own concrete
-    # topology.  When a TS-only endpoint topology has no optimized endpoint
-    # Geometry, persistence may supply the already materialized concrete
-    # members of the same logical participant as an explicitly audited
-    # source-compatible fallback.  ``None`` retains the strict legacy rule.
-    allowed_topology_ids: frozenset[UUID] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,10 +146,7 @@ def _minimum_view(
     return ThermodynamicTopologyMinimumView(
         side=requirement.side,
         mapped_reaction_participant_id=requirement.mapped_reaction_participant_id,
-        # For a source-compatible fallback this is the topology that owns the
-        # selected Geometry, not the TS-only strict topology that requested it.
-        # Exact candidates retain the previous value because both IDs match.
-        topology_id=candidate.topology_id,
+        topology_id=requirement.topology_id,
         stoichiometric_coefficient=requirement.stoichiometric_coefficient,
         geometry_id=candidate.geometry_id,
         enthalpy_hartree=_required_float(view.enthalpy_hartree, label="H"),
@@ -238,7 +229,6 @@ def _requirements_by_component(
     requirements: Sequence[EndpointComponentRequirement],
 ) -> list[EndpointComponentRequirement]:
     coefficients: dict[tuple[str, UUID, UUID], int] = defaultdict(int)
-    allowed_topologies: dict[tuple[str, UUID, UUID], set[UUID]] = {}
     for requirement in requirements:
         key = (
             requirement.side,
@@ -246,19 +236,12 @@ def _requirements_by_component(
             requirement.topology_id,
         )
         coefficients[key] += requirement.stoichiometric_coefficient
-        if requirement.allowed_topology_ids is not None:
-            allowed_topologies.setdefault(key, set()).update(requirement.allowed_topology_ids)
     return [
         EndpointComponentRequirement(
             side,
             participant_id,
             topology_id,
             coefficient,
-            (
-                frozenset(allowed_topologies[(side, participant_id, topology_id)])
-                if (side, participant_id, topology_id) in allowed_topologies
-                else None
-            ),
         )
         for (side, participant_id, topology_id), coefficient in sorted(
             coefficients.items(), key=lambda item: (item[0][0], str(item[0][1]))
@@ -270,12 +253,7 @@ def _candidate_matches_requirement(
     candidate: GeometryThermodynamicCandidate,
     requirement: EndpointComponentRequirement,
 ) -> bool:
-    allowed_topology_ids = requirement.allowed_topology_ids
-    return (
-        candidate.topology_id in allowed_topology_ids
-        if allowed_topology_ids is not None
-        else candidate.topology_id == requirement.topology_id
-    )
+    return candidate.topology_id == requirement.topology_id
 
 
 def _candidate_keys(

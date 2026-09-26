@@ -249,6 +249,59 @@ def test_mapped_reaction_thermodynamics_keeps_reaction_without_transition_state(
     assert profile.activation is None
 
 
+def test_sibling_topology_cannot_supply_missing_endpoint_thermochemistry() -> None:
+    mapped_reaction_id = uuid4()
+    reactant_participant = uuid4()
+    product_participant = uuid4()
+    exact_reactant_topology = uuid4()
+    sibling_reactant_topology = uuid4()
+    product_topology = uuid4()
+    transition_state = _candidate(
+        topology_id=uuid4(),
+        enthalpy=-18.5,
+        gibbs=-19.25,
+        entropy=7.5,
+    )
+
+    result = build_mapped_reaction_thermodynamics(
+        mapped_reaction_id=mapped_reaction_id,
+        endpoint_requirements=[
+            EndpointComponentRequirement(
+                "reactant", reactant_participant, exact_reactant_topology, 1
+            ),
+            EndpointComponentRequirement("product", product_participant, product_topology, 1),
+        ],
+        candidates_by_component={
+            reactant_participant: [
+                _candidate(
+                    topology_id=sibling_reactant_topology,
+                    enthalpy=-10.0,
+                    gibbs=-11.0,
+                    entropy=1.0,
+                )
+            ],
+            product_participant: [
+                _candidate(
+                    topology_id=product_topology,
+                    enthalpy=-12.0,
+                    gibbs=-13.0,
+                    entropy=2.0,
+                )
+            ],
+        },
+        transition_state_candidates=[transition_state],
+    )
+
+    assert len(result.profiles) == 1
+    profile = result.profiles[0]
+    assert profile.reactants is None
+    assert profile.products is None
+    assert profile.activation is None
+    assert profile.reaction is None
+    assert profile.transition_state is not None
+    assert profile.transition_state.topologies[0].geometry_id == transition_state.geometry_id
+
+
 def test_mapped_reaction_thermodynamics_materializes_ts_only_profile() -> None:
     mapped_reaction_id = uuid4()
     transition_state = _candidate(
