@@ -22,7 +22,7 @@ dependencies = [
     "psycopg[binary,pool]>=3.2,<4",
     "pydantic==2.13.4",
     "pydantic-settings>=2.12,<3",
-    "pyjwt[crypto]>=2.10,<3",
+    "pyjwt[crypto]>=2.15,<3",
     "cryptography>=50,<51",
     "python-multipart>=0.0.22,<1",
     "prometheus-client>=0.24,<1",
@@ -70,6 +70,8 @@ dev = [
 packages = ["src/tricycle_reaction_db"]
 
 [tool.uv]
+# Security floor for botocore's transitive HTTP dependency.
+constraint-dependencies = ["urllib3>=2.8,<3"]
 # Keep the uv package cache inside the repository so `uv run` works in
 # environments where the user cache directory (~/.cache/uv) is not writable
 # (for example sandboxed developer shells).  Path is relative to this file.
