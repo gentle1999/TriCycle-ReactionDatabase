@@ -61,6 +61,11 @@ def _parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument(
+        "--candidate-manifest",
+        type=Path,
+        help="use a reviewed repair manifest instead of selecting overlapping revisions",
+    )
+    parser.add_argument(
         "--project-id",
         action="append",
         type=UUID,
@@ -270,16 +275,43 @@ async def _run(args: argparse.Namespace) -> int:
     if args.limit is not None and args.limit < 1:
         raise ValueError("limit must be positive")
 
-    queried_candidates = await _load_candidates(
-        args.project_ids,
-        filename_contains=args.filename_contains,
-    )
+    candidate_manifest = getattr(args, "candidate_manifest", None)
+    if candidate_manifest is not None:
+        if not candidate_manifest.is_file():
+            raise ValueError("candidate manifest does not exist")
+        queried_candidates = _load_manifest(candidate_manifest)
+        if not queried_candidates:
+            raise ValueError("candidate manifest contains no artifacts")
+        if args.project_ids:
+            queried_candidates = [c for c in queried_candidates if c.project_id in args.project_ids]
+        if args.filename_contains:
+            queried_candidates = [
+                c for c in queried_candidates if args.filename_contains in c.original_filename
+            ]
+    else:
+        queried_candidates = await _load_candidates(
+            args.project_ids,
+            filename_contains=args.filename_contains,
+        )
     if args.dry_run:
         candidates = (
             queried_candidates[: args.limit] if args.limit is not None else queried_candidates
         )
     else:
         candidates = _load_manifest(args.state_file)
+        if (
+            candidate_manifest is not None
+            and candidates
+            and (
+                _candidate_digest(candidates)
+                != _candidate_digest(
+                    queried_candidates[: args.limit]
+                    if args.limit is not None
+                    else queried_candidates
+                )
+            )
+        ):
+            raise ValueError("repair checkpoint belongs to a different candidate manifest")
         if not candidates:
             candidates = queried_candidates
             if args.limit is not None:

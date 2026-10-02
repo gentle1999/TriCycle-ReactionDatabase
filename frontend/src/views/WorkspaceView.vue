@@ -101,7 +101,7 @@ const reactionSort = ref<ReactionSort>({ sortBy: "default", sortDirection: "asc"
 const artifactOffset = ref(
   route.name === "artifacts" ? offsetFromPage(route.query.page, artifactPageSize.value) : 0,
 );
-const artifactSort = ref<ArtifactSort>({ sortBy: "created_at", sortDirection: "desc" });
+const artifactSort = ref<ArtifactSort>({ sortBy: "latest_parse_at", sortDirection: "desc" });
 
 const queries = useCatalogQueries({
   projectId: currentProjectId,

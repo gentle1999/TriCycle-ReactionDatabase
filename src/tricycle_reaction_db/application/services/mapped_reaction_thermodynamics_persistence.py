@@ -726,6 +726,43 @@ def _persist_profile_bounds(
     }
 
 
+def _bind_profile_endpoint_geometries(
+    session: Session,
+    mapped_reaction: MappedReaction,
+    participant_rows: Sequence[tuple[MappedReactionParticipant, LogicalReactionParticipant]],
+    binding_rows: Sequence[tuple[MappedReactionNode, MappedReactionNodeGeometry, Geometry]],
+    endpoint_geometries: Mapping[UUID, Sequence[Geometry]],
+) -> None:
+    """Persist associations from the same endpoint snapshot used by the profile.
+
+    A concurrent source import can make a geometry eligible after ingestion's
+    reconciliation barrier. Close that gap atomically with profile publication.
+    """
+    from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
+        ReconciliationBatchCache,
+        _bind_participant_geometry,
+    )
+
+    existing = {
+        (binding.mapped_reaction_participant_id, geometry.id)
+        for _, binding, geometry in binding_rows
+    }
+    cache = ReconciliationBatchCache()
+    for participant, _ in participant_rows:
+        participant_id = _require_id(participant, label="MappedReactionParticipant")
+        for geometry in endpoint_geometries.get(participant_id, ()):
+            if (participant_id, geometry.id) in existing:
+                continue
+            _bind_participant_geometry(
+                session,
+                participant=participant,
+                geometry=geometry,
+                mapped_reaction=mapped_reaction,
+                cache=cache,
+                thermodynamic_property_verified=True,
+            )
+
+
 def refresh_mapped_reaction_thermodynamics(
     session: Session,
     mapped_reaction: MappedReaction,
@@ -756,6 +793,13 @@ def refresh_mapped_reaction_thermodynamics(
     transition_state_node_ids = refresh_input.transition_state_node_ids
     composites = refresh_input.composites
     runtimes_by_geometry = refresh_input.runtimes_by_geometry
+    _bind_profile_endpoint_geometries(
+        session,
+        mapped_reaction,
+        participant_rows,
+        binding_rows,
+        refresh_input.endpoint_geometries_by_participant,
+    )
     result = _build_mapped_reaction_thermodynamics(
         mapped_reaction_id=mapped_reaction_id,
         participant_rows=participant_rows,
@@ -1112,6 +1156,13 @@ def refresh_mapped_reactions_thermodynamics(
     profile_rows: list[MappedReactionThermodynamicProfile] = []
     source_references_by_profile: list[tuple[_ProfileSourceReference, ...]] = []
     for mapped_reaction_id, _mapped_reaction in mapped_reactions_by_id.items():
+        _bind_profile_endpoint_geometries(
+            session,
+            _mapped_reaction,
+            participants_by_reaction[mapped_reaction_id],
+            bindings_by_reaction[mapped_reaction_id],
+            endpoint_geometries_by_reaction[mapped_reaction_id],
+        )
         result = _build_mapped_reaction_thermodynamics(
             mapped_reaction_id=mapped_reaction_id,
             participant_rows=participants_by_reaction[mapped_reaction_id],

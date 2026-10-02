@@ -25,7 +25,6 @@ from tricycle_reaction_db.application.services._persistence import (
     _flush_if_needed,
     _set_fast_pending_entities,
     _truncate_fast_pending_entities,
-    source_atom_mapping_is_authoritative,
     source_atom_order_authoritative,
 )
 from tricycle_reaction_db.application.services.calculations import (
@@ -966,24 +965,19 @@ def _reconcile_molop_geometry_context_impl(
                     cache=reconciliation_cache,
                     refresh_thermodynamics=refresh_thermodynamics,
                 )
-        if not source_atom_mapping_is_authoritative(session):
-            # A mapped reaction may have been created after its endpoint
-            # Geometry rows were persisted by an earlier ingestion microbatch.
-            # The normal Geometry pass cannot discover that ordering, so
-            # explicitly perform the reverse lookup for every reaction
-            # registered during this batch.  The legacy bulk importer keeps
-            # the previous one-way reconciliation barrier on its hot path.
-            for mapped_reaction in context.mapped_reactions_to_reconcile.values():
-                mapped_reaction_id = mapped_reaction.id
-                if mapped_reaction_id is None:
-                    continue
-                reconcile_mapped_reaction_with_geometries(
-                    session,
-                    mapped_reaction,
-                    refresh_thermodynamics=False,
-                    cache=reconciliation_cache,
-                )
-                reconciliation_cache.affected_reactions_by_id[mapped_reaction_id] = mapped_reaction
+        # New reactions must also find endpoint geometries from earlier
+        # batches, including imports that preserve the source atom order.
+        for mapped_reaction in context.mapped_reactions_to_reconcile.values():
+            mapped_reaction_id = mapped_reaction.id
+            if mapped_reaction_id is None:
+                continue
+            reconcile_mapped_reaction_with_geometries(
+                session,
+                mapped_reaction,
+                refresh_thermodynamics=False,
+                cache=reconciliation_cache,
+            )
+            reconciliation_cache.affected_reactions_by_id[mapped_reaction_id] = mapped_reaction
         _attach_pending_entities(session)
         _flush_if_needed(session)
         affected_reactions = tuple(reconciliation_cache.affected_reactions_by_id.values())

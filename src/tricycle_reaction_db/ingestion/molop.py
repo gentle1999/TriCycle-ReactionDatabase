@@ -61,6 +61,10 @@ def normalize_molop_frame(frame: BaseCalcFrame[Any]) -> NormalizedMoleculeRecord
     rdmol = frame.rdmol
     if not isinstance(rdmol, Chem.Mol):
         raise ValueError("MolOP frame does not provide a reconstructed RDKit molecule")
+    if [atom.GetAtomicNum() for atom in rdmol.GetAtoms()] != list(frame.atoms):  # type: ignore[no-untyped-call]
+        raise ValueError(
+            "reconstructed graph must preserve the complete source atom inventory/order"
+        )
     # MolGR returns the reconstructed graph and its Cartesian conformer, but
     # RDKit's SMILES writer may still need neighboring BondDir metadata. Keep
     # this as the single MolGR -> ingestion stereo boundary.

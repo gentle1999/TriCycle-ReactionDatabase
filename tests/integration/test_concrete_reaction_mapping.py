@@ -17,6 +17,12 @@ from tricycle_reaction_db.application.dtos.reactions import (
     MappedReactionNodeGeometryRecord,
     MappedReactionRecord,
 )
+from tricycle_reaction_db.application.services.canonical_reaction_identity import (
+    canonical_reaction_identity,
+)
+from tricycle_reaction_db.application.services.mapped_geometry_atom_order import (
+    parse_mapped_reaction_smiles,
+)
 from tricycle_reaction_db.application.services.molecular_geometry import (
     GeometryPersistenceContext,
 )
@@ -51,6 +57,10 @@ from tricycle_reaction_db.application.services.topology_abstraction import (
     assigned_stereo_features,
     persist_stereo_abstraction_projection,
 )
+from tricycle_reaction_db.core.chemistry_config import (
+    REACTION_TS_GEOMETRY_LINK_METHOD,
+    REACTION_TS_GEOMETRY_LINK_POLICY_VERSION,
+)
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
     LogicalReactionParticipant,
@@ -68,7 +78,11 @@ from tricycle_reaction_db.domain.enums import (
     MappedReactionNodeRole,
 )
 from tricycle_reaction_db.domain.identity import SYSTEM_PROJECT_ID
-from tricycle_reaction_db.ingestion.normalization import normalize_molecule, normalize_topology
+from tricycle_reaction_db.ingestion.normalization import (
+    normalize_molecule,
+    normalize_topology,
+    normalize_topology_with_mapping,
+)
 
 pytestmark = [
     pytest.mark.integration,
@@ -101,6 +115,7 @@ def _strict_stereo_topology(
 ) -> MolecularTopology:
     molecule = Chem.MolFromSmiles(smiles)
     assert molecule is not None
+    molecule = Chem.AddHs(molecule)
     return persist_molecular_topology(
         session,
         normalize_topology(
@@ -158,8 +173,12 @@ def _mapped_reaction_fixture(
         )
 
     atom_maps = [index + 1 for index in range(source.atom_count)]
+    identity = canonical_reaction_identity(
+        {side: [(source.mol, atom_maps)] for side in LogicalReactionParticipantSide}
+    )
+    atom_maps = [identity.source_map_to_canonical[number] for number in atom_maps]
     mapped_smiles = mapped_smiles_for_topology(source, atom_maps)
-    mapped_reaction_smiles = f"{mapped_smiles}>>{mapped_smiles}"
+    mapped_reaction_smiles = identity.smiles
     mapping_hash = sha256(mapped_reaction_smiles.encode("utf-8")).hexdigest()
     mapped_reaction = persist_mapped_reaction(
         session,
@@ -181,6 +200,8 @@ def _mapped_reaction_fixture(
         precomputed_mapped_smiles_by_template={
             (side, 0): mapped_smiles for side in LogicalReactionParticipantSide
         },
+        source_mapped_reaction_smiles=identity.smiles,
+        canonical_identity=identity,
     )
     session.flush()
     return source, target, logical, mapped_reaction
@@ -214,7 +235,13 @@ def test_new_concrete_topology_gets_mapping_via_logical_graph() -> None:
             )
             assert target_mapping.id != source_mapping.id
             assert target_mapping.mapping_hash != source_mapping.mapping_hash
-            assert target_mapping.mapped_reaction_smiles.count("[C@@H:") == 2
+            parsed = parse_mapped_reaction_smiles(target_mapping.mapped_reaction_smiles)
+            for molecule in (*parsed.GetReactants(), *parsed.GetProducts()):
+                for atom in molecule.GetAtoms():
+                    atom.SetAtomMapNum(0)
+                assert Chem.MolToSmiles(Chem.RemoveHs(molecule)) == Chem.MolToSmiles(
+                    Chem.RemoveHs(target.mol)
+                )
 
             participants = session.exec(
                 select(MappedReactionParticipant).where(
@@ -298,7 +325,10 @@ def test_logical_reaction_expands_existing_concrete_members() -> None:
         engine.dispose()
 
 
-def test_derived_mapping_shares_source_ts_and_unchanged_endpoint_evidence() -> None:
+@pytest.mark.parametrize("trusted_source_mapping", [False, True])
+def test_derived_stereoisomer_keeps_endpoints_without_borrowing_source_ts(
+    trusted_source_mapping: bool,
+) -> None:
     engine = create_engine(get_settings().database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
@@ -313,13 +343,15 @@ def test_derived_mapping_shares_source_ts_and_unchanged_endpoint_evidence() -> N
                     [0.0, 0.0, 1.1],
                     [1.0, 1.0, 1.0],
                     [2.0, 0.0, 1.0],
+                    [1.4, -1.0, 0.0],
+                    [0.2, 0.4, 2.0],
                 ],
                 dtype=np.float64,
             )
             source_geometry = persist_molecular_geometry(
                 session,
                 normalize_molecule(
-                    Chem.MolFromSmiles("F[C@H](Cl)[C@H](Br)I"),
+                    Chem.AddHs(Chem.MolFromSmiles("F[C@H](Cl)[C@H](Br)I")),
                     coordinates,
                     charge=0,
                     multiplicity=1,
@@ -330,7 +362,7 @@ def test_derived_mapping_shares_source_ts_and_unchanged_endpoint_evidence() -> N
             ts_geometry = persist_molecular_geometry(
                 session,
                 normalize_molecule(
-                    Chem.MolFromSmiles("F[C@H](Cl)[C@H](Br)I"),
+                    Chem.AddHs(Chem.MolFromSmiles("F[C@H](Cl)[C@H](Br)I")),
                     coordinates + 0.2,
                     charge=0,
                     multiplicity=1,
@@ -403,8 +435,14 @@ def test_derived_mapping_shares_source_ts_and_unchanged_endpoint_evidence() -> N
                         atom_maps,
                         include_stereochemistry=False,
                     ),
-                    mapping_method="tests/shared-evidence",
-                    mapping_version="1",
+                    mapping_method=(
+                        REACTION_TS_GEOMETRY_LINK_METHOD
+                        if trusted_source_mapping
+                        else "tests/shared-evidence"
+                    ),
+                    mapping_version=(
+                        REACTION_TS_GEOMETRY_LINK_POLICY_VERSION if trusted_source_mapping else "1"
+                    ),
                     verified=True,
                 ),
             )
@@ -437,7 +475,11 @@ def test_derived_mapping_shares_source_ts_and_unchanged_endpoint_evidence() -> N
                     )
                 ).all()
                 assert len(edges) == 1
-                assert {binding.geometry_id for binding in ts_bindings} == {ts_geometry.id}
+                # A concrete stereoisomer does not have the source TS's inferred
+                # endpoints. Sharing a logical graph alone is not TS evidence,
+                # even when the source association uses the current policy.
+                expected = {ts_geometry.id} if mapping.id == source_mapping.id else set()
+                assert {binding.geometry_id for binding in ts_bindings} == expected
 
             reactant_variant = next(
                 mapping
@@ -497,6 +539,7 @@ def test_geometry_arrival_uses_strict_topology_and_can_bind_new_mapping() -> Non
             source, target, _logical, source_mapping = _mapped_reaction_fixture(session)
             molecule = Chem.MolFromSmiles("F[C@@H](Cl)[C@H](Br)I")
             assert molecule is not None
+            molecule = Chem.AddHs(molecule)
             normalized = normalize_molecule(
                 molecule,
                 np.asarray(
@@ -507,6 +550,8 @@ def test_geometry_arrival_uses_strict_topology_and_can_bind_new_mapping() -> Non
                         [0.0, 0.0, 1.1],
                         [1.0, 1.0, 1.0],
                         [2.0, 0.0, 1.0],
+                        [1.4, -1.0, 0.0],
+                        [0.2, 0.4, 2.0],
                     ],
                     dtype=np.float64,
                 ),
@@ -603,24 +648,29 @@ def test_inversion_projection_clears_n_related_ez_only() -> None:
             ):
                 molecule = Chem.MolFromSmiles(smiles)
                 assert molecule is not None
-                persisted = persist_molecular_topology(
-                    session,
-                    normalize_topology(
-                        molecule,
-                        add_hydrogens=False,
-                        reconstruction_method=f"tests/inversion-{side.value}",
-                        reconstruction_version="1",
-                    ),
+                molecule = Chem.AddHs(molecule)
+                next_map = max(atom.GetAtomMapNum() for atom in molecule.GetAtoms()) + 1
+                for atom in molecule.GetAtoms():
+                    if not atom.GetAtomMapNum():
+                        atom.SetAtomMapNum(next_map)
+                        next_map += 1
+                record, source_to_topology = normalize_topology_with_mapping(
+                    molecule,
+                    add_hydrogens=False,
+                    reconstruction_method=f"tests/inversion-{side.value}",
+                    reconstruction_version="1",
                 )
+                topology_maps = [0] * molecule.GetNumAtoms()
+                for index, atom in enumerate(molecule.GetAtoms()):
+                    topology_maps[source_to_topology[index]] = atom.GetAtomMapNum()
+                persisted = persist_molecular_topology(session, record)
                 components.append(
                     _ResolvedComponent(
                         side=side,
                         template_index=0,
                         formula=persisted.formula,
                         topology=persisted.topology,
-                        topology_atom_map_numbers=[
-                            atom.GetAtomMapNum() for atom in molecule.GetAtoms()
-                        ],
+                        topology_atom_map_numbers=topology_maps,
                     )
                 )
 
@@ -663,24 +713,29 @@ def test_inversion_projection_clears_sulfur_chirality() -> None:
             ):
                 molecule = Chem.MolFromSmiles(smiles)
                 assert molecule is not None
-                persisted = persist_molecular_topology(
-                    session,
-                    normalize_topology(
-                        molecule,
-                        add_hydrogens=False,
-                        reconstruction_method=f"tests/inversion-{side.value}",
-                        reconstruction_version="1",
-                    ),
+                molecule = Chem.AddHs(molecule)
+                next_map = max(atom.GetAtomMapNum() for atom in molecule.GetAtoms()) + 1
+                for atom in molecule.GetAtoms():
+                    if not atom.GetAtomMapNum():
+                        atom.SetAtomMapNum(next_map)
+                        next_map += 1
+                record, source_to_topology = normalize_topology_with_mapping(
+                    molecule,
+                    add_hydrogens=False,
+                    reconstruction_method=f"tests/inversion-{side.value}",
+                    reconstruction_version="1",
                 )
+                topology_maps = [0] * molecule.GetNumAtoms()
+                for index, atom in enumerate(molecule.GetAtoms()):
+                    topology_maps[source_to_topology[index]] = atom.GetAtomMapNum()
+                persisted = persist_molecular_topology(session, record)
                 components.append(
                     _ResolvedComponent(
                         side=side,
                         template_index=0,
                         formula=persisted.formula,
                         topology=persisted.topology,
-                        topology_atom_map_numbers=[
-                            atom.GetAtomMapNum() for atom in molecule.GetAtoms()
-                        ],
+                        topology_atom_map_numbers=topology_maps,
                     )
                 )
 

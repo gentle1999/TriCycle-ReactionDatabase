@@ -29,6 +29,7 @@ from tricycle_reaction_db.application.services.reaction_commands import (
     _mapped_reaction_smiles_from_components,
 )
 from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
+    _mapped_reaction_matches_participant_projection,
     _target_ts_geometry_atom_maps,
     _validated_target_ts_geometry_atom_maps,
 )
@@ -48,6 +49,10 @@ from tricycle_reaction_db.application.services.reactions import (
     persist_mapped_reaction,
     persist_mapped_reaction_node_geometry_mapping,
     persist_mapped_reaction_participant,
+)
+from tricycle_reaction_db.core.chemistry_config import (
+    REACTION_TS_GEOMETRY_LINK_METHOD,
+    REACTION_TS_GEOMETRY_LINK_POLICY_VERSION,
 )
 from tricycle_reaction_db.db.models import (
     Geometry,
@@ -296,7 +301,7 @@ def test_atom_maps_are_translated_to_reused_topology_atom_order() -> None:
     } == source_atom_properties
 
 
-def test_atom_maps_align_when_reused_topology_has_a_different_stereo_projection() -> None:
+def test_atom_maps_reject_reused_topology_with_opposite_stereochemistry() -> None:
     parsed_source = Chem.MolFromSmiles("C[C@](F)(Cl)Br")
     source_mol = Chem.AddHs(parsed_source) if parsed_source is not None else None
     assert source_mol is not None
@@ -335,22 +340,8 @@ def test_atom_maps_align_when_reused_topology_has_a_different_stereo_projection(
         ),
     )
 
-    aligned_maps = _atom_maps_in_persisted_topology_order(
-        normalized.topology,
-        persisted_topology,
-        source_maps,
-    )
-
-    assert mapped_smiles_for_topology(
-        persisted_topology,
-        aligned_maps,
-        include_stereochemistry=False,
-    ) == mapped_smiles_for_topology(
-        cast(MolecularTopology, normalized.topology),
-        source_maps,
-        include_stereochemistry=False,
-    )
-    assert sorted(aligned_maps) == sorted(source_maps)
+    with pytest.raises(ValueError, match="labelled stereochemical graph"):
+        _atom_maps_in_persisted_topology_order(normalized.topology, persisted_topology, source_maps)
 
 
 @pytest.mark.parametrize(
@@ -849,7 +840,10 @@ def test_shared_ts_geometry_maps_are_rebased_between_mapping_variants(
     monkeypatch.setattr(
         session,
         "get",
-        lambda _model, _topology_id: SimpleNamespace(atom_count=2),
+        lambda _model, _topology_id: SimpleNamespace(
+            atom_count=2,
+            mol=Chem.MolFromSmiles("CO"),
+        ),
     )
 
     assert _target_ts_geometry_atom_maps(
@@ -858,6 +852,28 @@ def test_shared_ts_geometry_maps_are_rebased_between_mapping_variants(
         target_participants=target_participants,
         source_geometry_atom_maps=[1, 2],
     ) == [2, 1]
+
+
+def test_mapped_reaction_projection_rejects_same_element_map_link_mismatch() -> None:
+    participants = [
+        SimpleNamespace(
+            side=LogicalReactionParticipantSide.REACTANT,
+            mapped_smiles="[CH3:1][CH2:2][CH3:3]",
+        ),
+        SimpleNamespace(
+            side=LogicalReactionParticipantSide.PRODUCT,
+            mapped_smiles="[CH3:1][CH2:2][CH3:3]",
+        ),
+    ]
+
+    assert _mapped_reaction_matches_participant_projection(
+        "[CH3:1][CH2:2][CH3:3]>>[CH3:1][CH2:2][CH3:3]",
+        participants,
+    )
+    assert not _mapped_reaction_matches_participant_projection(
+        "[CH3:1][CH2:2][CH3:3]>>[CH3:2][CH2:1][CH3:3]",
+        participants,
+    )
 
 
 def test_shared_ts_geometry_is_not_rebased_when_reaction_sides_disagree(
@@ -898,7 +914,10 @@ def test_shared_ts_geometry_is_not_rebased_when_reaction_sides_disagree(
     monkeypatch.setattr(
         session,
         "get",
-        lambda _model, _topology_id: SimpleNamespace(atom_count=2),
+        lambda _model, _topology_id: SimpleNamespace(
+            atom_count=2,
+            mol=Chem.MolFromSmiles("CO"),
+        ),
     )
 
     assert (
@@ -915,45 +934,60 @@ def test_shared_ts_geometry_is_not_rebased_when_reaction_sides_disagree(
 def test_shared_ts_geometry_skips_element_incompatible_sibling_mapping(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    topology_id = UUID("00000000-0000-7000-8000-00000000009a")
+    reactant_topology_id = UUID("00000000-0000-7000-8000-00000000009a")
+    product_topology_id = UUID("00000000-0000-7000-8000-00000000009f")
     logical_participant_id = UUID("00000000-0000-7000-8000-00000000009b")
     source_participants = [
         SimpleNamespace(
-            side=side,
+            side=LogicalReactionParticipantSide.REACTANT,
             template_index=0,
             logical_reaction_participant_id=logical_participant_id,
-            concrete_topology_id=topology_id,
+            concrete_topology_id=reactant_topology_id,
             atom_map_numbers=[1, 2],
-        )
-        for side in (
-            LogicalReactionParticipantSide.REACTANT,
-            LogicalReactionParticipantSide.PRODUCT,
-        )
+        ),
+        SimpleNamespace(
+            side=LogicalReactionParticipantSide.PRODUCT,
+            template_index=0,
+            logical_reaction_participant_id=logical_participant_id,
+            concrete_topology_id=product_topology_id,
+            atom_map_numbers=[1, 2],
+        ),
     ]
     target_participants = [
         SimpleNamespace(
-            side=side,
+            side=LogicalReactionParticipantSide.REACTANT,
             template_index=0,
             logical_reaction_participant_id=logical_participant_id,
-            concrete_topology_id=topology_id,
+            concrete_topology_id=reactant_topology_id,
             atom_map_numbers=[2, 1],
-        )
-        for side in (
-            LogicalReactionParticipantSide.REACTANT,
-            LogicalReactionParticipantSide.PRODUCT,
-        )
+        ),
+        SimpleNamespace(
+            side=LogicalReactionParticipantSide.PRODUCT,
+            template_index=0,
+            logical_reaction_participant_id=logical_participant_id,
+            concrete_topology_id=product_topology_id,
+            atom_map_numbers=[2, 1],
+        ),
     ]
     session = Session()
     monkeypatch.setattr(
         session,
         "get",
-        lambda _model, _topology_id: SimpleNamespace(atom_count=2),
+        lambda _model, topology_id: SimpleNamespace(
+            atom_count=2,
+            mol=Chem.MolFromSmiles("CO" if topology_id == reactant_topology_id else "C=O"),
+        ),
     )
     molecule = Chem.MolFromSmiles("CO")
     assert molecule is not None
     geometry = SimpleNamespace(id=UUID("00000000-0000-7000-8000-00000000009c"), mol=molecule)
     reaction = "[CH3:1][OH:2]>>[CH2:1]=[O:2]"
-    source_mapping = SimpleNamespace(geometry_atom_map_numbers=[1, 2])
+    source_mapping = SimpleNamespace(
+        geometry_atom_map_numbers=[1, 2],
+        mapping_method=REACTION_TS_GEOMETRY_LINK_METHOD,
+        mapping_version=REACTION_TS_GEOMETRY_LINK_POLICY_VERSION,
+        verified=True,
+    )
 
     assert (
         _validated_target_ts_geometry_atom_maps(

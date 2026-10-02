@@ -45,6 +45,7 @@ from tricycle_reaction_db.db.models import (
     MolecularTopologyDerivation,
 )
 from tricycle_reaction_db.domain.enums import GeometryAssignmentKind
+from tricycle_reaction_db.domain.explicit_hydrogens import require_explicit_hydrogens
 from tricycle_reaction_db.domain.internal_coordinates import proper_rigid_alignment
 
 _IDENTITY_TRANSFORM: tuple[float, ...] = (
@@ -180,6 +181,7 @@ class GeometryPersistenceContext:
     # endpoint/topology identities; reaction_smiles alone is not sufficient
     # because one logical reaction can have several concrete stereochemical
     # variants.
+    inferred_reaction_maps_by_key: dict[str, dict[int, int]] = field(default_factory=dict)
     inferred_reaction_ids_by_key: dict[str, tuple[UUID, UUID]] = field(default_factory=dict)
     inferred_reaction_topology_records_by_key: dict[str, tuple[Any, ...]] = field(
         default_factory=dict
@@ -590,6 +592,9 @@ def _validate_cached_topology(
     persisted: PersistedMolecularTopology,
     record: NormalizedTopologyRecord,
 ) -> None:
+    require_explicit_hydrogens(persisted.topology.mol)
+    if persisted.topology.mol.GetNumAtoms() != record.topology.atom_count:
+        raise ValueError("stored topology atom inventory requires repair from its source")
     if persisted.formula.composition_hash != record.formula.composition_hash:
         raise ValueError("cached molecular formula identity is inconsistent")
     topology = persisted.topology
@@ -715,6 +720,7 @@ def _preload_molecular_topologies(
     project_id = _require_geometry_project_context(context)
     pending: dict[tuple[str, ...], NormalizedTopologyRecord] = {}
     for record in records:
+        require_explicit_hydrogens(record.topology.mol)
         context_key = _topology_context_key(record)
         if context_key not in context.topologies:
             pending.setdefault(context_key, record)
@@ -932,6 +938,7 @@ def persist_molecular_topology(
     """Insert or reuse Formula and Topology without requiring a Geometry."""
 
     project_id = _require_geometry_project_context(context)
+    require_explicit_hydrogens(record.topology.mol)
     context_key = _topology_context_key(record)
     if context is not None and (cached := context.topologies.get(context_key)) is not None:
         _validate_cached_topology(cached, record)
@@ -1005,6 +1012,9 @@ def persist_molecular_topology(
         _flush_shared_entity(session, topology, label="MolecularTopology", defer_if_fast=True)
     elif topology.formula_id != formula.id:
         raise ValueError("topology identity resolved to a different molecular formula")
+    require_explicit_hydrogens(topology.mol)
+    if topology.mol.GetNumAtoms() != record.topology.atom_count:
+        raise ValueError("stored topology atom inventory requires repair from its source")
     _promote_stereo_abstraction_upstream_marker(
         session,
         topology,
@@ -1097,6 +1107,7 @@ def persist_molecular_geometry(
     """Insert or reuse one normalized three-level chemical record."""
 
     project_id = _require_geometry_project_context(context)
+    require_explicit_hydrogens(record.geometry.mol)
     persisted_topology = persist_molecular_topology(
         session,
         NormalizedTopologyRecord(
@@ -1169,6 +1180,10 @@ def persist_molecular_geometry(
             context.equivalent_geometry_candidates[geometry_key] = (
                 _require_id(geometry, label="Geometry"),
             )
+    if geometry is not None:
+        require_explicit_hydrogens(geometry.mol)
+        if geometry.atom_count != record.geometry.atom_count:
+            raise ValueError("stored Geometry atom inventory requires repair from its source")
     assignment_kind = GeometryAssignmentKind.PARSED_EXACT
     assignment_indices: list[int] | None = list(record.observed_to_geometry_atom_indices)
     assignment_transform = tuple(record.observed_to_geometry_transform)

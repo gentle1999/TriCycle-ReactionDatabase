@@ -34,6 +34,12 @@ from tricycle_reaction_db.application.services.authorization import (
     AuthorizationService,
     ProjectPermission,
 )
+from tricycle_reaction_db.application.services.canonical_atom_mapping import (
+    canonical_atom_index_mapping,
+)
+from tricycle_reaction_db.application.services.canonical_reaction_identity import (
+    canonical_reaction_identity,
+)
 from tricycle_reaction_db.application.services.molecular_geometry import (
     GeometryPersistenceContext,
     persist_molecular_topology,
@@ -199,17 +205,11 @@ def _mapped_reaction_smiles_from_components(
 
 
 def _atom_maps_in_persisted_topology_order(
-    source_topology: MolecularTopologyRecord,
+    source_topology: MolecularTopologyRecord | MolecularTopology,
     persisted_topology: MolecularTopology,
     atom_map_numbers: list[int],
 ) -> list[int]:
-    """Translate maps across graph-identical projections with different atom order.
-
-    Stereo is ignored only while finding this within-topology atom-order
-    correspondence; unique temporary atom labels must still reproduce the
-    source connectivity, bond orders, charges, and isotopes exactly. This does
-    not infer correspondence between reaction sides.
-    """
+    """Translate source maps into a reused topology's stored atom order."""
 
     if not atom_map_numbers:
         return []
@@ -220,74 +220,31 @@ def _atom_maps_in_persisted_topology_order(
     if len(atom_map_numbers) != source_mol.GetNumAtoms():
         raise ValueError("source atom-map count does not match its topology projection")
 
-    # Synthetic unique labels let this verification work even when the source
-    # reaction only maps a subset of atoms. They are not persisted.
-    source_labels = list(range(1, source_mol.GetNumAtoms() + 1))
-    source_labelled_smiles = mapped_smiles_for_topology(
-        cast(MolecularTopology, source_topology),
-        source_labels,
-        include_stereochemistry=False,
+    from tricycle_reaction_db.application.services.canonical_atom_mapping import (
+        _uniquely_labelled_smiles,
     )
 
-    def translated_maps(match: tuple[int, ...]) -> list[int]:
-        translated = [0] * len(match)
-        for source_index, persisted_index in enumerate(match):
+    # A different E/Z writer traversal may hide an otherwise valid candidate.
+    # Connectivity may propose the permutation, but both labelled stereo
+    # graphs must agree before any map vector is accepted.
+    for include_stereo in (True, False):
+        source_to_persisted = canonical_atom_index_mapping(
+            source_mol, persisted_mol, include_stereochemistry=include_stereo
+        )
+        if source_to_persisted is None:
+            continue
+        translated = [0] * persisted_mol.GetNumAtoms()
+        for source_index, persisted_index in enumerate(source_to_persisted):
             translated[persisted_index] = atom_map_numbers[source_index]
-        return translated
-
-    def matching_projection(match: tuple[int, ...]) -> list[int] | None:
-        candidate = translated_maps(match)
-        candidate_smiles = mapped_smiles_for_topology(
-            persisted_topology,
-            source_labels_for(match),
-            include_stereochemistry=False,
+        source_labelled = _uniquely_labelled_smiles(
+            source_mol, atom_map_numbers, include_stereochemistry=True
         )
-        if candidate_smiles == source_labelled_smiles:
-            return candidate
-        return None
-
-    def source_labels_for(match: tuple[int, ...]) -> list[int]:
-        translated = [0] * len(match)
-        for source_index, persisted_index in enumerate(match):
-            translated[persisted_index] = source_labels[source_index]
-        return translated
-
-    if (
-        mapped_smiles_for_topology(
-            persisted_topology,
-            source_labels,
-            include_stereochemistry=False,
+        target_labelled = _uniquely_labelled_smiles(
+            persisted_mol, translated, include_stereochemistry=True
         )
-        == source_labelled_smiles
-    ):
-        return atom_map_numbers.copy()
-
-    first_matches = persisted_mol.GetSubstructMatches(
-        source_mol,
-        uniquify=False,
-        useChirality=False,
-        maxMatches=1,
-    )
-    if not first_matches:
-        raise ValueError("reused topology is not graph-isomorphic to its source projection")
-    for match in first_matches:
-        aligned = matching_projection(match)
-        if aligned is not None:
-            return aligned
-
-    matches = persisted_mol.GetSubstructMatches(
-        source_mol,
-        uniquify=False,
-        useChirality=False,
-        maxMatches=4096,
-    )
-    for match in matches[1:]:
-        aligned = matching_projection(match)
-        if aligned is not None:
-            return aligned
-    raise ValueError(
-        "could not verify source atom order against the reused molecular topology projection"
-    )
+        if source_labelled is not None and source_labelled == target_labelled:
+            return translated
+    raise ValueError("reused topology is not the same labelled stereochemical graph")
 
 
 def _ordered_molecular_graph_signature(mol: Any) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
@@ -383,29 +340,11 @@ def _resolve_components(
                 ).topology
             if include_creation_metadata and existing is None:
                 topologies_created += 1
-            if session.info.get(SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY, False):
-                source_mol = normalized.topology.mol
-                persisted_mol = persisted.topology.mol
-                if _ordered_molecular_graph_signature(source_mol) != (
-                    _ordered_molecular_graph_signature(persisted_mol)
-                ):
-                    raise ValueError(
-                        "source-index-preserving topology identity collision: "
-                        f"requested={normalized.topology.identity_schema_version}/"
-                        f"{normalized.topology.graph_hash}, "
-                        f"resolved={persisted.topology.identity_schema_version}/"
-                        f"{persisted.topology.graph_hash}, "
-                        "the source-index identity did not distinguish their atom orders"
-                    )
-                topology_atom_maps_in_persisted_order = [
-                    int(number) for number in topology_atom_maps
-                ]
-            else:
-                topology_atom_maps_in_persisted_order = _atom_maps_in_persisted_topology_order(
-                    normalized.topology,
-                    persisted.topology,
-                    [int(number) for number in topology_atom_maps],
-                )
+            topology_atom_maps_in_persisted_order = _atom_maps_in_persisted_topology_order(
+                normalized.topology,
+                persisted.topology,
+                [int(number) for number in topology_atom_maps],
+            )
             components.append(
                 _ResolvedComponent(
                     side=side,
@@ -507,35 +446,44 @@ def reaction_topology_records(
     ]
 
 
-def _has_complete_mapping(components: list[_ResolvedComponent]) -> bool:
-    map_sets: dict[LogicalReactionParticipantSide, set[int]] = {}
-    any_mapping = False
-    for side in LogicalReactionParticipantSide:
-        side_maps: list[int] = []
-        for component in components:
-            if component.side is not side:
-                continue
-            template_maps = component.topology_atom_map_numbers
-            side_maps.extend(template_maps)
-            any_mapping = any_mapping or any(template_maps)
-            if any(template_maps) and len(template_maps) != component.topology.atom_count:
-                raise ValueError(
-                    "mapped reaction components must explicitly contain every topology atom"
-                )
-        positive_maps = [number for number in side_maps if number > 0]
-        if len(positive_maps) != len(side_maps) and positive_maps:
-            raise ValueError("reaction atom mapping must be either absent or complete")
-        if len(set(positive_maps)) != len(positive_maps):
-            raise ValueError("reaction atom-map numbers must be unique on each side")
-        map_sets[side] = set(positive_maps)
-    if not any_mapping:
+def _validate_atom_mapping_sides(sides: list[list[int]]) -> bool:
+    """Reject incomplete labels before topology persistence or map translation."""
+    if not any(number for side in sides for number in side):
         return False
-    if (
-        map_sets[LogicalReactionParticipantSide.REACTANT]
-        != map_sets[LogicalReactionParticipantSide.PRODUCT]
-    ):
+    for numbers in sides:
+        if not numbers or any(number <= 0 for number in numbers):
+            raise ValueError("reaction atom mapping must be either absent or complete")
+        if len(set(numbers)) != len(numbers):
+            raise ValueError("reaction atom-map numbers must be unique on each side")
+    if set(sides[0]) != set(sides[1]):
         raise ValueError("reactant and product atom-map sets must match")
     return True
+
+
+def _has_complete_mapping(components: list[_ResolvedComponent]) -> bool:
+    for component in components:
+        if component.topology_atom_map_numbers and (
+            len(component.topology_atom_map_numbers) != component.topology.atom_count
+        ):
+            raise ValueError(
+                "mapped reaction components must explicitly contain every topology atom"
+            )
+    return _validate_atom_mapping_sides(
+        [
+            [
+                number
+                for component in components
+                if component.side is side
+                for number in (
+                    component.topology_atom_map_numbers or [0] * component.topology.atom_count
+                )
+            ]
+            for side in (
+                LogicalReactionParticipantSide.REACTANT,
+                LogicalReactionParticipantSide.PRODUCT,
+            )
+        ]
+    )
 
 
 def _logicalize_components(
@@ -675,6 +623,13 @@ def _create_reaction(
         if precomputed_topology_records is not None
         else _reaction_from_representation(command.reaction)
     )
+    if definition is not None:
+        _validate_atom_mapping_sides(
+            [
+                [atom.GetAtomMapNum() for molecule in templates for atom in molecule.GetAtoms()]
+                for templates in (definition.GetReactants(), definition.GetProducts())
+            ]
+        )
     components, topologies_created = _resolve_components(
         session,
         definition,
@@ -683,10 +638,35 @@ def _create_reaction(
         precomputed_topology_records=precomputed_topology_records,
     )
     mapping_complete = _has_complete_mapping(components)
+    identity = None
+    if mapping_complete:
+        identity = canonical_reaction_identity(
+            {
+                side: [
+                    (component.topology.mol, component.topology_atom_map_numbers)
+                    for component in components
+                    if component.side == side
+                ]
+                for side in (
+                    LogicalReactionParticipantSide.REACTANT,
+                    LogicalReactionParticipantSide.PRODUCT,
+                )
+            }
+        )
+        components = [
+            replace(
+                component,
+                topology_atom_map_numbers=[
+                    identity.source_map_to_canonical[number]
+                    for number in component.topology_atom_map_numbers
+                ],
+            )
+            for component in components
+        ]
+
     if session.info.get(SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY, False):
-        # Raw MolOP endpoint indices determine mapping identity. Keep the
-        # separately normalized canonical topology only for logical reaction
-        # identity; concrete participant maps remain in source atom order.
+        # Source authority applies to inferred chemistry. Reaction maps have
+        # already been translated to canonical precursor numbering above.
         logical_components = [
             replace(component, logical_topology=component.logical_topology or component.topology)
             for component in components
@@ -746,9 +726,7 @@ def _create_reaction(
                 participant_index=component.template_index,
             ),
             candidate_topologies=(
-                ()
-                if source_atom_mapping_is_authoritative(session)
-                else (component.topology,)
+                () if source_atom_mapping_is_authoritative(session) else (component.topology,)
             ),
         )
     validate_logical_reaction(
@@ -784,17 +762,8 @@ def _create_reaction(
         (component.side, component.template_index): component.topology_atom_map_numbers
         for component in components
     }
-    # MolOP's endpoint projection assigned atom maps directly from the source
-    # atom indices. Preserve each component's exact SMILES while ordering
-    # components by the logical participant slots selected above.
-    canonical_smiles = _mapped_reaction_smiles_from_components(
-        command.reaction,
-        precomputed_mapped_smiles_by_template,
-        preserve_source_serialization=precomputed_topology_records is not None,
-        source_atom_maps_by_template=(
-            source_atom_maps_by_template if precomputed_topology_records is not None else None
-        ),
-    )
+    assert identity is not None
+    canonical_smiles = identity.smiles
     mapping_hash = sha256(canonical_smiles.encode("utf-8")).hexdigest()
     topology_ids_by_template = {
         (component.side, component.template_index): _require_id(
@@ -836,10 +805,9 @@ def _create_reaction(
         topology_ids_by_template=topology_ids_by_template,
         concrete_topology_ids_by_template=concrete_topology_ids_by_template,
         precomputed_mapped_smiles_by_template=precomputed_mapped_smiles_by_template,
-        source_mapped_reaction_smiles=(
-            canonical_smiles if precomputed_topology_records is not None else None
-        ),
+        source_mapped_reaction_smiles=(canonical_smiles),
         topology_context=topology_context,
+        canonical_identity=identity,
     )
     # A logical reaction may have been created after other concrete topology
     # rows were already persisted.  Expand those existing DAG members now
@@ -891,14 +859,14 @@ def _create_reaction(
             raise ValueError("deferred Geometry reconciliation requires a topology context")
         mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
         topology_context.mapped_reactions_to_reconcile[mapped_reaction_id] = mapped_reaction
-    elif not session.info.get(SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY, False):
+    else:
         reconcile_mapped_reaction_with_geometries(
             session,
             mapped_reaction,
             refresh_thermodynamics=not defer_thermodynamic_refresh,
             cache=reconciliation_cache,
         )
-    return CreateReactionResult(
+    result = CreateReactionResult(
         logical_reaction_id=_require_id(logical_reaction, label="LogicalReaction"),
         mapped_reaction_id=_require_id(mapped_reaction, label="MappedReaction"),
         reactant_node_id=_require_id(reactant_node, label="MappedReactionNode"),
@@ -914,6 +882,8 @@ def _create_reaction(
             else False
         ),
     )
+    result._source_map_to_canonical.update(identity.source_map_to_canonical)
+    return result
 
 
 class ReactionCommandService(UseCaseService):  # type: ignore[misc]

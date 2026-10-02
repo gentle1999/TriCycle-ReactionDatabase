@@ -17,8 +17,16 @@ from tricycle_reaction_db.ingestion.normalization import normalize_topology_with
 def _normalized_topology_with_source_maps(
     smiles: str,
 ) -> tuple[object, list[int]]:
-    molecule = Chem.MolFromSmiles(smiles)
+    parser = Chem.SmilesParserParams()
+    parser.removeHs = False
+    molecule = Chem.MolFromSmiles(smiles, parser)
     assert molecule is not None
+    molecule = Chem.AddHs(molecule)
+    next_map = max(atom.GetAtomMapNum() for atom in molecule.GetAtoms()) + 1
+    for atom in molecule.GetAtoms():
+        if atom.GetAtomMapNum() == 0:
+            atom.SetAtomMapNum(next_map)
+            next_map += 1
     source_maps = [atom.GetAtomMapNum() for atom in molecule.GetAtoms()]
     record, source_to_topology = normalize_topology_with_mapping(
         molecule,

@@ -628,7 +628,13 @@ watch(
                 <ArrowDownUp v-else :size="13" aria-hidden="true" />
               </button>
             </th>
-            <th>验证时间</th>
+            <th scope="col" :aria-sort="sortAriaValue('latest_parse_at')">
+              <button class="data-table-sort-button" type="button" :data-sort-by="'latest_parse_at'" :aria-label="sortButtonLabel('latest_parse_at', '最新解析时间')" @click="updateSortBy">
+                最新解析时间
+                <ArrowUp v-if="sort.sortBy === 'latest_parse_at' && sort.sortDirection === 'asc'" :size="13" aria-hidden="true" />
+                <ArrowDown v-else-if="sort.sortBy === 'latest_parse_at'" :size="13" aria-hidden="true" />
+              </button>
+            </th>
             <th><span class="sr-only">文件操作</span></th>
           </tr>
         </thead>
@@ -679,7 +685,7 @@ watch(
             </td>
             <td><code :title="artifact.content_sha256">{{ shortId(artifact.content_sha256) }}</code></td>
             <td>{{ artifact.created_at ? new Date(artifact.created_at).toLocaleString("zh-CN") : "—" }}</td>
-            <td>{{ artifact.storage_verified_at ? new Date(artifact.storage_verified_at).toLocaleString("zh-CN") : "—" }}</td>
+            <td>{{ artifact.latest_parse_at ? new Date(artifact.latest_parse_at).toLocaleString("zh-CN") : "—" }}</td>
             <td>
               <div class="table-actions">
                 <RouterLink

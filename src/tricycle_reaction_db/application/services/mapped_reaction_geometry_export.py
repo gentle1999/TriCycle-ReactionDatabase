@@ -5,23 +5,34 @@ from __future__ import annotations
 import json
 import logging
 import math
+from collections import defaultdict
 from collections.abc import AsyncIterator
+from typing import Any, cast
 from uuid import UUID
 
 from rdkit import Chem
 from rdkit.Chem.rdchem import KekulizeException
+from sqlalchemy.orm import undefer
 from sqlmodel import col, select
 
+from tricycle_reaction_db.application.services.mapped_calculation_order import (
+    MappedCalculationOrder,
+)
 from tricycle_reaction_db.application.services.mapped_geometry_atom_order import (
     molecule_in_atom_map_order,
     validate_geometry_atom_map_elements,
 )
 from tricycle_reaction_db.db.models import (
+    CalculationFrame,
     Geometry,
     MappedReaction,
     MappedReactionNode,
     MappedReactionNodeGeometry,
     MappedReactionNodeGeometryMapping,
+    NMRResult,
+    NMRShieldingTensor,
+    ScientificArray,
+    ScientificArrayAssignment,
 )
 from tricycle_reaction_db.db.session import session_factory
 from tricycle_reaction_db.domain.enums import MappedReactionNodeRole
@@ -30,12 +41,63 @@ logger = logging.getLogger(__name__)
 PAGE_SIZE = 64
 
 
+def _calculation_record(
+    frame: CalculationFrame,
+    geometry_maps: list[int],
+    arrays: list[tuple[ScientificArray, NMRResult | None, NMRShieldingTensor | None]],
+) -> dict[str, Any]:
+    projection = MappedCalculationOrder.from_geometry(
+        list(frame.observed_to_geometry_atom_indices), geometry_maps
+    )
+    values = []
+    for array, nmr, shielding in arrays:
+        data, axes = projection.scientific_array(
+            array.kind,
+            array.data,
+            coupling_atom_indices=list(nmr.coupling_atom_indices) if nmr is not None else None,
+        )
+        metadata = dict(array.array_metadata or {})
+        # Replace source-axis declarations as a unit; retaining old axis_order
+        # beside reordered values would give consumers contradictory metadata.
+        metadata.pop("axis_order", None)
+        metadata.update(axes)
+        metadata["atom_order"] = "mapped_reaction"
+        metadata["coordinate_reference"] = "calculation.observed_coordinates_angstrom"
+        if shielding is not None:
+            metadata["atom_index"] = projection.atom_indices([shielding.atom_index])[0]
+            metadata["isotropic_ppm"] = shielding.isotropic_ppm
+            metadata["anisotropy_ppm"] = shielding.anisotropy_ppm
+            metadata["orientation"] = shielding.orientation
+        values.append(
+            {
+                "id": str(array.id),
+                "kind": array.kind.value,
+                "ordinal": array.ordinal,
+                "unit": array.unit,
+                "shape": list(data.shape),
+                "data": data.tolist(),
+                "metadata": metadata,
+            }
+        )
+    return {
+        "frame_id": str(frame.id),
+        "atom_order": "mapped_reaction",
+        "coordinate_frame": "source_cartesian",
+        "source_to_mapped_atom_indices": list(projection.source_to_mapped),
+        "observed_coordinates_angstrom": projection.array(
+            frame.observed_coordinates, axes=(0,)
+        ).tolist(),
+        "scientific_arrays": values,
+    }
+
+
 def _jsonl_record(
     *,
     binding: MappedReactionNodeGeometry,
     mapped_reaction: MappedReaction,
     geometry: Geometry,
     mapping: MappedReactionNodeGeometryMapping,
+    calculations: list[dict[str, Any]] | None = None,
 ) -> bytes | None:
     """Serialize one verified binding with coordinates and an RDKit-readable Mol block."""
 
@@ -99,9 +161,10 @@ def _jsonl_record(
         )
         mol_block = Chem.MolToMolBlock(molecule, kekulize=False)
     record = {
-        "schema": "mapped-reaction-ts-geometry-v2",
+        "schema": "mapped-reaction-ts-geometry-v3",
         "key": mapped_reaction.mapped_reaction_smiles,
         "value": {
+            "calculations": calculations or [],
             "geometry": {
                 "geometry_id": str(geometry.id),
                 "geometry_binding_id": str(binding.id),
@@ -165,8 +228,47 @@ async def iter_mapped_reaction_geometry_export(
         if last_binding_id is not None:
             statement = statement.where(col(MappedReactionNodeGeometry.id) > last_binding_id)
 
+        frames_by_geometry: dict[UUID, list[CalculationFrame]] = defaultdict(list)
+        arrays_by_frame: dict[UUID, list[Any]] = defaultdict(list)
         async with session_factory() as session:
             rows = (await session.exec(statement)).all()
+            geometry_ids = [geometry.id for _, _, geometry, _ in rows]
+            if geometry_ids:
+                frames = (
+                    await session.exec(
+                        select(CalculationFrame)
+                        .options(undefer(cast(Any, CalculationFrame.observed_coordinates)))
+                        .where(col(CalculationFrame.geometry_id).in_(geometry_ids))
+                    )
+                ).all()
+                for frame in frames:
+                    frames_by_geometry[frame.geometry_id].append(frame)
+                frame_ids = [frame.id for frame in frames]
+                if frame_ids:
+                    arrays = (
+                        await session.exec(
+                            select(ScientificArray, NMRResult, NMRShieldingTensor)
+                            .options(undefer(cast(Any, ScientificArray.data)))
+                            .outerjoin(
+                                ScientificArrayAssignment,
+                                col(ScientificArrayAssignment.scientific_array_id)
+                                == col(ScientificArray.id),
+                            )
+                            .outerjoin(
+                                NMRResult,
+                                col(NMRResult.id) == col(ScientificArrayAssignment.nmr_result_id),
+                            )
+                            .outerjoin(
+                                NMRShieldingTensor,
+                                col(NMRShieldingTensor.id)
+                                == col(ScientificArrayAssignment.nmr_shielding_tensor_id),
+                            )
+                            .where(col(ScientificArray.frame_id).in_(frame_ids))
+                            .order_by(col(ScientificArray.kind), col(ScientificArray.ordinal))
+                        )
+                    ).all()
+                    for array, nmr, shielding in arrays:
+                        arrays_by_frame[array.frame_id].append((array, nmr, shielding))
         if not rows:
             break
 
@@ -174,11 +276,25 @@ async def iter_mapped_reaction_geometry_export(
             if binding.id is None:
                 continue
             last_binding_id = binding.id
+            try:
+                calculations = [
+                    _calculation_record(
+                        frame,
+                        list(mapping.geometry_atom_map_numbers),
+                        arrays_by_frame.get(cast(UUID, frame.id), []),
+                    )
+                    for frame in frames_by_geometry.get(cast(UUID, geometry.id), [])
+                ]
+            except ValueError as error:
+                raise ValueError(
+                    f"cannot export mapped calculation for Geometry {geometry.id}"
+                ) from error
             record = _jsonl_record(
                 binding=binding,
                 mapped_reaction=mapped_reaction,
                 geometry=geometry,
                 mapping=mapping,
+                calculations=calculations,
             )
             if record is not None:
                 yield record

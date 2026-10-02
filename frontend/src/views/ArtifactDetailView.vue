@@ -132,6 +132,7 @@ function applyAcceptedReparse(item: { status?: string | null; ingestion_status?:
   const updated: ArtifactSummary = {
     ...artifact.value,
     ingestion_status: ingestionStatus,
+    latest_parse_at: null,
     source_frame_count: null,
     transition_state_frame_count: null,
     running_time_seconds: null,
@@ -346,7 +347,7 @@ const frameError = computed(() => frameQuery.error.value instanceof Error ? fram
           <div><dt>过渡态帧</dt><dd>{{ artifact.transition_state_frame_count ?? "—" }}</dd></div>
           <div><dt>SHA-256</dt><dd><code :title="artifact.content_sha256">{{ shortId(artifact.content_sha256) }}</code></dd></div>
           <div><dt>项目 ID</dt><dd><code>{{ artifact.project_id }}</code></dd></div>
-          <div><dt>验证时间</dt><dd>{{ artifact.storage_verified_at ? new Date(artifact.storage_verified_at).toLocaleString("zh-CN") : "—" }}</dd></div>
+          <div><dt>最新解析时间</dt><dd>{{ artifact.latest_parse_at ? new Date(artifact.latest_parse_at).toLocaleString("zh-CN") : "—" }}</dd></div>
         </dl>
       </section>
 

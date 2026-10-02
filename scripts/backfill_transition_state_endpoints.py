@@ -231,6 +231,7 @@ def _mark_reinference_succeeded(
     *,
     inference: TransitionStateInference,
     inferred: _SuccessfulInference,
+    cleanup_obsolete: bool = True,
 ) -> int:
     """Replace endpoint evidence and reaction links with a new TS outcome."""
 
@@ -240,6 +241,7 @@ def _mark_reinference_succeeded(
     from tricycle_reaction_db.application.services.artifact_uploads import (
         _persist_transition_state_endpoints,
         _prepare_inference_topology_records,
+        _reaction_index_snapshot,
         _resolve_and_bind_transition_state_reaction,
     )
     from tricycle_reaction_db.application.services.molecular_geometry import (
@@ -262,12 +264,14 @@ def _mark_reinference_succeeded(
         session.flush()
     prepared_topology_records = _prepare_inference_topology_records(inferred)
     with source_atom_order_authoritative(session):
-        logical_reaction_id, mapped_reaction_id = _resolve_and_bind_transition_state_reaction(
-            session,
-            inferred=inferred,
-            calculation_frame=frame,
-            topology_context=topology_context,
-            prepared_topology_records=prepared_topology_records,
+        logical_reaction_id, mapped_reaction_id, source_atom_maps = (
+            _resolve_and_bind_transition_state_reaction(
+                session,
+                inferred=inferred,
+                calculation_frame=frame,
+                topology_context=topology_context,
+                prepared_topology_records=prepared_topology_records,
+            )
         )
         _persist_transition_state_endpoints(
             session,
@@ -276,11 +280,19 @@ def _mark_reinference_succeeded(
             topology_context=topology_context,
             prepared_topology_records=prepared_topology_records,
         )
+    # Fetch before mutating status: the lookup can autoflush, and a failed
+    # inference does not yet have the required succeeded-state foreign keys.
+    reaction_index_snapshot = _reaction_index_snapshot(
+        session, mapped_reaction_id=mapped_reaction_id, source_atom_maps=source_atom_maps
+    )
     inference.imaginary_mode_index = inferred.imaginary_mode_index
     inference.imaginary_frequency_cm1 = inferred.imaginary_frequency_cm1
     inference.status = TransitionStateInferenceStatus.SUCCEEDED
     inference.inference_method = "molop/possible_pre_post_ts"
-    inference.inference_settings = _reinference_settings(inferred)
+    inference.inference_settings = {
+        **_reinference_settings(inferred),
+        **reaction_index_snapshot,
+    }
     inference.logical_reaction_id = logical_reaction_id
     inference.mapped_reaction_id = mapped_reaction_id
     inference.calculation_frame_id = frame.id
@@ -288,6 +300,8 @@ def _mark_reinference_succeeded(
     inference.error_message = None
     session.add(inference)
     session.flush()
+    if not cleanup_obsolete:
+        return 0
     return _remove_unreferenced_reaction(
         session,
         old_logical_reaction_id=old_logical_reaction_id,
@@ -484,9 +498,12 @@ async def _reinfer_all(
                     fallback=inference,
                 )
                 prior_status = inference.status
-                if invalid_mappings_only and not isinstance(inferred, _SuccessfulInference):
+                if (
+                    invalid_mappings_only
+                    or prior_status is TransitionStateInferenceStatus.SUCCEEDED
+                ) and not isinstance(inferred, _SuccessfulInference):
                     raise SourceReparseMismatch(
-                        "invalid mapped reaction no longer reproduces a successful TS inference"
+                        "historical TS did not reproduce; preserve its evidence for review"
                     )
                 if dry_run and isinstance(inferred, _SuccessfulInference):
                     await session.run_sync(
@@ -573,6 +590,7 @@ def _backfill(
         _parse_calculation_output,
         _persist_transition_state_endpoints,
         _prepare_inference_topology_records,
+        _reaction_index_snapshot,
         _resolve_and_bind_transition_state_reaction,
     )
     from tricycle_reaction_db.application.services.molecular_geometry import (
@@ -662,7 +680,7 @@ def _backfill(
                         )
                         old_logical_reaction_id = inference.logical_reaction_id
                         old_mapped_reaction_id = inference.mapped_reaction_id
-                        logical_reaction_id, mapped_reaction_id = (
+                        logical_reaction_id, mapped_reaction_id, source_atom_maps = (
                             _resolve_and_bind_transition_state_reaction(
                                 session,
                                 inferred=inferred,
@@ -675,6 +693,11 @@ def _backfill(
                         inference.mapped_reaction_id = mapped_reaction_id
                         inference_settings = {
                             **inference.inference_settings,
+                            **_reaction_index_snapshot(
+                                session,
+                                mapped_reaction_id=mapped_reaction_id,
+                                source_atom_maps=source_atom_maps,
+                            ),
                             "endpoint_selection": "molop.possible_pre_post_ts",
                         }
                         for key in ("sampling_min_ratio", "sampling_max_ratio", "sampling_steps"):
@@ -794,7 +817,9 @@ async def main() -> None:
     async with session_factory() as session:
         invalid_mapped_reaction_ids: set[UUID] | None = None
         if args.invalid_mappings_only:
-            await session.exec(text(f"SET LOCAL statement_timeout = {args.statement_timeout_ms}"))
+            await session.execute(
+                text(f"SET LOCAL statement_timeout = {args.statement_timeout_ms}")
+            )
             invalid_mapped_reaction_ids = await _invalid_mapped_reaction_ids(session)
         if args.reinfer_all:
             result = await _reinfer_all(

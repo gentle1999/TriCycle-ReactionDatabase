@@ -38,7 +38,16 @@ from tricycle_reaction_db.application.services._persistence import (
     _require_id,
     source_atom_mapping_is_authoritative,
 )
+from tricycle_reaction_db.application.services.canonical_atom_mapping import (
+    canonical_atom_index_mapping,
+    canonical_reaction_atom_map_translation,
+)
+from tricycle_reaction_db.application.services.canonical_reaction_identity import (
+    CanonicalReactionIdentity,
+    canonical_reaction_identity,
+)
 from tricycle_reaction_db.application.services.mapped_geometry_atom_order import (
+    initialize_parsed_reaction_stereo,
     mapped_reaction_atom_elements,
     mapped_reaction_atom_signatures,
     validate_geometry_atom_map_elements,
@@ -176,6 +185,7 @@ def _reaction_from_representation(
         raise ValueError("RDKit rejected reaction representation")
     if reaction.GetNumReactantTemplates() == 0 or reaction.GetNumProductTemplates() == 0:
         raise ValueError("reaction representation requires reactant and product templates")
+    initialize_parsed_reaction_stereo(reaction)
     return reaction
 
 
@@ -1020,71 +1030,31 @@ def _transferred_atom_maps(
     if source_topology.atom_count != target_topology.atom_count:
         raise ValueError("source and target concrete topologies use different atom counts")
 
-    from tricycle_reaction_db.application.services.topology_abstraction import (
-        find_topology_matches,
-        topology_abstraction_mapping_witness,
-    )
-
     abstract_topology = logical_participant.topology
-    source_witness = topology_abstraction_mapping_witness(
-        session,
-        source_topology,
-        abstract_topology,
-        require_projection_provenance=True,
-        require_unique=True,
+    source_to_abstract = canonical_atom_index_mapping(
+        source_topology.mol,
+        abstract_topology.mol,
+        include_stereochemistry=False,
     )
-    source_matches: tuple[tuple[int, ...], ...]
-    target_matches: tuple[tuple[int, ...], ...]
-    target_witness = topology_abstraction_mapping_witness(
-        session,
-        target_topology,
-        abstract_topology,
-        require_projection_provenance=True,
-        require_unique=True,
+    target_to_abstract = canonical_atom_index_mapping(
+        target_topology.mol,
+        abstract_topology.mol,
+        include_stereochemistry=False,
     )
-    if source_witness is not None and target_witness is not None:
-        # These mappings were preserved from the original endpoint atom order
-        # during normalization. They are stronger than a rediscovered graph
-        # isomorphism for map transfer and avoid enumerating large symmetric
-        # molecular graphs on the upload/reconciliation path.
-        source_matches = (source_witness,)
-        target_matches = (target_witness,)
-    else:
-        source_matches = find_topology_matches(source_topology.mol, abstract_topology.mol)
-        target_matches = find_topology_matches(target_topology.mol, abstract_topology.mol)
-    if not source_matches or not target_matches:
+    if source_to_abstract is None or target_to_abstract is None:
         raise ValueError(
-            "source or target concrete topology is not a stereo-aware match for its "
-            "logical topology"
+            "source or target concrete topology does not share the logical topology's "
+            "canonical atom traversal"
         )
-    candidate_maps: set[tuple[int, ...]] = set()
-    for source_match in source_matches:
-        abstract_to_source_map = {
-            abstract_index: source_maps[source_index]
-            for abstract_index, source_index in enumerate(source_match)
-        }
-        for target_match in target_matches:
-            target_maps = [0] * target_topology.atom_count
-            for abstract_index, target_index in enumerate(target_match):
-                target_maps[target_index] = abstract_to_source_map[abstract_index]
-            if any(number <= 0 for number in target_maps) or len(set(target_maps)) != len(
-                target_maps
-            ):
-                raise ValueError("abstract mapping transfer did not cover target topology")
-            candidate_maps.add(tuple(target_maps))
-    if not candidate_maps:
-        raise ValueError("abstract mapping transfer produced no complete mapping")
-    if len(candidate_maps) > 1:
-        raise MappingTransferAmbiguityError(
-            logical_participant_id=_require_id(
-                logical_participant,
-                label="LogicalReactionParticipant",
-            ),
-            source_topology_id=_require_id(source_topology, label="MolecularTopology"),
-            target_topology_id=_require_id(target_topology, label="MolecularTopology"),
-            candidate_atom_maps=sorted(candidate_maps),
-        )
-    return list(next(iter(candidate_maps)))
+    source_maps_by_abstract_index = [0] * source_topology.atom_count
+    for source_index, abstract_index in enumerate(source_to_abstract):
+        source_maps_by_abstract_index[abstract_index] = source_maps[source_index]
+    target_maps = [0] * target_topology.atom_count
+    for target_index, abstract_index in enumerate(target_to_abstract):
+        target_maps[target_index] = source_maps_by_abstract_index[abstract_index]
+    if any(number <= 0 for number in target_maps) or len(set(target_maps)) != len(target_maps):
+        raise ValueError("canonical atom-order map transfer did not cover target topology")
+    return target_maps
 
 
 def transfer_mapped_reaction_to_concrete_topologies(
@@ -1094,11 +1064,12 @@ def transfer_mapped_reaction_to_concrete_topologies(
 ) -> TransferredMappedReaction:
     """Transfer one complete mapping through each logical participant topology.
 
-    The existing mapped reaction is the only source of atom-map labels.  Both
-    the source and target concrete topologies are matched to the same logical
-    graph, and the two graph correspondences are composed.  Isomeric SMILES is
-    rendered only after this graph operation; it is never used to infer the
-    atom mapping.
+    The existing mapped reaction is the only source of atom-map labels. Source
+    and target topology orders are transformed through canonical SMILES
+    traversal of their logical graph. The complete transferred reaction is
+    then checked to ensure those participant-local transforms did not alter
+    any non-symmetry-equivalent cross-side map links. Target isomeric SMILES is
+    rendered only after the atom-order transform.
     """
 
     _require_id(mapped_reaction, label="MappedReaction")
@@ -1135,6 +1106,20 @@ def transfer_mapped_reaction_to_concrete_topologies(
     atom_maps_by_template: dict[tuple[LogicalReactionParticipantSide, int], tuple[int, ...]] = {}
     mapped_smiles_by_template: dict[tuple[LogicalReactionParticipantSide, int], str] = {}
     resolved_topologies: dict[tuple[LogicalReactionParticipantSide, int], MolecularTopology] = {}
+    source_components: dict[
+        LogicalReactionParticipantSide,
+        list[tuple[Chem.Mol, list[int]]],
+    ] = {
+        LogicalReactionParticipantSide.REACTANT: [],
+        LogicalReactionParticipantSide.PRODUCT: [],
+    }
+    target_components: dict[
+        LogicalReactionParticipantSide,
+        list[tuple[Chem.Mol, list[int]]],
+    ] = {
+        LogicalReactionParticipantSide.REACTANT: [],
+        LogicalReactionParticipantSide.PRODUCT: [],
+    }
     for source_participant in sorted(
         source_participants,
         key=lambda participant: (participant.side.value, participant.template_index),
@@ -1150,6 +1135,9 @@ def transfer_mapped_reaction_to_concrete_topologies(
             session,
             concrete_topologies_by_template[key],
         )
+        source_components[source_participant.side].append(
+            (Chem.Mol(source_topology.mol), list(source_participant.atom_map_numbers))
+        )
         if source_topology.id == target_topology.id:
             atom_maps = list(source_participant.atom_map_numbers)
         else:
@@ -1160,6 +1148,9 @@ def transfer_mapped_reaction_to_concrete_topologies(
                 source_atom_maps=source_participant.atom_map_numbers,
                 target_topology=target_topology,
             )
+        target_components[source_participant.side].append(
+            (Chem.Mol(target_topology.mol), atom_maps)
+        )
         mapped_smiles = mapped_smiles_for_topology(target_topology, atom_maps)
         atom_maps_by_template[key] = tuple(atom_maps)
         mapped_smiles_by_template[key] = mapped_smiles
@@ -1184,6 +1175,18 @@ def transfer_mapped_reaction_to_concrete_topologies(
         != side_map_sets[LogicalReactionParticipantSide.PRODUCT]
     ):
         raise ValueError("transferred reaction atom maps do not conserve both sides")
+    if (
+        canonical_reaction_atom_map_translation(
+            source_components,
+            target_components,
+            include_stereochemistry=False,
+        )
+        is None
+    ):
+        raise ValueError(
+            "canonical participant atom-order transforms change the complete reaction's "
+            "non-symmetry-equivalent atom-map links"
+        )
     reactants = ".".join(
         mapped_smiles
         for _, mapped_smiles in sorted(canonical_sides[LogicalReactionParticipantSide.REACTANT])
@@ -1555,6 +1558,7 @@ def persist_mapped_reaction(
     | None = None,
     source_mapped_reaction_smiles: str | None = None,
     topology_context: Any | None = None,
+    canonical_identity: CanonicalReactionIdentity | None = None,
 ) -> MappedReaction:
     """Insert or reuse one explicit mapped reaction under a logical reaction."""
 
@@ -1562,6 +1566,41 @@ def persist_mapped_reaction(
     # This uses RDKit's reaction parser (rather than splitting on ``>``), so
     # metal coordination arrows such as ``[n:1]->[Pd+2:2]`` remain intact.
     mapped_reaction_atom_signatures(record.mapped_reaction_smiles)
+    # Import/re-inference passes its once-selected form. Recanonicalizing its
+    # serialization here can choose another representative (or oscillate).
+    index_definition = _reaction_from_representation(record.mapped_reaction_smiles)
+    index_identity = canonical_identity or canonical_reaction_identity(
+        {
+            side: [
+                (molecule, [atom.GetAtomMapNum() for atom in molecule.GetAtoms()])
+                for molecule in templates
+            ]
+            for side, templates in (
+                (LogicalReactionParticipantSide.REACTANT, index_definition.GetReactants()),
+                (LogicalReactionParticipantSide.PRODUCT, index_definition.GetProducts()),
+            )
+        }
+    )
+    if index_identity.smiles != record.mapped_reaction_smiles:
+        raise ValueError(
+            "mapped reaction persistence requires canonical precursor atom-map numbering"
+        )
+    if record.mapping_hash != sha256(record.mapped_reaction_smiles.encode("utf-8")).hexdigest():
+        raise ValueError("mapping_hash does not match the selected mapped reaction form")
+    normalization_metadata = index_identity.normalization_metadata()
+
+    def remember_selected_form(mapped_reaction: MappedReaction) -> None:
+        if mapped_reaction.mapped_reaction_smiles != record.mapped_reaction_smiles:
+            raise ValueError("existing reaction does not match the selected normal form")
+        if mapped_reaction.normalization_metadata is None:
+            mapped_reaction.normalization_metadata = dict(normalization_metadata)
+            session.add(mapped_reaction)
+        elif (
+            mapped_reaction.normalization_metadata.get("selected_mapped_reaction_smiles")
+            != mapped_reaction.mapped_reaction_smiles
+        ):
+            raise ValueError("existing reaction normal-form provenance is inconsistent")
+
     reaction_id = _require_id(reaction, label="LogicalReaction")
     project_id = reaction.project_id
     if not isinstance(project_id, UUID):
@@ -1691,7 +1730,11 @@ def persist_mapped_reaction(
                 topology_context=topology_context,
                 project_id=project_id,
             )
-            if existing_concrete is not None:
+            if (
+                existing_concrete is not None
+                and existing_concrete.mapped_reaction_smiles == record.mapped_reaction_smiles
+            ):
+                remember_selected_form(existing_concrete)
                 return existing_concrete
 
         _acquire_identity_locks(
@@ -1713,11 +1756,13 @@ def persist_mapped_reaction(
                 MappedReaction,
                 logical_reaction=reaction,
                 project_id=project_id,
+                normalization_metadata=normalization_metadata,
                 **record.model_dump(),
             )
             _flush_new_entity(session, mapped_reaction, label="MappedReaction")
             _mark_new_mapped_reaction_in_cache(topology_context, mapped_reaction)
 
+        remember_selected_form(mapped_reaction)
         for component_key in sorted(
             component_keys,
             key=lambda item: (item[0].value, item[1]),
@@ -1753,16 +1798,10 @@ def persist_mapped_reaction(
         )
 
     definition = _reaction_from_representation(record.mapped_reaction_smiles)
-    canonical_smiles = _canonical_mapped_reaction_smiles(definition)
+    # Preserve the selected normal form established above, including its atom
+    # labels. A second RDKit serialization is not an identity-validation step.
+    canonical_smiles = record.mapped_reaction_smiles
     expected_hash = sha256(canonical_smiles.encode("utf-8")).hexdigest()
-    if record.mapped_reaction_smiles != canonical_smiles:
-        canonical_definition = _reaction_from_representation(canonical_smiles)
-        if _reaction_graph_smiles(definition) != _reaction_graph_smiles(canonical_definition):
-            raise ValueError("mapped_reaction_smiles must use canonical RDKit serialization")
-        # RDKit can rewrite unsupported metal stereochemistry differently on
-        # each parse. Keep the graph-equivalent canonical projection in storage.
-        record = record.model_copy(update={"mapped_reaction_smiles": canonical_smiles})
-        definition = canonical_definition
     if record.mapping_hash != expected_hash:
         raise ValueError("mapping_hash does not match mapped_reaction_smiles")
 
@@ -1801,11 +1840,13 @@ def persist_mapped_reaction(
             MappedReaction,
             logical_reaction=reaction,
             project_id=project_id,
+            normalization_metadata=normalization_metadata,
             **record.model_dump(),
         )
         _flush_new_entity(session, mapped_reaction, label="MappedReaction")
         _mark_new_mapped_reaction_in_cache(topology_context, mapped_reaction)
 
+    remember_selected_form(mapped_reaction)
     for side, templates in (
         (LogicalReactionParticipantSide.REACTANT, definition.GetReactants()),
         (LogicalReactionParticipantSide.PRODUCT, definition.GetProducts()),
@@ -1952,23 +1993,6 @@ def persist_mapped_reaction_participant(
             raise ValueError("mapped participant resolved to different side")
         if assignment.template_index != template_index:
             raise ValueError("mapped participant resolved to different template_index")
-        if source_atom_mapping_is_authoritative(session):
-            # The raw TS source owns atom numbering. A previous participant
-            # row may have been written against a shared topology whose atom
-            # array used another source's order; rebind that row to the
-            # source-order concrete topology and its direct map vector.
-            if (
-                assignment.concrete_topology_id != concrete_topology_id
-                or assignment.atom_map_numbers != atom_map_numbers
-                or assignment.mapped_smiles != mapped_smiles
-            ):
-                assignment.concrete_topology = concrete_topology
-                assignment.concrete_topology_id = concrete_topology_id
-                assignment.atom_map_numbers = list(atom_map_numbers)
-                assignment.mapped_smiles = mapped_smiles
-                session.add(assignment)
-                session.flush()
-            return assignment
         if assignment.mapped_smiles != mapped_smiles:
             raise ValueError("mapped participant resolved to different mapped_smiles")
         if set(assignment.atom_map_numbers) != set(atom_map_numbers):
@@ -2330,7 +2354,11 @@ def persist_mapped_reaction_node_geometry_mapping(
     *,
     identity_is_new: bool = False,
 ) -> MappedReactionNodeGeometryMapping:
-    """Persist one verified mapped-reaction to Geometry atom-order conversion."""
+    """Persist an atom-order conversion owned by one reaction-node binding.
+
+    Geometry identity never determines reaction map numbers. The same Geometry
+    can have independent transforms in different reactions or participant slots.
+    """
 
     node_geometry_id = _require_id(node_geometry, label="MappedReactionNodeGeometry")
     node = node_geometry.mapped_reaction_node
@@ -2368,7 +2396,7 @@ def persist_mapped_reaction_node_geometry_mapping(
         if set(record.geometry_atom_map_numbers) != logical_map_numbers:
             raise ValueError("TS Geometry mapping must cover every mapped reaction atom")
         for atom, map_number in zip(
-            node_geometry.geometry.mol.GetAtoms(),
+            node_geometry.geometry.mol.GetAtoms(),  # type: ignore[no-untyped-call]
             record.geometry_atom_map_numbers,
             strict=True,
         ):
@@ -2409,16 +2437,10 @@ def persist_mapped_reaction_node_geometry_mapping(
             if transition_state_mapping
             else binding.mapped_smiles
         )
-        mapping_matches = (
-            binding.geometry_atom_map_numbers == record.geometry_atom_map_numbers
-            if transition_state_mapping
-            else _reaction_mapping_isomorphic(
-                expected_atom_map_numbers=binding.geometry_atom_map_numbers,
-                expected_mapped_smiles=existing_smiles,
-                observed_atom_map_numbers=record.geometry_atom_map_numbers,
-                observed_mapped_smiles=record.mapped_smiles,
-            )
-        )
+        # This is one fixed coordinate order in one reaction association.
+        # Equal labelled graphs can still exchange symmetry-equivalent atoms
+        # and their scientific properties, so require the actual vector here.
+        mapping_matches = binding.geometry_atom_map_numbers == record.geometry_atom_map_numbers
         if not mapping_matches:
             if transition_state_mapping:
                 try:
@@ -2451,9 +2473,9 @@ def persist_mapped_reaction_node_geometry_mapping(
             binding.mapping_method = REACTION_TS_GEOMETRY_LINK_METHOD
             binding.mapping_version = REACTION_TS_GEOMETRY_LINK_POLICY_VERSION
             session.add(binding)
-        # TS map vectors are expressed in Geometry.mol order. Source atom order
-        # and its permutation belong to each CalculationFrame, so an equivalent
-        # Geometry mapping can be reused across QM programs and files.
+        # Source order belongs to each CalculationFrame. This transform can
+        # be reused across frames only within this reaction-node association;
+        # sharing geometry_id with another binding does not share its mapping.
         return binding
     binding = _new_entity(
         session,

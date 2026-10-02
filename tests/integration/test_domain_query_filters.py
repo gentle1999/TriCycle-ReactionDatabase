@@ -25,6 +25,7 @@ from tricycle_reaction_db.application.services import (
 from tricycle_reaction_db.application.services.reaction_geometry_policy import (
     geometry_has_thermodynamic_property_predicate,
 )
+from tricycle_reaction_db.core.chemistry_config import MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.core.units import HARTREE_PER_PARTICLE_TO_KCAL_PER_MOLE_FACTOR
 from tricycle_reaction_db.db.models import (
@@ -232,11 +233,11 @@ def _create_domain_sample(session: Session) -> tuple[Any, ...]:
         observed_to_geometry_transform=np.eye(4, dtype=np.float64).reshape(-1).tolist(),
         geometry_assignment_rmsd_angstrom=0.0,
         geometry_assignment_max_abs_angstrom=0.0,
-        geometry_assignment_policy_version="domain-filter-test-v1",
+        geometry_assignment_policy_version=MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION,
         electronic_total_energy_hartree=-1.0,
         selected_energy_hartree=-1.0,
         selected_energy_kind=SelectedEnergyKind.ELECTRONIC_TOTAL,
-        energy_selection_policy_version="domain-filter-test-v1",
+        energy_selection_policy_version=MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION,
         frequency_count=1,
         negative_frequency_count=1,
         lowest_frequency_cm1=-100.0,
@@ -289,7 +290,7 @@ def _create_domain_sample(session: Session) -> tuple[Any, ...]:
     profile = MappedReactionThermodynamicProfile(
         id=uuid4(),
         mapped_reaction_id=mapped_reaction.id,
-        policy_version="domain-filter-test-v1",
+        policy_version=MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION,
         source_key_hash=_fixture_hash(f"domain-profile:{suffix}"),
         electronic_level=["test"],
         thermochemistry_level=["test"],
@@ -1126,11 +1127,11 @@ def test_transition_state_node_topology_resolves_reactions(
                 observed_to_geometry_transform=np.eye(4, dtype=np.float64).reshape(-1).tolist(),
                 geometry_assignment_rmsd_angstrom=0.0,
                 geometry_assignment_max_abs_angstrom=0.0,
-                geometry_assignment_policy_version="domain-filter-test-v1",
+                geometry_assignment_policy_version=MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION,
                 electronic_total_energy_hartree=-1.1,
                 selected_energy_hartree=-1.1,
                 selected_energy_kind=SelectedEnergyKind.ELECTRONIC_TOTAL,
-                energy_selection_policy_version="domain-filter-test-v1",
+                energy_selection_policy_version=MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION,
                 frequency_count=1,
                 negative_frequency_count=1,
                 lowest_frequency_cm1=-100.0,

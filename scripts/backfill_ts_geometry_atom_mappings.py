@@ -106,10 +106,10 @@ def _reaction_map_translation(
         target_maps = target[2]
         if source[1] != target[1]:
             try:
-                # Render the target map vector in source topology order so
-                # corresponding atoms can be paired by their topology graph.
+                # Render the target map vector in source topology order through
+                # the shared canonical-SMILES atom-order transform.
                 target_maps = _atom_maps_in_persisted_topology_order(
-                    cast(MolecularTopology, target_topology),
+                    target_topology,
                     source_topology,
                     target_maps,
                 )
@@ -165,17 +165,15 @@ async def _repair_candidates(
                 col(MappedReactionNodeGeometryMapping.verified).is_(True),
             )
             .options(
-                selectinload(
-                    cast(Any, MappedReactionNodeGeometry.geometry)
-                ).selectinload(cast(Any, Geometry.topology))
+                selectinload(cast(Any, MappedReactionNodeGeometry.geometry)).selectinload(
+                    cast(Any, Geometry.topology)
+                )
             )
             .order_by(col(MappedReactionNodeGeometry.id))
             .limit(PAGE_SIZE)
         )
         if last_binding_id is not None:
-            statement = statement.where(
-                col(MappedReactionNodeGeometry.id) > last_binding_id
-            )
+            statement = statement.where(col(MappedReactionNodeGeometry.id) > last_binding_id)
         rows = (await session.exec(statement)).all()
         if not rows:
             break
@@ -183,16 +181,12 @@ async def _repair_candidates(
             scanned += 1
             last_binding_id = binding.id
             try:
-                reaction_elements = reaction_elements_by_smiles.get(
-                    reaction.mapped_reaction_smiles
-                )
+                reaction_elements = reaction_elements_by_smiles.get(reaction.mapped_reaction_smiles)
                 if reaction_elements is None:
                     reaction_elements = mapped_reaction_atom_elements(
                         reaction.mapped_reaction_smiles
                     )
-                    reaction_elements_by_smiles[reaction.mapped_reaction_smiles] = (
-                        reaction_elements
-                    )
+                    reaction_elements_by_smiles[reaction.mapped_reaction_smiles] = reaction_elements
                 validate_geometry_atom_map_elements(
                     geometry.mol,
                     mapping.geometry_atom_map_numbers,
@@ -218,8 +212,7 @@ async def _repair_candidates(
             )
             .join(
                 CalculationFrame,
-                col(CalculationFrame.id)
-                == col(TransitionStateInference.calculation_frame_id),
+                col(CalculationFrame.id) == col(TransitionStateInference.calculation_frame_id),
             )
             .where(
                 TransitionStateInference.status == TransitionStateInferenceStatus.SUCCEEDED,
@@ -241,13 +234,11 @@ async def _repair_candidates(
             continue
         sources_by_geometry[geometry_id].append((reaction_id, atom_maps))
 
-    reaction_ids = {
-        reaction.id for _, reaction, _ in invalid_rows if reaction.id is not None
-    } | {reaction_id for rows in sources_by_geometry.values() for reaction_id, _ in rows}
+    reaction_ids = {reaction.id for _, reaction, _ in invalid_rows if reaction.id is not None} | {
+        reaction_id for rows in sources_by_geometry.values() for reaction_id, _ in rows
+    }
     reactions = (
-        await session.exec(
-            select(MappedReaction).where(col(MappedReaction.id).in_(reaction_ids))
-        )
+        await session.exec(select(MappedReaction).where(col(MappedReaction.id).in_(reaction_ids)))
     ).all()
     reactions_by_id = {reaction.id: reaction for reaction in reactions}
     participant_rows = (
@@ -309,12 +300,8 @@ async def _repair_candidates(
                 translation = _reaction_map_translation(
                     source_reaction_id=source_reaction_id,
                     target_reaction_id=target_reaction.id,
-                    source_participants=participants_by_reaction.get(
-                        source_reaction_id, {}
-                    ),
-                    target_participants=participants_by_reaction.get(
-                        target_reaction.id, {}
-                    ),
+                    source_participants=participants_by_reaction.get(source_reaction_id, {}),
+                    target_participants=participants_by_reaction.get(target_reaction.id, {}),
                     topologies=topologies_by_id,
                 )
                 if translation is None or not set(source_atom_maps).issubset(translation):

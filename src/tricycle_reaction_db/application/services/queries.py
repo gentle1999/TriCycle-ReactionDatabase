@@ -1175,6 +1175,7 @@ def _artifact_summary(
         artifact_kind=_enum_value(artifact.artifact_kind),
         storage_status=_enum_value(artifact.storage_status),
         storage_verified_at=artifact.storage_verified_at,
+        latest_parse_at=ingestion.completed_at if ingestion is not None else None,
         preview_available=artifact_preview_available(artifact.media_type),
         ingestion_status=_enum_value(ingestion.status) if ingestion is not None else None,
         source_frame_count=(ingestion.source_frame_count if ingestion is not None else None),
@@ -1257,6 +1258,9 @@ class ArtifactQueryService(UseCaseService):  # type: ignore[misc]
             else literal(None)
         ).label("running_time_seconds")
         artifact_sort_fields = {
+            "latest_parse_at": (
+                col(ArtifactIngestion.completed_at) if include_derived_metadata else literal(None)
+            ),
             "created_at": col(ArtifactFile.created_at),
             "original_filename": col(ArtifactFile.original_filename),
             "size_bytes": col(ArtifactFile.size_bytes),
@@ -1268,13 +1272,18 @@ class ArtifactQueryService(UseCaseService):  # type: ignore[misc]
         if sort_expression is None:
             raise ValueError(
                 "sort_by must be created_at, original_filename, size_bytes, artifact_kind, "
-                "storage_status, or running_time_seconds"
+                "storage_status, running_time_seconds, or latest_parse_at"
             )
         if cursor is not None and (sort_by != "created_at" or sort_direction != "desc"):
             raise ValueError("cursor pagination only supports created_at descending order")
 
         count_statement = sqlmodel_select(func.count()).select_from(ArtifactFile)
         statement = sqlmodel_select(ArtifactFile, latest_running_time)
+        if sort_by == "latest_parse_at" and include_derived_metadata:
+            statement = statement.outerjoin(
+                ArtifactIngestion,
+                col(ArtifactIngestion.artifact_file_id) == col(ArtifactFile.id),
+            )
         if include_derived_metadata:
             statement = statement.options(joinedload(cast(Any, ArtifactFile.ingestion)))
         active_criterion = col(ArtifactFile.storage_status) != StorageStatus.RETIRED
@@ -1308,6 +1317,9 @@ class ArtifactQueryService(UseCaseService):  # type: ignore[misc]
                         col(ArtifactIngestion.artifact_file_id) == col(ArtifactFile.id),
                         col(ArtifactIngestion.status) == ingestion_status,
                     )
+                    # Sorting can also join ingestion in the outer query; keep
+                    # this EXISTS local to ingestion and correlate only the file.
+                    .correlate(ArtifactFile)
                     .exists()
                 )
             count_statement = count_statement.where(criterion)
@@ -3442,11 +3454,11 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
                 tuple(float(value) if value is not None else None for value in profile_bounds_row),
             )
 
-        mappings_by_geometry: dict[UUID, list[NodeGeometryMappingView]] = {
-            geometry_id: [] for geometry_id in node_geometry_ids
+        mappings_by_node_geometry: dict[UUID, list[NodeGeometryMappingView]] = {
+            node_geometry_id: [] for node_geometry_id in node_geometry_ids
         }
         for mapping in geometry_mapping_rows:
-            mappings_by_geometry[mapping.mapped_reaction_node_geometry_id].append(
+            mappings_by_node_geometry[mapping.mapped_reaction_node_geometry_id].append(
                 NodeGeometryMappingView(
                     id=_required_uuid(mapping.id, "MappedReactionNodeGeometryMapping"),
                     geometry_atom_map_numbers=mapping.geometry_atom_map_numbers,
@@ -3525,7 +3537,7 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
                     geometry_id=node_geometry.geometry_id,
                     topology_id=geometry.topology_id,
                     canonical_isomeric_smiles=topology.canonical_isomeric_smiles,
-                    mappings=mappings_by_geometry[node_geometry_id],
+                    mappings=mappings_by_node_geometry[node_geometry_id],
                     calculations=calculations_by_geometry[geometry.id],
                     energy_view=composite.view,
                 )

@@ -63,6 +63,7 @@ def _artifact_summary(artifact: ArtifactFile) -> ArtifactSummary:
         artifact_kind=artifact.artifact_kind.value,
         storage_status=artifact.storage_status.value,
         storage_verified_at=artifact.storage_verified_at,
+        latest_parse_at=ingestion.completed_at if ingestion is not None else None,
         preview_available=artifact_preview_available(artifact.media_type),
         ingestion_status=ingestion.status.value if ingestion is not None else None,
         source_frame_count=ingestion.source_frame_count if ingestion is not None else None,

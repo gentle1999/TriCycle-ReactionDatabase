@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 from uuid import UUID
 
+from rdkit import Chem
 from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import aliased, selectinload
 from sqlmodel import Session, col, select
@@ -23,6 +24,15 @@ from tricycle_reaction_db.application.services._persistence import (
     _require_id,
     source_atom_mapping_is_authoritative,
 )
+from tricycle_reaction_db.application.services.canonical_atom_mapping import (
+    ReactionComponents,
+    canonical_reaction_atom_map_translation,
+    reaction_atom_maps_in_geometry_order,
+)
+from tricycle_reaction_db.application.services.canonical_reaction_identity import (
+    canonical_reaction_identity,
+    serialize_reaction_components,
+)
 from tricycle_reaction_db.application.services.mapped_geometry_atom_order import (
     validate_geometry_atom_map_elements,
 )
@@ -37,9 +47,8 @@ from tricycle_reaction_db.application.services.reaction_geometry_policy import (
     geometry_has_thermodynamic_property_predicate,
 )
 from tricycle_reaction_db.application.services.reactions import (
-    _reaction_mapping_isomorphic,
-    atom_maps_from_source_order,
     mapped_smiles_for_geometry,
+    mapped_smiles_for_topology,
     persist_mapped_reaction_edge,
     persist_mapped_reaction_node,
     persist_mapped_reaction_node_geometry,
@@ -67,6 +76,7 @@ from tricycle_reaction_db.db.models import (
     MappedReactionNodeGeometryMapping,
     MappedReactionParticipant,
     MolecularTopology,
+    TransitionStateEndpoint,
 )
 from tricycle_reaction_db.domain.enums import (
     LogicalReactionParticipantSide,
@@ -481,18 +491,29 @@ def _ensure_mapping(
             if transition_state_mapping
             else existing.mapped_smiles
         )
-        mapping_matches = (
-            existing.geometry_atom_map_numbers == coordinate_atom_maps
-            if transition_state_mapping
-            else _reaction_mapping_isomorphic(
-                expected_atom_map_numbers=existing.geometry_atom_map_numbers,
-                expected_mapped_smiles=existing_mapped_smiles,
-                observed_atom_map_numbers=coordinate_atom_maps,
-                observed_mapped_smiles=mapped_smiles,
-            )
-        )
+        # Both vectors refer to the same association and the same Geometry
+        # atom order. Graph automorphisms cannot establish equality of this
+        # coordinate transform, for endpoints any more than for TS objects.
+        mapping_matches = existing.geometry_atom_map_numbers == coordinate_atom_maps
         if not mapping_matches:
             if transition_state_mapping:
+                # A mapping written under an older policy did not store the
+                # source-frame -> target-reaction transform. The current call
+                # has recomputed and validated that transform from source
+                # endpoints, so migrate this legacy row in place.
+                if (
+                    existing.mapping_method != mapping_method
+                    or existing.mapping_version != mapping_version
+                ):
+                    existing.geometry_atom_map_numbers = coordinate_atom_maps
+                    existing.mapped_smiles = mapped_smiles
+                    existing.mapping_method = mapping_method
+                    existing.mapping_version = mapping_version
+                    existing.verified = True
+                    session.add(existing)
+                    if cache is not None:
+                        cache.mappings_by_node_geometry_id[node_geometry_id] = existing
+                    return existing
                 try:
                     validate_geometry_atom_map_elements(
                         node_geometry.geometry.mol,
@@ -500,16 +521,16 @@ def _ensure_mapping(
                         node_geometry.mapped_reaction_node.mapped_reaction.mapped_reaction_smiles,
                     )
                 except ValueError:
-                    # A current source-derived vector may repair an invalid
-                    # historical row. A different mapping that still
-                    # conserves elements remains an explicit identity conflict.
+                    # A current source-derived vector may repair a malformed
+                    # row even when the row claims the current policy.
                     existing.geometry_atom_map_numbers = coordinate_atom_maps
                     existing.mapped_smiles = mapped_smiles
                     existing.mapping_method = mapping_method
                     existing.mapping_version = mapping_version
                     existing.verified = True
                     session.add(existing)
-                    cache.mappings_by_node_geometry_id[node_geometry_id] = existing
+                    if cache is not None:
+                        cache.mappings_by_node_geometry_id[node_geometry_id] = existing
                     return existing
             raise ValueError("existing node Geometry has an incompatible reaction mapping")
         if transition_state_mapping and (
@@ -521,9 +542,8 @@ def _ensure_mapping(
             existing.mapping_method = mapping_method
             existing.mapping_version = mapping_version
             session.add(existing)
-        # TS map identity is geometry-indexed: two vectors are reusable only
-        # when every Geometry atom keeps the same reaction map, including
-        # symmetry-equivalent atoms whose canonical mapped SMILES may coincide.
+        # Reuse only inside this node-Geometry association. Other reaction
+        # nodes may bind the same Geometry with entirely different map vectors.
         return existing
     mapping = persist_mapped_reaction_node_geometry_mapping(
         session,
@@ -697,41 +717,22 @@ def _concrete_participant_topology_id(
     return logical_participant.topology_id
 
 
-def _target_ts_geometry_atom_maps(
+def _reaction_components_from_participants(
     session: Session,
-    *,
-    source_participants: Iterable[MappedReactionParticipant],
-    target_participants: Iterable[MappedReactionParticipant],
-    source_geometry_atom_maps: Iterable[int],
-) -> list[int] | None:
-    """Rebase source TS maps when paired participants share the same atom order."""
-
-    source_by_key = {
-        (participant.side, participant.template_index): participant
-        for participant in source_participants
+    participants: Iterable[MappedReactionParticipant],
+) -> ReactionComponents | None:
+    components: dict[LogicalReactionParticipantSide, list[tuple[Chem.Mol, list[int]]]] = {
+        LogicalReactionParticipantSide.REACTANT: [],
+        LogicalReactionParticipantSide.PRODUCT: [],
     }
-    target_by_key = {
-        (participant.side, participant.template_index): participant
-        for participant in target_participants
-    }
-    if not source_by_key or source_by_key.keys() != target_by_key.keys():
-        return None
-
-    source_to_target: dict[int, int] = {}
-    target_to_source: dict[int, int] = {}
-    source_reaction_maps: set[int] = set()
-    for key, source_participant in source_by_key.items():
-        target_participant = target_by_key[key]
-        if (
-            source_participant.logical_reaction_participant_id
-            != target_participant.logical_reaction_participant_id
-        ):
+    seen_keys: set[tuple[LogicalReactionParticipantSide, int]] = set()
+    for participant in participants:
+        key = (participant.side, participant.template_index)
+        if key in seen_keys:
             return None
-        source_topology_id = _concrete_participant_topology_id(session, source_participant)
-        target_topology_id = _concrete_participant_topology_id(session, target_participant)
-        if source_topology_id != target_topology_id:
-            return None
-        topology = session.get(MolecularTopology, source_topology_id)
+        seen_keys.add(key)
+        topology_id = _concrete_participant_topology_id(session, participant)
+        topology = session.get(MolecularTopology, topology_id)
         if topology is None:
             topology = next(
                 (
@@ -740,33 +741,159 @@ def _target_ts_geometry_atom_maps(
                         *tuple(session.new),
                         *tuple(session.info.get("_fast_pending_entities", ())),
                     )
-                    if isinstance(entity, MolecularTopology) and entity.id == source_topology_id
+                    if isinstance(entity, MolecularTopology) and entity.id == topology_id
                 ),
                 None,
             )
-        if topology is None:
+        if topology is None or len(participant.atom_map_numbers) != topology.atom_count:
             return None
-        source_maps = list(source_participant.atom_map_numbers)
-        target_maps = list(target_participant.atom_map_numbers)
+        map_numbers = list(participant.atom_map_numbers)
+        stored_mapped_smiles = getattr(participant, "mapped_smiles", None)
         if (
-            len(source_maps) != topology.atom_count
-            or len(target_maps) != topology.atom_count
-            or any(number <= 0 for number in (*source_maps, *target_maps))
-            or len(set(source_maps)) != len(source_maps)
-            or len(set(target_maps)) != len(target_maps)
+            isinstance(stored_mapped_smiles, str)
+            and mapped_smiles_for_topology(topology, map_numbers) != stored_mapped_smiles
         ):
             return None
-        source_reaction_maps.update(source_maps)
-        for source_map, target_map in zip(source_maps, target_maps, strict=True):
-            previous_target = source_to_target.setdefault(source_map, target_map)
-            previous_source = target_to_source.setdefault(target_map, source_map)
-            if previous_target != target_map or previous_source != source_map:
-                return None
-
-    source_geometry_atom_maps = list(source_geometry_atom_maps)
-    if set(source_geometry_atom_maps) != source_reaction_maps:
+        components[participant.side].append((Chem.Mol(topology.mol), map_numbers))
+    if (
+        not components[LogicalReactionParticipantSide.REACTANT]
+        or not components[LogicalReactionParticipantSide.PRODUCT]
+    ):
         return None
-    return [source_to_target[map_number] for map_number in source_geometry_atom_maps]
+    return components
+
+
+def _mapped_reaction_matches_participant_projection(
+    mapped_reaction_smiles: str,
+    participants: Iterable[MappedReactionParticipant],
+) -> bool:
+    """Check the serialized reaction against its mapped participant records."""
+
+    sides = mapped_reaction_smiles.split(">>")
+    if len(sides) != 2 or any(not side.strip() for side in sides):
+        return False
+    participant_rows = tuple(participants)
+    if any(
+        not isinstance(getattr(participant, "mapped_smiles", None), str)
+        for participant in participant_rows
+    ):
+        return False
+
+    def canonical_side(smiles: str) -> str | None:
+        try:
+            molecule = Chem.MolFromSmiles(smiles)
+            if molecule is None:
+                return None
+            return Chem.MolToSmiles(
+                molecule,
+                canonical=True,
+                isomericSmiles=True,
+                allHsExplicit=True,
+            )
+        except (RuntimeError, ValueError):
+            return None
+
+    for side, serialized_side in zip(
+        (LogicalReactionParticipantSide.REACTANT, LogicalReactionParticipantSide.PRODUCT),
+        sides,
+        strict=True,
+    ):
+        component_smiles = [
+            participant.mapped_smiles
+            for participant in participant_rows
+            if participant.side is side
+        ]
+        if not component_smiles:
+            return False
+        expected = canonical_side(".".join(component_smiles))
+        observed = canonical_side(serialized_side)
+        if expected is None or expected != observed:
+            return False
+    return True
+
+
+def _reaction_components_from_source_endpoints(
+    negative_endpoint: Chem.Mol,
+    positive_endpoint: Chem.Mol,
+) -> ReactionComponents | None:
+    if negative_endpoint.GetNumAtoms() != positive_endpoint.GetNumAtoms():
+        return None
+    negative_signature = [
+        (atom.GetAtomicNum(), atom.GetIsotope()) for atom in cast(Any, negative_endpoint).GetAtoms()
+    ]
+    positive_signature = [
+        (atom.GetAtomicNum(), atom.GetIsotope()) for atom in cast(Any, positive_endpoint).GetAtoms()
+    ]
+    if negative_signature != positive_signature:
+        return None
+    reactant, product = sorted(
+        (negative_endpoint, positive_endpoint),
+        key=lambda endpoint: len(Chem.GetMolFrags(endpoint)),
+        reverse=True,
+    )
+    maps = list(range(1, reactant.GetNumAtoms() + 1))
+    return {
+        LogicalReactionParticipantSide.REACTANT: [(Chem.Mol(reactant), maps)],
+        LogicalReactionParticipantSide.PRODUCT: [(Chem.Mol(product), maps.copy())],
+    }
+
+
+def _reaction_components_from_persisted_endpoints(
+    session: Session,
+    calculation_frame: CalculationFrame,
+) -> ReactionComponents | None:
+    endpoints = session.exec(
+        select(TransitionStateEndpoint).where(
+            TransitionStateEndpoint.calculation_frame_id == calculation_frame.id,
+        )
+    ).all()
+    if len(endpoints) != 2:
+        return None
+    source_molecules: list[tuple[Any, Chem.Mol]] = []
+    for endpoint in endpoints:
+        topology = endpoint.topology
+        permutation = list(endpoint.source_to_topology_atom_indices)
+        if (
+            topology is None
+            or topology.atom_count != endpoint.atom_count
+            or sorted(permutation) != list(range(endpoint.atom_count))
+        ):
+            return None
+        try:
+            source_molecule = Chem.RenumberAtoms(Chem.Mol(topology.mol), permutation)
+        except (RuntimeError, ValueError):
+            return None
+        source_molecules.append((endpoint.direction, source_molecule))
+    source_molecules.sort(
+        key=lambda item: (
+            -len(Chem.GetMolFrags(item[1])),
+            str(item[0].value),
+        )
+    )
+    reactant, product = (item[1] for item in source_molecules)
+    return _reaction_components_from_source_endpoints(reactant, product)
+
+
+def _target_ts_geometry_atom_maps(
+    session: Session,
+    *,
+    source_participants: Iterable[MappedReactionParticipant],
+    target_participants: Iterable[MappedReactionParticipant],
+    source_geometry_atom_maps: Iterable[int],
+) -> list[int] | None:
+    """Translate TS Geometry maps by complete reaction identity, not array position."""
+
+    source_components = _reaction_components_from_participants(session, source_participants)
+    target_components = _reaction_components_from_participants(session, target_participants)
+    if source_components is None or target_components is None:
+        return None
+    translation = canonical_reaction_atom_map_translation(source_components, target_components)
+    if translation is None:
+        return None
+    try:
+        return [translation.source_to_target[number] for number in source_geometry_atom_maps]
+    except KeyError:
+        return None
 
 
 def _validated_target_ts_geometry_atom_maps(
@@ -787,6 +914,35 @@ def _validated_target_ts_geometry_atom_maps(
     translated vector against the target reaction before creating any target
     geometry rows.
     """
+
+    if (
+        not source_mapping.verified
+        or source_mapping.mapping_method != REACTION_TS_GEOMETRY_LINK_METHOD
+        or source_mapping.mapping_version != REACTION_TS_GEOMETRY_LINK_POLICY_VERSION
+    ):
+        logger.info(
+            "Not sharing legacy or unverified TS atom mapping for Geometry %s from mapped "
+            "reaction %s",
+            geometry.id,
+            source_mapped_reaction.id,
+        )
+        return None
+
+    source_participants = tuple(source_participants)
+    target_participants = tuple(target_participants)
+    if not _mapped_reaction_matches_participant_projection(
+        source_mapped_reaction.mapped_reaction_smiles,
+        source_participants,
+    ) or not _mapped_reaction_matches_participant_projection(
+        target_mapped_reaction.mapped_reaction_smiles,
+        target_participants,
+    ):
+        logger.warning(
+            "Not sharing TS Geometry %s: mapped-reaction text disagrees with participant "
+            "topology/map projections",
+            geometry.id,
+        )
+        return None
 
     try:
         validate_geometry_atom_map_elements(
@@ -1073,13 +1229,19 @@ def share_mapped_reaction_evidence(
                     target_id,
                 )
             else:
-                logger.warning(
-                    "Not replacing element-valid TS atom mapping for Geometry %s on mapped "
-                    "reaction %s; the stored vector differs from the transferred source mapping",
-                    geometry.id,
-                    target_id,
-                )
-                continue
+                if (
+                    existing_mapping.mapping_method == REACTION_TS_GEOMETRY_LINK_METHOD
+                    and existing_mapping.mapping_version == REACTION_TS_GEOMETRY_LINK_POLICY_VERSION
+                ):
+                    logger.warning(
+                        "Not replacing current-policy TS atom mapping for Geometry %s on "
+                        "mapped reaction %s; the vector differs from verified source mapping",
+                        geometry.id,
+                        target_id,
+                    )
+                    continue
+                # The current source-to-target transform is stronger than a
+                # legacy direct-index vector; let _ensure_mapping replace it.
         _ensure_mapping(
             session,
             node_geometry=node_geometry,
@@ -1863,11 +2025,41 @@ def ensure_transition_state_path(
     return transition_state_node
 
 
+def _geometry_maps_from_creation_witness(
+    source_components: ReactionComponents,
+    target_components: ReactionComponents,
+    frame_to_geometry: list[int],
+    creation_source_maps: dict[int, int],
+) -> list[int]:
+    """Validate the selected form without choosing another symmetry representative."""
+    atom_count = len(frame_to_geometry)
+    if sorted(frame_to_geometry) != list(range(atom_count)):
+        raise ValueError("frame-to-Geometry order is not a complete permutation")
+    expected = set(range(1, atom_count + 1))
+    if set(creation_source_maps) != expected or set(creation_source_maps.values()) != expected:
+        raise ValueError("reaction creation witness is not a complete atom permutation")
+    labelled_source = {
+        side: [(mol, [creation_source_maps[number] for number in maps]) for mol, maps in entries]
+        for side, entries in source_components.items()
+    }
+    if serialize_reaction_components(labelled_source) != serialize_reaction_components(
+        target_components
+    ):
+        raise ValueError("reaction creation witness disagrees with labelled TS endpoints")
+    geometry_atom_maps = [0] * atom_count
+    for source_index, geometry_index in enumerate(frame_to_geometry):
+        geometry_atom_maps[geometry_index] = creation_source_maps[source_index + 1]
+    return geometry_atom_maps
+
+
 def bind_transition_state_frame(
     session: Session,
     *,
     mapped_reaction: MappedReaction,
     calculation_frame: CalculationFrame,
+    source_endpoints: tuple[Chem.Mol, Chem.Mol] | None = None,
+    resolved_source_atom_maps: list[int] | None = None,
+    creation_source_maps: dict[int, int] | None = None,
     cache: ReconciliationBatchCache | None = None,
     refresh_thermodynamics: bool = True,
 ) -> MappedReactionNodeGeometry:
@@ -1879,18 +2071,93 @@ def bind_transition_state_frame(
     if calculation_frame.geometry.project_id != project_id:
         raise ValueError("TS calculation Geometry crosses the mapped reaction project boundary")
 
+    source_components = (
+        _reaction_components_from_source_endpoints(*source_endpoints)
+        if source_endpoints is not None
+        else _reaction_components_from_persisted_endpoints(session, calculation_frame)
+    )
+    if source_components is None:
+        raise ValueError("TS source endpoints cannot establish a complete atom-order mapping")
+    target_participants = tuple(
+        session.exec(
+            select(MappedReactionParticipant).where(
+                MappedReactionParticipant.mapped_reaction_id == mapped_reaction.id,
+            )
+        ).all()
+    ) + tuple(
+        entity
+        for entity in (
+            *tuple(session.new),
+            *tuple(session.info.get("_fast_pending_entities", ())),
+        )
+        if isinstance(entity, MappedReactionParticipant)
+        and entity.mapped_reaction_id == mapped_reaction.id
+    )
+    target_components = _reaction_components_from_participants(session, target_participants)
+    geometry = calculation_frame.geometry
+    frame_to_geometry = list(calculation_frame.observed_to_geometry_atom_indices)
+    if sorted(frame_to_geometry) != list(range(geometry.atom_count)):
+        raise ValueError("TS frame-to-Geometry atom order is not a complete permutation")
+    source_reactants = source_components[LogicalReactionParticipantSide.REACTANT]
+    source_products = source_components[LogicalReactionParticipantSide.PRODUCT]
+    reactant_source_molecule = source_reactants[0][0]
+    product_source_molecule = source_products[0][0]
+    if (
+        reactant_source_molecule.GetNumAtoms() != geometry.atom_count
+        or product_source_molecule.GetNumAtoms() != geometry.atom_count
+    ):
+        raise ValueError("TS endpoint atom count differs from its Geometry")
+    for source_molecule in (reactant_source_molecule, product_source_molecule):
+        if any(
+            (source_atom.GetAtomicNum(), source_atom.GetIsotope())
+            != (
+                geometry.mol.GetAtomWithIdx(frame_to_geometry[source_index]).GetAtomicNum(),
+                geometry.mol.GetAtomWithIdx(frame_to_geometry[source_index]).GetIsotope(),
+            )
+            for source_index, source_atom in enumerate(cast(Any, source_molecule).GetAtoms())
+        ):
+            raise ValueError("TS endpoint source nuclide order disagrees with its Geometry")
+
+    if target_components is None or not _mapped_reaction_matches_participant_projection(
+        mapped_reaction.mapped_reaction_smiles,
+        target_participants,
+    ):
+        raise ValueError(
+            "mapped reaction serialization disagrees with its participant topology/map records"
+        )
+    geometry_atom_maps: list[int] | None
+    if creation_source_maps is not None:
+        geometry_atom_maps = _geometry_maps_from_creation_witness(
+            source_components, target_components, frame_to_geometry, creation_source_maps
+        )
+    else:
+        source_identity = canonical_reaction_identity(source_components)
+        if source_identity.smiles == mapped_reaction.mapped_reaction_smiles:
+            geometry_atom_maps = [0] * geometry.atom_count
+            for source_index, geometry_index in enumerate(frame_to_geometry):
+                geometry_atom_maps[geometry_index] = source_identity.source_map_to_canonical[
+                    source_index + 1
+                ]
+        else:
+            geometry_atom_maps = reaction_atom_maps_in_geometry_order(
+                source_components,
+                target_components,
+                frame_to_geometry,
+            )
+    if geometry_atom_maps is None:
+        raise ValueError(
+            "TS source reaction does not map bijectively to the persisted Geometry and reaction"
+        )
+
     transition_state_node = ensure_transition_state_path(
         session,
         mapped_reaction=mapped_reaction,
         cache=cache,
     )
-    geometry = calculation_frame.geometry
-    frame_source_atom_maps = list(range(1, geometry.atom_count + 1))
-    source_to_geometry_atom_indices = list(calculation_frame.observed_to_geometry_atom_indices)
-    geometry_atom_maps = atom_maps_from_source_order(
-        geometry,
-        frame_source_atom_maps,
-        source_to_geometry_atom_indices,
+    validate_geometry_atom_map_elements(
+        geometry.mol,
+        geometry_atom_maps,
+        mapped_reaction.mapped_reaction_smiles,
     )
     node_geometry = _find_or_create_node_geometry(
         session,
@@ -1902,7 +2169,43 @@ def bind_transition_state_frame(
         prefer_primary=True,
         cache=cache,
     )
-    _ensure_mapping(
+    # A reused Geometry can carry a different representative of a true
+    # endpoint symmetry. Reuse it only after checking BOTH labelled endpoint
+    # graphs; matching elements or the TS graph alone cannot prove this.
+    node_geometry_id = _require_id(node_geometry, label="MappedReactionNodeGeometry")
+    existing_mapping = (
+        cache.mappings_by_node_geometry_id.get(node_geometry_id) if cache is not None else None
+    )
+    if existing_mapping is None:
+        existing_mapping = session.exec(
+            select(MappedReactionNodeGeometryMapping).where(
+                MappedReactionNodeGeometryMapping.mapped_reaction_node_geometry_id
+                == node_geometry_id
+            )
+        ).first()
+    if (
+        existing_mapping is not None
+        and len(existing_mapping.geometry_atom_map_numbers) == geometry.atom_count
+    ):
+        existing_source_maps = [
+            existing_mapping.geometry_atom_map_numbers[index] for index in frame_to_geometry
+        ]
+        candidate_components = {
+            side: [
+                (mol, [existing_source_maps[number - 1] for number in maps])
+                for mol, maps in entries
+            ]
+            for side, entries in source_components.items()
+        }
+        try:
+            same_labelled_reaction = serialize_reaction_components(
+                candidate_components
+            ) == serialize_reaction_components(target_components)
+        except (ValueError, RuntimeError):
+            same_labelled_reaction = False
+        if same_labelled_reaction:
+            geometry_atom_maps = list(existing_mapping.geometry_atom_map_numbers)
+    mapping = _ensure_mapping(
         session,
         node_geometry=node_geometry,
         coordinate_atom_maps=geometry_atom_maps,
@@ -1913,6 +2216,10 @@ def bind_transition_state_frame(
         ),
         cache=cache,
     )
+    if resolved_source_atom_maps is not None:
+        resolved_source_atom_maps[:] = [
+            mapping.geometry_atom_map_numbers[index] for index in frame_to_geometry
+        ]
     mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
     if cache is not None:
         cache.affected_reactions_by_id[mapped_reaction_id] = mapped_reaction

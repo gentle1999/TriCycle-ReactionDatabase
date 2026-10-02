@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from hashlib import sha256
 from typing import Any, cast
 from uuid import UUID
 
@@ -12,6 +14,9 @@ from tricycle_reaction_db.application.dtos.reactions import MappedReactionRecord
 from tricycle_reaction_db.application.services._persistence import (
     _attach_pending_entities,
     _require_id,
+)
+from tricycle_reaction_db.application.services.canonical_reaction_identity import (
+    canonical_reaction_identity,
 )
 from tricycle_reaction_db.application.services.mapped_geometry_atom_order import (
     mapped_reaction_atom_signatures,
@@ -28,6 +33,7 @@ from tricycle_reaction_db.application.services.reaction_topology_membership impo
 )
 from tricycle_reaction_db.application.services.reactions import (
     _resolve_topology_value,
+    mapped_smiles_for_topology,
     persist_mapped_reaction,
     transfer_mapped_reaction_to_concrete_topologies,
 )
@@ -666,6 +672,33 @@ def ensure_mapped_reactions_for_concrete_topology(
                 source_mapped_reaction,
                 target_topologies,
             )
+            identity = canonical_reaction_identity(
+                {
+                    side: [
+                        (topology.mol, transferred.atom_maps_by_template[key])
+                        for key, topology in transferred.concrete_topologies_by_template.items()
+                        if key[0] == side
+                    ]
+                    for side in (
+                        LogicalReactionParticipantSide.REACTANT,
+                        LogicalReactionParticipantSide.PRODUCT,
+                    )
+                }
+            )
+            canonical_maps = {
+                key: tuple(identity.source_map_to_canonical[number] for number in numbers)
+                for key, numbers in transferred.atom_maps_by_template.items()
+            }
+            transferred = replace(
+                transferred,
+                mapped_reaction_smiles=identity.smiles,
+                mapping_hash=sha256(identity.smiles.encode("utf-8")).hexdigest(),
+                atom_maps_by_template=canonical_maps,
+                mapped_smiles_by_template={
+                    key: mapped_smiles_for_topology(topology, list(canonical_maps[key]))
+                    for key, topology in transferred.concrete_topologies_by_template.items()
+                },
+            )
             mapped_reaction = persist_mapped_reaction(
                 session,
                 logical_reaction,
@@ -693,7 +726,9 @@ def ensure_mapped_reactions_for_concrete_topology(
                 },
                 concrete_topology_ids_by_template=transferred.concrete_topologies_by_template,
                 precomputed_mapped_smiles_by_template=transferred.mapped_smiles_by_template,
+                source_mapped_reaction_smiles=transferred.mapped_reaction_smiles,
                 topology_context=topology_context,
+                canonical_identity=identity,
             )
             mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
             created_or_reused[mapped_reaction_id] = mapped_reaction

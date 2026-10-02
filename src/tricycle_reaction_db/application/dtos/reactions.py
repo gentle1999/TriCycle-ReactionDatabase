@@ -3,7 +3,7 @@
 from typing import Self
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from tricycle_reaction_db.domain.enums import (
     ArtifactResolutionStatus,
@@ -120,6 +120,7 @@ class CreateReactionResult(BaseModel):
     mapping_complete: bool
     logical_reaction_created: bool
     mapped_reaction_created: bool
+    _source_map_to_canonical: dict[int, int] = PrivateAttr(default_factory=dict)
 
 
 class LogicalReactionParticipantRecord(BaseModel):
@@ -181,7 +182,11 @@ class MappedReactionNodeGeometryRecord(BaseModel):
 
 
 class MappedReactionNodeGeometryMappingRecord(BaseModel):
-    """One verified reaction-map to coordinate-order conversion."""
+    """Geometry-indexed reaction maps for one specific node association.
+
+    This vector is not an intrinsic Geometry property. TS bindings cover the
+    complete reaction; an endpoint component may use noncontiguous map numbers.
+    """
 
     model_config = ConfigDict(frozen=True)
 

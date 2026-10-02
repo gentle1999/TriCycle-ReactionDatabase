@@ -9,6 +9,7 @@ from sqlalchemy import func
 from sqlalchemy.engine import Dialect
 from sqlalchemy.sql.elements import ColumnElement
 
+from tricycle_reaction_db.domain.explicit_hydrogens import require_explicit_hydrogens
 from tricycle_reaction_db.domain.mol_properties import restore_mol_atom_properties
 
 
@@ -20,6 +21,18 @@ class AnnotatedRdkitMol(RdkitMol):
     """
 
     cache_ok = True
+
+    def bind_processor(self, dialect: Dialect) -> Any:
+        parent = super().bind_processor(dialect)  # type: ignore[no-untyped-call]
+
+        def process(value: Any) -> Any:
+            if value is not None:
+                if not isinstance(value, Chem.Mol):
+                    raise ValueError("persisted MOL requires an explicit-hydrogen RDKit molecule")
+                require_explicit_hydrogens(value)
+            return parent(value)
+
+        return process
 
     def column_expression(self, colexpr: Any) -> ColumnElement[Any]:
         return func.jsonb_build_array(

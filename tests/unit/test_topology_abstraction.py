@@ -51,7 +51,7 @@ def test_retained_bond_stereo_is_not_reassigned_by_atom_cip_validation(monkeypat
 def _two_center_molecule() -> Chem.Mol:
     molecule = Chem.MolFromSmiles("F[C@H](Cl)[C@H](Br)I")
     assert molecule is not None
-    return molecule
+    return Chem.AddHs(molecule)
 
 
 def test_identity_abstraction_is_a_noop_without_a_self_edge():
@@ -221,6 +221,7 @@ def test_known_projection_mapping_verifies_stereo_delta_without_graph_match(
 ) -> None:
     molecule = Chem.MolFromSmiles(smiles)
     assert molecule is not None
+    molecule = Chem.AddHs(molecule)
     feature = assigned_stereo_features(molecule)[feature_index]
     projection = stereo_abstraction_projection(molecule, (feature,))
     normalized, source_to_general = normalize_topology_with_mapping(

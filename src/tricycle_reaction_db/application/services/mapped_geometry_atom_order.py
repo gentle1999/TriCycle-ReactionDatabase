@@ -8,6 +8,20 @@ from rdkit import Chem
 from rdkit.Chem import rdChemReactions
 
 
+def initialize_parsed_reaction_stereo(reaction: rdChemReactions.ChemicalReaction) -> None:
+    """Decode SMILES slash directions at the parser boundary, without sanitizing.
+
+    ReactionFromSmarts(useSmiles=True) leaves BondStereo unset. The lossless
+    graph serializer consumes BondStereo, so direction-only parsed templates
+    must be decoded before they enter the source-authoritative graph pipeline.
+    """
+    for molecule in (*reaction.GetReactants(), *reaction.GetProducts(), *reaction.GetAgents()):
+        molecule.UpdatePropertyCache(strict=False)
+        Chem.FastFindRings(molecule)
+        Chem.SetBondStereoFromDirections(molecule)
+        Chem.AssignStereochemistry(molecule, cleanIt=False, force=True)
+
+
 def parse_mapped_reaction_smiles(
     mapped_reaction_smiles: str,
 ) -> rdChemReactions.ChemicalReaction:
@@ -23,6 +37,7 @@ def parse_mapped_reaction_smiles(
         or reaction.GetNumProductTemplates() == 0
     ):
         raise ValueError("mapped reaction SMILES must contain reactant and product templates")
+    initialize_parsed_reaction_stereo(reaction)
     return reaction
 
 
@@ -70,7 +85,7 @@ def mapped_reaction_atom_signatures(
     for templates in (reaction.GetReactants(), reaction.GetProducts()):
         signatures: dict[int, tuple[int, int]] = {}
         for molecule in templates:
-            for atom in molecule.GetAtoms():  # type: ignore[no-untyped-call]
+            for atom in molecule.GetAtoms():
                 map_number = atom.GetAtomMapNum()
                 if map_number <= 0:
                     raise ValueError("mapped reaction atoms must have positive atom-map numbers")
@@ -112,11 +127,20 @@ def validate_geometry_atom_map_elements(
     mapped_reaction_smiles: str,
     *,
     reaction_elements: Mapping[int, int] | None = None,
+    reaction_isotopes: Mapping[int, int] | None = None,
 ) -> None:
-    """Raise when a geometry map does not identify the same element in RXN SMILES."""
+    """Raise when a geometry map does not identify the same nuclide in RXN SMILES."""
 
-    if reaction_elements is None:
-        reaction_elements = mapped_reaction_atom_elements(mapped_reaction_smiles)
+    if reaction_elements is None or reaction_isotopes is None:
+        signatures = mapped_reaction_atom_signatures(mapped_reaction_smiles)
+        if reaction_elements is None:
+            reaction_elements = {
+                map_number: signature[0] for map_number, signature in signatures.items()
+            }
+        if reaction_isotopes is None:
+            reaction_isotopes = {
+                map_number: signature[1] for map_number, signature in signatures.items()
+            }
     if len(geometry_atom_map_numbers) != molecule.GetNumAtoms():
         raise ValueError("geometry atom mapping length does not match its topology")
     if len(set(geometry_atom_map_numbers)) != len(geometry_atom_map_numbers):
@@ -125,15 +149,21 @@ def validate_geometry_atom_map_elements(
         raise ValueError("geometry atom maps must cover the mapped reaction atoms exactly")
 
     for atom, map_number in zip(
-        molecule.GetAtoms(),
+        molecule.GetAtoms(),  # type: ignore[no-untyped-call]
         geometry_atom_map_numbers,
-        strict=True,  # type: ignore[no-untyped-call]
+        strict=True,
     ):
         expected_atomic_number = reaction_elements[map_number]
         if atom.GetAtomicNum() != expected_atomic_number:
             raise ValueError(
                 f"geometry map {map_number} has atomic number {atom.GetAtomicNum()}, "
                 f"but mapped reaction atom has atomic number {expected_atomic_number}"
+            )
+        expected_isotope = reaction_isotopes[map_number]
+        if atom.GetIsotope() != expected_isotope:
+            raise ValueError(
+                f"geometry map {map_number} has isotope {atom.GetIsotope()}, "
+                f"but mapped reaction atom has isotope {expected_isotope}"
             )
 
 

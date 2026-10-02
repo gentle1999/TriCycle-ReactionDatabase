@@ -6,11 +6,12 @@ import os
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import create_engine, delete
-from sqlmodel import Session, col
+from sqlalchemy import create_engine, delete, update
+from sqlmodel import Session, col, select
 from test_domain_query_filters import _create_domain_sample, _delete_domain_sample
 
 from tricycle_reaction_db.application.services import ReactionThermodynamicAnalyticsService
+from tricycle_reaction_db.core.chemistry_config import MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
     LogicalReaction,
@@ -100,7 +101,7 @@ async def test_statistics_and_export_share_logical_reaction_filters(
                 session.add(
                     MappedReactionThermodynamicProfile(
                         mapped_reaction_id=mapped_reaction.id,
-                        policy_version="analytics-filter-test-v1",
+                        policy_version=MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION,
                         source_key_hash=hashlib.sha256(
                             f"profile:{suffix}:{index}".encode()
                         ).hexdigest(),
@@ -146,6 +147,38 @@ async def test_statistics_and_export_share_logical_reaction_filters(
         assert statistics.profile_count == 1
         assert len(rows) == statistics.profile_count
         assert {row["logical_reaction_id"] for row in rows} == {str(logical_reaction_id)}
+
+        # Old policy materializations must not reappear in either read path.
+        async with session_factory() as session:
+            await session.execute(
+                update(MappedReactionThermodynamicProfile)
+                .values(policy_version="legacy-test")
+                .where(
+                    col(MappedReactionThermodynamicProfile.policy_version)
+                    == MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION
+                )
+                .where(
+                    col(MappedReactionThermodynamicProfile.mapped_reaction_id).in_(
+                        select(col(MappedReaction.id)).where(
+                            col(MappedReaction.logical_reaction_id).in_(logical_reaction_ids)
+                        )
+                    )
+                )
+            )
+            await session.commit()
+        stale_statistics = await ReactionThermodynamicAnalyticsService.statistics(
+            project_id=SYSTEM_PROJECT_ID,
+            filter_expression=filter_expression,
+        )
+        stale_export = await ReactionThermodynamicAnalyticsService.export_csv(
+            project_id=SYSTEM_PROJECT_ID,
+            filter_expression=filter_expression,
+        )
+        assert stale_statistics.profile_count == 0
+        assert (
+            list(csv.DictReader(io.StringIO("".join([chunk async for chunk in stale_export]))))
+            == []
+        )
     finally:
         async with session_factory() as session:
             if logical_reaction_ids:

@@ -50,6 +50,9 @@ from tricycle_reaction_db.application.services import (
     reaction_hash_for_participants,
     validate_logical_reaction,
 )
+from tricycle_reaction_db.application.services.canonical_reaction_identity import (
+    canonical_reaction_identity,
+)
 from tricycle_reaction_db.application.services.molecular_geometry import (
     GeometryPersistenceContext,
 )
@@ -465,7 +468,24 @@ def test_real_da_subset_round_trips_manifest_reaction_path_and_frame_bindings(
                 )
                 reaction_participants[(side.value, declaration["participant_index"])] = participant
             validate_logical_reaction(reaction)
-            canonical_mapped_smiles = rdChemReactions.ReactionToSmiles(definition, True)
+            identity = canonical_reaction_identity(
+                {
+                    side: [
+                        (persisted.topology.mol, maps)
+                        for _declaration, persisted, component_side, maps in participant_payloads
+                        if component_side is side
+                    ]
+                    for side in (
+                        LogicalReactionParticipantSide.REACTANT,
+                        LogicalReactionParticipantSide.PRODUCT,
+                    )
+                }
+            )
+            participant_payloads = [
+                (declaration, persisted, side, [identity.source_map_to_canonical[n] for n in maps])
+                for declaration, persisted, side, maps in participant_payloads
+            ]
+            canonical_mapped_smiles = identity.smiles
             mapping_hash = sha256(canonical_mapped_smiles.encode("utf-8")).hexdigest()
             mapped_reaction = persist_mapped_reaction(
                 session,
@@ -475,6 +495,7 @@ def test_real_da_subset_round_trips_manifest_reaction_path_and_frame_bindings(
                     label="conf-00 to product-03",
                     mapped_reaction_kind=MappedReactionKind.CURATED,
                     mapped_reaction_smiles=canonical_mapped_smiles,
+                    normalization_metadata=identity.normalization_metadata(),
                     mapping_hash=mapping_hash,
                 ),
                 source_atom_maps_by_template={
@@ -532,7 +553,10 @@ def test_real_da_subset_round_trips_manifest_reaction_path_and_frame_bindings(
                     )
                     topology_maps = atom_maps_from_source_order(
                         calculation_frame.geometry,
-                        component["source_atom_map_numbers"],
+                        [
+                            identity.source_map_to_canonical[n]
+                            for n in component["source_atom_map_numbers"]
+                        ],
                         calculation_frame.observed_to_geometry_atom_indices,
                     )
                     persist_mapped_reaction_node_geometry_mapping(

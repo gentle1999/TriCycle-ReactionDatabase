@@ -254,22 +254,13 @@ def test_molgr_geometry_creation_clears_inversion_labile_atom_chirality() -> Non
     )
     assert cleaned.GetAtomWithIdx(0).GetChiralTag() == source_carbon.GetChiralTag()
 
+    molecule = Chem.AddHs(molecule)
+    assert AllChem.EmbedMolecule(molecule, randomSeed=17) == 0
     record = normalize_molecule(
         molecule,
-        np.asarray(
-            (
-                (0.0, 0.0, 0.0),
-                (0.0, 1.2, 0.0),
-                (0.0, 0.0, 1.7),
-                (1.8, 0.0, 0.0),
-                (2.8, 0.8, 0.0),
-                (2.8, -0.6, 0.0),
-                (3.8, 0.0, 0.0),
-            ),
-            dtype=np.float64,
-        ),
+        np.asarray(molecule.GetConformer().GetPositions()),
         charge=0,
-        multiplicity=2,
+        multiplicity=1,
         reconstruction_method="molgr/cpp",
         reconstruction_version="test",
     )
@@ -371,6 +362,8 @@ def test_unsanitizable_topology_retains_searchable_connectivity_and_geometry(mon
 
 def test_unsanitizable_fallback_initializes_ring_info_for_postgresql_rdkit() -> None:
     molecule = _unsanitizable_ring_molecule()
+    molecule.UpdatePropertyCache(strict=False)
+    molecule = Chem.AddHs(molecule)
 
     record = normalize_molecule(
         molecule,
@@ -466,7 +459,7 @@ def test_trusted_ts_endpoint_normalization_does_not_sanitize(monkeypatch) -> Non
 
 
 def test_trusted_molgr_e_z_stereo_gets_serializable_direction_metadata() -> None:
-    assigned = Chem.MolFromSmiles("F/C=C/F")
+    assigned = Chem.AddHs(Chem.MolFromSmiles("F/C=C/F"))
     assert assigned is not None
     rdDepictor.Compute2DCoords(assigned)
     incomplete = Chem.MolFromMolBlock(
@@ -1074,6 +1067,7 @@ def test_trusted_normalization_preserves_enhanced_stereo_groups() -> None:
     source = Chem.MolFromSmiles("F[C@H](Cl)[C@H](Br)I |&1:1,3|")
     assert source is not None
     assert len(source.GetStereoGroups()) == 1
+    source = Chem.AddHs(source)
 
     record = normalize_topology(
         source,
@@ -1149,9 +1143,7 @@ def test_source_authoritative_topology_preserves_source_atom_order(
         )
         records.append(record)
         assert source_to_topology == list(range(molecule.GetNumAtoms()))
-        assert _indexed_graph_signature(molecule) == _indexed_graph_signature(
-            record.topology.mol
-        )
+        assert _indexed_graph_signature(molecule) == _indexed_graph_signature(record.topology.mol)
         assert record.topology_derivation.reconstruction_metadata[
             "topology_atom_map_numbers"
         ] == list(range(1, molecule.GetNumAtoms() + 1))

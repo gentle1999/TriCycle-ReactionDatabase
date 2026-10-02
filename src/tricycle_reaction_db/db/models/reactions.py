@@ -524,6 +524,9 @@ class MappedReaction(SQLModel, table=True):
         )
     )
     mapped_reaction_smiles: str = Field(sa_type=Text, nullable=False)
+    normalization_metadata: dict[str, str] | None = Field(
+        default=None, sa_column=Column(JSONB(none_as_null=True), nullable=True)
+    )
     reaction: str | None = Field(
         default=None,
         sa_column=Column(
@@ -1125,7 +1128,13 @@ class MappedReactionNodeGeometry(SQLModel, table=True):
 
 
 class MappedReactionNodeGeometryMapping(SQLModel, table=True):
-    """Explicit conversion from one logical reaction mapping to a coordinate."""
+    """Reaction atom maps owned by one node-Geometry association, for any role.
+
+    ``geometry_atom_map_numbers[g]`` is the owning mapped reaction's 1-based
+    atom map for Geometry atom g. Endpoint components can cover a subset.
+    Uniqueness is on the association, never on geometry_id: the same Geometry
+    can carry different transforms in different reactions or participant slots.
+    """
 
     __tablename__ = "mapped_reaction_node_geometry_mapping"  # pyright: ignore[reportAssignmentType]
     __table_args__ = (

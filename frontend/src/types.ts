@@ -488,6 +488,7 @@ export interface ArtifactSummary {
   artifact_kind: string;
   storage_status: string;
   storage_verified_at: string | null;
+  latest_parse_at: string | null;
   preview_available: boolean;
   ingestion_status: "pending" | "processing" | "succeeded" | "partial" | "filtered" | "failed" | null;
   source_frame_count: number | null;

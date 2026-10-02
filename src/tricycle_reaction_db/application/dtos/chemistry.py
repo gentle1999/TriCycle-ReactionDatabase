@@ -14,6 +14,7 @@ from tricycle_reaction_db.domain.enums import (
     StereoStatus,
     TopologySanitizationStatus,
 )
+from tricycle_reaction_db.domain.explicit_hydrogens import require_explicit_hydrogens
 from tricycle_reaction_db.domain.formulas import ELEMENT_COUNT_VECTOR_SIZE
 from tricycle_reaction_db.domain.internal_coordinates import internal_coordinate_hash
 from tricycle_reaction_db.domain.mol_properties import mol_atom_properties
@@ -276,6 +277,7 @@ class MolecularTopologyRecord(BaseModel):
 
     @model_validator(mode="after")
     def validate_graph_only_mol(self) -> "MolecularTopologyRecord":
+        require_explicit_hydrogens(self.mol)
         if self.mol.GetNumConformers() != 0:
             raise ValueError("MolecularTopology.mol must not contain conformers")
         if self.mol.GetNumAtoms() != self.atom_count:
@@ -344,6 +346,7 @@ class GeometryRecord(BaseModel):
 
     @model_validator(mode="after")
     def validate_invariant_geometry(self) -> "GeometryRecord":
+        require_explicit_hydrogens(self.mol)
         atom_count = self.mol.GetNumAtoms()
         if atom_count == 0:
             raise ValueError("Geometry.mol must contain at least one atom")

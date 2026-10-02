@@ -73,6 +73,9 @@ from tricycle_reaction_db.application.services import (
     reconcile_mapped_reaction_with_geometries,
     validate_logical_reaction,
 )
+from tricycle_reaction_db.application.services.canonical_reaction_identity import (
+    canonical_reaction_identity,
+)
 from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics_persistence import (
     refresh_mapped_reaction_thermodynamics,
 )
@@ -788,7 +791,29 @@ def seed_da_bench_fixture(
         )
         if definition is None:
             raise ValueError("RDKit could not parse seeded mapped reaction SMILES")
-        canonical_mapped_smiles = rdChemReactions.ReactionToSmiles(definition, True)
+        identity = canonical_reaction_identity(
+            {
+                side: [
+                    (persisted.topology.mol, atom_maps)
+                    for _declaration, persisted, component_side, atom_maps in participant_payloads
+                    if component_side == side
+                ]
+                for side in (
+                    LogicalReactionParticipantSide.REACTANT,
+                    LogicalReactionParticipantSide.PRODUCT,
+                )
+            }
+        )
+        participant_payloads = [
+            (
+                declaration,
+                persisted,
+                side,
+                [identity.source_map_to_canonical[number] for number in atom_maps],
+            )
+            for declaration, persisted, side, atom_maps in participant_payloads
+        ]
+        canonical_mapped_smiles = identity.smiles
         mapping_hash = sha256(canonical_mapped_smiles.encode("utf-8")).hexdigest()
         # The RDKit reaction template is allowed to reorder atoms while
         # serializing a component.  The manifest's source atom sequence,
@@ -821,6 +846,15 @@ def seed_da_bench_fixture(
             ),
             source_atom_maps_by_template=source_atom_maps_by_template,
             topology_ids_by_template=topology_ids_by_template,
+            concrete_topology_ids_by_template=topology_ids_by_template,
+            precomputed_mapped_smiles_by_template={
+                (side, declaration["participant_index"]): mapped_smiles_for_topology(
+                    persisted.topology, atom_maps
+                )
+                for declaration, persisted, side, atom_maps in participant_payloads
+            },
+            source_mapped_reaction_smiles=canonical_mapped_smiles,
+            canonical_identity=identity,
         )
         # A reaction declaration sees only participant Geometries with at
         # least one converged optimization.  Curated selectors below then
@@ -890,7 +924,10 @@ def seed_da_bench_fixture(
                     )
                 topology_atom_maps = atom_maps_from_source_order(
                     authority_frame.geometry,
-                    component["source_atom_map_numbers"],
+                    [
+                        identity.source_map_to_canonical[number]
+                        for number in component["source_atom_map_numbers"]
+                    ],
                     authority_frame.observed_to_geometry_atom_indices,
                 )
                 node_geometry = persist_mapped_reaction_node_geometry(

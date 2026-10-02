@@ -1266,9 +1266,7 @@ def thermodynamic_profile_is_visible(
 ) -> Any:
     """Return a fail-closed source authorization predicate for one profile."""
 
-    current_policy = (
-        col(profile.policy_version) == MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION
-    )
+    current_policy = col(profile.policy_version) == MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION
     if scope.unrestricted:
         return current_policy
     if scope.uses_project_owned_fast_path:

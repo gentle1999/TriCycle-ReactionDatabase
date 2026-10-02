@@ -1123,6 +1123,7 @@ test("catalog page size settings enforce view-specific maximums", async ({ page 
     created_by_user_id: "00000000-0000-7000-8000-000000000002",
     media_type: "text/plain",
     storage_verified_at: "2026-08-16T00:00:00Z",
+    latest_parse_at: null,
     preview_available: true,
   }];
   const artifactLimits: number[] = [];
@@ -1757,6 +1758,7 @@ test("artifact catalog pages by offset and jumps to a requested page", async ({ 
     created_by_user_id: "00000000-0000-7000-8000-000000000002",
     media_type: "text/plain",
     storage_verified_at: "2026-08-16T00:00:00Z",
+    latest_parse_at: null,
     preview_available: true,
   });
   const observedOffsets: number[] = [];
@@ -1807,15 +1809,19 @@ test("artifact catalog sorts directly from table headers", async ({ page }) => {
     created_by_user_id: "00000000-0000-7000-8000-000000000002",
     media_type: "text/plain",
     storage_verified_at: "2026-08-16T00:00:00Z",
+    latest_parse_at: null,
     preview_available: true,
   };
   const sortRequests: Array<{ sortBy: string | null; sortDirection: string | null }> = [];
   await page.route("**/api/artifacts?*", async (route) => {
     const url = new URL(route.request().url());
-    sortRequests.push({
-      sortBy: url.searchParams.get("sort_by"),
-      sortDirection: url.searchParams.get("sort_direction"),
-    });
+    // The metrics band also requests limit=1 without a sort; inspect table requests.
+    if (url.searchParams.get("limit") === "50") {
+      sortRequests.push({
+        sortBy: url.searchParams.get("sort_by"),
+        sortDirection: url.searchParams.get("sort_direction"),
+      });
+    }
     await route.fulfill({
       contentType: "application/json",
       body: JSON.stringify({ items: [artifact], page: { total: 1, limit: 50, offset: 0 } }),
@@ -1824,7 +1830,8 @@ test("artifact catalog sorts directly from table headers", async ({ page }) => {
 
   await page.goto("/artifacts");
   await expect(page.getByText("header-sort.log")).toBeVisible();
-  await expect(page.locator('th[aria-sort="descending"] button[data-sort-by="created_at"]')).toHaveCount(1);
+  await expect(page.locator('th[aria-sort="descending"] button[data-sort-by="latest_parse_at"]')).toHaveCount(1);
+  expect(sortRequests[0]).toEqual({ sortBy: "latest_parse_at", sortDirection: "desc" });
 
   const filenameSort = page.locator('button.data-table-sort-button[data-sort-by="original_filename"]');
   await filenameSort.click();
@@ -1852,6 +1859,7 @@ test("selected artifact files download as one archive", async ({ page }) => {
     created_by_user_id: "00000000-0000-7000-8000-000000000302",
     media_type: "text/plain",
     storage_verified_at: "2026-08-16T00:00:00Z",
+    latest_parse_at: null,
     preview_available: true,
   }));
   let requestedIds: string[] = [];
@@ -3234,6 +3242,7 @@ test("project manager can confirm and delete an artifact", async ({ page }) => {
     created_by_user_id: "00000000-0000-7000-8000-000000000922",
     media_type: "text/plain",
     storage_verified_at: "2026-08-14T00:00:00Z",
+    latest_parse_at: null,
     preview_available: true,
   };
   let deleted = false;
@@ -3304,6 +3313,7 @@ test("anonymous user can preview a public artifact and access its download link"
     created_by_user_id: "00000000-0000-7000-8000-000000000903",
     media_type: "text/plain",
     storage_verified_at: "2026-08-14T00:00:00Z",
+    latest_parse_at: null,
     preview_available: true,
   };
   const publicPayload = "Gaussian public test data\n";

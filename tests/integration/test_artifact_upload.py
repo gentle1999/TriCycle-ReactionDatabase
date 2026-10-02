@@ -20,6 +20,9 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
     _parse_calculation_output,
     _persist_parsed_artifact,
 )
+from tricycle_reaction_db.application.services.canonical_reaction_identity import (
+    serialize_reaction_components,
+)
 from tricycle_reaction_db.application.services.catalog import persist_artifact_file
 from tricycle_reaction_db.application.services.molecular_geometry import GeometryPersistenceContext
 from tricycle_reaction_db.application.services.query_visibility import (
@@ -29,6 +32,7 @@ from tricycle_reaction_db.application.services.query_visibility import (
 from tricycle_reaction_db.application.services.reaction_commands import _create_reaction
 from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
     ReconciliationBatchCache,
+    _reaction_components_from_source_endpoints,
     bind_transition_state_frame,
 )
 from tricycle_reaction_db.application.services.reactions import (
@@ -276,7 +280,18 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
             assert reused_from_partial_cache.id == inferred_geometry.id
 
             mapping = inferred_geometry.mapping_bindings[0]
-            expected_map_set = list(range(1, ts_frame.geometry.atom_count + 1))
+            # The selected form is persisted because RDKit need not have a fixed
+            # point when already-normalized endpoints are canonicalized again.
+            assert (
+                inference.inference_settings["canonical_mapped_reaction_smiles"]
+                == mapped_reaction.mapped_reaction_smiles
+            )
+            assert (
+                mapped_reaction.normalization_metadata["selected_mapped_reaction_smiles"]
+                == mapped_reaction.mapped_reaction_smiles
+            )
+            expected_source_maps = inference.inference_settings["source_atom_map_numbers"]
+            assert sorted(expected_source_maps) == list(range(1, ts_frame.geometry.atom_count + 1))
             frame_source_to_geometry = list(ts_frame.observed_to_geometry_atom_indices)
             parsed_ts_frame = next(
                 record
@@ -290,7 +305,7 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
             ] == parsed_ts_frame.molecule.observed_atomic_numbers
             assert mapping.geometry_atom_map_numbers == atom_maps_from_source_order(
                 ts_frame.geometry,
-                expected_map_set,
+                expected_source_maps,
                 frame_source_to_geometry,
             )
             assert mapping.mapped_smiles == mapped_smiles_for_topology(
@@ -331,7 +346,22 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
             endpoint_by_direction = {endpoint.direction: endpoint for endpoint in endpoints}
             mapped_reaction = session.get(MappedReaction, inference.mapped_reaction_id)
             assert mapped_reaction is not None
-            assert mapped_reaction.mapped_reaction_smiles == parsed.inferences[0].reaction_smiles
+            source_components = _reaction_components_from_source_endpoints(
+                parsed.inferences[0].negative_endpoint,
+                parsed.inferences[0].positive_endpoint,
+            )
+            assert source_components is not None
+            labelled_components = {
+                side: [
+                    (molecule, [expected_source_maps[n - 1] for n in maps])
+                    for molecule, maps in entries
+                ]
+                for side, entries in source_components.items()
+            }
+            assert (
+                serialize_reaction_components(labelled_components)
+                == mapped_reaction.mapped_reaction_smiles
+            )
             negative_coordinates = np.asarray(
                 endpoint_by_direction[TransitionStateEndpointDirection.NEGATIVE].source_coordinates,
                 dtype=np.float64,
@@ -424,9 +454,11 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
             alternate_frame.optimization_status = OptimizationStatus.CONVERGED
             alternate_frame.frame_role = FrameRole.TERMINAL
             session.flush()
+            # This optimization frame has no inferred endpoints; it cannot
+            # establish the association mapping even with an eligible role.
             with pytest.raises(
                 ValueError,
-                match="requires at least one thermodynamic property",
+                match="TS source endpoints cannot establish a complete atom-order mapping",
             ):
                 bind_transition_state_frame(
                     session,

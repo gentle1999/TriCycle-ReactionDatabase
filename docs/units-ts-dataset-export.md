@@ -73,7 +73,7 @@ Each line is one JSON object with this shape:
 
 ```json
 {
-  "schema": "mapped-reaction-ts-geometry-v2",
+  "schema": "mapped-reaction-ts-geometry-v3",
   "key": "<mapped reaction SMILES>",
   "value": {
     "geometry": {
@@ -92,7 +92,8 @@ Each line is one JSON object with this shape:
         }
       ]
     },
-    "rdkit_mol": {"format": "molblock", "value": "..."}
+    "rdkit_mol": {"format": "molblock", "value": "..."},
+    "calculations": []
   }
 }
 ```
@@ -156,3 +157,19 @@ Samples without verified atom
 mapping, valid 3D coordinates, supported UniTS charge/multiplicity, or an
 inferable reaction center are skipped. Their aggregated reasons appear in
 `skip_reasons`; an export with no usable samples ends as `failed`.
+
+Version 3 also includes `value.calculations` for the bound calculation frames.
+Each entry contains `frame_id`, the explicit `source_to_mapped_atom_indices`
+provenance permutation, `observed_coordinates_angstrom`, and `scientific_arrays`.
+Atom axes use map number minus one, including forces, normal modes, populations,
+bond orders and Fukui data. Both Cartesian block axes of a Hessian are permuted.
+NMR coupling subsets carry sorted mapped atom indices and permuted matrix axes;
+shielding metadata carries its mapped atom index. Molecular vectors and tensors
+without atom axes retain their components.
+
+Calculation coordinates and arrays remain in their original Cartesian reference
+frame (`coordinate_frame: source_cartesian`); they are not silently rotated into
+the separately exported canonical Geometry frame. Invalid array dimensions stop
+the export rather than emitting mismatched scientific data. Source arrays in the
+database are never modified. Geometry hashes identify the stored Geometry, not
+the reordered output.

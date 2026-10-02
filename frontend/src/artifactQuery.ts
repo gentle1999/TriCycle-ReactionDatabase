@@ -7,6 +7,7 @@ export type ArtifactQueryField =
   | "ingestion_status";
 
 export type ArtifactSortBy =
+  | "latest_parse_at"
   | "created_at"
   | "original_filename"
   | "size_bytes"

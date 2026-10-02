@@ -1126,8 +1126,8 @@ def test_reactant_and_product_ez_are_independent_of_ts_stereo() -> None:
 def test_inference_topology_records_are_normalized_once_per_microbatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    negative = Chem.MolFromSmiles("C/C=C/C")
-    positive = Chem.MolFromSmiles("C/C=C\\C")
+    negative = Chem.AddHs(Chem.MolFromSmiles("C/C=C/C"))
+    positive = Chem.AddHs(Chem.MolFromSmiles("C/C=C\\C"))
     assert negative is not None
     assert positive is not None
     inferred = _SuccessfulInference(

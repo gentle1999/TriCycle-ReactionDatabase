@@ -615,8 +615,11 @@ def test_logical_reaction_removes_mapping_and_keeps_distinct_mappings() -> None:
                         renumbered.mapped_reaction_id,
                     }
                 )
-                == 3
+                == 2
             )
+            assert renumbered.mapped_reaction_id == first.mapped_reaction_id
+            assert renumbered.mapped_reaction_created is False
+            assert second.mapped_reaction_id != first.mapped_reaction_id
             assert repeated.mapped_reaction_id == second.mapped_reaction_id
             assert repeated.mapped_reaction_created is False
             assert (
@@ -625,7 +628,7 @@ def test_logical_reaction_removes_mapping_and_keeps_distinct_mappings() -> None:
                     .select_from(MappedReaction)
                     .where(MappedReaction.logical_reaction_id == first.logical_reaction_id)
                 ).one()
-                == 3
+                == 2
             )
     finally:
         transaction.rollback()
@@ -832,7 +835,8 @@ def test_later_converged_frame_links_to_preexisting_reaction(tmp_path) -> None:
                 ),
             )
             assert backfilled.mapped_reaction_id is not None
-            assert backfilled.mapped_reaction_id != reaction.mapped_reaction_id
+            assert backfilled.mapped_reaction_id == reaction.mapped_reaction_id
+            assert backfilled.mapped_reaction_created is False
             backfilled_node_geometries = session.exec(
                 select(MappedReactionNodeGeometry)
                 .join(MappedReactionNode)
@@ -855,7 +859,9 @@ def test_later_converged_frame_links_to_preexisting_reaction(tmp_path) -> None:
                 topology_context=deferred_context,
                 reconciliation_cache=deferred_context.reconciliation_cache,
             )
-            assert deferred.mapped_reaction_id is not None
+            assert deferred.mapped_reaction_id == reaction.mapped_reaction_id
+            assert deferred.mapped_reaction_created is False
+            # Deferral preserves bindings already attached to the canonical reaction.
             assert (
                 session.exec(
                     select(func.count())
@@ -863,7 +869,7 @@ def test_later_converged_frame_links_to_preexisting_reaction(tmp_path) -> None:
                     .join(MappedReactionNode)
                     .where(MappedReactionNode.mapped_reaction_id == deferred.mapped_reaction_id)
                 ).one()
-                == 0
+                == 2
             )
 
             reconcile_molop_geometry_context(session, deferred_context)

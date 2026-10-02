@@ -37,6 +37,7 @@ class ArtifactSummary(QueryView):
     artifact_kind: str
     storage_status: str
     storage_verified_at: datetime | None = None
+    latest_parse_at: datetime | None = None
     preview_available: bool
     ingestion_status: str | None = None
     source_frame_count: int | None = None

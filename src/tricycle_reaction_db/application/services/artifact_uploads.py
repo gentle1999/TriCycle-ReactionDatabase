@@ -135,6 +135,10 @@ from tricycle_reaction_db.application.services.authorization import (
     AuthorizationService,
     ProjectPermission,
 )
+from tricycle_reaction_db.application.services.canonical_reaction_identity import (
+    REACTION_INDEX_POLICY,
+    canonical_reaction_identity,
+)
 from tricycle_reaction_db.application.services.database_statistics import (
     refresh_project_statistics,
 )
@@ -178,6 +182,7 @@ from tricycle_reaction_db.domain.enums import (
     ArtifactIngestionStatus,
     ArtifactKind,
     ArtifactVisibility,
+    LogicalReactionParticipantSide,
     MappedReactionKind,
     ParseCompleteness,
     StorageStatus,
@@ -2569,7 +2574,7 @@ def _resolve_and_bind_transition_state_reaction(
     topology_context: GeometryPersistenceContext | None = None,
     prepared_topology_records: _PreparedInferenceTopologyRecords | None = None,
     refresh_thermodynamics: bool | None = None,
-) -> tuple[UUID, UUID]:
+) -> tuple[UUID, UUID, list[int]]:
     """Create the mapped endpoint reaction and bind its TS coordinate evidence."""
 
     effective_refresh_thermodynamics = (
@@ -2616,6 +2621,7 @@ def _resolve_and_bind_transition_state_reaction(
         cache_key = None
         cached_reaction_ids = None
     assert prepared_records is not None
+    creation_source_maps: dict[int, int] | None = None
     if cached_reaction_ids is None:
         if topology_context is not None:
             assert cache_key is not None
@@ -2655,10 +2661,13 @@ def _resolve_and_bind_transition_state_reaction(
         )
         if reaction_result.mapped_reaction_id is None:
             raise ValueError("MolOP TS endpoint reaction did not produce a complete atom mapping")
+        creation_source_maps = reaction_result._source_map_to_canonical or None
         logical_reaction_id = reaction_result.logical_reaction_id
         mapped_reaction_id = reaction_result.mapped_reaction_id
         if topology_context is not None:
             assert cache_key is not None
+            if creation_source_maps is not None:
+                topology_context.inferred_reaction_maps_by_key[cache_key] = creation_source_maps
             topology_context.inferred_reaction_ids_by_key[cache_key] = (
                 logical_reaction_id,
                 mapped_reaction_id,
@@ -2671,6 +2680,8 @@ def _resolve_and_bind_transition_state_reaction(
     else:
         logical_reaction_id, mapped_reaction_id = cached_reaction_ids
         if topology_context is not None:
+            assert cache_key is not None
+            creation_source_maps = topology_context.inferred_reaction_maps_by_key.get(cache_key)
             topology_context.inferred_reaction_cache_hits += 1
     if topology_context is not None and legacy_bulk_import:
         # The source-order authority scope ends with this inference savepoint,
@@ -2702,11 +2713,15 @@ def _resolve_and_bind_transition_state_reaction(
     # Reaction reconciliation may flush internally; register all deferred
     # reaction rows before that happens so relationship backrefs stay intact.
     _attach_pending_entities(session)
+    source_atom_maps: list[int] = []
     if is_transition_state_frame_eligible(calculation_frame.frame_role):
         bind_transition_state_frame(
             session,
             mapped_reaction=mapped_reaction,
             calculation_frame=calculation_frame,
+            source_endpoints=(inferred.negative_endpoint, inferred.positive_endpoint),
+            resolved_source_atom_maps=source_atom_maps,
+            creation_source_maps=creation_source_maps,
             cache=(topology_context.reconciliation_cache if topology_context is not None else None),
             refresh_thermodynamics=effective_refresh_thermodynamics,
         )
@@ -2716,7 +2731,34 @@ def _resolve_and_bind_transition_state_reaction(
             mapped_reaction=mapped_reaction,
             cache=(topology_context.reconciliation_cache if topology_context is not None else None),
         )
-    return logical_reaction_id, mapped_reaction_id
+    return logical_reaction_id, mapped_reaction_id, source_atom_maps
+
+
+def _reaction_index_snapshot(
+    session: Session, *, mapped_reaction_id: UUID, source_atom_maps: list[int]
+) -> dict[str, Any]:
+    """Snapshot the actual bound reaction form for import and source re-inference."""
+    mapped_reaction = session.get(MappedReaction, mapped_reaction_id)
+    if mapped_reaction is None:
+        mapped_reaction = next(
+            (
+                entity
+                for entity in (*session.new, *session.info.get("_fast_pending_entities", ()))
+                if isinstance(entity, MappedReaction) and entity.id == mapped_reaction_id
+            ),
+            None,
+        )
+    if mapped_reaction is None:
+        raise RuntimeError("TS inference references a missing mapped reaction")
+    if not source_atom_maps or sorted(source_atom_maps) != list(
+        range(1, len(source_atom_maps) + 1)
+    ):
+        raise ValueError("TS source mapping must be a complete reaction atom permutation")
+    return {
+        "reaction_index_policy": REACTION_INDEX_POLICY,
+        "canonical_mapped_reaction_smiles": mapped_reaction.mapped_reaction_smiles,
+        "source_atom_map_numbers": list(source_atom_maps),
+    }
 
 
 def _persist_successful_inference(
@@ -2736,14 +2778,35 @@ def _persist_successful_inference(
         if topology_context is not None
         else _prepare_inference_topology_records(inferred)
     )
-    logical_reaction_id, mapped_reaction_id = _resolve_and_bind_transition_state_reaction(
-        session,
-        inferred=inferred,
-        calculation_frame=calculation_frame,
-        topology_context=topology_context,
-        prepared_topology_records=prepared_topology_records,
-        refresh_thermodynamics=(topology_context is None and not defer_thermodynamic_refresh),
+    logical_reaction_id, mapped_reaction_id, source_atom_maps = (
+        _resolve_and_bind_transition_state_reaction(
+            session,
+            inferred=inferred,
+            calculation_frame=calculation_frame,
+            topology_context=topology_context,
+            prepared_topology_records=prepared_topology_records,
+            refresh_thermodynamics=(topology_context is None and not defer_thermodynamic_refresh),
+        )
     )
+    if not source_atom_maps:
+        reactant, product = sorted(
+            (inferred.negative_endpoint, inferred.positive_endpoint),
+            key=lambda endpoint: len(Chem.GetMolFrags(endpoint)),
+            reverse=True,
+        )
+        identity = canonical_reaction_identity(
+            {
+                LogicalReactionParticipantSide.REACTANT: [
+                    (reactant, list(range(1, reactant.GetNumAtoms() + 1)))
+                ],
+                LogicalReactionParticipantSide.PRODUCT: [
+                    (product, list(range(1, product.GetNumAtoms() + 1)))
+                ],
+            }
+        )
+        source_atom_maps = [
+            identity.source_map_to_canonical[index + 1] for index in range(reactant.GetNumAtoms())
+        ]
     endpoint_validation = {
         "negative": endpoint_provenance(inferred.negative_endpoint),
         "positive": endpoint_provenance(inferred.positive_endpoint),
@@ -2764,6 +2827,9 @@ def _persist_successful_inference(
             else "molop/possible_pre_post_ts+openbabel-fallback"
         ),
         "inference_settings": {
+            **_reaction_index_snapshot(
+                session, mapped_reaction_id=mapped_reaction_id, source_atom_maps=source_atom_maps
+            ),
             "endpoint_selection": (
                 "molop.possible_pre_post_ts"
                 if strictly_validated
@@ -2915,6 +2981,7 @@ _INFERENCE_CONTEXT_MUTABLE_FIELDS = (
     "molecular_topologies_by_id",
     "mapped_reactions_to_reconcile",
     "inferred_reaction_ids_by_key",
+    "inferred_reaction_maps_by_key",
     "inferred_reaction_topology_records_by_key",
 )
 _INFERENCE_CONTEXT_SCALAR_FIELDS = ("source_atom_order_authoritative",)
@@ -2985,9 +3052,9 @@ def _restore_inference_context(
         current = getattr(topology_context, name)
         if isinstance(current, dict | set):
             current.clear()
-            current.update(saved)
+            current.update(cast(Any, saved))
         elif isinstance(current, list):
-            current[:] = saved
+            current[:] = cast(list[Any], saved)
         else:
             setattr(topology_context, name, saved)
     topology_context.inferred_reaction_cache_hits = cache_hits
@@ -2998,9 +3065,9 @@ def _restore_inference_context(
         current = getattr(cache, name)
         if isinstance(current, dict | set):
             current.clear()
-            current.update(saved)
+            current.update(cast(Any, saved))
         elif isinstance(current, list):
-            current[:] = saved
+            current[:] = cast(list[Any], saved)
         else:
             setattr(cache, name, saved)
 
@@ -3197,6 +3264,11 @@ def _persist_artifact_inferences_batch(
                             session,
                             mapped_reaction=mapped_reaction,
                             calculation_frame=calculation_frame,
+                            source_endpoints=(
+                                (inferred.negative_endpoint, inferred.positive_endpoint)
+                                if isinstance(inferred, _SuccessfulInference)
+                                else None
+                            ),
                             cache=(
                                 topology_context.reconciliation_cache
                                 if topology_context is not None
@@ -4162,7 +4234,7 @@ def _source_atom_order_identity(inferred: _SuccessfulInference) -> str:
                 atom.GetIsAromatic(),
                 atom.GetAtomMapNum(),
             )
-            for atom in molecule.GetAtoms()
+            for atom in molecule.GetAtoms()  # type: ignore[no-untyped-call]
         ]
         bonds = [
             (
@@ -4174,7 +4246,7 @@ def _source_atom_order_identity(inferred: _SuccessfulInference) -> str:
                 tuple(int(index) for index in bond.GetStereoAtoms()),
                 int(bond.GetBondDir()),
             )
-            for bond in molecule.GetBonds()
+            for bond in molecule.GetBonds()  # type: ignore[no-untyped-call]
         ]
         coordinates: list[tuple[float, float, float]] = []
         if molecule.GetNumConformers():
@@ -4265,7 +4337,7 @@ def _prepare_inference_topology_records(
                     normalize_topology(
                         fragment,
                         add_hydrogens=False,
-                        preserve_source_atom_order=True,
+                        preserve_source_atom_order=False,
                         reconstruction_method="molgr/possible_pre_post_ts",
                         reconstruction_version=MOLOP_VERSION,
                         reconstruction_metadata={

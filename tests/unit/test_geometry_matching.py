@@ -42,6 +42,7 @@ def test_cached_topology_allows_an_alternate_graph_projection() -> None:
         ),
         topology=SimpleNamespace(
             formula_id=formula_id,
+            mol=record.topology.mol,
             identity_schema_version=record.topology.identity_schema_version,
             graph_hash=record.topology.graph_hash,
             canonical_isomeric_smiles=record.topology.canonical_isomeric_smiles,
@@ -59,6 +60,7 @@ def test_database_topology_reuses_identity_with_an_alternate_projection(monkeypa
     formula = SimpleNamespace(id=formula_id, composition_hash=record.formula.composition_hash)
     topology = SimpleNamespace(
         id=topology_id,
+        mol=record.topology.mol,
         formula_id=formula_id,
         identity_schema_version=record.topology.identity_schema_version,
         graph_hash=record.topology.graph_hash,

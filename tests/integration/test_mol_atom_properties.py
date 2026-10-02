@@ -55,7 +55,7 @@ def test_metal_spin_survives_cartridge_storage_and_aliased_scalar_reads() -> Non
         Column("mol_atom_properties", JSONB),
         prefixes=["TEMPORARY"],
     )
-    molecule = Chem.MolFromSmiles("[Fe]<-N/C=C/F")
+    molecule = Chem.AddHs(Chem.MolFromSmiles("[Fe]<-N/C=C/F"))
     molecule.GetAtomWithIdx(0).SetIntProp(METAL_SPIN, 4)
     molecule.GetAtomWithIdx(0).SetNumRadicalElectrons(0)
     # Production bulk ingestion must retain mol_from_pkl(), not COPY raw

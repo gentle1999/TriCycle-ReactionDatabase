@@ -68,9 +68,7 @@ def test_mapped_reaction_parser_supports_dative_bonds_and_mapped_hydrogen() -> N
 
     assert mapped_reaction_atom_elements(mapped_reaction) == {1: 7, 2: 46}
     assert mapped_reaction_atom_elements("[C:1][H:2]>>[C:1][H:2]") == {1: 6, 2: 1}
-    assert mapped_reaction_atom_elements(
-        "[n:1]->[Pd+2:2]>[O:3]>[n:1]->[Pd+2:2]"
-    ) == {1: 7, 2: 46}
+    assert mapped_reaction_atom_elements("[n:1]->[Pd+2:2]>[O:3]>[n:1]->[Pd+2:2]") == {1: 7, 2: 46}
 
     dative_bond_change = "[n:1]->[Pd+2:2]>>[n:1].[Pd+2:2]"
     assert reaction_center_atom_maps(dative_bond_change) == frozenset({1, 2})
@@ -78,9 +76,7 @@ def test_mapped_reaction_parser_supports_dative_bonds_and_mapped_hydrogen() -> N
     assert reaction_center_atom_maps(reversed_dative_direction) == frozenset({1, 2})
     same_dative_direction = "[n:1]->[Pd+2:2]>>[Pd+2:2]<-[n:1]"
     assert reaction_center_atom_maps(same_dative_direction) == frozenset()
-    dative_bond_change_with_quadruple = (
-        "[C:1]$[C:2].[n:3]->[Pd+2:4]>>[C:1]$[C:2].[n:3].[Pd+2:4]"
-    )
+    dative_bond_change_with_quadruple = "[C:1]$[C:2].[n:3]->[Pd+2:4]>>[C:1]$[C:2].[n:3].[Pd+2:4]"
     assert reaction_center_atom_maps(dative_bond_change_with_quadruple) == frozenset({3, 4})
 
 
@@ -102,6 +98,18 @@ def test_geometry_atom_validation_accepts_cached_reaction_elements() -> None:
         reaction.mapped_reaction_smiles,
         reaction_elements=reaction_elements,
     )
+
+
+def test_geometry_atom_validation_rejects_isotope_mismatch() -> None:
+    geometry = _geometry()
+    reaction = "[O:1][13C:2]>>[O:1][13C:2]"
+
+    with pytest.raises(ValueError, match="isotope"):
+        validate_geometry_atom_map_elements(
+            geometry.mol,
+            [2, 1],
+            reaction,
+        )
 
 
 def test_units_ts_sample_and_raw_record_use_atom_map_order() -> None:
@@ -178,7 +186,7 @@ def test_mapped_geometry_jsonl_reorders_atoms_and_molblock() -> None:
     assert record_bytes is not None
     record = json.loads(record_bytes)
 
-    assert record["schema"] == "mapped-reaction-ts-geometry-v2"
+    assert record["schema"] == "mapped-reaction-ts-geometry-v3"
     reaction_smiles = _mapped_reaction().mapped_reaction_smiles
     assert record["key"] == reaction_smiles
     reactants, products = reaction_smiles.split(">>")

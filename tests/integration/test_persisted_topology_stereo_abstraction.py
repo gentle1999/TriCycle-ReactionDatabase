@@ -35,7 +35,7 @@ pytestmark = [
 
 
 def test_persisted_stereo_abstraction_is_a_dag() -> None:
-    molecule = Chem.MolFromSmiles("F[C@H](Cl)[C@H](Br)I")
+    molecule = Chem.AddHs(Chem.MolFromSmiles("F[C@H](Cl)[C@H](Br)I"))
     assert molecule is not None
     record = normalize_topology(
         molecule,
@@ -104,7 +104,7 @@ def test_persisted_stereo_abstraction_is_a_dag() -> None:
             assert one_center_b.is_stereo_abstraction_upstream is True
             assert zero_center_a.is_stereo_abstraction_upstream is True
 
-            alternate_molecule = Chem.MolFromSmiles("F[C@@H](Cl)[C@H](Br)I")
+            alternate_molecule = Chem.AddHs(Chem.MolFromSmiles("F[C@@H](Cl)[C@H](Br)I"))
             assert alternate_molecule is not None
             alternate_record = normalize_topology(
                 alternate_molecule,
@@ -161,7 +161,7 @@ def test_persisted_stereo_abstraction_is_a_dag() -> None:
             assert len(loaded) == 5
             assert set(dag_component_ids) == {*reachable_ids, zero_center_id}
 
-            isolated_molecule = Chem.MolFromSmiles("[CH3][CH3]")
+            isolated_molecule = Chem.AddHs(Chem.MolFromSmiles("[CH3][CH3]"))
             assert isolated_molecule is not None
             isolated_record = normalize_topology(
                 isolated_molecule,

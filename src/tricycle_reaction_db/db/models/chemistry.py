@@ -17,6 +17,7 @@ from sqlalchemy import (
     Computed,
     Float,
     Index,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -210,6 +211,12 @@ class MolecularTopology(SQLModel, table=True):
             "(sanitization_status = 'failed' AND sanitization_error IS NOT NULL)",
             name="ck_molecular_topology_sanitization_evidence",
         ),
+        CheckConstraint(
+            "(coordinate_complete_mol IS NULL AND coordinate_complete_mol_format IS NULL) "
+            "OR (coordinate_complete_mol IS NOT NULL "
+            "AND coordinate_complete_mol_format = 'rdkit-mol-binary-v1')",
+            name="ck_molecular_topology_coordinate_complete_pair",
+        ),
         RdkitIndex("ix_molecular_topology_mol_gist", "mol"),
         RdkitIndex("ix_molecular_topology_morgan_bfp_gist", "morgan_bfp"),
         Index(
@@ -241,6 +248,14 @@ class MolecularTopology(SQLModel, table=True):
         nullable=False,
     )
     mol: Chem.Mol = Field(sa_column=Column(AnnotatedRdkitMol(return_type="mol"), nullable=False))
+    # Preserve payloads written by deployed revision 0060. These legacy columns
+    # are not used to infer reaction maps or to fabricate missing QM atoms.
+    coordinate_complete_mol: bytes | None = Field(
+        default=None, sa_column=Column(LargeBinary, nullable=True)
+    )
+    coordinate_complete_mol_format: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
     mol_atom_properties: dict[str, int] = Field(
         default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default="{}")
     )

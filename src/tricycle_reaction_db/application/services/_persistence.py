@@ -52,6 +52,7 @@ def source_atom_order_authoritative(session: Session) -> Iterator[None]:
         else:
             session.info[SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY] = previous
 
+
 _FAST_INSERT_SAFE_LOCK_NAMES = frozenset(
     {
         "calculation_frame_segment",

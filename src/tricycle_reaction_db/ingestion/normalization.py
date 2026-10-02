@@ -36,6 +36,7 @@ from tricycle_reaction_db.core.chemistry_config import (
     TOPOLOGY_STEREO_AGNOSTIC_GRAPH_HASH_VERSION,
 )
 from tricycle_reaction_db.domain.enums import StereoStatus, TopologySanitizationStatus
+from tricycle_reaction_db.domain.explicit_hydrogens import require_explicit_hydrogens
 from tricycle_reaction_db.domain.formulas import element_count_vector_from_composition
 from tricycle_reaction_db.domain.internal_coordinates import (
     canonical_cartesian_coordinates,
@@ -379,6 +380,7 @@ def _canonical_topology(
     preserve_source_order: bool = False,
     preserve_stereochemistry: bool = False,
 ) -> tuple[Chem.Mol, list[int], TopologySanitizationStatus, str | None]:
+    require_explicit_hydrogens(mol)
     source_topology = Chem.Mol(mol)
     source_topology.RemoveAllConformers()
     unpaired_electron_state = _capture_unpaired_electron_state(source_topology)
@@ -1347,6 +1349,13 @@ def _serialize_molecule_smiles_once(
     """
 
     projected = Chem.Mol(mol)
+    # These RDKit writer caches contain atom indices and are not updated by
+    # RenumberAtoms/CombineMols. Chiral tags remain the authoritative evidence.
+    for atom in projected.GetAtoms():  # type: ignore[no-untyped-call]
+        for name in ("_ringStereoAtoms", "_ringStereochemCand"):
+            if atom.HasProp(name):
+                atom.ClearProp(name)
+
     _clear_smiles_output_order(projected)
     retain_atom_maps = retain_atom_maps or preserve_atom_maps
     if preserve_atom_maps:
@@ -2138,16 +2147,12 @@ def _normalized_topology_records(
                     **(
                         {
                             "source_atom_order_identity": str(
-                                (reconstruction_metadata or {})[
-                                    "source_atom_order_identity"
-                                ]
+                                (reconstruction_metadata or {})["source_atom_order_identity"]
                             )
                         }
                         if preserve_source_atom_order
                         and isinstance(
-                            (reconstruction_metadata or {}).get(
-                                "source_atom_order_identity"
-                            ),
+                            (reconstruction_metadata or {}).get("source_atom_order_identity"),
                             str,
                         )
                         else {}
