@@ -85,6 +85,10 @@ from tricycle_reaction_db.domain.enums import (
     OptimizationStatus,
 )
 from tricycle_reaction_db.domain.reaction_frames import is_transition_state_frame_eligible
+from tricycle_reaction_db.ingestion.normalization import (
+    recover_smiles_double_bond_stereochemistry,
+    serialize_molecule_smiles,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -781,15 +785,18 @@ def _mapped_reaction_matches_participant_projection(
 
     def canonical_side(smiles: str) -> str | None:
         try:
-            molecule = Chem.MolFromSmiles(smiles)
+            # These strings describe validated, coordinate-authoritative
+            # endpoint graphs. Default sanitization can change their aromatic,
+            # valence or coordination stereo state; default H removal can
+            # also destroy reaction-map inventory.
+            parser: Any = Chem.SmilesParserParams()
+            parser.removeHs = False
+            parser.sanitize = False
+            molecule = Chem.MolFromSmiles(smiles, parser)
             if molecule is None:
                 return None
-            return Chem.MolToSmiles(
-                molecule,
-                canonical=True,
-                isomericSmiles=True,
-                allHsExplicit=True,
-            )
+            molecule = recover_smiles_double_bond_stereochemistry(molecule)
+            return serialize_molecule_smiles(molecule, preserve_atom_maps=True)
         except (RuntimeError, ValueError):
             return None
 

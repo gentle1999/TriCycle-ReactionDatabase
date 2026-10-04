@@ -29,6 +29,7 @@ from tricycle_reaction_db.application.services.mapped_geometry_atom_order import
     validate_geometry_atom_map_elements,
 )
 from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
+    _geometry_maps_from_creation_witness,
     _mapped_reaction_matches_participant_projection,
     _reaction_components_from_source_endpoints,
 )
@@ -79,6 +80,7 @@ class FrameSource:
     geometry_id: UUID
     observed_to_geometry: list[int]
     frame_role: Any
+    source_atom_maps: list[int] | None = None
     endpoints: list[FrameEndpoint] = field(default_factory=list)
     source_components: ReactionComponents | None = None
     source_error: str | None = None
@@ -346,8 +348,7 @@ def _mapping_matches_source_frame(
     geometry: Geometry,
     geometry_maps: list[int],
     source_components: ReactionComponents,
-    source_evidence: ReactionEvidence,
-    target_evidence: ReactionEvidence,
+    target_components: ReactionComponents,
 ) -> tuple[bool, str]:
     if not is_transition_state_frame_eligible(frame.frame_role):
         return False, "source-frame-role-not-eligible-for-transition-state-binding"
@@ -381,19 +382,21 @@ def _mapping_matches_source_frame(
         ):
             return False, "source-endpoint-nuclide-order-disagrees-with-geometry"
 
-    if not _reaction_translation_exists(source_evidence, target_evidence):
-        return False, "complete-reaction-canonical-transform-could-not-be-established"
-    source_links = source_evidence.source_map_to_canonical
-    target_links = target_evidence.source_map_to_canonical
-    if set(source_links) != set(range(1, atom_count + 1)) or len(target_links) != atom_count:
-        return False, "reaction-maps-do-not-cover-the-source-atom-sequence"
-    for source_index, geometry_index in enumerate(source_to_geometry):
-        target_map = geometry_maps[geometry_index]
-        if (
-            target_map not in target_links
-            or source_links[source_index + 1] != target_links[target_map]
-        ):
-            return False, "stored-map-links-a-source-atom-to-a-non-equivalent-reaction-atom"
+    # Audit the form actually selected at creation. Recanonicalizing either
+    # endpoint pair can choose another valid representative of a symmetric
+    # reaction; equality of those newly chosen numbers is not source evidence.
+    source_maps = [geometry_maps[index] for index in source_to_geometry]
+    if frame.source_atom_maps is not None and source_maps != frame.source_atom_maps:
+        return False, "stored-geometry-map-disagrees-with-source-snapshot"
+    try:
+        _geometry_maps_from_creation_witness(
+            source_components,
+            target_components,
+            source_to_geometry,
+            dict(enumerate(source_maps, 1)),
+        )
+    except (ValueError, RuntimeError, KeyError):
+        return False, "stored-map-does-not-preserve-labelled-source-endpoints"
     return True, "source-frame-transform-verified"
 
 
@@ -547,6 +550,7 @@ def _load_source_frames(
             col(CalculationFrame.geometry_id),
             col(CalculationFrame.observed_to_geometry_atom_indices),
             col(CalculationFrame.frame_role),
+            col(TransitionStateInference.inference_settings),
             col(TransitionStateEndpoint.direction),
             col(TransitionStateEndpoint.topology_id),
             col(TransitionStateEndpoint.atom_count),
@@ -576,6 +580,7 @@ def _load_source_frames(
             geometry_id,
             observed_to_geometry,
             frame_role,
+            inference_settings,
             direction,
             topology_id,
             atom_count,
@@ -596,6 +601,11 @@ def _load_source_frames(
                 geometry_id=geometry_id,
                 observed_to_geometry=list(observed_to_geometry or []),
                 frame_role=frame_role,
+                source_atom_maps=(
+                    list(inference_settings["source_atom_map_numbers"])
+                    if isinstance(inference_settings.get("source_atom_map_numbers"), list)
+                    else None
+                ),
             )
             by_frame[frame_id] = source
         if direction is not None and topology_id is not None and atom_count is not None:
@@ -832,28 +842,12 @@ def _validate_direct_ts_row(
         if error is not None or components is None:
             unavailable.append(f"{source.inference_id}:{error or 'source-reconstruction-failed'}")
             continue
-        source_evidence = _cached_reaction_evidence(
-            components,
-            source.reaction_evidence,
-            include_stereochemistry=True,
-        )
-        target_evidence = _cached_reaction_evidence(
-            row.context.components,
-            row.context.reaction_evidence,
-            include_stereochemistry=True,
-        )
-        if source_evidence is None or target_evidence is None:
-            contradictions.append(
-                f"{source.inference_id}:complete-reaction-map-link-classes-could-not-be-built"
-            )
-            continue
         okay, detail = _mapping_matches_source_frame(
             frame=source,
             geometry=row.geometry,
             geometry_maps=list(row.mapping.geometry_atom_map_numbers),
             source_components=components,
-            source_evidence=source_evidence,
-            target_evidence=target_evidence,
+            target_components=row.context.components,
         )
         if okay:
             usable += 1

@@ -952,8 +952,9 @@ def test_safe_smiles_serialization_selects_deterministic_valid_ez_cycle_member(
     # canonicalizer alternating between them after each validated round trip.
     candidates = iter((forward, equivalent, forward, forward, equivalent, forward))
 
-    def alternating_writer(*_: object, **__: object) -> str:
-        return next(candidates)
+    def alternating_writer(*_: object, **__: object) -> tuple[str, Chem.Mol]:
+        smiles = next(candidates)
+        return smiles, Chem.MolFromSmiles(smiles)
 
     monkeypatch.setattr(
         normalization_module,

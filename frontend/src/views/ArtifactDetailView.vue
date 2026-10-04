@@ -5,6 +5,7 @@ import { computed, ref, watch } from "vue";
 import { RouterLink, useRoute, useRouter } from "vue-router";
 
 import { api, artifactDownloadUrl } from "@/api";
+import ArtifactParseDiagnostics from "@/components/ArtifactParseDiagnostics.vue";
 import ArtifactIngestionStatus from "@/components/ArtifactIngestionStatus.vue";
 import CalculationFrameList from "@/components/CalculationFrameList.vue";
 import ChemDoodleFrameMovie3D from "@/components/ChemDoodleFrameMovie3D.vue";
@@ -34,12 +35,15 @@ const artifactQuery = useQuery({
 const artifact = computed(() => artifactQuery.data.value ?? null);
 const parseRevisionsQuery = useQuery({
   queryKey: computed(() => ["artifact-detail-parse-revisions", { artifactId: artifactId.value, projectId: currentProjectId.value }]),
-  queryFn: ({ signal }) => api.parseRevisions({
-    artifactFileId: artifactId.value ?? "",
-    projectId: currentProjectId.value ?? undefined,
-    limit: 50,
-    offset: 0,
-  }, signal),
+  queryFn: async ({ signal }) => {
+    const options = { artifactFileId: artifactId.value ?? "", projectId: currentProjectId.value ?? undefined, limit: 1, offset: 0 };
+    const first = await api.parseRevisions(options, signal);
+    // Revisions are ordered oldest first by the API; do not silently stop at
+    // the first page when a file has been reparsed many times.
+    return first.page.total > 1
+      ? api.parseRevisions({ ...options, offset: first.page.total - 1 }, signal)
+      : first;
+  },
   enabled: computed(() => artifact.value !== null && currentProjectId.value !== null),
   staleTime: 30_000,
 });
@@ -250,10 +254,12 @@ const framesQuery = useQuery({
 });
 
 watch(
-  () => artifact.value?.ingestion_status,
-  (status, previousStatus) => {
-    if (["pending", "processing"].includes(previousStatus ?? "")
-      && !["pending", "processing"].includes(status ?? "")) {
+  () => [artifact.value?.id, artifact.value?.ingestion_status, artifact.value?.latest_parse_at] as const,
+  ([id, status, completedAt], [previousId, previousStatus, previousCompletedAt]) => {
+    if (id !== previousId) selectedFrameId.value = null;
+    if (id === previousId && !["pending", "processing"].includes(status ?? "")
+      && (completedAt !== previousCompletedAt || ["pending", "processing"].includes(previousStatus ?? ""))) {
+      selectedFrameId.value = null;
       void framesQuery.refetch();
       void parseRevisionsQuery.refetch();
     }
@@ -270,6 +276,7 @@ const frameQuery = useQuery({
 const detailError = computed(() => artifactQuery.error.value instanceof Error ? artifactQuery.error.value.message : "");
 const previewError = computed(() => previewQuery.error.value instanceof Error ? previewQuery.error.value.message : "");
 const framesError = computed(() => framesQuery.error.value instanceof Error ? framesQuery.error.value.message : "");
+const diagnosticsError = computed(() => parseRevisionsQuery.error.value instanceof Error ? parseRevisionsQuery.error.value.message : "");
 const frameError = computed(() => frameQuery.error.value instanceof Error ? frameQuery.error.value.message : "");
 </script>
 
@@ -351,6 +358,19 @@ const frameError = computed(() => frameQuery.error.value instanceof Error ? fram
         </dl>
       </section>
 
+      <ArtifactParseDiagnostics
+        v-if="artifact.artifact_kind === 'calculation_output'"
+        :artifact="artifact"
+        :revision="latestParseRevision"
+        :frames="framesQuery.data.value?.items ?? []"
+        :loading="parseRevisionsQuery.isFetching.value"
+        :frames-loading="framesQuery.isFetching.value"
+        :frames-error="framesError"
+        :error="diagnosticsError"
+        @open-frame="selectedFrameId = $event"
+        @retry="parseRevisionsQuery.refetch(); framesQuery.refetch()"
+      />
+
       <section class="artifact-detail-section artifact-notes-section" aria-labelledby="artifact-notes-title">
         <header class="artifact-detail-section-header">
           <div><span class="eyebrow">User metadata</span><h2 id="artifact-notes-title">文件备注</h2></div>
@@ -399,9 +419,7 @@ const frameError = computed(() => frameQuery.error.value instanceof Error ? fram
       <section v-if="artifact.ingestion_status === 'filtered'" class="artifact-detail-section" aria-label="解析结果">
         <div class="artifact-detail-empty">文件已保存，但其中没有可识别的计算帧，因此未进入计算数据目录。</div>
       </section>
-      <section v-else-if="artifact.ingestion_status === 'failed'" class="artifact-detail-section" aria-label="解析错误">
-        <div class="artifact-detail-empty is-error" role="alert">{{ artifact.ingestion_error_message ?? "文件解析失败" }}</div>
-      </section>
+
 
       <section class="artifact-detail-section" aria-labelledby="artifact-content-title">
         <header class="artifact-detail-section-header">

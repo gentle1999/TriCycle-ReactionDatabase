@@ -122,3 +122,59 @@ def test_fast_ingestion_retains_metal_spin() -> None:
                 transaction.rollback()
     finally:
         engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "smiles",
+    [
+        "F[Pt@SP1](Cl)(Br)I",
+        "F[As@TB4](Cl)(Br)(I)N",
+        "F[Co@OH16](Cl)(Br)(I)(N)O",
+    ],
+)
+def test_coordination_arrangement_survives_normalization_and_cartridge(smiles) -> None:
+    """A ChiralTag without its permutation silently loses the actual isomer."""
+    from tricycle_reaction_db.ingestion.normalization import serialize_molecule_smiles
+
+    source = Chem.AddHs(Chem.MolFromSmiles(smiles))
+    normalized = normalize_topology(
+        source,
+        add_hydrogens=False,
+        reconstruction_method="molgr/test",
+        reconstruction_version="test",
+    )
+    table = Table(
+        "_coordination_stereo_roundtrip_probe",
+        MetaData(),
+        Column("id", Integer, primary_key=True),
+        Column("mol", AnnotatedRdkitMol(return_type="mol")),
+        Column("mol_atom_properties", JSONB),
+        prefixes=["TEMPORARY"],
+    )
+    expected = serialize_molecule_smiles(source)
+    engine = create_engine(get_settings().database_url)
+    try:
+        with engine.connect() as connection:
+            transaction = connection.begin()
+            try:
+                table.create(connection)
+                connection.execute(
+                    table.insert(),
+                    {
+                        "id": 1,
+                        "mol": normalized.topology.mol,
+                        "mol_atom_properties": normalized.topology.mol_atom_properties,
+                    },
+                )
+                for selected in (table, table.alias("aliased_coordination")):
+                    restored = connection.execute(select(selected.c.mol)).scalar_one()
+                    assert serialize_molecule_smiles(restored) == expected
+                    assert any(
+                        atom.HasProp("_chiralPermutation")
+                        and atom.GetIntProp("_chiralPermutation") > 0
+                        for atom in restored.GetAtoms()
+                    )
+            finally:
+                transaction.rollback()
+    finally:
+        engine.dispose()

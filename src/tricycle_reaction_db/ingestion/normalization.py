@@ -119,7 +119,10 @@ def _clear_rdkit_properties(
     for atom in mol.GetAtoms():  # type: ignore[no-untyped-call]
         atom.SetAtomMapNum(0)
         for prop_name in list(atom.GetPropNames(includePrivate=True, includeComputed=True)):
-            if prop_name == RADICAL_ELECTRONS_PROP:
+            # Non-tetrahedral stereo stores its actual SP/TB/OH arrangement
+            # here, not in ChiralTag alone. It is chemical state even for
+            # ordinary topology inputs, rather than disposable writer metadata.
+            if prop_name in (RADICAL_ELECTRONS_PROP, "_chiralPermutation"):
                 continue
             if preserve_stereochemistry and _is_stereochemistry_property(prop_name):
                 continue
@@ -777,6 +780,22 @@ def _normalize_coordination_ring_stereo(mol: Chem.Mol) -> None:
             bond.SetStereo(Chem.BondStereo.STEREONONE)
 
 
+def recover_smiles_double_bond_stereochemistry(mol: Chem.Mol) -> Chem.Mol:
+    """Recover physical E/Z from an unsanitized SMILES parse.
+
+    Shared slashes may decorate a small ring's double bond even though it has
+    no independent geometric isomerism. Apply the same redundancy rules as
+    the source boundary without changing connectivity, atom chirality or
+    electronic state. This is for parsed text, not frozen MolGR assignments.
+    """
+    recovered = Chem.Mol(mol)
+    recovered.UpdatePropertyCache(strict=False)
+    Chem.SetBondStereoFromDirections(recovered)
+    _clear_nonstereogenic_double_bond_tags(recovered)
+    _normalize_coordination_ring_stereo(recovered)
+    return recovered
+
+
 def infer_molgr_stereochemistry_from_3d(mol: Chem.Mol) -> Chem.Mol:
     """Create one coordinate-authoritative stereo snapshot of a MolGR graph.
 
@@ -1062,8 +1081,13 @@ def _validate_smiles_round_trip(
     preserve_atom_maps: bool,
     retain_atom_maps: bool,
     isomeric_smiles: bool,
-) -> dict[frozenset[int], DoubleBondStereoSignature]:
-    """Validate the exact output text against its source graph and E/Z state."""
+) -> Chem.Mol:
+    """Validate output and adopt its stereo traversal on a copy of the source.
+
+    An unsanitized SMILES parse has no inferred radicals or MolGR electronic
+    annotations. It is evidence for the emitted graph/stereo, never a new
+    authority for the next serialization's chemical state.
+    """
 
     parser: Any = Chem.SmilesParserParams()
     parser.removeHs = False
@@ -1189,6 +1213,33 @@ def _validate_smiles_round_trip(
         if isomeric_smiles
         else {}
     )
+    # Direction recovery is deliberately unsanitized and can decorate a
+    # non-stereogenic double bond (for example one in a small ring). Determine
+    # redundancy using the source's electronic state, which the parser lacks.
+    # Never clear a source assignment or an added, genuinely stereogenic tag.
+    source_by_identity = {identity: index for index, identity in enumerate(source_identities)}
+    round_trip = _renumber_atoms_preserving_stereochemistry(
+        source, [source_by_identity[identity] for identity in parsed_identities]
+    )
+    _copy_bond_directions(parsed, round_trip)
+    recovered_stereo = _e_z_stereo_signature(serialized_stereo_mol, preserve_atom_maps=True)
+    if set(recovered_stereo) - set(expected_stereo):
+        redundant_probe = Chem.Mol(round_trip)
+        redundant_probe.UpdatePropertyCache(strict=False)
+        _clear_nonstereogenic_double_bond_tags(redundant_probe)
+        _normalize_coordination_ring_stereo(redundant_probe)
+        for bond in serialized_stereo_mol.GetBonds():  # type: ignore[no-untyped-call]
+            edge = frozenset(
+                (parsed_identities[bond.GetBeginAtomIdx()], parsed_identities[bond.GetEndAtomIdx()])
+            )
+            probe_bond = redundant_probe.GetBondBetweenAtoms(
+                bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+            )
+            if edge not in expected_stereo and probe_bond.GetStereo() == Chem.BondStereo.STEREONONE:
+                bond.SetStereo(Chem.BondStereo.STEREONONE)
+                round_trip.GetBondBetweenAtoms(
+                    bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+                ).SetStereo(Chem.BondStereo.STEREONONE)
     serialized_stereo = (
         _e_z_stereo_signature(serialized_stereo_mol, preserve_atom_maps=True)
         if isomeric_smiles
@@ -1196,7 +1247,7 @@ def _validate_smiles_round_trip(
     )
     if not _stereo_signatures_match(serialized_stereo, expected_stereo):
         raise ValueError("SMILES round trip changed a source E/Z control-atom relationship")
-    return serialized_stereo
+    return round_trip
 
 
 def _stereo_root_candidates(
@@ -1331,6 +1382,42 @@ def _restore_tree_bond_directions(
     return "".join(result) if atom_index == len(output_order) else smiles
 
 
+def _prune_smiles_directions(source: Chem.Mol, smiles: str, output_order: list[int] | None) -> str:
+    """Remove redundant slashes without losing any assigned physical E/Z.
+
+    A direction shared with an unspecified conjugated double bond can invent
+    an assignment there. Prefer the other substituent when the writer emitted
+    both. Only direction characters change; the caller validates the entire
+    resulting graph, including rejection of any remaining new assignments.
+    """
+    if output_order is None:
+        return smiles
+    expected_mol = Chem.Mol(source)
+    for atom in expected_mol.GetAtoms():  # type: ignore[no-untyped-call]
+        atom.SetAtomMapNum(atom.GetIdx() + 1)
+    expected = _e_z_stereo_signature(expected_mol, preserve_atom_maps=True)
+    parser: Any = Chem.SmilesParserParams()
+    parser.removeHs = False
+    parser.sanitize = False
+    characters = list(smiles)
+    for index, character in enumerate(characters):
+        if character not in ("/", "\\"):
+            continue
+        characters[index] = ""
+        parsed = Chem.MolFromSmiles("".join(characters), parser)
+        if parsed is None or parsed.GetNumAtoms() != len(output_order):
+            characters[index] = character
+            continue
+        Chem.SetBondStereoFromDirections(parsed)
+        for atom, source_index in zip(parsed.GetAtoms(), output_order, strict=True):  # type: ignore[no-untyped-call]
+            atom.SetAtomMapNum(source_index + 1)
+        observed = _e_z_stereo_signature(parsed, preserve_atom_maps=True)
+        assigned = {edge: signature for edge, signature in observed.items() if edge in expected}
+        if not _stereo_signatures_match(assigned, expected):
+            characters[index] = character
+    return "".join(characters)
+
+
 def _serialize_molecule_smiles_once(
     mol: Chem.Mol,
     *,
@@ -1338,7 +1425,7 @@ def _serialize_molecule_smiles_once(
     retain_atom_maps: bool = False,
     isomeric_smiles: bool = True,
     all_hs_explicit: bool = True,
-) -> str:
+) -> tuple[str, Chem.Mol]:
     """Write and validate one exact SMILES candidate.
 
     Canonical output remains the fast path and preserves existing identities
@@ -1409,7 +1496,7 @@ def _serialize_molecule_smiles_once(
     else:
         canonical_error = ""
         try:
-            _validate_smiles_round_trip(
+            round_trip = _validate_smiles_round_trip(
                 projected,
                 canonical_smiles,
                 canonical_order,
@@ -1417,7 +1504,7 @@ def _serialize_molecule_smiles_once(
                 retain_atom_maps=retain_atom_maps,
                 isomeric_smiles=isomeric_smiles,
             )
-            return canonical_smiles
+            return canonical_smiles, round_trip
         except (RuntimeError, ValueError) as error:
             canonical_error = f"{type(error).__name__}: {error}"
 
@@ -1426,20 +1513,25 @@ def _serialize_molecule_smiles_once(
         repaired_smiles = _restore_tree_bond_directions(
             projected, canonical_smiles, canonical_order
         )
-        if repaired_smiles != canonical_smiles:
+        for candidate_smiles in dict.fromkeys(
+            (
+                repaired_smiles,
+                _prune_smiles_directions(projected, canonical_smiles, canonical_order),
+                _prune_smiles_directions(projected, repaired_smiles, canonical_order),
+            )
+        ):
             try:
-                _validate_smiles_round_trip(
+                round_trip = _validate_smiles_round_trip(
                     projected,
-                    repaired_smiles,
+                    candidate_smiles,
                     canonical_order,
                     preserve_atom_maps=preserve_atom_maps,
                     retain_atom_maps=retain_atom_maps,
                     isomeric_smiles=isomeric_smiles,
                 )
-                return repaired_smiles
+                return candidate_smiles, round_trip
             except (RuntimeError, ValueError):
                 pass
-    last_serialized: dict[frozenset[int], DoubleBondStereoSignature] = {}
     traversal = _deterministic_smiles_traversal(
         projected,
         preserve_atom_maps=preserve_atom_maps,
@@ -1453,7 +1545,7 @@ def _serialize_molecule_smiles_once(
         )
         try:
             smiles, output_order = write_candidate(traversal, canonical=False, root=root)
-            last_serialized = _validate_smiles_round_trip(
+            round_trip = _validate_smiles_round_trip(
                 traversal,
                 smiles,
                 output_order,
@@ -1461,7 +1553,7 @@ def _serialize_molecule_smiles_once(
                 retain_atom_maps=retain_atom_maps,
                 isomeric_smiles=isomeric_smiles,
             )
-            return smiles
+            return smiles, round_trip
         except (RuntimeError, ValueError):
             continue
 
@@ -1475,7 +1567,6 @@ def _serialize_molecule_smiles_once(
         f"canonical validation failed: {canonical_error}",
         reason="no_lossless_smiles_traversal",
         expected={edge: signature[0] for edge, signature in expected_stereo.items()},
-        serialized={edge: signature[0] for edge, signature in last_serialized.items()},
     )
     evidence = projection_error.evidence()
     evidence["canonical_attempt_error"] = canonical_error
@@ -1497,7 +1588,8 @@ def serialize_molecule_smiles(
     A safe rooted fallback can parse into a different but physically
     equivalent ``BondStereo`` control-atom pair. RDKit may then accept its
     canonical traversal even though it rejected the original molecule's. Run
-    the exact writer/round-trip check to a fixed point (bounded to four passes).
+    the exact writer/round-trip check to a fixed point (bounded to four passes),
+    carrying the frozen source chemistry through every atom-order projection.
     If equivalent valid strings form a cycle, select its lexicographically
     first member so subsequent calls return the same text.
     """
@@ -1513,7 +1605,7 @@ def serialize_molecule_smiles(
             preserve_atom_maps=preserve_atom_maps,
         ).items()
     }
-    current = _serialize_molecule_smiles_once(
+    current, round_trip = _serialize_molecule_smiles_once(
         mol,
         preserve_atom_maps=preserve_atom_maps,
         retain_atom_maps=retain_atom_maps,
@@ -1526,39 +1618,8 @@ def serialize_molecule_smiles(
     path = [current]
     path_positions = {current: 0}
     for _ in range(4):
-        parser: Any = Chem.SmilesParserParams()
-        parser.removeHs = False
-        parser.sanitize = False
-        parsed = Chem.MolFromSmiles(current, parser)
-        if parsed is None:
-            raise _stereo_projection_failure(
-                mol,
-                "generated SMILES could not be parsed during stability validation",
-                reason="smiles_stability_parse_failed",
-                expected=expected_stereo,
-            )
-        try:
-            Chem.SetBondStereoFromDirections(parsed)
-        except (RuntimeError, ValueError) as error:
-            raise _stereo_projection_failure(
-                mol,
-                "generated SMILES directions could not restore E/Z during stability validation",
-                reason="smiles_stability_stereo_recovery_failed",
-                expected=expected_stereo,
-            ) from error
-        if not any(
-            bond.GetStereo() in _SERIALIZED_DOUBLE_BOND_STEREO
-            for bond in parsed.GetBonds()  # type: ignore[no-untyped-call]
-        ):
-            raise _stereo_projection_failure(
-                mol,
-                "generated SMILES did not recover its assigned E/Z state",
-                reason="smiles_stability_lost_e_z",
-                expected=expected_stereo,
-            )
-
-        rewritten = _serialize_molecule_smiles_once(
-            parsed,
+        rewritten, round_trip = _serialize_molecule_smiles_once(
+            round_trip,
             preserve_atom_maps=preserve_atom_maps,
             retain_atom_maps=retain_atom_maps,
             isomeric_smiles=isomeric_smiles,
@@ -1666,9 +1727,19 @@ def _solve_double_bond_direction_constraints(
     if not stereo_bonds:
         return True
     try:
-        # Slash directions cannot be emitted on a dative bond. Switch such a
-        # control atom to the other covalent substituent and flip the relative
-        # cis/trans bit, preserving physical geometry rather than its label.
+        # Choose the same covalent controls regardless of the last writer's
+        # traversal. Changing one substituent flips the relative cis/trans bit;
+        # changing both keeps it. Dative bonds cannot carry slash directions.
+        mol.UpdatePropertyCache(strict=False)
+        ranks = (
+            _stereo_identity_numbers(mol, preserve_atom_maps=True)
+            if preserve_atom_maps
+            else list(
+                Chem.CanonicalRankAtoms(
+                    mol, breakTies=True, includeChirality=False, includeIsotopes=True
+                )
+            )
+        )
         for bond in stereo_bonds:
             controls = list(bond.GetStereoAtoms())
             if len(controls) != 2:
@@ -1676,19 +1747,17 @@ def _solve_double_bond_direction_constraints(
             flipped = False
             ends = (bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
             for side, endpoint in enumerate(ends):
-                control_bond = mol.GetBondBetweenAtoms(endpoint, controls[side])
-                if control_bond.GetBondType() != Chem.BondType.DATIVE:
-                    continue
                 alternatives = [
                     neighbor.GetIdx()
                     for neighbor in mol.GetAtomWithIdx(endpoint).GetNeighbors()
                     if neighbor.GetIdx() != ends[1 - side]
                     and mol.GetBondBetweenAtoms(endpoint, neighbor.GetIdx()).GetBondType()
-                    != Chem.BondType.DATIVE
+                    == Chem.BondType.SINGLE
                 ]
-                if len(alternatives) == 1:
-                    controls[side] = alternatives[0]
-                    flipped = not flipped
+                if alternatives:
+                    control = min(alternatives, key=lambda index: ranks[index])
+                    flipped ^= control != controls[side]
+                    controls[side] = control
             bond.SetStereoAtoms(*controls)
             if flipped:
                 bond.SetStereo(_flip_e_z_stereo(bond.GetStereo()))
@@ -1872,13 +1941,14 @@ def ensure_serializable_double_bond_stereochemistry(
     for atom in mapped.GetAtoms():  # type: ignore[no-untyped-call]
         atom.SetAtomMapNum(atom.GetIdx() + 1)
     smiles = serialize_molecule_smiles(mapped, preserve_atom_maps=True)
-    parser: Any = Chem.SmilesParserParams()
-    parser.removeHs = False
-    parser.sanitize = False
-    parsed = Chem.MolFromSmiles(smiles, parser)
-    if parsed is None:
-        raise ValueError("validated stereo SMILES could not be parsed")
-    Chem.SetBondStereoFromDirections(parsed)
+    parsed = _validate_smiles_round_trip(
+        mapped,
+        smiles,
+        None,
+        preserve_atom_maps=True,
+        retain_atom_maps=True,
+        isomeric_smiles=True,
+    )
     by_identity = {
         atom.GetAtomMapNum(): atom.GetIdx()
         for atom in parsed.GetAtoms()  # type: ignore[no-untyped-call]
@@ -2455,6 +2525,7 @@ __all__ = [
     "normalize_topology",
     "normalize_topology_with_mapping",
     "project_serializable_double_bond_stereochemistry",
+    "recover_smiles_double_bond_stereochemistry",
     "serialize_molecule_smiles",
     "stereo_agnostic_graph_hash",
     "validate_serializable_double_bond_stereochemistry",

@@ -1,4 +1,4 @@
-"""Electronic annotations which plain SMILES and the RDKit cartridge omit."""
+"""Atom evidence which the RDKit cartridge omits from stored MOL graphs."""
 
 from molgr.utils.converter import METAL_UNPAIRED_ELECTRONS_PROP
 from rdkit import Chem
@@ -14,10 +14,13 @@ def annotate_electronic_state(molecule: Chem.Mol) -> None:
 
 
 def mol_atom_properties(molecule: Chem.Mol) -> dict[str, int]:
-    """Capture metal spin and ordinary radical evidence in persisted atom order.
+    """Capture electronic and coordination stereo evidence in persisted atom order.
 
     Numeric keys retain the v1 metal format; ``radical:N`` stores ordinary
     atom N's assignment, including known zero-electron open-valence states.
+    ``chiral_permutation:N`` retains the SP/TB/OH arrangement associated with
+    the atom's native ChiralTag. The cartridge omits this private property
+    even when its input pickle includes all RDKit properties.
     """
 
     properties = {
@@ -32,13 +35,25 @@ def mol_atom_properties(molecule: Chem.Mol) -> dict[str, int]:
             if atom.HasProp(RADICAL_ELECTRONS_PROP)
         }
     )
+    properties.update(
+        {
+            f"chiral_permutation:{atom.GetIdx()}": atom.GetIntProp("_chiralPermutation")
+            for atom in molecule.GetAtoms()  # type: ignore[no-untyped-call]
+            if atom.HasProp("_chiralPermutation")
+            and atom.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
+        }
+    )
     return properties
 
 
 def restore_mol_atom_properties(molecule: Chem.Mol, properties: dict[str, int]) -> Chem.Mol:
-    """Restore sidecar evidence without deriving spin from bracket valence."""
+    """Restore source atom evidence without reassigning electronic or stereo state."""
 
     for index, count in properties.items():
+        if index.startswith("chiral_permutation:"):
+            atom = molecule.GetAtomWithIdx(int(index.split(":", 1)[1]))
+            atom.SetIntProp("_chiralPermutation", count)
+            continue
         if index.startswith("radical:"):
             atom = molecule.GetAtomWithIdx(int(index.split(":", 1)[1]))
             atom.SetNumRadicalElectrons(count)

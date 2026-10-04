@@ -74,3 +74,56 @@ def test_audit_distinguishes_stereoisomers_unless_projection_explicitly_requeste
 @pytest.mark.parametrize("smiles", ["[He:1]>>[Ne:1]", "[He:1]>>[He:2]", "[H:1][H:1]>>[H:1][H:1]"])
 def test_audit_rejects_nonconserving_or_nonbijective_labels(smiles):
     assert evidence(smiles) is None
+
+
+def direct_proof(source, target, maps, *, snapshot=None):
+    from types import SimpleNamespace
+
+    from tricycle_reaction_db.domain.enums import FrameRole
+
+    count = source.GetNumAtoms()
+    return audit._mapping_matches_source_frame(
+        frame=SimpleNamespace(
+            frame_role=FrameRole.SINGLE_POINT,
+            observed_to_geometry=list(range(count)),
+            source_atom_maps=snapshot,
+        ),
+        geometry=SimpleNamespace(mol=source),
+        geometry_maps=maps,
+        source_components={side: [(source, list(range(1, count + 1)))] for side in Side},
+        target_components={side: [(target, list(range(1, count + 1)))] for side in Side},
+    )
+
+
+def test_audit_verifies_selected_symmetric_maps_without_renumbering(monkeypatch):
+    molecule = Chem.AddHs(Chem.MolFromSmiles("C"))
+    maps = [1, 3, 2, 4, 5]  # Valid selected exchange of two indistinguishable H atoms.
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("must verify the stored correspondence, not select a new one")
+
+    monkeypatch.setattr(audit, "canonical_reaction_identity", unexpected)
+    assert direct_proof(molecule, molecule, maps, snapshot=maps)[0]
+
+
+def test_audit_rejects_map_vector_that_disagrees_with_source_snapshot():
+    molecule = Chem.AddHs(Chem.MolFromSmiles("C"))
+    okay, reason = direct_proof(molecule, molecule, [1, 3, 2, 4, 5], snapshot=[1, 2, 3, 4, 5])
+    assert not okay
+    assert reason == "stored-geometry-map-disagrees-with-source-snapshot"
+
+
+def test_audit_rejects_ring_permutation_despite_equal_local_symmetry_classes():
+    molecule = Chem.AddHs(Chem.MolFromSmiles("C1CCCCC1"))
+    maps = list(range(1, molecule.GetNumAtoms() + 1))
+    maps[0], maps[1] = maps[1], maps[0]
+    okay, reason = direct_proof(molecule, molecule, maps, snapshot=maps)
+    assert not okay
+    assert reason == "stored-map-does-not-preserve-labelled-source-endpoints"
+
+
+def test_audit_selected_form_still_rejects_opposite_stereo():
+    source = Chem.AddHs(Chem.MolFromSmiles("F[C@H](Cl)Br"))
+    target = Chem.AddHs(Chem.MolFromSmiles("F[C@@H](Cl)Br"))
+    maps = list(range(1, source.GetNumAtoms() + 1))
+    assert not direct_proof(source, target, maps, snapshot=maps)[0]

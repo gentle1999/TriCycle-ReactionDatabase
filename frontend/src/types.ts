@@ -514,6 +514,8 @@ export interface ParseRevisionSummary {
   running_time_seconds: number | null;
   error_code: string | null;
   error_message: string | null;
+  error_metadata_json?: string | null;
+  parse_diagnostics_json?: string;
   comments: ParsedComments;
   started_at: string | null;
   completed_at: string | null;
@@ -675,6 +677,7 @@ export interface TransitionStateInferenceResult {
 }
 
 export interface TransitionStateInferenceSummary extends TransitionStateInferenceResult {
+  error_metadata_json?: string | null;
   artifact_ingestion_id: string;
   parse_revision_id: string;
 }

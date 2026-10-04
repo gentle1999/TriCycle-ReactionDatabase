@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ArrowDown, ArrowDownUp, ArrowUp, ArrowUpRight, ChevronDown, CircleHelp, Download, Eye, Globe2, ListFilter, LoaderCircle, LockKeyhole, RotateCcw, Search, Trash2, UploadCloud, X } from "@lucide/vue";
+import { ArrowDown, ArrowDownUp, ArrowUp, ArrowUpRight, ChevronDown, ChevronRight, CircleHelp, Download, Eye, Globe2, ListFilter, LoaderCircle, LockKeyhole, RotateCcw, Search, Trash2, UploadCloud, X } from "@lucide/vue";
 import { computed, ref, watch } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 
@@ -681,7 +681,19 @@ watch(
             <td class="number-cell">{{ formatDurationSeconds(artifact.running_time_seconds) }}</td>
             <td><span class="status-dot" :class="statusTone(artifact.storage_status)">{{ labelFor(artifact.storage_status) }}</span></td>
             <td>
-              <ArtifactIngestionStatus :status="artifact.ingestion_status" :error-message="artifact.ingestion_error_message" />
+              <RouterLink
+                v-if="['failed', 'partial'].includes(artifact.ingestion_status ?? '')"
+                class="artifact-diagnostic-status"
+                :class="{ 'is-failed': artifact.ingestion_status === 'failed' }"
+                :title="artifact.ingestion_error_message ? `查看解析诊断：${artifact.ingestion_error_message}` : '查看解析诊断'"
+                :to="{ name: 'artifact-detail', params: { artifactId: artifact.id }, query: navigationQuery }"
+                :aria-label="`查看解析原因 ${artifact.original_filename}`"
+                @click.stop
+              >
+                <ArtifactIngestionStatus :status="artifact.ingestion_status" />
+                <ChevronRight :size="12" aria-hidden="true" />
+              </RouterLink>
+              <ArtifactIngestionStatus v-else :status="artifact.ingestion_status" :error-message="artifact.ingestion_error_message" />
             </td>
             <td><code :title="artifact.content_sha256">{{ shortId(artifact.content_sha256) }}</code></td>
             <td>{{ artifact.created_at ? new Date(artifact.created_at).toLocaleString("zh-CN") : "—" }}</td>
@@ -760,3 +772,31 @@ watch(
     <ArtifactAdvancedQueryModal :open="advancedQueryOpen" :initial-filters="queryFilters" @close="advancedQueryOpen = false" @apply="applyAdvancedFilters" />
   </section>
 </template>
+
+<style scoped>
+.artifact-diagnostic-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 7px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: var(--amber-soft);
+  color: var(--amber);
+  text-decoration: none;
+  white-space: nowrap;
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+.artifact-diagnostic-status.is-failed {
+  background: var(--red-soft);
+  color: var(--danger);
+}
+.artifact-diagnostic-status:hover { border-color: currentColor; }
+.artifact-diagnostic-status:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 3px;
+}
+.artifact-diagnostic-status > svg { flex: 0 0 auto; opacity: .65; }
+.artifact-diagnostic-status:hover > svg,
+.artifact-diagnostic-status:focus-visible > svg { opacity: 1; }
+</style>

@@ -17,8 +17,8 @@ def test_conjugated_coordination_keeps_both_double_bond_controls():
         bond = mol.GetBondBetweenAtoms(indices[a], indices[b])
         bond.SetStereoAtoms(indices[c], indices[d])
         bond.SetStereo(Chem.BondStereo.STEREOE)
-    smiles = n._serialize_molecule_smiles_once(mol, preserve_atom_maps=True)
-    signature = n._validate_smiles_round_trip(
+    smiles, _ = n._serialize_molecule_smiles_once(mol, preserve_atom_maps=True)
+    projected = n._validate_smiles_round_trip(
         mol,
         smiles,
         None,
@@ -26,7 +26,7 @@ def test_conjugated_coordination_keeps_both_double_bond_controls():
         retain_atom_maps=True,
         isomeric_smiles=True,
     )
-    assert len(signature) == 2
+    assert len(n._e_z_stereo_signature(projected, preserve_atom_maps=True)) == 2
     assert "<-" in smiles
 
 
