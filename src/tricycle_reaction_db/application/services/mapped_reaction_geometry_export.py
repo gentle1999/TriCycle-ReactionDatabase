@@ -64,7 +64,9 @@ def _calculation_record(
         metadata["atom_order"] = "mapped_reaction"
         metadata["coordinate_reference"] = "calculation.observed_coordinates_angstrom"
         if shielding is not None:
-            metadata["atom_index"] = projection.atom_indices([shielding.atom_index])[0]
+            mapped_atom_index = projection.atom_indices([shielding.atom_index])[0]
+            metadata["atom_index"] = mapped_atom_index
+            metadata["atom_map_number"] = mapped_atom_index + 1
             metadata["isotropic_ppm"] = shielding.isotropic_ppm
             metadata["anisotropy_ppm"] = shielding.anisotropy_ppm
             metadata["orientation"] = shielding.orientation

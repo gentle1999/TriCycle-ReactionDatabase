@@ -8,10 +8,11 @@ from dataclasses import dataclass
 from functools import lru_cache
 from hashlib import sha256
 from typing import Any, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from rdkit import Chem
 from rdkit.Chem import rdChemReactions
+from sqlalchemy import text
 from sqlmodel import Session, col, select
 
 from tricycle_reaction_db.application.dtos.reactions import (
@@ -2026,6 +2027,90 @@ def persist_mapped_reaction_participant(
     )
     _flush_new_entity(session, assignment, label="MappedReactionParticipant")
     return assignment
+
+
+def reindex_mapped_reaction_endpoint_geometry_components(
+    session: Session,
+    mapped_reaction_id: UUID,
+) -> int:
+    """Align endpoint Geometry display slots with their current participants.
+
+    A mapping rebuild can move a participant to a new template index while its
+    Geometry bindings retain the old component key/index.  Stage changed keys
+    first so swaps do not collide with the per-component coordinate unique
+    constraint, then write the canonical identities derived from the linked
+    participant rows.
+    """
+
+    session.execute(text("LOCK TABLE mapped_reaction_node_geometry IN SHARE ROW EXCLUSIVE MODE"))
+    rows = session.exec(
+        select(
+            MappedReactionNodeGeometry,
+            MappedReactionNode,
+            MappedReactionParticipant,
+        )
+        .join(
+            MappedReactionNode,
+            col(MappedReactionNode.id) == col(MappedReactionNodeGeometry.mapped_reaction_node_id),
+        )
+        .outerjoin(
+            MappedReactionParticipant,
+            col(MappedReactionParticipant.id)
+            == col(MappedReactionNodeGeometry.mapped_reaction_participant_id),
+        )
+        .where(
+            col(MappedReactionNode.mapped_reaction_id) == mapped_reaction_id,
+            col(MappedReactionNode.role).in_(
+                (MappedReactionNodeRole.REACTANT, MappedReactionNodeRole.PRODUCT)
+            ),
+        )
+        .with_for_update(of=MappedReactionNodeGeometry)
+    ).all()
+
+    targets: list[tuple[MappedReactionNodeGeometry, str, int]] = []
+    target_identities: dict[tuple[UUID, str, int], UUID] = {}
+    for binding, node, participant in rows:
+        if participant is None:
+            raise ValueError("endpoint Geometry binding has no mapped reaction participant")
+        if participant.mapped_reaction_id != mapped_reaction_id:
+            raise ValueError("endpoint Geometry participant belongs to another mapped reaction")
+        expected_side = (
+            LogicalReactionParticipantSide.REACTANT
+            if node.role is MappedReactionNodeRole.REACTANT
+            else LogicalReactionParticipantSide.PRODUCT
+        )
+        if participant.side is not expected_side:
+            raise ValueError("endpoint Geometry participant side does not match its node role")
+
+        binding_id = _require_id(binding, label="MappedReactionNodeGeometry")
+        node_id = _require_id(node, label="MappedReactionNode")
+        component_key = f"{participant.side.value}:{participant.template_index}"
+        identity = (node_id, component_key, binding.coordinate_index)
+        prior_binding_id = target_identities.get(identity)
+        if prior_binding_id is not None and prior_binding_id != binding_id:
+            raise ValueError("endpoint Geometry reindex would collide at a component coordinate")
+        target_identities[identity] = binding_id
+        targets.append((binding, component_key, participant.template_index))
+
+    changed = [
+        (binding, component_key, component_index)
+        for binding, component_key, component_index in targets
+        if binding.component_key != component_key or binding.component_index != component_index
+    ]
+    if not changed:
+        return 0
+
+    for binding, _component_key, _component_index in changed:
+        binding.component_key = f"__component_reindex__:{uuid4()}"
+        session.add(binding)
+    session.flush()
+
+    for binding, component_key, component_index in changed:
+        binding.component_key = component_key
+        binding.component_index = component_index
+        session.add(binding)
+    session.flush()
+    return len(changed)
 
 
 def persist_mapped_reaction_node(

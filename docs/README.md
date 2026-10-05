@@ -23,6 +23,7 @@ current operating instructions.
 | [业务模型](business-model.md) | [Business model](en/business-model.md) | 面向用户的对象、流程和非目标 / user-facing objects, workflows, and non-goals |
 | [生产运维与恢复 Runbook](operations-runbook.md) | [Production operations and recovery runbook](en/operations-runbook.md) | 备份、恢复、监控与定时任务 / backup, recovery, monitoring, and scheduled work |
 | [MolOP 计算结果导出需求](molop-export-requirements.md) | [MolOP calculation-result export requirements](en/molop-export-requirements.md) | 上游导出与 ingestion 契约 / upstream export and ingestion contract |
+| [映射反应导出的原子索引约定](mapped-reaction-atom-indexing.md) | [Atom indexing in mapped-reaction exports](en/mapped-reaction-atom-indexing.md) | 映射原子顺序、逐原子数组与样本 join key / mapped atom order, per-atom arrays, and sample join keys |
 | [数据库实体关系图](database-erd.md) | [Database entity relationship diagram](en/database-erd.md) | 数据库边界、ERD 和完整性约束 / database boundaries, ERD, and integrity constraints |
 | [RDKit Mol 对象数据库往返契约](rdkit-mol-roundtrip.md) | [RDKit Mol database round-trip contract](en/rdkit-mol-roundtrip.md) | RDKit binary Mol 的持久化边界 / RDKit binary Mol persistence boundary |
 

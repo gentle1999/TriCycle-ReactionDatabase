@@ -157,6 +157,7 @@ def project_logical_topology(
     *,
     context: object | None = None,
     rule_ids: Iterable[str] = (),
+    backfill_existing_downstreams: bool = True,
 ) -> MolecularTopology:
     """Materialize one lazy logical projection, retaining unrelated stereo."""
 
@@ -177,6 +178,7 @@ def project_logical_topology(
             "rule_ids": sorted(set(rule_ids)),
             "labile_atom_map_numbers": sorted({int(number) for number in labile_atom_map_numbers}),
         },
+        backfill_existing_downstreams=backfill_existing_downstreams,
     )
     return projected
 

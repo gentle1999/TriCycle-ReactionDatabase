@@ -11,11 +11,15 @@ from sqlalchemy import create_engine
 from sqlmodel import Session, col, select
 
 from tricycle_reaction_db.application.dtos.reactions import (
+    CreateReactionCommand,
     LogicalReactionParticipantRecord,
     LogicalReactionRecord,
     MappedReactionNodeGeometryMappingRecord,
     MappedReactionNodeGeometryRecord,
     MappedReactionRecord,
+)
+from tricycle_reaction_db.application.services._persistence import (
+    source_atom_order_authoritative,
 )
 from tricycle_reaction_db.application.services.canonical_reaction_identity import (
     canonical_reaction_identity,
@@ -33,6 +37,7 @@ from tricycle_reaction_db.application.services.molecular_geometry import (
     persist_molecular_topology as _persist_molecular_topology_impl,
 )
 from tricycle_reaction_db.application.services.reaction_commands import (
+    _create_reaction,
     _logicalize_components,
     _ResolvedComponent,
 )
@@ -688,6 +693,75 @@ def test_inversion_projection_clears_n_related_ez_only() -> None:
             assert product.logical_topology.id == product.topology.id
             assert reactant.logical_topology.id != reactant.topology.id
             assert reactant.logical_topology.is_stereo_abstraction_upstream is True
+    finally:
+        transaction.rollback()
+        connection.close()
+        engine.dispose()
+
+
+def test_source_authoritative_reaction_uses_product_flip_centres_for_precursor() -> None:
+    reaction_smiles = (
+        "[H:11][O:12][C:13]([H:14])([H:15])/[C:16]([H:17])="
+        "[C:18](/[H:19])[C:20]([H:21])([H:22])[O:23][H:24]."
+        "[H:1][O:2]/[N:3]=[C:4]([H:5])/[C:6]([H:7])="
+        "[N:8]/[O:9][H:10]>>"
+        "[H:1][O:2][N:3]1[C:4]([H:5])=[C:6]([H:7])[N:8]([O:9][H:10])"
+        "[C@:18]([H:19])([C:20]([H:21])([H:22])[O:23][H:24])"
+        "[C@@:16]1([C:13]([O:12][H:11])([H:14])[H:15])[H:17]"
+    )
+    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    connection = engine.connect()
+    transaction = connection.begin()
+    try:
+        with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
+            with source_atom_order_authoritative(session):
+                reaction = _create_reaction(
+                    session,
+                    CreateReactionCommand(reaction=reaction_smiles),
+                    topology_context=GeometryPersistenceContext(project_id=SYSTEM_PROJECT_ID),
+                )
+
+            assert reaction.mapped_reaction_id is not None
+            mapped_participants = session.exec(
+                select(MappedReactionParticipant).where(
+                    MappedReactionParticipant.mapped_reaction_id == reaction.mapped_reaction_id,
+                    MappedReactionParticipant.side == LogicalReactionParticipantSide.REACTANT,
+                )
+            ).all()
+            oxime = next(
+                participant
+                for participant in mapped_participants
+                if sum(
+                    atom.GetAtomicNum() == 7
+                    for atom in Chem.MolFromSmiles(participant.mapped_smiles).GetAtoms()
+                )
+                == 2
+            )
+            logical_participant = session.get(
+                LogicalReactionParticipant,
+                oxime.logical_reaction_participant_id,
+            )
+            assert logical_participant is not None
+            logical_topology = session.get(MolecularTopology, logical_participant.topology_id)
+            concrete_topology = session.get(MolecularTopology, oxime.concrete_topology_id)
+            assert logical_topology is not None
+            assert concrete_topology is not None
+
+            def imine_ez_count(molecule: Chem.Mol) -> int:
+                return sum(
+                    bond.GetBondType() == Chem.BondType.DOUBLE
+                    and bond.GetStereo() != Chem.BondStereo.STEREONONE
+                    and {
+                        bond.GetBeginAtom().GetAtomicNum(),
+                        bond.GetEndAtom().GetAtomicNum(),
+                    }
+                    == {6, 7}
+                    for bond in molecule.GetBonds()
+                )
+
+            assert imine_ez_count(concrete_topology.mol) == 2
+            assert imine_ez_count(logical_topology.mol) == 0
+            assert logical_topology.id != concrete_topology.id
     finally:
         transaction.rollback()
         connection.close()

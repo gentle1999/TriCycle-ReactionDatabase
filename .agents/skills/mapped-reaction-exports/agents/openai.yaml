@@ -1,0 +1,3 @@
+interface:
+  display_name: "Mapped Reaction Exports"
+  short_description: "Keep atom arrays aligned with reaction maps"

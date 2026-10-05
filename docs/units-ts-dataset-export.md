@@ -109,6 +109,13 @@ multiple bound TS geometries, so its key may appear on multiple JSONL lines.
 Only records with a verified mapping, conserved map-to-element identities, and
 exactly one finite 3D conformer are emitted. Inconsistent legacy mappings are
 skipped and logged instead of being exported under the wrong reaction atom.
+The reaction key can repeat because one mapped reaction may have multiple TS
+Geometry bindings. Use `(key, geometry_binding_id)` as the Geometry-sample key,
+and include `frame_id` when identifying a calculation-frame record. Within a
+reaction, `(key, atom_map_number)` identifies an atom; for array-only fields,
+map `n` is at index `n - 1`. See the [mapped-reaction atom-indexing
+contract](mapped-reaction-atom-indexing.md) for the complete join and ordering
+rules.
 
 Use JSONL when the consumer needs incremental processing. Keep NPY for the
 upstream UniTS-compatible feature arrays; changing that existing contract to
@@ -163,8 +170,10 @@ Each entry contains `frame_id`, the explicit `source_to_mapped_atom_indices`
 provenance permutation, `observed_coordinates_angstrom`, and `scientific_arrays`.
 Atom axes use map number minus one, including forces, normal modes, populations,
 bond orders and Fukui data. Both Cartesian block axes of a Hessian are permuted.
-NMR coupling subsets carry sorted mapped atom indices and permuted matrix axes;
-shielding metadata carries its mapped atom index. Molecular vectors and tensors
+NMR coupling subsets carry sorted zero-based mapped atom indices, their
+one-based atom-map numbers, and correspondingly permuted matrix axes. Per-atom
+shielding and principal-value records carry both the zero-based mapped
+`atom_index` and one-based `atom_map_number`. Molecular vectors and tensors
 without atom axes retain their components.
 
 Calculation coordinates and arrays remain in their original Cartesian reference
@@ -173,3 +182,9 @@ the separately exported canonical Geometry frame. Invalid array dimensions stop
 the export rather than emitting mismatched scientific data. Source arrays in the
 database are never modified. Geometry hashes identify the stored Geometry, not
 the reordered output.
+
+This map-order contract applies to mapped-reaction dataset and geometry exports.
+Geometry-ID SDF/XYZ downloads and calculation-frame TS-anchor downloads have no
+selected mapped reaction, so they retain canonical Geometry or source-frame
+order. Use the mapped-reaction JSONL or UniTS exports when atom indices must be
+joined directly to reaction atom-map numbers.

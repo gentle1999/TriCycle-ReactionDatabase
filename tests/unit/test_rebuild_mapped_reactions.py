@@ -20,6 +20,8 @@ def _state():
     plan = {
         "database_key": "test-db",
         "project_id": None,
+        "logical_reaction_ids": None,
+        "retire_scoped_logicals": False,
         "policy": rebuild.REACTION_INDEX_POLICY,
         "inferences": [],
         "reactions": [],
@@ -67,14 +69,14 @@ def test_resume_rejects_wrong_scope_or_modified_plan(change):
     else:
         state["plan"]["inferences"].append({"id": str(uuid4())})
     with pytest.raises(rebuild.RebuildBlocked, match="does not match"):
-        rebuild._validate_state(state, project, database)
+        rebuild._validate_state(state, project, database, None, False)
 
 
 def test_snapshot_file_roundtrip_is_atomic_and_private(tmp_path):
     path = tmp_path / "run.json"
     state = _state()
     rebuild._save(path, state)
-    rebuild._validate_state(json.loads(path.read_text()), None, "test-db")
+    rebuild._validate_state(json.loads(path.read_text()), None, "test-db", None, False)
     assert path.stat().st_mode & 0o777 == 0o600
     assert list(tmp_path.iterdir()) == [path]
 

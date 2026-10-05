@@ -33,16 +33,22 @@ from tricycle_reaction_db.application.services.artifact_uploads import (
 from tricycle_reaction_db.application.services.canonical_reaction_identity import (
     REACTION_INDEX_POLICY,
 )
+from tricycle_reaction_db.application.services.reactions import (
+    reindex_mapped_reaction_endpoint_geometry_components,
+)
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
     CalculationFrame,
     LogicalReaction,
+    LogicalReactionParticipant,
     MappedReaction,
     MappedReactionEdge,
     MappedReactionNode,
     MappedReactionNodeGeometry,
     MappedReactionNodeGeometryMapping,
+    MappedReactionParticipant,
+    MappedReactionThermodynamicProfile,
     TransitionStateInference,
 )
 from tricycle_reaction_db.domain.enums import MappedReactionKind, MappedReactionNodeRole
@@ -106,29 +112,89 @@ def _current_form(smiles: str, mapping_hash: str, metadata: dict[str, Any] | Non
     )
 
 
+def _logical_scope_filter(
+    logical_reaction_ids: tuple[UUID, ...] | None,
+    *,
+    column: str,
+) -> tuple[str, dict[str, str]]:
+    if logical_reaction_ids is None:
+        return "", {}
+    return (
+        f" AND {column} IN ("
+        "SELECT value::uuid FROM jsonb_array_elements_text("
+        "CAST(:logical_reaction_ids AS jsonb)) AS scope(value))",
+        {"logical_reaction_ids": json.dumps([str(item) for item in logical_reaction_ids])},
+    )
+
+
 def _snapshot(
-    session: Session, project_id: UUID | None, database_key: str, *, include_evidence: bool = True
+    session: Session,
+    project_id: UUID | None,
+    database_key: str,
+    *,
+    include_evidence: bool = True,
+    logical_reaction_ids: tuple[UUID, ...] | None = None,
+    retire_scoped_logicals: bool = False,
 ) -> dict[str, Any]:
     params = {"project": project_id}
+    reaction_filter, reaction_filter_params = _logical_scope_filter(
+        logical_reaction_ids,
+        column="logical_reaction_id",
+    )
+    inference_filter, inference_filter_params = _logical_scope_filter(
+        logical_reaction_ids,
+        column="i.logical_reaction_id",
+    )
+    association_filter, association_filter_params = _logical_scope_filter(
+        logical_reaction_ids,
+        column="r.logical_reaction_id",
+    )
     # Snapshot all existing reactions, including already-normalized ones. Full
     # update re-infers their TS sources too; no old reaction string is input.
-    reactions = (
+    reaction_rows = (
         session.execute(
-            text("""
+            text(f"""
         SELECT id, logical_reaction_id, project_id, mapped_reaction_smiles, mapping_hash,
                normalization_metadata, mapped_reaction_key, mapped_reaction_kind
         FROM mapped_reaction
-        WHERE CAST(:project AS uuid) IS NULL OR project_id=CAST(:project AS uuid)
+        WHERE (CAST(:project AS uuid) IS NULL OR project_id=CAST(:project AS uuid))
+          {reaction_filter}
         ORDER BY id
     """),
-            params,
+            {**params, **reaction_filter_params},
         )
         .mappings()
         .all()
     )
+    profile_counts = {
+        row[0]: (row[1], row[2])
+        for row in session.execute(
+            text(f"""
+            SELECT r.id, count(DISTINCT p.id) AS profile_count,
+                   count(DISTINCT s.id) AS profile_source_count
+            FROM mapped_reaction r
+            LEFT JOIN mapped_reaction_thermodynamic_profile p
+              ON p.mapped_reaction_id=r.id
+            LEFT JOIN mapped_reaction_thermodynamic_profile_source s
+              ON s.profile_id=p.id
+            WHERE (CAST(:project AS uuid) IS NULL OR r.project_id=CAST(:project AS uuid))
+              {reaction_filter}
+            GROUP BY r.id
+        """),
+            {**params, **reaction_filter_params},
+        ).all()
+    }
+    reactions: list[dict[str, Any]] = [
+        {
+            **dict(reaction),
+            "thermodynamic_profile_count": profile_counts.get(reaction["id"], (0, 0))[0],
+            "thermodynamic_profile_source_count": profile_counts.get(reaction["id"], (0, 0))[1],
+        }
+        for reaction in reaction_rows
+    ]
     inferences = (
         session.execute(
-            text("""
+            text(f"""
         SELECT i.id, i.mapped_reaction_id, i.logical_reaction_id, i.calculation_frame_id,
                i.parse_revision_id, i.file_frame_index, a.id AS artifact_id,
                a.content_sha256, a.project_id, i.inference_settings
@@ -137,9 +203,10 @@ def _snapshot(
         JOIN artifact_file a ON a.id=r.artifact_file_id
         WHERE i.mapped_reaction_id IS NOT NULL
           AND (CAST(:project AS uuid) IS NULL OR a.project_id=CAST(:project AS uuid))
+          {inference_filter}
         ORDER BY a.id, i.file_frame_index, i.id
     """),
-            params,
+            {**params, **inference_filter_params},
         )
         .mappings()
         .all()
@@ -154,6 +221,10 @@ def _snapshot(
     plan = {
         "database_key": database_key,
         "project_id": str(project_id) if project_id else None,
+        "logical_reaction_ids": (
+            None if logical_reaction_ids is None else [str(item) for item in logical_reaction_ids]
+        ),
+        "retire_scoped_logicals": retire_scoped_logicals,
         "policy": REACTION_INDEX_POLICY,
         "reactions": encode(reactions),
         "inferences": encode(inferences),
@@ -161,7 +232,7 @@ def _snapshot(
     if include_evidence:
         associations = (
             session.execute(
-                text("""
+                text(f"""
             SELECT n.mapped_reaction_id, n.node_key, n.role, g.id AS association_id,
                    g.geometry_id, g.mapped_reaction_participant_id, g.component_key,
                    m.geometry_atom_map_numbers, m.mapped_smiles, m.mapping_method,
@@ -171,10 +242,11 @@ def _snapshot(
             JOIN mapped_reaction_node_geometry g ON g.mapped_reaction_node_id=n.id
             LEFT JOIN mapped_reaction_node_geometry_mapping m
               ON m.mapped_reaction_node_geometry_id=g.id
-            WHERE CAST(:project AS uuid) IS NULL OR r.project_id=CAST(:project AS uuid)
+            WHERE (CAST(:project AS uuid) IS NULL OR r.project_id=CAST(:project AS uuid))
+              {association_filter}
             ORDER BY n.mapped_reaction_id, g.id
         """),
-                params,
+                {**params, **association_filter_params},
             )
             .mappings()
             .all()
@@ -191,13 +263,24 @@ def _snapshot(
     }
 
 
-def _validate_state(state: dict[str, Any], project_id: UUID | None, database_key: str) -> None:
+def _validate_state(
+    state: dict[str, Any],
+    project_id: UUID | None,
+    database_key: str,
+    logical_reaction_ids: tuple[UUID, ...] | None,
+    retire_scoped_logicals: bool,
+) -> None:
     plan = state["plan"]
+    expected_logical_reaction_ids = (
+        None if logical_reaction_ids is None else [str(item) for item in logical_reaction_ids]
+    )
     if (
         state.get("version") != STATE_VERSION
         or state.get("plan_digest") != _digest(plan)
         or plan.get("database_key") != database_key
         or plan.get("project_id") != (str(project_id) if project_id else None)
+        or plan.get("logical_reaction_ids") != expected_logical_reaction_ids
+        or plan.get("retire_scoped_logicals", False) != retire_scoped_logicals
         or plan.get("policy") != REACTION_INDEX_POLICY
     ):
         raise RebuildBlocked("state file does not match this database, project or policy")
@@ -259,6 +342,11 @@ def _resume_complete(
     ):
         raise RebuildBlocked("checkpoint source does not match the saved plan")
     _verify_binding(session, inference)
+    if (
+        state["plan"].get("retire_scoped_logicals")
+        and str(inference.logical_reaction_id) == entry["logical_reaction_id"]
+    ):
+        raise RebuildBlocked("source inference remains under its specific logical reaction")
     return True
 
 
@@ -281,10 +369,17 @@ def _rebuild_one(
         session, inference=inference, inferred=inferred, cleanup_obsolete=False
     )
     reaction = _verify_binding(session, inference)
+    if (
+        state["plan"].get("retire_scoped_logicals")
+        and str(inference.logical_reaction_id) == entry["logical_reaction_id"]
+    ):
+        raise RebuildBlocked("source inference did not move to an abstract logical reaction")
     result = {
         "status": "updated",
         "old_reaction_id": entry["mapped_reaction_id"],
         "new_reaction_id": str(reaction.id),
+        "old_logical_reaction_id": entry["logical_reaction_id"],
+        "new_logical_reaction_id": str(inference.logical_reaction_id),
         "mapped_reaction_smiles": reaction.mapped_reaction_smiles,
     }
     inference.inference_settings = {
@@ -306,6 +401,253 @@ def _rebuild_one(
     return result
 
 
+def _geometry_binding_signatures(session: Session, reaction_id: UUID) -> set[tuple[Any, ...]]:
+    rows = session.execute(
+        text("""
+        SELECT n.node_key, n.role, g.geometry_id, g.component_key, g.component_index,
+               g.coordinate_index, g.is_primary, p.side, p.template_index, p.atom_map_numbers,
+               p.mapped_smiles, m.geometry_atom_map_numbers, m.mapped_smiles,
+               m.mapping_method, m.mapping_version, m.verified
+        FROM mapped_reaction_node n
+        JOIN mapped_reaction_node_geometry g ON g.mapped_reaction_node_id=n.id
+        LEFT JOIN mapped_reaction_participant p ON p.id=g.mapped_reaction_participant_id
+        LEFT JOIN mapped_reaction_node_geometry_mapping m
+          ON m.mapped_reaction_node_geometry_id=g.id
+        WHERE n.mapped_reaction_id=CAST(:reaction_id AS uuid)
+    """),
+        {"reaction_id": reaction_id},
+    ).all()
+    return {
+        tuple(tuple(value) if isinstance(value, list) else value for value in row) for row in rows
+    }
+
+
+def _endpoint_geometry_binding_signatures(
+    session: Session, reaction_id: UUID
+) -> set[tuple[Any, ...]]:
+    """Describe endpoint evidence independently of logical participant ordering.
+
+    Rebuilding a logical reaction can reorder its participant templates while
+    retaining the same concrete participant and atom-map assignment. Geometry
+    evidence is equivalent when its endpoint role, concrete topology and
+    verified geometry-to-map binding are unchanged.
+    """
+
+    rows = session.execute(
+        text("""
+        SELECT n.role, g.geometry_id, p.side, p.concrete_topology_id,
+               m.geometry_atom_map_numbers, m.mapped_smiles,
+               m.mapping_method, m.mapping_version, m.verified
+        FROM mapped_reaction_node n
+        JOIN mapped_reaction_node_geometry g ON g.mapped_reaction_node_id=n.id
+        LEFT JOIN mapped_reaction_participant p ON p.id=g.mapped_reaction_participant_id
+        LEFT JOIN mapped_reaction_node_geometry_mapping m
+          ON m.mapped_reaction_node_geometry_id=g.id
+        WHERE n.mapped_reaction_id=CAST(:reaction_id AS uuid)
+          AND n.role IN ('reactant', 'product')
+    """),
+        {"reaction_id": reaction_id},
+    ).all()
+    return {
+        tuple(tuple(value) if isinstance(value, list) else value for value in row) for row in rows
+    }
+
+
+def _reparent_distinct_mapping(
+    session: Session,
+    reaction: MappedReaction,
+    target_logical_id: UUID,
+) -> tuple[UUID, ...]:
+    """Attach a distinct valid concrete mapping to its abstract reaction.
+
+    Some legacy mappings are not reproduced byte-for-byte when their TS
+    sources are reparsed: the new source may choose a different atom-map
+    assignment, leaving the old mapping hash without a row under the abstract
+    reaction.  Keep that mapping and its geometry bindings, but only after the
+    same reaction-wide inversion projection proves that every endpoint lands
+    on the target logical participant slots.
+    """
+
+    from tricycle_reaction_db.application.services.molecular_geometry import (
+        GeometryPersistenceContext,
+    )
+    from tricycle_reaction_db.application.services.reaction_commands import (
+        _align_participant_indices,
+        _has_complete_mapping,
+        _logicalize_components,
+        _ResolvedComponent,
+    )
+    from tricycle_reaction_db.application.services.reaction_topology_membership import (
+        persist_logical_participant_concrete_topology,
+    )
+    from tricycle_reaction_db.application.services.reactions import reaction_hash_for_participants
+    from tricycle_reaction_db.db.models import (
+        MappedReactionParticipant,
+        MolecularTopology,
+    )
+    from tricycle_reaction_db.domain.enums import LogicalReactionParticipantSide
+
+    project_id = reaction.project_id
+    if not isinstance(project_id, UUID):
+        raise RebuildBlocked("distinct mapping has no project owner")
+    reaction_id = reaction.id
+    if not isinstance(reaction_id, UUID):
+        raise RebuildBlocked("distinct mapping has no persisted identifier")
+    geometry_before = _geometry_binding_signatures(session, reaction_id)
+    target_logical = session.exec(
+        select(LogicalReaction)
+        .where(
+            LogicalReaction.id == target_logical_id,
+            LogicalReaction.project_id == project_id,
+        )
+        .with_for_update()
+    ).first()
+    if target_logical is None:
+        raise RebuildBlocked("abstract destination reaction is missing")
+
+    participants = session.exec(
+        select(MappedReactionParticipant)
+        .where(MappedReactionParticipant.mapped_reaction_id == reaction.id)
+        .order_by(
+            col(MappedReactionParticipant.side),
+            col(MappedReactionParticipant.template_index),
+        )
+        .with_for_update()
+    ).all()
+    components: list[_ResolvedComponent] = []
+    for participant in participants:
+        if participant.concrete_topology_id is None:
+            raise RebuildBlocked("distinct mapping has a participant without concrete topology")
+        topology = session.get(MolecularTopology, participant.concrete_topology_id)
+        if topology is None or topology.project_id != project_id:
+            raise RebuildBlocked("distinct mapping participant topology is missing or foreign")
+        if topology.formula is None:
+            raise RebuildBlocked("distinct mapping participant topology has no formula")
+        components.append(
+            _ResolvedComponent(
+                side=participant.side,
+                template_index=participant.template_index,
+                formula=topology.formula,
+                topology=topology,
+                topology_atom_map_numbers=list(participant.atom_map_numbers),
+            )
+        )
+    if not components or not _has_complete_mapping(components):
+        raise RebuildBlocked("distinct mapping does not have a complete atom mapping")
+
+    logical_components = _logicalize_components(
+        session,
+        components,
+        topology_context=GeometryPersistenceContext(project_id=project_id),
+    )
+    projected_hash = reaction_hash_for_participants(
+        (component.side, component.logical_topology or component.topology, 1)
+        for component in logical_components
+    )
+    if projected_hash != target_logical.reaction_hash:
+        raise RebuildBlocked("distinct mapping does not project to the reparsed abstract reaction")
+
+    aligned_components, aligned_logical_components = _align_participant_indices(
+        components,
+        logical_components,
+        list(target_logical.participants),
+    )
+    target_participants = {
+        (item.side, item.participant_index): item for item in target_logical.participants
+    }
+    participant_updates: list[tuple[MappedReactionParticipant, UUID, int]] = []
+    for mapped_participant, component, logical_component in zip(
+        participants,
+        aligned_components,
+        aligned_logical_components,
+        strict=True,
+    ):
+        target_participant = target_participants.get((component.side, component.template_index))
+        if (
+            target_participant is None
+            or target_participant.topology_id
+            != (logical_component.logical_topology or logical_component.topology).id
+        ):
+            raise RebuildBlocked("distinct mapping does not match abstract participant slots")
+        persist_logical_participant_concrete_topology(
+            session,
+            target_participant,
+            component.topology,
+        )
+        target_participant_id = target_participant.id
+        if not isinstance(target_participant_id, UUID):
+            raise RebuildBlocked("abstract participant has no persisted identifier")
+        participant_updates.append(
+            (mapped_participant, target_participant_id, component.template_index)
+        )
+
+    existing_by_hash = session.exec(
+        select(MappedReaction).where(
+            MappedReaction.project_id == project_id,
+            MappedReaction.logical_reaction_id == target_logical_id,
+            MappedReaction.mapping_hash == reaction.mapping_hash,
+        )
+    ).all()
+    if existing_by_hash:
+        raise RebuildBlocked("distinct mapping hash already exists under the abstract reaction")
+    existing_by_key = session.exec(
+        select(MappedReaction).where(
+            MappedReaction.project_id == project_id,
+            MappedReaction.logical_reaction_id == target_logical_id,
+            MappedReaction.mapped_reaction_key == reaction.mapped_reaction_key,
+        )
+    ).all()
+    if existing_by_key:
+        raise RebuildBlocked("distinct mapping key already exists under the abstract reaction")
+
+    # Move indices out of the way before assigning target slots.  This avoids
+    # transient conflicts when the old stereo-specific ordering differs from
+    # the abstract participant ordering and the unique constraint is immediate.
+    reserved_by_side: dict[Any, list[int]] = {}
+    for side in LogicalReactionParticipantSide:
+        old_indices = {item.template_index for item in participants if item.side is side}
+        target_indices = {
+            index for item, _participant_id, index in participant_updates if item.side is side
+        }
+        reserved = [
+            value
+            for value in range(32767, -1, -1)
+            if value not in old_indices and value not in target_indices
+        ][: sum(item.side is side for item in participants)]
+        if len(reserved) != sum(item.side is side for item in participants):
+            raise RebuildBlocked("no temporary participant indices are available")
+        reserved_by_side[side] = reserved
+    for side, reserved in reserved_by_side.items():
+        side_rows = [item for item in participants if item.side is side]
+        for participant, temporary_index in zip(side_rows, reserved, strict=True):
+            participant.template_index = temporary_index
+            session.add(participant)
+    session.flush()
+
+    old_logical_id = reaction.logical_reaction_id
+    reaction.logical_reaction_id = target_logical_id
+    session.add(reaction)
+    for mapped_participant, target_participant_id, target_index in participant_updates:
+        mapped_participant.logical_reaction_participant_id = target_participant_id
+        mapped_participant.template_index = target_index
+        session.add(mapped_participant)
+    session.flush()
+    reindex_mapped_reaction_endpoint_geometry_components(session, reaction_id)
+    if reaction.logical_reaction_id != target_logical_id:
+        raise RebuildBlocked("distinct mapping did not move to the abstract reaction")
+    geometry_after = _geometry_binding_signatures(session, reaction_id)
+    # The component key/index and participant template index are expected to
+    # change together when a mapping moves to the abstract reaction's slots.
+    # Geometry identity, per-component coordinate order, primary status and
+    # mapping witnesses must remain unchanged.
+    normalized_before = {(*item[:3], *item[5:8], *item[9:]) for item in geometry_before}
+    normalized_after = {(*item[:3], *item[5:8], *item[9:]) for item in geometry_after}
+    if normalized_before != normalized_after:
+        raise RebuildBlocked("distinct mapping geometry evidence changed during reparenting")
+
+    return (old_logical_id,)
+
+
 def _cleanup_one(session: Session, entry: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     reaction_id = UUID(entry["id"])
     reaction = session.exec(
@@ -313,11 +655,15 @@ def _cleanup_one(session: Session, entry: dict[str, Any], state: dict[str, Any])
     ).first()
     if reaction is None:
         return {"status": "absent"}
-    if _is_current(reaction):
+    retire_scoped_logicals = state["plan"].get("retire_scoped_logicals", False)
+    if _is_current(reaction) and not retire_scoped_logicals:
         return {"status": "retained_current"}
     if (
         str(reaction.project_id) != str(entry["project_id"])
-        or str(reaction.logical_reaction_id) != entry["logical_reaction_id"]
+        or (
+            str(reaction.logical_reaction_id) != entry["logical_reaction_id"]
+            and not retire_scoped_logicals
+        )
         or reaction.mapped_reaction_smiles != entry["mapped_reaction_smiles"]
         or reaction.mapping_hash != entry["mapping_hash"]
     ):
@@ -336,6 +682,7 @@ def _cleanup_one(session: Session, entry: dict[str, Any], state: dict[str, Any])
     source_entries = [
         item for item in state["plan"]["inferences"] if item["mapped_reaction_id"] == entry["id"]
     ]
+    expanded_mapping_sibling = False
     if (
         not source_entries
         and reaction.mapped_reaction_kind is MappedReactionKind.OTHER
@@ -349,16 +696,143 @@ def _cleanup_one(session: Session, entry: dict[str, Any], state: dict[str, Any])
             for item in state["plan"]["inferences"]
             if item["logical_reaction_id"] == entry["logical_reaction_id"]
         ]
+        expanded_mapping_sibling = bool(source_entries)
     if not source_entries:
         raise RebuildBlocked("old reaction has no source TS in the plan; retained for review")
     target_geometry_ids = set()
+    target_reaction_ids: set[UUID] = set()
+    target_logical_ids: set[UUID] = set()
+    mapping_reparented_now = False
+    target_reaction_id: UUID | None = None
+    profiles: list[MappedReactionThermodynamicProfile] = []
     for source in source_entries:
         inference = session.get(TransitionStateInference, UUID(source["id"]))
         if inference is None or not _resume_complete(session, inference, source, state):
             raise RebuildBlocked("source re-inference has no verified durable checkpoint")
+        if inference.mapped_reaction_id is None:
+            raise RebuildBlocked("source re-inference is not bound to a mapped reaction")
+        target_reaction_ids.add(inference.mapped_reaction_id)
+        assert inference.logical_reaction_id is not None
+        target_logical_ids.add(inference.logical_reaction_id)
         frame = session.get(CalculationFrame, inference.calculation_frame_id)
         assert frame is not None
         target_geometry_ids.add(frame.geometry_id)
+    if retire_scoped_logicals:
+        if expanded_mapping_sibling:
+            if len(target_logical_ids) != 1:
+                raise RebuildBlocked(
+                    "expanded mapping sources do not converge on one logical reaction"
+                )
+            target_logical_id = next(iter(target_logical_ids))
+            matching_targets = session.exec(
+                select(MappedReaction)
+                .where(
+                    MappedReaction.project_id == reaction.project_id,
+                    MappedReaction.logical_reaction_id == target_logical_id,
+                    MappedReaction.mapping_hash == reaction.mapping_hash,
+                )
+                .with_for_update()
+            ).all()
+            if len(matching_targets) > 1:
+                raise RebuildBlocked(
+                    "expanded mapping has no unique concrete mapping under its abstract reaction"
+                )
+            if not matching_targets:
+                _reparent_distinct_mapping(session, reaction, target_logical_id)
+                mapping_reparented_now = True
+                matching_targets = [reaction]
+            target_reaction_id = matching_targets[0].id
+            if not isinstance(target_reaction_id, UUID):
+                raise RebuildBlocked("expanded mapping target is missing its persisted identifier")
+            if not _geometry_binding_signatures(session, reaction_id).issubset(
+                _geometry_binding_signatures(session, target_reaction_id)
+            ):
+                raise RebuildBlocked(
+                    "expanded mapping geometry associations are not preserved by its target mapping"
+                )
+            target_reaction_ids = {target_reaction_id}
+        if len(target_logical_ids) != 1:
+            raise RebuildBlocked("old mapping sources do not converge on one abstract reaction")
+        target_logical_id = next(iter(target_logical_ids))
+        already_reparented = reaction.logical_reaction_id == target_logical_id
+        if already_reparented:
+            parent_ids = session.exec(
+                select(LogicalReactionParticipant.logical_reaction_id)
+                .join(MappedReactionParticipant)
+                .where(MappedReactionParticipant.mapped_reaction_id == reaction_id)
+            ).all()
+            if not parent_ids or any(item != target_logical_id for item in parent_ids):
+                raise RebuildBlocked("reparented mapping has inconsistent participant ownership")
+        elif reaction.logical_reaction_id != UUID(entry["logical_reaction_id"]):
+            raise RebuildBlocked("old reaction moved to an unexpected logical reaction")
+        if target_logical_id == UUID(entry["logical_reaction_id"]):
+            raise RebuildBlocked("source mapping remained under its specific logical reaction")
+        target_reactions = session.exec(
+            select(MappedReaction)
+            .where(
+                col(MappedReaction.id).in_(target_reaction_ids),
+                MappedReaction.project_id == reaction.project_id,
+                MappedReaction.logical_reaction_id == target_logical_id,
+            )
+            .with_for_update()
+        ).all()
+        if len(target_reactions) != len(target_reaction_ids):
+            raise RebuildBlocked(
+                "source mapping did not converge on the expected abstract reaction"
+            )
+        matching_targets = session.exec(
+            select(MappedReaction)
+            .where(
+                MappedReaction.project_id == reaction.project_id,
+                MappedReaction.logical_reaction_id == target_logical_id,
+                MappedReaction.mapping_hash == reaction.mapping_hash,
+            )
+            .with_for_update()
+        ).all()
+        if len(matching_targets) != 1:
+            if matching_targets:
+                raise RebuildBlocked(
+                    "old concrete mapping has no unique destination under its abstract reaction"
+                )
+            if already_reparented:
+                raise RebuildBlocked("reparented mapping is missing from its abstract reaction")
+            _reparent_distinct_mapping(session, reaction, target_logical_id)
+            mapping_reparented_now = True
+            target_reaction = reaction
+            already_reparented = True
+        else:
+            target_reaction = matching_targets[0]
+        target_reaction_id = target_reaction.id
+        if (
+            not isinstance(target_reaction_id, UUID)
+            or target_reaction.mapped_reaction_smiles != reaction.mapped_reaction_smiles
+        ):
+            raise RebuildBlocked(
+                "matching target mapping does not preserve the old mapped reaction"
+            )
+        if not expanded_mapping_sibling and not _endpoint_geometry_binding_signatures(
+            session, reaction_id
+        ).issubset(_endpoint_geometry_binding_signatures(session, target_reaction_id)):
+            raise RebuildBlocked(
+                "old endpoint geometry evidence is not preserved by its abstract mapping"
+            )
+        profiles = list(
+            session.exec(
+                select(MappedReactionThermodynamicProfile).where(
+                    MappedReactionThermodynamicProfile.mapped_reaction_id == reaction_id
+                )
+            ).all()
+        )
+        from tricycle_reaction_db.application.services import (
+            mapped_reaction_thermodynamics_persistence,
+        )
+
+        refresh_targets = {item.id: item for item in target_reactions}
+        refresh_targets[target_reaction_id] = target_reaction
+        if (not expanded_mapping_sibling or profiles) and not (already_reparented and not profiles):
+            mapped_reaction_thermodynamics_persistence.enqueue_mapped_reaction_profile_refresh(
+                session, list(refresh_targets.values())
+            )
     old_ts_geometries = set(
         session.exec(
             select(MappedReactionNodeGeometry.geometry_id)
@@ -371,13 +845,40 @@ def _cleanup_one(session: Session, entry: dict[str, Any], state: dict[str, Any])
     )
     if not old_ts_geometries.issubset(target_geometry_ids):
         raise RebuildBlocked("old TS geometry evidence is not covered by the rebuilt sources")
+    logical_id = UUID(entry["logical_reaction_id"])
+    if retire_scoped_logicals and reaction.logical_reaction_id == next(iter(target_logical_ids)):
+        if not isinstance(target_reaction_id, UUID):
+            raise RebuildBlocked("abstract destination mapping identifier is missing")
+        session.exec(
+            select(LogicalReaction.id).where(LogicalReaction.id == logical_id).with_for_update()
+        ).first()
+        if (
+            session.exec(
+                select(MappedReaction.id).where(MappedReaction.logical_reaction_id == logical_id)
+            ).first()
+            is None
+            and session.exec(
+                select(TransitionStateInference.id).where(
+                    TransitionStateInference.logical_reaction_id == logical_id
+                )
+            ).first()
+            is None
+        ):
+            session.exec(delete(LogicalReaction).where(col(LogicalReaction.id) == logical_id))
+        return {
+            "status": "already_reparented" if not mapping_reparented_now else "reparented",
+            "old_reaction_id": entry["id"],
+            "target_reaction_id": str(target_reaction_id),
+            "target_reaction_ids": sorted(str(item) for item in target_reaction_ids),
+            "abstract_logical_reaction_id": str(next(iter(target_logical_ids))),
+            "geometry_evidence_preserved": True,
+        }
     # Edges restrict their own node deletions; remove them before parent CASCADE.
     session.exec(
         delete(MappedReactionEdge).where(col(MappedReactionEdge.mapped_reaction_id) == reaction_id)
     )
     session.exec(delete(MappedReaction).where(col(MappedReaction.id) == reaction_id))
     session.flush()
-    logical_id = UUID(entry["logical_reaction_id"])
     # Lock the parent before checking emptiness so a concurrent importer cannot
     # add a child between the checks and the logical reaction's CASCADE delete.
     session.exec(
@@ -396,7 +897,21 @@ def _cleanup_one(session: Session, entry: dict[str, Any], state: dict[str, Any])
         is None
     ):
         session.exec(delete(LogicalReaction).where(col(LogicalReaction.id) == logical_id))
-    return {"status": "deleted", "old_reaction_id": entry["id"]}
+    if retire_scoped_logicals and not isinstance(target_reaction_id, UUID):
+        raise RebuildBlocked("abstract destination mapping identifier is missing")
+    target_reaction_id_value = (
+        str(target_reaction_id) if isinstance(target_reaction_id, UUID) else None
+    )
+    return {
+        "status": "deleted",
+        "old_reaction_id": entry["id"],
+        "target_reaction_id": target_reaction_id_value,
+        "target_reaction_ids": sorted(str(item) for item in target_reaction_ids)
+        if retire_scoped_logicals
+        else [],
+        "thermodynamic_profiles_rebuilt_on_target": len(profiles) if retire_scoped_logicals else 0,
+        "expanded_mapping_reused": expanded_mapping_sibling,
+    }
 
 
 def _error(error: Exception) -> dict[str, str]:
@@ -428,6 +943,8 @@ def _event(path: Path, *, run_id: str, phase: str, row_id: str, result: dict[str
 
 def run(args: argparse.Namespace) -> int:
     _configure_backend_access()
+    logical_reaction_ids: tuple[UUID, ...] | None = args.logical_reaction_ids
+    retire_scoped_logicals: bool = args.retire_scoped_logicals
     engine = create_engine(
         get_settings().database_url,
         connect_args={
@@ -470,13 +987,29 @@ def run(args: argparse.Namespace) -> int:
                     )
                     if state_path.exists():
                         state = json.loads(state_path.read_text())
-                        _validate_state(state, args.project_id, database_key)
+                        _validate_state(
+                            state,
+                            args.project_id,
+                            database_key,
+                            logical_reaction_ids,
+                            retire_scoped_logicals,
+                        )
                     else:
-                        state = _snapshot(session, args.project_id, database_key)
+                        state = _snapshot(
+                            session,
+                            args.project_id,
+                            database_key,
+                            logical_reaction_ids=logical_reaction_ids,
+                            retire_scoped_logicals=retire_scoped_logicals,
+                        )
                         _save(state_path, state)
                 report: dict[str, Any] = {
                     "run_id": state["run_id"],
                     "apply": args.apply,
+                    "scope_logical_reaction_count": (
+                        None if logical_reaction_ids is None else len(logical_reaction_ids)
+                    ),
+                    "retire_scoped_logicals": retire_scoped_logicals,
                     "results": {},
                     "cleanup": {},
                 }
@@ -503,6 +1036,14 @@ def run(args: argparse.Namespace) -> int:
                 ]
                 report["planned_source_count"] = len(state["plan"]["inferences"])
                 report["planned_reaction_count"] = len(state["plan"]["reactions"])
+                report["planned_thermodynamic_profile_count"] = sum(
+                    item.get("thermodynamic_profile_count", 0)
+                    for item in state["plan"]["reactions"]
+                )
+                report["planned_thermodynamic_profile_source_count"] = sum(
+                    item.get("thermodynamic_profile_source_count", 0)
+                    for item in state["plan"]["reactions"]
+                )
                 _save(report_path, report)
                 cached_artifact: str | None = None
                 parsed: dict[int, Any] = {}
@@ -620,7 +1161,12 @@ def run(args: argparse.Namespace) -> int:
                 # deletion using a stale all-records selection.
                 with Session(engine) as session:
                     fresh = _snapshot(
-                        session, args.project_id, database_key, include_evidence=False
+                        session,
+                        args.project_id,
+                        database_key,
+                        include_evidence=False,
+                        logical_reaction_ids=logical_reaction_ids,
+                        retire_scoped_logicals=retire_scoped_logicals,
                     )
                 known = {entry["id"] for entry in state["plan"]["inferences"]}
                 report["new_inference_ids"] = [
@@ -635,11 +1181,41 @@ def run(args: argparse.Namespace) -> int:
                         entry["normalization_metadata"],
                     )
                 ]
+                if retire_scoped_logicals and logical_reaction_ids is not None:
+                    with Session(engine) as session:
+                        remaining_rows = (
+                            session.execute(
+                                text("""
+                            SELECT id
+                            FROM logical_reaction
+                            WHERE project_id=CAST(:project AS uuid)
+                              AND id IN (
+                                SELECT value::uuid
+                                FROM jsonb_array_elements_text(CAST(:logical_reaction_ids AS jsonb))
+                              )
+                            ORDER BY id
+                        """),
+                                {
+                                    "project": args.project_id,
+                                    "logical_reaction_ids": json.dumps(
+                                        [str(item) for item in logical_reaction_ids]
+                                    ),
+                                },
+                            )
+                            .scalars()
+                            .all()
+                        )
+                    report["remaining_scoped_logical_reaction_ids"] = [
+                        str(item) for item in remaining_rows
+                    ]
+                else:
+                    report["remaining_scoped_logical_reaction_ids"] = []
                 report["complete"] = bool(
                     args.apply
                     and not failed
                     and not report["new_inference_ids"]
                     and not report["remaining_legacy_reaction_ids"]
+                    and not report["remaining_scoped_logical_reaction_ids"]
                     and not any(item["status"] == "blocked" for item in report["cleanup"].values())
                 )
                 _save(report_path, report)
@@ -649,6 +1225,9 @@ def run(args: argparse.Namespace) -> int:
                             "report": str(report_path),
                             "complete": report["complete"],
                             "source_count": len(report["results"]),
+                            "remaining_scoped_logicals": len(
+                                report["remaining_scoped_logical_reaction_ids"]
+                            ),
                         }
                     )
                 )
@@ -678,7 +1257,43 @@ def main() -> None:
         help="reuse the same file to resume; never share it between databases",
     )
     parser.add_argument("--report", type=Path)
+    parser.add_argument(
+        "--logical-reaction-ids-file",
+        type=Path,
+        help=(
+            "newline-delimited logical reaction UUIDs to rebuild; requires --project-id "
+            "and limits cleanup to this exact set"
+        ),
+    )
+    parser.add_argument(
+        "--retire-scoped-logicals",
+        action="store_true",
+        help=(
+            "after all selected TS sources reparse successfully, remove the selected old "
+            "logical-reaction identities; requires --project-id and --logical-reaction-ids-file"
+        ),
+    )
     args = parser.parse_args()
+    if args.logical_reaction_ids_file is not None:
+        if args.project_id is None:
+            parser.error("--logical-reaction-ids-file requires --project-id")
+        logical_reaction_ids = tuple(
+            sorted(
+                {
+                    UUID(line.partition("#")[0].strip())
+                    for line in args.logical_reaction_ids_file.read_text().splitlines()
+                    if line.partition("#")[0].strip()
+                },
+                key=str,
+            )
+        )
+        if not logical_reaction_ids:
+            parser.error("--logical-reaction-ids-file contains no UUIDs")
+        args.logical_reaction_ids = logical_reaction_ids
+    else:
+        args.logical_reaction_ids = None
+    if args.retire_scoped_logicals and args.logical_reaction_ids is None:
+        parser.error("--retire-scoped-logicals requires --logical-reaction-ids-file")
     raise SystemExit(run(args))
 
 

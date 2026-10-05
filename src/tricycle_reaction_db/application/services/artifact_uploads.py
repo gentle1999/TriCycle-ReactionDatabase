@@ -235,15 +235,14 @@ MOLOP_PARSE_OPTIONS = ParseOptions(
     source_decode_errors="surrogateescape",
 )
 logger = logging.getLogger(__name__)
-# Keep the parser claim window independent from the database write window. A
-# file can contain many frames and one 32-file transaction was large enough to
-# hold hundreds of identity locks for tens of seconds. Eight files is the
-# normal hand-off/commit stack; the frame ceiling below prevents eight large
-# multi-frame files from recreating the same long transaction.
+# Keep the parser claim window independent from the database write window. TS
+# reconciliation can acquire several project-scoped identity locks per frame,
+# so keep each default write transaction deliberately small. Deployments can
+# raise these limits after measuring their PostgreSQL lock-table capacity.
 # Defaults for callers that do not supply worker settings.  The durable
 # worker resolves the same limits from Settings so deployments can tune the
 # commit boundary without changing parser admission.
-PERSISTENCE_PRELOAD_BATCH_SIZE = 16
+PERSISTENCE_PRELOAD_BATCH_SIZE = 8
 PERSISTENCE_BATCH_FRAME_LIMIT = 256
 # MolGR reconstruction is CPU-heavy and each frame crosses a process boundary.
 # Larger chunks amortize pickle/future overhead while retaining enough tasks to
@@ -4976,7 +4975,8 @@ class ArtifactUploadService:
                     return
                 driver_error = getattr(error, "orig", error)
                 sqlstate = getattr(driver_error, "sqlstate", None)
-                if (
+                lock_table_exhausted = sqlstate == "53200"
+                transport_failure = (
                     isinstance(
                         driver_error,
                         (
@@ -4986,12 +4986,22 @@ class ArtifactUploadService:
                             TimeoutError,
                         ),
                     )
+                    and not lock_table_exhausted
+                )
+                if (
+                    transport_failure
                     or getattr(error, "connection_invalidated", False)
-                    or (sqlstate is not None and sqlstate[:2] not in {"22", "23"})
+                    or (
+                        sqlstate is not None
+                        and sqlstate[:2] not in {"22", "23"}
+                        and not lock_table_exhausted
+                    )
                 ):
                     # An unavailable database, cancellation, deadlock or
-                    # resource limit is not evidence against a specific file.
-                    # Do not amplify it into a tree of identical DB attempts.
+                    # non-lock resource failure is not evidence against a
+                    # specific file. Do not amplify it into identical DB
+                    # attempts. PostgreSQL 53200 is split below because a
+                    # smaller transaction may fit the shared lock table.
                     results.update({task.artifact_id: error for task in remaining})
                     logger.warning(
                         "batch-wide persistence error; not splitting project=%s files=%d",
@@ -5010,10 +5020,12 @@ class ArtifactUploadService:
                     )
                     return
                 logger.warning(
-                    "splitting failed persistence microbatch project=%s files=%d remaining=%d",
+                    "splitting failed persistence microbatch project=%s files=%d remaining=%d "
+                    "sqlstate=%s",
                     project_id,
                     len(tasks),
                     len(remaining),
+                    sqlstate,
                     exc_info=True,
                 )
                 midpoint = max(1, len(remaining) // 2)

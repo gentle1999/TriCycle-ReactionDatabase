@@ -322,22 +322,6 @@ def _resolve_components(
                 normalized,
                 context=topology_context,
             )
-            logical_topology = None
-            if session.info.get(SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY, False):
-                logical_record = normalize_topology(
-                    normalized.topology.mol,
-                    add_hydrogens=False,
-                    reconstruction_method=normalized.topology_derivation.reconstruction_method,
-                    reconstruction_version=normalized.topology_derivation.reconstruction_version,
-                    reconstruction_metadata=(
-                        normalized.topology_derivation.reconstruction_metadata
-                    ),
-                )
-                logical_topology = persist_molecular_topology(
-                    session,
-                    logical_record,
-                    context=topology_context,
-                ).topology
             if include_creation_metadata and existing is None:
                 topologies_created += 1
             topology_atom_maps_in_persisted_order = _atom_maps_in_persisted_topology_order(
@@ -352,7 +336,6 @@ def _resolve_components(
                     formula=persisted.formula,
                     topology=persisted.topology,
                     topology_atom_map_numbers=topology_atom_maps_in_persisted_order,
-                    logical_topology=logical_topology,
                 )
             )
         component_keys = [(component.side, component.template_index) for component in components]
@@ -526,6 +509,9 @@ def _logicalize_components(
             labile_atom_maps,
             context=topology_context,
             rule_ids=reaction_rule_ids,
+            backfill_existing_downstreams=not session.info.get(
+                SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY, False
+            ),
         )
         logical_components.append(replace(component, logical_topology=logical_topology))
     return logical_components
@@ -664,14 +650,7 @@ def _create_reaction(
             for component in components
         ]
 
-    if session.info.get(SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY, False):
-        # Source authority applies to inferred chemistry. Reaction maps have
-        # already been translated to canonical precursor numbering above.
-        logical_components = [
-            replace(component, logical_topology=component.logical_topology or component.topology)
-            for component in components
-        ]
-    elif session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
+    if session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
         # The previous batch importer used the MolGR endpoint topologies as
         # the logical reaction identities. Keep its hot path for durable
         # reparses; stereo abstraction/membership expansion remains enabled
@@ -680,6 +659,9 @@ def _create_reaction(
             replace(component, logical_topology=component.topology) for component in components
         ]
     else:
+        # Source atom order is authoritative mapping evidence, not logical
+        # reaction identity. Apply the same reaction-wide labile-stereo
+        # projection while retaining the canonical atom maps selected above.
         logical_components = _logicalize_components(
             session,
             components,

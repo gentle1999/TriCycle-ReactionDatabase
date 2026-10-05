@@ -4,7 +4,8 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from psycopg.errors import InvalidTextRepresentation
+from psycopg.errors import InvalidTextRepresentation, OutOfMemory
+from sqlalchemy.exc import OperationalError
 
 from tricycle_reaction_db.application.services.artifact_upload_types import ParsedArtifactTask
 from tricycle_reaction_db.application.services.artifact_uploads import ArtifactUploadService
@@ -113,6 +114,28 @@ async def test_connection_failure_does_not_fan_out_or_erase_committed_results(mo
     assert len(calls) == 1
     assert result[entries[0].artifact_id] is committed
     assert all(result[t.artifact_id] is error for t in entries[1:])
+
+
+@pytest.mark.asyncio
+async def test_lock_table_exhaustion_bisects_persistence_batch(monkeypatch):
+    entries = tasks(8)
+    successes = {task.artifact_id: object() for task in entries}
+    calls = []
+
+    async def once(subset, **_kwargs):
+        calls.append(len(subset))
+        if len(subset) > 2:
+            cause = OutOfMemory("out of shared memory")
+            raise OperationalError("persist", {}, cause)
+        return {task.artifact_id: successes[task.artifact_id] for task in subset}
+
+    monkeypatch.setattr(ArtifactUploadService, "_persist_parsed_microbatch_once", once)
+    result = await ArtifactUploadService.persist_parsed_microbatch(
+        entries, project_id=uuid4(), user_id=uuid4()
+    )
+
+    assert calls == [8, 4, 2, 2, 4, 2, 2]
+    assert result == successes
 
 
 @pytest.mark.asyncio

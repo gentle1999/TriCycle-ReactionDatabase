@@ -19,6 +19,7 @@ snapshot is not mistaken for a current deployment instruction.
 | [Business model](business-model.md) | [业务模型](../business-model.md) | User-facing objects, workflows, and non-goals |
 | [Production operations and recovery runbook](operations-runbook.md) | [生产运维与恢复 Runbook](../operations-runbook.md) | Backup, recovery, monitoring, and scheduled work |
 | [MolOP calculation-result export requirements](molop-export-requirements.md) | [MolOP 计算结果导出需求](../molop-export-requirements.md) | Upstream export and ingestion contract |
+| [Atom indexing in mapped-reaction exports](mapped-reaction-atom-indexing.md) | [映射反应导出的原子索引约定](../mapped-reaction-atom-indexing.md) | Mapped atom order, per-atom arrays, and sample join keys |
 | [Database entity relationship diagram](database-erd.md) | [数据库实体关系图](../database-erd.md) | Database boundaries, ERD, and integrity constraints |
 | [RDKit Mol database round-trip contract](rdkit-mol-roundtrip.md) | [RDKit Mol 对象数据库往返契约](../rdkit-mol-roundtrip.md) | RDKit binary Mol persistence boundary |
 

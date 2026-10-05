@@ -1159,6 +1159,7 @@ def persist_stereo_abstraction_projection(
     context: Any | None = None,
     abstraction_policy_version: str = STEREO_ABSTRACTION_POLICY_VERSION,
     abstraction_metadata: dict[str, Any] | None = None,
+    backfill_existing_downstreams: bool = True,
 ) -> tuple[MolecularTopology, MolecularTopologyAbstraction | None]:
     """Materialize one requested abstraction node and its directed edge.
 
@@ -1211,24 +1212,25 @@ def persist_stereo_abstraction_projection(
         abstraction_metadata=abstraction_metadata,
         known_match=known_match,
     )
-    context_candidates = tuple(
-        topology
-        for topology in getattr(context, "topologies_by_identity", {}).values()
-        if isinstance(topology, MolecularTopology)
-    )
-    backfill_stereo_abstraction_downstreams(
-        session,
-        persisted.topology,
-        project_id=(
-            context.project_id
-            if context is not None
-            else getattr(persisted.topology, "project_id", None)
-        ),
-        candidate_topologies=context_candidates,
-        abstraction_policy_version=abstraction_policy_version,
-        abstraction_metadata=abstraction_metadata,
-    )
-    if context is not None:
+    if backfill_existing_downstreams:
+        context_candidates = tuple(
+            topology
+            for topology in getattr(context, "topologies_by_identity", {}).values()
+            if isinstance(topology, MolecularTopology)
+        )
+        backfill_stereo_abstraction_downstreams(
+            session,
+            persisted.topology,
+            project_id=(
+                context.project_id
+                if context is not None
+                else getattr(persisted.topology, "project_id", None)
+            ),
+            candidate_topologies=context_candidates,
+            abstraction_policy_version=abstraction_policy_version,
+            abstraction_metadata=abstraction_metadata,
+        )
+    if context is not None and backfill_existing_downstreams:
         # A concrete topology may have been resolved before this abstraction
         # appeared in the same ingestion context.  Do not let a cached
         # reflexive upstream result hide the newly repaired DAG edge.

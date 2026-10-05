@@ -87,6 +87,10 @@ class MappedCalculationOrder:
             value = np.asarray(data)
             if value.shape != (len(mapped), len(mapped)):
                 raise ValueError("NMR coupling dimensions do not match its atom subset")
-            return value[np.ix_(order, order)], {"atom_indices": sorted(mapped)}
+            atom_indices = sorted(mapped)
+            return value[np.ix_(order, order)], {
+                "atom_indices": atom_indices,
+                "atom_map_numbers": [index + 1 for index in atom_indices],
+            }
         axes = _ATOM_AXES.get(kind, ())
         return self.array(data, axes=axes), {"atom_axes": list(axes)}

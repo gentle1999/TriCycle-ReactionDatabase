@@ -136,7 +136,7 @@ class Settings(BaseSettings):
     # The worker keeps parsing ahead of the database but commits one
     # project/user microbatch at these limits.  They are deliberately
     # configurable because database latency and frame density vary by host.
-    upload_worker_persistence_batch_files: int = Field(default=16, ge=1, le=64)
+    upload_worker_persistence_batch_files: int = Field(default=8, ge=1, le=64)
     upload_worker_persistence_frame_limit: int = Field(default=256, ge=1, le=10_000)
     upload_worker_concurrency: int = Field(default=2, ge=1, le=32)
     # Source spans, block hashes, segment boundaries, and frame roles are
