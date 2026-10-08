@@ -45,3 +45,19 @@ MOL 文本暂存 COPY、普通内置类型二进制 COPY、Decimal 二进制帧 
 ## 提交范围
 
 提交源码、Compose 配置、索引迁移、回归测试和本记录。部署 `.env`、本地 Compose 覆盖、凭据、原始文件、profile/benchmark 输出、调试转储及 `.tmp` 目录不纳入 Git。完整本地证据保留在 `.tmp/ingestion-bottleneck-20261008`、`.tmp/ingestion-queue-20261008`、`.tmp/ingestion-write-20261008` 等优化目录。
+
+## GitHub Actions 后续修复
+
+提交 `8a8433d` 的 [CI 运行 #56](https://github.com/gentle1999/TriCycle-ReactionDatabase/actions/runs/37775824009) 中，`postgres-rdkit` 的三个反应重建测试失败。脚本把 `alembic_version` 严格限定为 `0061_reaction_normal_form`，新增 staged 队列索引迁移 `0062` 后错误地拒绝了已升级数据库。版本门禁现通过仓库 Alembic 迁移图验证 `0061` 是当前版本的祖先，接受最低版本及已知后继，拒绝旧版本、未知版本、部分 ID、别名和无关分支。新增 7 个单元回归，覆盖未来非数字版本及无关分支；未放宽来源证据、原子映射或旧反应删除校验。
+
+同一提交的 [Supply chain 运行 #62](https://github.com/gentle1999/TriCycle-ReactionDatabase/actions/runs/37775823878) 中，`npm-lock-audit` 报告三个 high 项，对应两个漏洞：Vue 的 server-renderer 属性名校验缺少 CR（[GHSA-g2v6-rqmx-r4w6](https://github.com/advisories/GHSA-g2v6-rqmx-r4w6)）和 source-map-js 索引段偏移引起的阻塞（[GHSA-68fv-2mgg-jv7q](https://github.com/advisories/GHSA-68fv-2mgg-jv7q)）。Vue 及对应编译器/运行时包升级到 `3.5.43`，传递依赖 source-map-js 更新到 `1.2.2`，重新生成并验证锁文件，审计阈值不变。
+
+修复验证：
+
+- 反应重建单元测试 19 项通过；原失败集成文件的 6 项测试全部通过。
+- 与 CI 相同的 `pytest -m "integration and not rustfs"` 在真正独立的 PostgreSQL/RDKit 容器中执行：154 passed、2 skipped、894 deselected，114.75 秒。两项 Redis 测试按该作业配置跳过；697 条既有弃用警告。
+- `ruff check src tests migrations scripts`、387 个 Python 文件的格式检查通过；`mypy src scripts` 的 183 个源文件通过，`pyright src scripts` 为 0 errors / 0 warnings。
+- 新锁文件 `npm ci` 成功，`npm audit --audit-level=high --registry=https://registry.npmjs.org` 为 0 漏洞；前端 5 项单元测试、vue-tsc 类型检查和 Vite 构建通过。构建仍有既有 bundle 大小提示。
+- 本地验证使用 Python 3.12、Node 24.18.0 / npm 11.16.0；GitHub 作业使用 Ubuntu x86 runner 和 Node 20，因此上述结果为本地复现，不等于远端新一轮 CI 已通过。
+
+专用容器、测试数据库和生成的密码文件已清理，未对业务数据库执行维护脚本。原始本地验证输出保留在 `.tmp/ci-fix-20261008`，不纳入 Git。此处仅记录修复和本地验证，未触发远端新一轮运行。

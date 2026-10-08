@@ -54,6 +54,36 @@ def _inference(entry):
     )
 
 
+@pytest.mark.parametrize("version", ["0061_reaction_normal_form", "0062_staged_upload_claim_index"])
+def test_rebuild_accepts_required_schema_and_known_descendants(version):
+    rebuild._require_reaction_schema(version)
+
+
+@pytest.mark.parametrize("version", ["0001_initial_schema", "9999_unknown", "head", "0061"])
+def test_rebuild_rejects_old_unknown_or_nonliteral_schema_versions(version):
+    with pytest.raises(rebuild.RebuildBlocked, match="schema must be upgraded"):
+        rebuild._require_reaction_schema(version)
+
+
+def test_rebuild_checks_migration_ancestry_instead_of_revision_number(monkeypatch, tmp_path):
+    from alembic.script import ScriptDirectory
+
+    versions = tmp_path / "versions"
+    versions.mkdir()
+    for version, parent in (
+        (rebuild.MINIMUM_SCHEMA_REVISION, None),
+        ("future_queue_index", rebuild.MINIMUM_SCHEMA_REVISION),
+        ("9999_unrelated", None),
+    ):
+        (versions / f"{version}.py").write_text(
+            f"revision = {version!r}\ndown_revision = {parent!r}\n"
+        )
+    monkeypatch.setattr(rebuild, "ScriptDirectory", lambda _: ScriptDirectory(str(tmp_path)))
+    rebuild._require_reaction_schema("future_queue_index")
+    with pytest.raises(rebuild.RebuildBlocked, match="schema must be upgraded"):
+        rebuild._require_reaction_schema("9999_unrelated")
+
+
 @pytest.mark.parametrize("change", ["database", "project", "policy", "plan_digest"])
 def test_resume_rejects_wrong_scope_or_modified_plan(change):
     state = _state()

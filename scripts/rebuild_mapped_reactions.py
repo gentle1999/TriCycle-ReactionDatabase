@@ -17,6 +17,8 @@ from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
+from alembic.script import ScriptDirectory
+from alembic.util import CommandError
 from sqlalchemy import create_engine, delete, text
 from sqlmodel import Session, col, select
 
@@ -56,10 +58,35 @@ from tricycle_reaction_db.storage.rustfs import RustFSObjectStore, RustFSSetting
 
 STATE_VERSION = 1
 CHECKPOINT_KEY = "mapped_reaction_rebuild"
+MINIMUM_SCHEMA_REVISION = "0061_reaction_normal_form"
 
 
 class RebuildBlocked(ValueError):
     """Source evidence or a concurrent change prevents a safe update."""
+
+
+def _require_reaction_schema(version: str) -> None:
+    """Accept the required migration and its known descendants, never older schemas."""
+    migrations = ScriptDirectory(str(Path(__file__).resolve().parents[1] / "migrations"))
+    try:
+        current = migrations.get_revision(version)
+        # Database version rows contain complete revision IDs, not Alembic
+        # aliases or partial IDs. Unknown future revisions also fail closed.
+        if (
+            current is not None
+            and current.revision == version
+            and any(
+                revision.revision == MINIMUM_SCHEMA_REVISION
+                for revision in migrations.iterate_revisions(version, "base")
+            )
+        ):
+            return
+    except CommandError:
+        pass
+    raise RebuildBlocked(
+        f"schema must be upgraded to {MINIMUM_SCHEMA_REVISION} or a known descendant "
+        f"(current revision: {version})"
+    )
 
 
 def _digest(value: Any) -> str:
@@ -973,8 +1000,7 @@ def run(args: argparse.Namespace) -> int:
                     version = session.execute(
                         text("SELECT version_num FROM alembic_version")
                     ).scalar_one()
-                    if version != "0061_reaction_normal_form":
-                        raise RebuildBlocked("schema must be upgraded to 0061_reaction_normal_form")
+                    _require_reaction_schema(version)
                     database_key = _digest(
                         list(
                             session.execute(
