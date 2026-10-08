@@ -169,6 +169,9 @@ services:
       - tricycle-upload-worker
     restart: unless-stopped
     environment:
+      # Record Python stacks for native faults in this worker and its spawned
+      # parser processes; truncated native core dumps may omit their stacks.
+      PYTHONFAULTHANDLER: "1"
       # Background persistence may legitimately outlive the interactive API
       # query budget. Keep the API's 15 s guard, but give the durable worker a
       # separately configurable database statement budget.

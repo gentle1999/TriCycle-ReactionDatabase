@@ -7,7 +7,7 @@ from collections import Counter
 from contextlib import suppress
 from functools import lru_cache
 from hashlib import sha256
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -99,6 +99,26 @@ def _is_stereochemistry_property(prop_name: str) -> bool:
     return prop_name in _STEREOCHEMISTRY_PROPERTIES or prop_name.startswith("_CIP")
 
 
+def _rdkit_property_names(owner: Any) -> tuple[str, ...]:
+    """Enumerate metadata in bulk without losing unsupported property types."""
+
+    names = owner.GetPropNames(includePrivate=True, includeComputed=True)
+    if not names:
+        return ()
+    # GetPropsAsDict converts keys in C++, avoiding the Python iteration over
+    # RDKit's wrapped string vector. Some native property values cannot be
+    # exported; count the complete name vector and fall back in that case.
+    try:
+        properties = owner.GetPropsAsDict(
+            includePrivate=True, includeComputed=True, autoConvertStrings=False
+        )
+    except (TypeError, ValueError, RuntimeError):
+        return tuple(names)
+    if len(properties) != len(names):
+        return tuple(names)
+    return tuple(properties)
+
+
 def _clear_rdkit_properties(
     mol: Chem.Mol,
     *,
@@ -112,13 +132,14 @@ def _clear_rdkit_properties(
     MolGR graphs retain those properties verbatim.
     """
 
-    for prop_name in list(mol.GetPropNames(includePrivate=True, includeComputed=True)):
+    for prop_name in _rdkit_property_names(mol):
         if preserve_stereochemistry and _is_stereochemistry_property(prop_name):
             continue
         mol.ClearProp(prop_name)
-    for atom in mol.GetAtoms():  # type: ignore[no-untyped-call]
+    for atom_index in range(mol.GetNumAtoms()):
+        atom = mol.GetAtomWithIdx(atom_index)
         atom.SetAtomMapNum(0)
-        for prop_name in list(atom.GetPropNames(includePrivate=True, includeComputed=True)):
+        for prop_name in _rdkit_property_names(atom):
             # Non-tetrahedral stereo stores its actual SP/TB/OH arrangement
             # here, not in ChiralTag alone. It is chemical state even for
             # ordinary topology inputs, rather than disposable writer metadata.
@@ -127,8 +148,9 @@ def _clear_rdkit_properties(
             if preserve_stereochemistry and _is_stereochemistry_property(prop_name):
                 continue
             atom.ClearProp(prop_name)
-    for bond in mol.GetBonds():  # type: ignore[no-untyped-call]
-        for prop_name in list(bond.GetPropNames(includePrivate=True, includeComputed=True)):
+    for bond_index in range(mol.GetNumBonds()):
+        bond = mol.GetBondWithIdx(bond_index)
+        for prop_name in _rdkit_property_names(bond):
             if preserve_stereochemistry and _is_stereochemistry_property(prop_name):
                 continue
             bond.ClearProp(prop_name)
@@ -1576,6 +1598,78 @@ def _serialize_molecule_smiles_once(
 
 
 def serialize_molecule_smiles(
+    mol: Chem.Mol,
+    *,
+    preserve_atom_maps: bool = False,
+    retain_atom_maps: bool = False,
+    isomeric_smiles: bool = True,
+    all_hs_explicit: bool = True,
+) -> str:
+    """Reuse successful serialization only for identical frozen graph evidence.
+
+    Atom/bond properties include MolGR spin, coordination permutations and
+    stereo caches; atom order, maps, isotopes and all writer options are part
+    of the key. Coordinates are not read by this serialization boundary.
+    Never retain a caller's mutable molecule or cache a failed validation.
+    """
+
+    try:
+        graph = mol.ToBinary(
+            Chem.PropertyPickleOptions.AllProps | Chem.PropertyPickleOptions.NoConformers
+        )
+        return _validated_smiles_from_graph(
+            graph,
+            preserve_atom_maps,
+            retain_atom_maps,
+            isomeric_smiles,
+            all_hs_explicit,
+            (
+                _serialize_molecule_smiles_uncached,
+                _serialize_molecule_smiles_once,
+                _validate_smiles_round_trip,
+                _e_z_stereo_signature,
+                _stereo_signatures_match,
+                project_serializable_double_bond_stereochemistry,
+                Chem.MolToSmiles,
+                Chem.MolFromSmiles,
+            ),
+        )
+    except Exception:
+        # Unsupported pickle metadata or a serialization failure must retain
+        # the original source and its full diagnostic, including coordinates.
+        return _serialize_molecule_smiles_uncached(
+            mol,
+            preserve_atom_maps=preserve_atom_maps,
+            retain_atom_maps=retain_atom_maps,
+            isomeric_smiles=isomeric_smiles,
+            all_hs_explicit=all_hs_explicit,
+        )
+
+
+@lru_cache(maxsize=512)
+def _validated_smiles_from_graph(
+    graph: bytes,
+    preserve_atom_maps: bool,
+    retain_atom_maps: bool,
+    isomeric_smiles: bool,
+    all_hs_explicit: bool,
+    validation_implementation: tuple[object, ...],
+) -> str:
+    """Bounded successful-result cache; implementation changes invalidate keys."""
+
+    # Function identities bind the cached proof to its validation implementation,
+    # including callers that replace a writer or validation hook in this process.
+    del validation_implementation
+    return _serialize_molecule_smiles_uncached(
+        Chem.Mol(cast(Any, graph)),
+        preserve_atom_maps=preserve_atom_maps,
+        retain_atom_maps=retain_atom_maps,
+        isomeric_smiles=isomeric_smiles,
+        all_hs_explicit=all_hs_explicit,
+    )
+
+
+def _serialize_molecule_smiles_uncached(
     mol: Chem.Mol,
     *,
     preserve_atom_maps: bool = False,

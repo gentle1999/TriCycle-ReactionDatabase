@@ -366,7 +366,6 @@ def _internal_coordinate_arrays_equivalent(
         or candidate_dihedral_values.size != candidate_length
         or observed_angle_values.size != observed_length
         or observed_dihedral_values.size != observed_length
-        or any(not np.isfinite(array).all() for array in arrays)
     ):
         return False
 
@@ -387,6 +386,12 @@ def _internal_coordinate_arrays_equivalent(
         coordinate_tolerance = max(1e-8, 1.1 * 10.0 ** (-known_places))
     distance_tolerance = 2.2 * coordinate_tolerance
     if np.any(np.abs(candidate_distance_values - observed_distance_values) > distance_tolerance):
+        return False
+
+    # Most pending candidates differ in distance. Reject them before the six
+    # finiteness reductions; candidates that might match still undergo every
+    # validation, including angle/dihedral values ignored for linear atoms.
+    if any(not np.isfinite(array).all() for array in arrays):
         return False
 
     positive_distances = np.concatenate(
@@ -486,6 +491,67 @@ def _register_in_memory_geometry(
         context.in_memory_geometries_by_identity[identity] = (*candidates, geometry)
 
 
+def _distance_compatible_geometry_candidates(
+    candidates: Sequence[Geometry],
+    observed_distances: Sequence[float],
+    observed_coordinate_decimal_places: int | None,
+) -> list[Geometry]:
+    """Reject distance mismatches in bounded NumPy batches.
+
+    This is only a necessary-condition filter. Survivors still pass the full
+    equivalence predicate, including finite evidence, angles and torsions.
+    Read each candidate's current precision so a later observation that
+    refines it cannot leave a stale tolerance in an index.
+    """
+
+    observed = np.asarray(observed_distances, dtype=np.float64)
+    if observed.ndim != 1 or not observed.size or not np.isfinite(observed).all():
+        return []
+    matches: list[Geometry] = []
+    for start in range(0, len(candidates), 256):
+        rows: list[Geometry] = []
+        distances: list[Sequence[float]] = []
+        tolerances: list[float] = []
+        for candidate in candidates[start : start + 256]:
+            projection = _geometry_projection_from_entity(candidate)
+            if projection is None:
+                continue
+            candidate_distances = projection[0]
+            if len(candidate_distances) != observed.size:
+                continue
+            places = candidate.minimum_coordinate_decimal_places
+            if places is None and observed_coordinate_decimal_places is None:
+                tolerance = 1e-6
+            else:
+                known_places = min(
+                    places if places is not None else 18,
+                    observed_coordinate_decimal_places
+                    if observed_coordinate_decimal_places is not None
+                    else 18,
+                )
+                tolerance = max(1e-8, 1.1 * 10.0 ** (-known_places))
+            rows.append(candidate)
+            distances.append(candidate_distances)
+            tolerances.append(2.2 * tolerance)
+        if not rows:
+            continue
+        try:
+            values = np.asarray(distances, dtype=np.float64)
+        except ValueError:
+            matches.extend(rows)
+            continue
+        if values.ndim != 2:
+            # Persisted projections are one-dimensional; malformed evidence
+            # remains subject to the original predicate rather than reshaping.
+            matches.extend(rows)
+            continue
+        rejected = np.any(np.abs(values - observed) > np.asarray(tolerances)[:, np.newaxis], axis=1)
+        matches.extend(
+            candidate for candidate, reject in zip(rows, rejected, strict=True) if not reject
+        )
+    return matches
+
+
 def _find_in_memory_geometry_match(
     context: GeometryPersistenceContext,
     *,
@@ -505,7 +571,14 @@ def _find_in_memory_geometry_match(
         record.geometry.internal_coordinates
     )
     matches: list[Geometry] = []
-    for candidate in context.in_memory_geometries_by_identity.get(identity, ()):
+    candidates = context.in_memory_geometries_by_identity.get(identity, ())
+    if len(candidates) >= 8:
+        candidates = tuple(
+            _distance_compatible_geometry_candidates(
+                candidates, observed_distances, coordinate_decimal_places
+            )
+        )
+    for candidate in candidates:
         projection = _geometry_projection_from_entity(candidate)
         if projection is None:
             continue
@@ -1402,6 +1475,13 @@ def preload_molecular_geometry_context(
                 geometry_columns.canonicalization_version,
                 geometry_columns.geometry_hash,
                 geometry_columns.minimum_coordinate_decimal_places,
+                # Identity construction and persistence validate these fields
+                # for every exact hit. Leaving them deferred turns one batch
+                # lookup into per-row SELECTs when existing geometries recur.
+                geometry_columns.charge,
+                geometry_columns.multiplicity,
+                geometry_columns.mol,
+                geometry_columns.mol_atom_properties,
             )
         )
         .join(

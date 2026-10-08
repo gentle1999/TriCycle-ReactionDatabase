@@ -426,6 +426,44 @@ def test_unexpected_chunk_frame_failure_does_not_discard_neighbours(
     assert result[1].error_code == "frame_conversion_failed"
 
 
+def test_coordinate_only_frame_chunks_keep_the_worker_reconstruction_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CoordinateFrame:
+        _rdmol = None
+        bonds: list[object] = []
+        atoms = [6]
+        topology_reconstruction_status = None
+
+        def __init__(self, index: int) -> None:
+            self.file_frame_index = index
+
+    converted: list[int] = []
+
+    def convert(frame: CoordinateFrame, fallback_index: int, schema_version: str) -> object:
+        assert schema_version == "test-schema"
+        converted.append(frame.file_frame_index)
+        return SimpleNamespace(file_frame_index=frame.file_frame_index, record=object())
+
+    def reject_nested_native_configuration(**_kwargs: object) -> None:
+        pytest.fail("a spawned worker must retain its single-thread reconstruction policy")
+
+    monkeypatch.setattr(upload_module, "BaseCalcFrame", CoordinateFrame)
+    monkeypatch.setattr(upload_module, "_process_frame_without_configuration", convert)
+    monkeypatch.setattr(
+        upload_module,
+        "configure_molecular_graph_reconstruction",
+        reject_nested_native_configuration,
+    )
+    result = _process_frame_chunk_worker(
+        ((CoordinateFrame(7), 0), (CoordinateFrame(19), 1)), "test-schema"
+    )
+
+    assert converted == [7, 19]
+    assert [item.file_frame_index for item in result] == [7, 19]
+    assert all(item.record is not None for item in result)
+
+
 def test_frame_failure_diagnostic_keeps_specific_error_code_and_evidence() -> None:
     error = upload_module.StereoProjectionError(
         "stereo projection is ambiguous",

@@ -206,6 +206,12 @@ class UploadBatchItem(SQLModel, table=True):
             "position",
         ),
         Index(
+            "ix_upload_batch_item_staged_claim",
+            "created_at",
+            "id",
+            postgresql_where=text("status = 'staged'"),
+        ),
+        Index(
             "ix_upload_batch_item_processing_lease",
             "status",
             "worker_lease_expires_at",

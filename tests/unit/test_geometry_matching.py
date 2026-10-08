@@ -195,3 +195,107 @@ def test_nearest_geometry_candidate_uses_aligned_cartesian_rmsd() -> None:
     assert selected is nearest_candidate
     assert rmsd >= 0
     assert max_abs >= rmsd
+
+
+@pytest.mark.parametrize("field", [0, 1, 2, 4, 5, 6])
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+def test_pending_geometry_rejects_nonfinite_coordinates_even_for_linear_atoms(field, invalid):
+    # Linear atoms ignore torsion differences, but must still reject invalid
+    # evidence. A distance short circuit must not skip this validation.
+    arguments = [[1.0], [0.0], [0.0], None, [1.0], [0.0], [0.0], None]
+    arguments[field][0] = invalid
+    assert not molecular_geometry._internal_coordinate_arrays_equivalent(*arguments)
+
+
+@pytest.mark.parametrize("precision", [None, 4, 8])
+def test_pending_geometry_retains_distance_precision_boundary_and_periodic_torsions(precision):
+    tolerance = 2.2 * (1e-6 if precision is None else max(1e-8, 1.1 * 10**-precision))
+    assert molecular_geometry._internal_coordinate_arrays_equivalent(
+        [1.0],
+        [90.0],
+        [-179.0],
+        precision,
+        [1.0 + tolerance * 0.9],
+        [90.0],
+        [181.0],
+        precision,
+    )
+    assert not molecular_geometry._internal_coordinate_arrays_equivalent(
+        [1.0],
+        [90.0],
+        [-179.0],
+        precision,
+        [1.0 + tolerance * 1.1],
+        [90.0],
+        [181.0],
+        precision,
+    )
+
+
+@pytest.mark.parametrize("observed", [[], [[1.0]], [1.0, 2.0]])
+def test_pending_geometry_rejects_invalid_distance_shape(observed):
+    assert not molecular_geometry._internal_coordinate_arrays_equivalent(
+        [1.0],
+        [0.0],
+        [0.0],
+        None,
+        observed,
+        [0.0],
+        [0.0],
+        None,
+    )
+
+
+@pytest.mark.parametrize("observed_precision", [None, 2, 4, 8])
+def test_batched_distance_filter_preserves_full_equivalence(observed_precision):
+    rng = np.random.default_rng(1729)
+    observed = (np.array([0.0, 1.0, 1.5]), np.array([0.0, 90.0, 180.0]), np.zeros(3))
+    candidates = []
+    for index in range(700):
+        distances = observed[0] + rng.normal(0, 1e-3, 3)
+        if index % 7 == 0:
+            distances = observed[0].copy()
+        candidate = SimpleNamespace(
+            internal_coordinate_distances_angstrom=distances.tolist(),
+            internal_coordinate_angles_degrees=observed[1].tolist(),
+            internal_coordinate_dihedrals_degrees=observed[2].tolist(),
+            minimum_coordinate_decimal_places=[None, 2, 4, 8][index % 4],
+        )
+        if index == 10:
+            candidate.internal_coordinate_distances_angstrom[1] = float("nan")
+        if index == 11:
+            candidate.internal_coordinate_angles_degrees[2] = float("inf")
+        if index == 12:
+            candidate.internal_coordinate_dihedrals_degrees[2] = float("nan")
+        if index == 13:
+            candidate.internal_coordinate_distances_angstrom = [1.0]
+        if index == 14:
+            candidate.internal_coordinate_distances_angstrom = [[0.0], [1.0], [1.5]]
+        candidates.append(candidate)
+
+    def equivalent(candidate):
+        return molecular_geometry._internal_coordinate_arrays_equivalent(
+            *molecular_geometry._geometry_projection_from_entity(candidate),
+            candidate.minimum_coordinate_decimal_places,
+            *observed,
+            observed_precision,
+        )
+
+    expected = [id(candidate) for candidate in candidates if equivalent(candidate)]
+    survivors = molecular_geometry._distance_compatible_geometry_candidates(
+        candidates, observed[0], observed_precision
+    )
+    assert [id(candidate) for candidate in survivors if equivalent(candidate)] == expected
+    # Precision can be revised after initial registration within a transaction.
+    candidates[0].minimum_coordinate_decimal_places = 1
+    survivors = molecular_geometry._distance_compatible_geometry_candidates(
+        candidates, observed[0], observed_precision
+    )
+    assert [id(candidate) for candidate in survivors if equivalent(candidate)] == [
+        id(candidate) for candidate in candidates if equivalent(candidate)
+    ]
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+def test_batched_distance_filter_rejects_nonfinite_observations(invalid):
+    assert molecular_geometry._distance_compatible_geometry_candidates([], [invalid], None) == []

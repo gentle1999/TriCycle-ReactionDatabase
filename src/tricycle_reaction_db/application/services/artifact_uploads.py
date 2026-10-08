@@ -36,7 +36,6 @@ import numpy as np
 from molop import AutoFileParser
 from molop.config import molopconfig
 from molop.io.base_models.ChemFileFrame import BaseCalcFrame
-from molop.io.base_models.Molecule import reconstruct_topologies_batch
 from molop.io.codec_types import ParseOptions
 from psycopg import InterfaceError as PsycopgInterfaceError
 from psycopg import OperationalError as PsycopgOperationalError
@@ -1181,43 +1180,15 @@ def _process_frame_chunk_worker(
     frames: tuple[tuple[BaseCalcFrame[Any], int], ...],
     schema_version: str,
 ) -> tuple[_ProcessedFrame, ...]:
-    """Process a frame chunk after one-time worker initialization."""
+    """Convert a bounded chunk through the worker-safe single-frame API.
 
-    # A frame-by-frame MolGR call pays the native boundary and topology
-    # scheduler overhead once per frame.  The outer ProcessPoolExecutor is
-    # already the shared CPU admission boundary, so use MolOP's native batch
-    # API inside one pool task with one native worker.  This keeps the total
-    # number of active CPU slots bounded by the shared process pool while
-    # still letting MolGR amortize its C++ setup over the whole frame chunk.
-    candidates = [
-        frame
-        for frame, _fallback_index in frames
-        if isinstance(frame, BaseCalcFrame)
-        and getattr(frame, "_rdmol", None) is None
-        and not frame.bonds
-        and bool(frame.atoms)
-        and frame.topology_reconstruction_status is None
-    ]
-    if candidates:
-        configure_molecular_graph_reconstruction(allow_native_parallel=True)
-        try:
-            results = reconstruct_topologies_batch(
-                candidates,
-                max_workers=1,
-                queue_size=max(1, len(candidates)),
-                ordered=False,
-                raise_on_error=False,
-                retain_results=True,
-            )
-        finally:
-            configure_molecular_graph_reconstruction()
-        if len(results) != len(candidates):
-            raise RuntimeError(
-                "MolOP native batch reconstruction returned an incomplete frame result set"
-            )
-        for frame, result in zip(candidates, results, strict=True):
-            frame._apply_batch_reconstruction_result(result)
-
+    MolOP's native batch reconstruction rejects spawned worker processes.
+    Calling it here made every chunk fail and resubmit each frame as its own
+    IPC task. Keep one task per chunk and use the same reconstruction and
+    scientific validation as the successful single-frame recovery path.
+    The pool initializer limits each child to one native thread, and frame
+    failures remain isolated so valid neighbours retain their results.
+    """
     return tuple(
         _process_frame_chunk_item(frame, fallback_index, schema_version)
         for frame, fallback_index in frames
@@ -1531,6 +1502,12 @@ async def _process_parsed_artifact_frames(
         if isinstance(result, tuple):
             processed.extend(result)
             continue
+        logger.warning(
+            "retrying failed frame chunk individually frames=%d error_type=%s reason=%s",
+            len(chunk),
+            type(result).__name__,
+            str(result)[:500],
+        )
         processed.extend(await recover_frame_chunk(chunk))
     status_by_index = {
         item.file_frame_index: item.topology_reconstruction_status for item in processed

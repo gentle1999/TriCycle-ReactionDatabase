@@ -93,6 +93,7 @@ _FAST_RELATIONSHIP_BINDINGS: dict[type[Any], tuple[tuple[str, str, str], ...]] =
 _FAST_RELATIONSHIP_KEYS: dict[type[Any], frozenset[str]] = {}
 _FAST_RELATIONSHIPS: dict[type[Any], dict[str, Any]] = {}
 _FAST_MAPPERS: dict[type[Any], Any] = {}
+_FAST_PRIMARY_KEY_KEYS: dict[type[Any], tuple[str, ...]] = {}
 
 _FAST_PENDING_ENTITIES_KEY = "_fast_pending_entities"
 _FAST_PENDING_ENTITY_INDEX_KEY = "_fast_pending_entity_index"
@@ -165,7 +166,7 @@ def _fast_insert_enabled(session: Session) -> bool:
     return bool(session.info.get("tricycle_fast_insert", False))
 
 
-def _entity_identity_key(entity: object) -> Any | None:
+def _entity_identity_key(entity: object, *, state: Any = None) -> Any | None:
     """Return an ORM identity key even before a new row is attached.
 
     SQLAlchemy does not populate ``InstanceState.key`` for a transient object,
@@ -175,12 +176,17 @@ def _entity_identity_key(entity: object) -> Any | None:
     and collide when the second one is attached.
     """
 
-    state = cast(Any, sa_inspect(entity))
+    if state is None:
+        state = cast(Any, sa_inspect(entity))
     if state.key is not None:
         return state.key
-    primary_key_values = tuple(
-        cast(Any, entity).__dict__.get(column.key) for column in state.mapper.primary_key
-    )
+    entity_type = type(entity)
+    primary_key_keys = _FAST_PRIMARY_KEY_KEYS.get(entity_type)
+    if primary_key_keys is None:
+        primary_key_keys = tuple(column.key for column in state.mapper.primary_key)
+        _FAST_PRIMARY_KEY_KEYS[entity_type] = primary_key_keys
+    entity_dict = cast(Any, entity).__dict__
+    primary_key_values = tuple(entity_dict.get(key) for key in primary_key_keys)
     if not primary_key_values or any(value is None for value in primary_key_values):
         return None
     return state.mapper.identity_key_from_primary_key(primary_key_values)
@@ -540,25 +546,27 @@ def _prepare_new_entity(
 def _attach_pending_entities(session: Session) -> None:
     """Attach deferred fast-path rows in one ORM operation."""
 
+    if session.info.get("tricycle_fast_insert", False) and not session.info.get(
+        "tricycle_bulk_insert_disabled", False
+    ):
+        # The bulk writer consumes the queue itself. Popping and restoring it
+        # here would rebuild every identity index immediately before dropping
+        # those indexes again, even though appends already maintain them.
+        _bulk_insert_pending_entities(session)
+        return
     pending = _pop_fast_pending_entities(session)
     if pending:
-        if session.info.get("tricycle_fast_insert", False) and not session.info.get(
-            "tricycle_bulk_insert_disabled", False
-        ):
-            _set_fast_pending_entities(session, pending)
-            _bulk_insert_pending_entities(session)
-        else:
-            # A persistence window may contain detached identity holders and a
-            # canonical instance loaded by a later reconciliation query. An
-            # unconditional ``add_all`` attempts to attach both objects and
-            # raises when their identity keys are equal.  Reuse the identity
-            # map entry while copying the holder's scalar values instead.
-            _set_fast_pending_entities(session, pending)
-            try:
-                for entity in pending:
-                    _attach_or_reuse_entity(session, entity)
-            finally:
-                _set_fast_pending_entities(session, ())
+        # A persistence window may contain detached identity holders and a
+        # canonical instance loaded by a later reconciliation query. An
+        # unconditional ``add_all`` attempts to attach both objects and
+        # raises when their identity keys are equal.  Reuse the identity
+        # map entry while copying the holder's scalar values instead.
+        _set_fast_pending_entities(session, pending)
+        try:
+            for entity in pending:
+                _attach_or_reuse_entity(session, entity)
+        finally:
+            _set_fast_pending_entities(session, ())
 
 
 def _flush_if_needed(session: Session) -> bool:
@@ -660,7 +668,7 @@ def _bulk_insert_pending_entities(session: Session) -> None:
             # flushed later by the ORM after its Core row was inserted.
             session.expunge(entity)
             state = cast(Any, sa_inspect(entity))
-        identity_key = _entity_identity_key(entity)
+        identity_key = _entity_identity_key(entity, state=state)
         if identity_key is not None:
             # A single persistence window can discover the same client-side
             # UUID through two relationship graphs. Core INSERT has no ORM

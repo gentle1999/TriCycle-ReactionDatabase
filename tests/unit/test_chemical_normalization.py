@@ -1328,3 +1328,126 @@ def test_normalized_record_rejects_graph_charge_and_spin_inconsistency() -> None
             geometry=inconsistent_spin_geometry,
             multiplicity=2,
         )
+
+
+@pytest.mark.parametrize("preserve_stereochemistry", [False, True])
+def test_property_cleanup_preserves_chemical_state_and_removes_typed_metadata(
+    preserve_stereochemistry,
+):
+    from tricycle_reaction_db.domain.mol_properties import RADICAL_ELECTRONS_PROP
+
+    molecule = Chem.AddHs(Chem.MolFromSmiles("F[Pt@SP1](Cl)(Br)I"))
+    platinum = molecule.GetAtomWithIdx(1)
+    platinum.SetIntProp(RADICAL_ELECTRONS_PROP, 2)
+    permutation = platinum.GetIntProp("_chiralPermutation")
+    for owner in (molecule, platinum, molecule.GetBondWithIdx(0)):
+        owner.SetProp("parser_string", "001")
+        owner.SetIntProp("parser_int", 17)
+        owner.SetDoubleProp("parser_real", 1.25)
+        owner.SetBoolProp("parser_bool", True)
+        owner.SetProp("_CIPCustom", "trusted")
+    platinum.SetAtomMapNum(19)
+    before = _indexed_graph_signature(molecule)
+
+    normalization_module._clear_rdkit_properties(
+        molecule, preserve_stereochemistry=preserve_stereochemistry
+    )
+
+    assert _indexed_graph_signature(molecule) == before
+    assert platinum.GetAtomMapNum() == 0
+    assert platinum.GetIntProp("_chiralPermutation") == permutation
+    assert platinum.GetIntProp(RADICAL_ELECTRONS_PROP) == 2
+    for owner in (molecule, platinum, molecule.GetBondWithIdx(0)):
+        for name in ("parser_string", "parser_int", "parser_real", "parser_bool"):
+            assert not owner.HasProp(name)
+        assert bool(owner.HasProp("_CIPCustom")) == preserve_stereochemistry
+
+
+@pytest.mark.parametrize("dictionary_raises", [False, True])
+def test_property_name_enumeration_retains_nonexportable_native_properties(dictionary_raises):
+    def exported(**_kwargs):
+        if dictionary_raises:
+            raise TypeError("native property cannot be converted to Python")
+        return {"supported": 1}
+
+    owner = SimpleNamespace(
+        GetPropNames=lambda **_kwargs: ("supported", "native_only"),
+        GetPropsAsDict=exported,
+    )
+    assert normalization_module._rdkit_property_names(owner) == ("supported", "native_only")
+
+
+def test_smiles_proof_cache_preserves_source_and_invalidates_graph_mutations(monkeypatch):
+    source = Chem.AddHs(Chem.MolFromSmiles("F/C=C/F"))
+    for index in range(source.GetNumAtoms()):
+        source.GetAtomWithIdx(index).SetAtomMapNum(index + 1)
+    original_validator = normalization_module._validate_smiles_round_trip
+    calls = []
+
+    def validate(*args, **kwargs):
+        calls.append(1)
+        return original_validator(*args, **kwargs)
+
+    monkeypatch.setattr(normalization_module, "_validate_smiles_round_trip", validate)
+    normalization_module._validated_smiles_from_graph.cache_clear()
+    original = source.ToBinary(Chem.PropertyPickleOptions.AllProps)
+    expected = serialize_molecule_smiles(source, preserve_atom_maps=True)
+    validated = len(calls)
+    assert serialize_molecule_smiles(Chem.Mol(source), preserve_atom_maps=True) == expected
+    assert len(calls) == validated
+    assert source.ToBinary(Chem.PropertyPickleOptions.AllProps) == original
+    # Every change remains a new proof even if its output text is unchanged.
+    source.GetAtomWithIdx(0).SetAtomMapNum(99)
+    source.GetAtomWithIdx(0).SetIsotope(19)
+    actual = serialize_molecule_smiles(source, preserve_atom_maps=True)
+    assert len(calls) > validated
+    assert actual == normalization_module._serialize_molecule_smiles_uncached(
+        source, preserve_atom_maps=True
+    )
+    assert actual != expected
+
+    # A new validation implementation cannot reuse an older proof.
+    def reject(*args, **kwargs):
+        raise StereoProjectionError("new validator rejected the graph")
+
+    monkeypatch.setattr(normalization_module, "_validate_smiles_round_trip", reject)
+    with pytest.raises(StereoProjectionError):
+        serialize_molecule_smiles(source, preserve_atom_maps=True)
+
+
+@pytest.mark.parametrize(
+    "smiles",
+    ["F/C=C/F", "F[Pt@SP1](Cl)(Br)I", "N->[Cu+2]<-N", "[13CH3][15NH2]"],
+)
+@pytest.mark.parametrize("option", ["isomeric_smiles", "all_hs_explicit", "retain_atom_maps"])
+def test_smiles_proof_cache_preserves_writer_options_and_coordination(smiles, option):
+    source = Chem.AddHs(Chem.MolFromSmiles(smiles))
+    for index in range(source.GetNumAtoms()):
+        source.GetAtomWithIdx(index).SetAtomMapNum(index + 1)
+    for value in (False, True, False):
+        kwargs = {option: value}
+        assert serialize_molecule_smiles(source, **kwargs) == (
+            normalization_module._serialize_molecule_smiles_uncached(source, **kwargs)
+        )
+
+
+def test_failed_smiles_proof_retains_original_source_diagnostic(monkeypatch):
+    source = Chem.AddHs(Chem.MolFromSmiles("CO"))
+    source.AddConformer(Chem.Conformer(source.GetNumAtoms()))
+    seen = []
+
+    def reject(molecule, **_kwargs):
+        seen.append(molecule.GetNumConformers())
+        raise StereoProjectionError(
+            "source could not be serialized",
+            evidence={"source_conformers": molecule.GetNumConformers()},
+        )
+
+    monkeypatch.setattr(normalization_module, "_serialize_molecule_smiles_uncached", reject)
+    normalization_module._validated_smiles_from_graph.cache_clear()
+    for _ in range(2):
+        with pytest.raises(StereoProjectionError) as error:
+            serialize_molecule_smiles(source)
+        assert error.value.evidence() == {"source_conformers": 1}
+    assert seen == [0, 1, 0, 1]
+    assert normalization_module._validated_smiles_from_graph.cache_info().currsize == 0

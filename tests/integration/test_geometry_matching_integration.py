@@ -6,7 +6,8 @@ from typing import Any
 import numpy as np
 import pytest
 from rdkit import Chem
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
+from sqlalchemy import inspect as sa_inspect
 from sqlmodel import Session
 
 from tricycle_reaction_db.application.services.molecular_geometry import (
@@ -410,4 +411,61 @@ def test_ambiguous_geometry_match_selects_nearest_candidate() -> None:
     finally:
         transaction.rollback()
         connection.close()
+        engine.dispose()
+
+
+def test_exact_geometry_preload_does_not_issue_per_row_field_queries():
+    molecule = Chem.AddHs(Chem.MolFromSmiles("[13CH3][15NH2]"))
+    atom_indices = np.arange(molecule.GetNumAtoms(), dtype=np.float64)
+    coordinates = np.column_stack(
+        (atom_indices * 0.7, atom_indices**2 * 0.2, atom_indices**3 * 0.1)
+    )
+    records = [
+        normalize_molecule(
+            molecule,
+            coordinates + np.array([index, 0.0, 0.0]),
+            charge=0,
+            multiplicity=multiplicity,
+            reconstruction_method="exact-preload-field-test",
+            reconstruction_version="v1",
+        )
+        for index, multiplicity in enumerate((1, 3, 5))
+    ]
+    statements = []
+
+    def capture(_conn, _cursor, statement, _params, _context, _executemany):
+        if "FROM geometry" in statement:
+            statements.append(statement)
+
+    engine = create_engine(get_settings().database_url)
+    try:
+        with engine.connect() as connection:
+            transaction = connection.begin()
+            try:
+                with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
+                    for record in records:
+                        persist_molecular_geometry(session, record, coordinate_decimal_places=8)
+                    session.flush()
+                    session.expunge_all()
+                    context = GeometryPersistenceContext(project_id=SYSTEM_PROJECT_ID)
+                    event.listen(engine, "before_cursor_execute", capture)
+                    try:
+                        preload_molecular_geometry_context(
+                            session, [(record, 8) for record in records], context=context
+                        )
+                        assert len(context.geometries_by_hash) == 3
+                        for geometry in context.geometries_by_hash.values():
+                            assert (
+                                not {"charge", "multiplicity", "mol", "mol_atom_properties"}
+                                & sa_inspect(geometry).unloaded
+                            )
+                            assert geometry.charge == 0
+                            assert geometry.multiplicity in (1, 3, 5)
+                            assert geometry.mol.GetNumAtoms() == molecule.GetNumAtoms()
+                        assert len(statements) == 1
+                    finally:
+                        event.remove(engine, "before_cursor_execute", capture)
+            finally:
+                transaction.rollback()
+    finally:
         engine.dispose()

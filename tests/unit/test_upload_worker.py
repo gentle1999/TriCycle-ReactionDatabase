@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from types import SimpleNamespace
 from uuid import UUID
@@ -289,3 +290,159 @@ async def test_reparse_batch_uses_fixed_persistence_microbatch_boundary(
 
     assert persistence_boundaries == [upload_module.PERSISTENCE_PRELOAD_BATCH_SIZE]
     assert artifact.id in results
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [ConnectionError, RuntimeError])
+async def test_worker_reclaims_interrupted_cycle_after_all_tasks_stop(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+) -> None:
+    """A poll failure must not strand hour-long leases while the worker stays alive."""
+    settings = Settings(
+        _env_file=None,
+        upload_worker_poll_interval_seconds=0.06,
+        upload_worker_prefetch_files=4,
+        upload_worker_persistence_batch_files=1,
+    )
+    jobs = [
+        _job(project_id=PROJECT_A, batch_id=30, item_id=30, artifact_id=301),
+        _job(project_id=PROJECT_A, batch_id=30, item_id=31, artifact_id=302),
+    ]
+    expires_at = datetime.now(UTC) + timedelta(seconds=settings.upload_worker_lease_seconds)
+    jobs = [replace(job, lease_expires_at=expires_at) for job in jobs]
+    worker = UploadBatchWorker()
+    stop = asyncio.Event()
+    parser_started = asyncio.Event()
+    parser_stopped = asyncio.Event()
+    consumer_started = asyncio.Event()
+    consumer_stopped = asyncio.Event()
+    heartbeat_stopped = asyncio.Event()
+    orphaned: set[UUID] = set()
+    recoveries: list[bool] = []
+    claims = 0
+
+    async def recover_stale(*, limit: int, recover_unexpired_processing: bool = False) -> int:
+        recoveries.append(recover_unexpired_processing)
+        if recover_unexpired_processing and orphaned:
+            assert all(
+                job.lease_expires_at is not None and job.lease_expires_at > datetime.now(UTC)
+                for job in jobs
+            )
+            assert not worker._stream_active
+            assert parser_stopped.is_set()
+            assert consumer_stopped.is_set()
+            assert heartbeat_stopped.is_set()
+            count = len(orphaned)
+            orphaned.clear()
+            return count
+        return 0
+
+    async def reconcile_completed_staged_items(**_: object) -> int:
+        return 0
+
+    async def claim_stream_jobs(**_: object) -> list[UploadProcessingJob]:
+        nonlocal claims
+        claims += 1
+        if claims == 1:
+            orphaned.update(job.artifact_file_id for job in jobs)
+            return jobs
+        if claims == 2:
+            await asyncio.wait_for(parser_started.wait(), timeout=1)
+            await asyncio.wait_for(consumer_started.wait(), timeout=1)
+            raise error_type("database unavailable during refill")
+        assert not orphaned, "The next cycle cannot leave the previous claims orphaned"
+        stop.set()
+        return []
+
+    async def clear_claimed_parse_state(*_: object, **__: object) -> dict[UUID, Exception]:
+        return {}
+
+    async def parse_staged_artifact(artifact_id: UUID) -> ParsedArtifactTask:
+        if artifact_id == jobs[1].artifact_file_id:
+            parser_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                parser_stopped.set()
+        return ParsedArtifactTask(
+            artifact_id=artifact_id,
+            started_at=datetime.now(UTC),
+            parsed=SimpleNamespace(frame_records=(), source_frame_count=1),  # type: ignore[arg-type]
+        )
+
+    async def persist_parsed_microbatch(*_: object, **__: object) -> dict[UUID, object]:
+        consumer_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            consumer_stopped.set()
+        return {}
+
+    async def renew_stream_leases(_: object, finished: asyncio.Event) -> None:
+        try:
+            await finished.wait()
+        finally:
+            heartbeat_stopped.set()
+
+    async def flush_statistics() -> None:
+        return None
+
+    monkeypatch.setattr(worker_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(worker_module, "molop_process_worker_count", lambda: 2)
+    monkeypatch.setattr(UploadBatchService, "recover_stale", recover_stale)
+    monkeypatch.setattr(
+        UploadBatchService, "reconcile_completed_staged_items", reconcile_completed_staged_items
+    )
+    monkeypatch.setattr(worker, "_claim_stream_jobs", claim_stream_jobs)
+    monkeypatch.setattr(worker, "_clear_claimed_parse_state", clear_claimed_parse_state)
+    monkeypatch.setattr(worker, "_renew_stream_leases", renew_stream_leases)
+    monkeypatch.setattr(worker, "_flush_statistics", flush_statistics)
+    monkeypatch.setattr(ArtifactUploadService, "parse_staged_artifact", parse_staged_artifact)
+    monkeypatch.setattr(
+        ArtifactUploadService, "persist_parsed_microbatch", persist_parsed_microbatch
+    )
+
+    await asyncio.wait_for(worker.run(stop), timeout=2)
+
+    assert recoveries == [True, False, True, False]
+    assert not orphaned
+    assert claims == 3
+
+
+@pytest.mark.asyncio
+async def test_worker_normal_cycle_does_not_reclaim_unexpired_leases_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = UploadBatchWorker()
+    stop = asyncio.Event()
+    recoveries: list[bool] = []
+    cycles = 0
+
+    async def recover_stale(*, limit: int, recover_unexpired_processing: bool = False) -> int:
+        recoveries.append(recover_unexpired_processing)
+        return 0
+
+    async def reconcile_completed_staged_items(**_: object) -> int:
+        return 0
+
+    async def run_streaming_cycle(_: object) -> bool:
+        nonlocal cycles
+        cycles += 1
+        if cycles == 2:
+            stop.set()
+        return True
+
+    async def flush_statistics() -> None:
+        return None
+
+    monkeypatch.setattr(UploadBatchService, "recover_stale", recover_stale)
+    monkeypatch.setattr(
+        UploadBatchService, "reconcile_completed_staged_items", reconcile_completed_staged_items
+    )
+    monkeypatch.setattr(worker, "_run_streaming_cycle", run_streaming_cycle)
+    monkeypatch.setattr(worker, "_flush_statistics", flush_statistics)
+
+    await asyncio.wait_for(worker.run(stop), timeout=1)
+
+    assert recoveries == [True, False, False]

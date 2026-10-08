@@ -452,15 +452,38 @@ class UploadBatchWorker:
                             recovered_total += recovered
                             if recovered < recovery_limit:
                                 break
+                        reconciled_total = 0
+                        while True:
+                            reconciled = await UploadBatchService.reconcile_completed_staged_items(
+                                limit=512, scan_all=True
+                            )
+                            reconciled_total += reconciled
+                            if reconciled < 512:
+                                break
+                        if reconciled_total:
+                            logger.info(
+                                "acknowledged completed staged uploads without reparsing files=%d",
+                                reconciled_total,
+                            )
                         startup_recovery_complete = True
                         if recovered_total:
                             logger.warning(
-                                "recovered processing leases left by the previous upload worker "
+                                "recovered processing leases left by a previous or interrupted "
+                                "upload worker "
                                 "files=%d",
                                 recovered_total,
                             )
                     await UploadBatchService.recover_stale(limit=recovery_limit)
-                    had_work = await self._run_streaming_cycle(stop_event)
+                    try:
+                        had_work = await self._run_streaming_cycle(stop_event)
+                    except Exception:
+                        # The cycle has cancelled and awaited its producers,
+                        # database consumer and lease heartbeat. Its remaining
+                        # claims are now orphaned, just as after a restart.
+                        # Reclaim them before admitting the next cycle instead
+                        # of waiting up to an hour for their leases to expire.
+                        startup_recovery_complete = False
+                        raise
                     if had_work:
                         continue
                     await self._flush_statistics()

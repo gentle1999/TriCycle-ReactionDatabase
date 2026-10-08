@@ -8,8 +8,19 @@ from uuid import uuid4
 
 import psycopg
 import pytest
+from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine, select
+from sqlalchemy.orm import registry
+from sqlmodel import Session
 
-from tricycle_reaction_db.application.services._persistence import _copy_rows_to_postgresql
+from tricycle_reaction_db.application.services._persistence import (
+    _attach_pending_entities,
+    _copy_rows_to_postgresql,
+    _entity_identity_key,
+    _fast_pending_entity_count,
+    _queue_fast_pending_entity,
+    _session_entity_for_identity,
+    _truncate_fast_pending_entities,
+)
 from tricycle_reaction_db.application.services.artifact_upload_types import ParsedArtifactTask
 from tricycle_reaction_db.application.services.artifact_uploads import ArtifactUploadService
 from tricycle_reaction_db.core.config import get_settings
@@ -20,6 +31,100 @@ pytestmark = [
         os.getenv("TRICYCLE_RUN_DATABASE_TESTS") != "1", reason="requires PostgreSQL"
     ),
 ]
+
+
+@pytest.mark.parametrize("bulk_disabled", [False, True])
+def test_deferred_flush_deduplicates_and_preserves_file_rollback(bulk_disabled):
+    """Queue optimizations must preserve COPY, ORM fallback and failed-file isolation."""
+    mapper_registry = registry()
+    table = Table(
+        "_deferred_flush_probe",
+        MetaData(),
+        Column("owner", Integer, primary_key=True),
+        Column("position", Integer, primary_key=True),
+        Column("value", String, nullable=False),
+        prefixes=["TEMPORARY"],
+    )
+
+    class Row:
+        pass
+
+    mapper_registry.map_imperatively(Row, table)
+    engine = create_engine(get_settings().database_url)
+    try:
+        with engine.connect() as connection, connection.begin():
+            table.create(connection)
+            with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
+                session.info["tricycle_fast_insert"] = True
+                session.info["tricycle_bulk_insert_disabled"] = bulk_disabled
+                first = Row(owner=1, position=0, value="first")
+                _queue_fast_pending_entity(session, first)
+                _queue_fast_pending_entity(session, first)
+                duplicate = Row(owner=1, position=0, value="first")
+                _queue_fast_pending_entity(session, duplicate)
+                assert _session_entity_for_identity(session, duplicate) is first
+                checkpoint = _fast_pending_entity_count(session)
+                failed = Row(owner=1, position=1, value="failed")
+                _queue_fast_pending_entity(session, failed)
+                _truncate_fast_pending_entities(session, checkpoint)
+                replacement = Row(owner=1, position=1, value="replacement")
+                assert _session_entity_for_identity(session, replacement) is replacement
+                _queue_fast_pending_entity(session, replacement)
+                for position in range(2, 72):
+                    _queue_fast_pending_entity(
+                        session, Row(owner=1, position=position, value=str(position))
+                    )
+                _attach_pending_entities(session)
+                session.flush()
+                assert _fast_pending_entity_count(session) == 0
+                rows = connection.execute(select(table).order_by(table.c.position)).all()
+                assert len(rows) == 72
+                assert rows[0].value == "first"
+                assert rows[1].value == "replacement"
+                # A later batch must reuse the loaded canonical object and
+                # update it, rather than INSERT its primary key a second time.
+                loaded = session.execute(
+                    select(Row).where(table.c.owner == 1, table.c.position == 0)
+                ).scalar_one()
+                _queue_fast_pending_entity(session, Row(owner=1, position=0, value="updated"))
+                _attach_pending_entities(session)
+                session.flush()
+                assert loaded.value == "updated"
+                assert (
+                    connection.execute(
+                        select(table.c.value).where(table.c.owner == 1, table.c.position == 0)
+                    ).scalar_one()
+                    == "updated"
+                )
+    finally:
+        engine.dispose()
+        mapper_registry.dispose()
+
+
+def test_identity_metadata_cache_reads_current_primary_key_values():
+    mapper_registry = registry()
+    table = Table(
+        "_identity_cache_probe",
+        MetaData(),
+        Column("owner", Integer, primary_key=True),
+        Column("position", Integer, primary_key=True),
+    )
+
+    class Row:
+        pass
+
+    mapper_registry.map_imperatively(Row, table)
+    try:
+        row = Row(owner=1)
+        assert _entity_identity_key(row) is None
+        row.position = 2
+        original = _entity_identity_key(row)
+        row.position = 3
+        assert _entity_identity_key(row) != original
+        row.owner = None
+        assert _entity_identity_key(row) is None
+    finally:
+        mapper_registry.dispose()
 
 
 @pytest.mark.asyncio

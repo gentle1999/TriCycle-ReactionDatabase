@@ -34,6 +34,10 @@ from tricycle_reaction_db.application.services.authorization import (
     AuthorizationService,
     ProjectPermission,
 )
+from tricycle_reaction_db.application.services.upload_queue_reconciliation import (
+    completed_staged_ingestion_predicate,
+    reconcile_completed_staged_items,
+)
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
@@ -697,15 +701,16 @@ class UploadBatchService:
                         ),
                     )
                     .order_by(col(UploadBatchItem.created_at), col(UploadBatchItem.id))
+                    .with_for_update()
                 )
             ).first()
             if existing is not None:
                 item, batch = existing
                 ingestion = (
                     await session.exec(
-                        select(ArtifactIngestion).where(
-                            col(ArtifactIngestion.artifact_file_id) == artifact_id
-                        )
+                        select(ArtifactIngestion)
+                        .where(col(ArtifactIngestion.artifact_file_id) == artifact_id)
+                        .with_for_update()
                     )
                 ).first()
                 if (
@@ -1641,10 +1646,11 @@ class UploadBatchService:
 
         Normal polling only reclaims expired leases. A worker restart is a
         stronger boundary: the process that owned every unexpired processing
-        lease is gone, so startup recovery must return those rows to ``staged``
-        before the new worker starts claiming work. The stronger mode is
-        intentionally explicit and is used only once by the single deployed
-        upload worker.
+        lease is gone, so recovery must return those rows to ``staged`` before
+        the new worker starts claiming work. A failed streaming cycle also
+        provides this boundary after all its producers, database consumer and
+        lease heartbeat have been stopped. The stronger mode is intentionally
+        explicit and is restricted to the single deployed upload worker.
         """
 
         settings = get_settings()
@@ -1899,7 +1905,9 @@ class UploadBatchService:
         UPDATE`` creates one database session per file and makes those
         heartbeat transactions wait behind the persistence transaction.  A
         single conditional update keeps the lease semantics while limiting
-        the heartbeat to one session for the whole group.
+        the heartbeat to one session for the whole group. Rows locked by
+        persistence are skipped until the next heartbeat instead of waiting
+        while holding other ingestion locks and deadlocking finalization.
         """
 
         if not jobs:
@@ -1921,7 +1929,14 @@ class UploadBatchService:
         async with session_factory() as session:
             result = await session.exec(
                 update(ArtifactIngestion)
-                .where(predicate)
+                .where(
+                    col(ArtifactIngestion.id).in_(
+                        select(col(ArtifactIngestion.id))
+                        .where(predicate)
+                        .order_by(col(ArtifactIngestion.id))
+                        .with_for_update(skip_locked=True)
+                    )
+                )
                 .values(worker_lease_expires_at=expires_at)
             )
             await session.commit()
@@ -2010,24 +2025,49 @@ class UploadBatchService:
             recovered += 1
         return recovered
 
+    @staticmethod
+    async def reconcile_completed_staged_items(*, limit: int = 512, scan_all: bool = False) -> int:
+        """Acknowledge completed work before admitting another parser job."""
+        async with session_factory() as session:
+            completed = await reconcile_completed_staged_items(
+                session, limit=limit, now=datetime.now(UTC), scan_all=scan_all
+            )
+            await session.commit()
+        return completed
+
     @classmethod
     async def claim_processing(cls, *, limit: int | None = None) -> list[UploadProcessingJob]:
         """Atomically lease staged artifacts to one parser worker."""
 
         settings = get_settings()
         resolved_limit = limit or settings.upload_worker_concurrency
+        await cls.reconcile_completed_staged_items(limit=max(512, resolved_limit))
         now = datetime.now(UTC)
         jobs: list[UploadProcessingJob] = []
         statement = (
             select(UploadBatchItem, UploadBatch)
             .join(UploadBatch, col(UploadBatch.id) == col(UploadBatchItem.batch_id))
+            .outerjoin(
+                ArtifactIngestion,
+                col(ArtifactIngestion.artifact_file_id) == col(UploadBatchItem.artifact_file_id),
+            )
             .where(
+                or_(
+                    col(ArtifactIngestion.id).is_(None),
+                    ~completed_staged_ingestion_predicate(),
+                ),
+                or_(
+                    col(ArtifactIngestion.id).is_(None),
+                    col(ArtifactIngestion.status) != ArtifactIngestionStatus.PROCESSING,
+                    col(ArtifactIngestion.worker_lease_expires_at).is_(None),
+                    col(ArtifactIngestion.worker_lease_expires_at) <= now,
+                ),
                 col(UploadBatch.status) == UploadBatchStatus.ACTIVE,
                 col(UploadBatchItem.status) == UploadBatchItemStatus.STAGED,
             )
             .order_by(col(UploadBatchItem.created_at), col(UploadBatchItem.id))
             .limit(resolved_limit)
-            .with_for_update(skip_locked=True)
+            .with_for_update(skip_locked=True, of=(UploadBatchItem, UploadBatch))
         )
         async with session_factory() as session:
             rows = (await session.exec(statement)).all()
@@ -2065,6 +2105,10 @@ class UploadBatchService:
             batch_deltas: dict[UUID, list[int]] = {}
             lease_expires_at = now + timedelta(seconds=settings.upload_worker_lease_seconds)
             for item, batch in rows:
+                # An immutable artifact can occur in several batches. Admit
+                # only one lease; its siblings stay staged until reconciliation.
+                if item.artifact_file_id in lease_by_artifact_id:
+                    continue
                 batch_id = _required_uuid(batch.id, "UploadBatch")
                 item_id = _required_uuid(item.id, "UploadBatchItem")
                 item_ids.append(item_id)
@@ -2344,7 +2388,9 @@ class UploadBatchService:
         The streaming worker owns the only persistence consumer for a
         project/user group.  Heartbeats must therefore share that same
         coarse-grained shape; a per-file locking query otherwise creates a
-        connection and a lock waiter for every claimed item.
+        connection and a lock waiter for every claimed item. Skip rows already
+        locked by a persistence or claim transaction: waiting with other rows
+        locked can deadlock finalization, aborting the whole persistence batch.
         """
 
         if not jobs:
@@ -2376,7 +2422,14 @@ class UploadBatchService:
         async with session_factory() as session:
             item_result = await session.exec(
                 update(UploadBatchItem)
-                .where(item_predicate)
+                .where(
+                    col(UploadBatchItem.id).in_(
+                        select(col(UploadBatchItem.id))
+                        .where(item_predicate)
+                        .order_by(col(UploadBatchItem.id))
+                        .with_for_update(skip_locked=True)
+                    )
+                )
                 .values(
                     worker_lease_expires_at=expires_at,
                     updated_at=now,
@@ -2384,7 +2437,14 @@ class UploadBatchService:
             )
             await session.exec(
                 update(ArtifactIngestion)
-                .where(ingestion_predicate)
+                .where(
+                    col(ArtifactIngestion.id).in_(
+                        select(col(ArtifactIngestion.id))
+                        .where(ingestion_predicate)
+                        .order_by(col(ArtifactIngestion.id))
+                        .with_for_update(skip_locked=True)
+                    )
+                )
                 .values(worker_lease_expires_at=expires_at)
             )
             await session.commit()

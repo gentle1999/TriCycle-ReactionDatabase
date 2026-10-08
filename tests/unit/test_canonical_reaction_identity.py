@@ -147,3 +147,45 @@ def test_symmetric_ring_reaction_identity_survives_joint_atom_permutations():
         order = list(range(endpoints[0].GetNumAtoms()))
         generator.shuffle(order)
         assert identity(*(Chem.RenumberAtoms(mol, order) for mol in endpoints)).smiles == expected
+
+
+@pytest.mark.parametrize("smiles", ["[CH4]", "[NH4+]", "c1ccccc1", "[C]", "[Fe+2]"])
+def test_hydrogen_validation_preserves_unsanitized_source_graph(smiles):
+    molecule = Chem.MolFromSmiles(smiles, sanitize=False)
+    before = molecule.ToBinary()
+    if smiles in {"[C]", "[Fe+2]"}:
+        require_explicit_hydrogens(molecule)
+    else:
+        with pytest.raises(ValueError, match="atom vertex"):
+            require_explicit_hydrogens(molecule)
+    assert molecule.ToBinary() == before
+
+
+def test_hydrogen_validation_cache_rechecks_mutated_graph():
+    from tricycle_reaction_db.domain.explicit_hydrogens import (
+        _require_explicit_hydrogens_from_graph,
+    )
+
+    _require_explicit_hydrogens_from_graph.cache_clear()
+    molecule = Chem.AddHs(Chem.MolFromSmiles("CO"))
+    require_explicit_hydrogens(molecule)
+    require_explicit_hydrogens(Chem.Mol(molecule))
+    assert _require_explicit_hydrogens_from_graph.cache_info().hits == 1
+    original = molecule.ToBinary(Chem.PropertyPickleOptions.AllProps)
+    require_explicit_hydrogens(molecule)
+    assert molecule.ToBinary(Chem.PropertyPickleOptions.AllProps) == original
+    molecule.GetAtomWithIdx(0).SetNumExplicitHs(1)
+    with pytest.raises(ValueError, match="atom vertex"):
+        require_explicit_hydrogens(molecule)
+    # Failures must not be memoized or conceal a subsequent repair.
+    molecule.GetAtomWithIdx(0).SetNumExplicitHs(0)
+    require_explicit_hydrogens(molecule)
+
+
+def test_hydrogen_validation_cache_rechecks_no_implicit_flag():
+    molecule = Chem.MolFromSmiles("[C]")
+    require_explicit_hydrogens(molecule)
+    molecule.GetAtomWithIdx(0).SetNumRadicalElectrons(0)
+    molecule.GetAtomWithIdx(0).SetNoImplicit(False)
+    with pytest.raises(ValueError, match="atom vertex"):
+        require_explicit_hydrogens(molecule)
