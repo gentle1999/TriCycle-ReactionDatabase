@@ -927,6 +927,7 @@ class CalculationFrameDetail(CalculationFrameSummary):
     optimization: GeometryOptimizationView | None = None
     vibration: VibrationView | None = None
     transition_state_endpoints: list[TransitionStateEndpointView]
+    transition_state_mapped_reaction_ids: list[UUID] = Field(default_factory=list)
     thermochemistry: ThermochemistryView | None = None
     calculation_status: CalculationStatusView | None = None
     scientific_arrays: list[ScientificArraySummary]
@@ -1089,7 +1090,8 @@ class MappedReactionThermodynamicsProfile(QueryView):
     activation: ThermodynamicDifferenceView | None = None
     reaction: ThermodynamicDifferenceView | None = None
     # Runtime is summed from distinct source files for each state.  It is
-    # intentionally separate from the per-frame running_time_seconds field.
+    # All attributable candidate files of this mapping, independently of the
+    # selected energy minima; separate from per-frame running_time_seconds.
     reactants_running_time_seconds: float | None = None
     transition_state_running_time_seconds: float | None = None
     products_running_time_seconds: float | None = None

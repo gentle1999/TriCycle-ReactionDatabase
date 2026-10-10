@@ -184,7 +184,8 @@ function formatDate(value: string | null | undefined): string {
           </div>
           <span class="export-format">CSV</span>
         </header>
-        <p class="export-card-description">从当前项目导出数据库中的映射反应自由能、活化自由能和各计算阶段耗时。项目和筛选条件均可按需调整。</p>
+        <p class="export-card-description">从当前项目导出数据库中的映射反应自由能、活化自由能、各计算阶段耗时和反应详情访问链接。项目和筛选条件均可按需调整。</p>
+        <p class="export-input-help">耗时包含当前 mapping 的全部前体、TS 和后体候选日志，按文件去重；同一 mapping 的不同能量行重复显示该总成本。</p>
 
         <dl class="export-spec-list">
           <div><dt>当前项目</dt><dd>{{ currentProject?.project_name ?? "未选择项目" }}<code v-if="currentProjectId">{{ currentProjectId }}</code></dd></div>
@@ -196,7 +197,7 @@ function formatDate(value: string | null | undefined): string {
           <span>reaction_smarts（可选）</span>
           <textarea v-model="reactionSmarts" rows="3" placeholder="留空时不按 reaction_smarts 筛选，由数据库返回当前项目中符合能量条件的记录。" />
         </label>
-        <p class="export-input-help">填写后按 reaction_smarts 数据库筛选语法传入；页面不会按 reaction_class 重新分类数据。</p>
+        <p class="export-input-help">填写后逐条匹配映射反应，仅导出符合条件的 mapping；不会连带导出同一逻辑反应下的其他 mapping。</p>
         <div class="export-option-list" aria-label="能量字段条件">
           <label><input v-model="requireActivationEnergy" type="checkbox" />仅包含有活化 Gibbs 自由能的记录</label>
           <label><input v-model="requireReactionEnergy" type="checkbox" />仅包含有反应 Gibbs 自由能的记录</label>

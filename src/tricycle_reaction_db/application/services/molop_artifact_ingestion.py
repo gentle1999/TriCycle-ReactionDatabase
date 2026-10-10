@@ -13,7 +13,7 @@ from hashlib import sha256
 from typing import Any
 from uuid import UUID
 
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from tricycle_reaction_db.application.dtos import (
     ParseRevisionCompletionRecord,
@@ -72,11 +72,13 @@ from tricycle_reaction_db.application.services.reaction_geometry_reconciliation 
     reconcilable_geometry_ids,
     reconcile_geometry_with_reactions,
     reconcile_mapped_reaction_with_geometries,
+    share_mapped_reaction_evidence,
 )
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
     CalculationFrame,
     ElectronicState,
+    MappedReaction,
     MolecularTopology,
     ParseRevision,
 )
@@ -888,40 +890,56 @@ def _reconcile_molop_geometry_context_impl(
     session.info["tricycle_fast_insert"] = False
     session.autoflush = True
     processed_topology_ids: set[UUID] = set()
+    # TS bindings created in the source-authority savepoint must be shared
+    # after all rows are visible, including with already existing siblings.
+    evidence_sources = tuple(reconciliation_cache.transition_state_sources_by_id.values())
     try:
-        if not context.source_atom_order_authoritative:
-            for logical_reaction_id in sorted(
-                context.logical_reactions_to_resolve_mappings,
-                key=str,
-            ):
-                logical_reaction = context.logical_reactions_to_resolve_mappings[
-                    logical_reaction_id
-                ]
-                if logical_reaction.project_id != project_id:
-                    raise ValueError("reaction expansion crosses project boundary")
-                ensure_mapped_reactions_for_logical_reaction(
-                    session,
-                    logical_reaction,
-                    topology_context=context,
-                    reconciliation_cache=reconciliation_cache,
-                    refresh_thermodynamics=False,
-                    processed_topology_ids=processed_topology_ids,
+        for logical_reaction_id in sorted(
+            context.logical_reactions_to_resolve_mappings,
+            key=str,
+        ):
+            logical_reaction = context.logical_reactions_to_resolve_mappings[logical_reaction_id]
+            if logical_reaction.project_id != project_id:
+                raise ValueError("reaction expansion crosses project boundary")
+            ensure_mapped_reactions_for_logical_reaction(
+                session,
+                logical_reaction,
+                topology_context=context,
+                reconciliation_cache=reconciliation_cache,
+                refresh_thermodynamics=False,
+            )
+        for topology_id in sorted(context.topologies_to_resolve_reactions, key=str):
+            if topology_id in processed_topology_ids:
+                continue
+            topology = context.molecular_topologies_by_id.get(topology_id)
+            if topology is None:
+                topology = session.get(MolecularTopology, topology_id)
+            if topology is None or topology.project_id != project_id:
+                raise ValueError("reaction expansion topology crosses project boundary")
+            ensure_mapped_reactions_for_concrete_topology(
+                session,
+                topology,
+                topology_context=context,
+                reconciliation_cache=reconciliation_cache,
+                refresh_thermodynamics=False,
+                skip_topology_ids=processed_topology_ids,
+            )
+        for source in evidence_sources:
+            if source.project_id != project_id:
+                raise ValueError("reaction evidence sharing crosses project boundary")
+            siblings = session.exec(
+                select(MappedReaction).where(
+                    MappedReaction.project_id == project_id,
+                    MappedReaction.logical_reaction_id == source.logical_reaction_id,
+                    MappedReaction.id != source.id,
                 )
-            for topology_id in sorted(context.topologies_to_resolve_reactions, key=str):
-                if topology_id in processed_topology_ids:
-                    continue
-                topology = context.molecular_topologies_by_id.get(topology_id)
-                if topology is None:
-                    topology = session.get(MolecularTopology, topology_id)
-                if topology is None or topology.project_id != project_id:
-                    raise ValueError("reaction expansion topology crosses project boundary")
-                ensure_mapped_reactions_for_concrete_topology(
+            ).all()
+            for target in siblings:
+                share_mapped_reaction_evidence(
                     session,
-                    topology,
-                    topology_context=context,
-                    reconciliation_cache=reconciliation_cache,
-                    refresh_thermodynamics=False,
-                    skip_topology_ids=processed_topology_ids,
+                    source_mapped_reaction=source,
+                    target_mapped_reaction=target,
+                    cache=reconciliation_cache,
                 )
         context.logical_reactions_to_resolve_mappings.clear()
         context.topologies_to_resolve_reactions.clear()
@@ -985,6 +1003,7 @@ def _reconcile_molop_geometry_context_impl(
             refresh_mapped_reactions_thermodynamics(session, affected_reactions)
         else:
             mark_mapped_reactions_thermodynamics_dirty(session, affected_reactions)
+        reconciliation_cache.transition_state_sources_by_id.clear()
         return {
             mapped_reaction_id
             for mapped_reaction_id in reconciliation_cache.affected_reactions_by_id

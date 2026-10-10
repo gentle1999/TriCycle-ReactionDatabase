@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -32,6 +32,7 @@ from tricycle_reaction_db.application.services.reaction_geometry_reconciliation 
     _mapped_reaction_matches_participant_projection,
     _target_ts_geometry_atom_maps,
     _validated_target_ts_geometry_atom_maps,
+    share_mapped_reaction_evidence,
 )
 from tricycle_reaction_db.application.services.reactions import (
     _canonical_mapped_reaction_smiles,
@@ -852,6 +853,91 @@ def test_shared_ts_geometry_maps_are_rebased_between_mapping_variants(
         target_participants=target_participants,
         source_geometry_atom_maps=[1, 2],
     ) == [2, 1]
+
+
+@pytest.mark.parametrize(
+    ("source_smiles", "target_smiles"),
+    [("F/C=C/Cl", "F/C=C\\Cl"), ("F[C@H](Cl)Br", "F[C@@H](Cl)Br")],
+)
+def test_concrete_stereo_variant_inherits_ts_with_rebased_atom_maps(
+    monkeypatch: pytest.MonkeyPatch,
+    source_smiles: str,
+    target_smiles: str,
+) -> None:
+    source_molecule = Chem.MolFromSmiles(source_smiles)
+    target_molecule = Chem.MolFromSmiles(target_smiles)
+    assert source_molecule is not None and target_molecule is not None
+    target_molecule = Chem.RenumberAtoms(target_molecule, [3, 2, 1, 0])
+    source_topology_id, target_topology_id = uuid4(), uuid4()
+    topologies = {
+        source_topology_id: SimpleNamespace(atom_count=4, mol=source_molecule),
+        target_topology_id: SimpleNamespace(atom_count=4, mol=target_molecule),
+    }
+    source_maps = [1, 2, 3, 4]
+    translated_maps = [3, 1, 4, 2]
+
+    def participant(
+        side: LogicalReactionParticipantSide, topology_id: UUID, maps: list[int]
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            side=side,
+            template_index=0,
+            concrete_topology_id=topology_id,
+            atom_map_numbers=maps,
+            mapped_smiles=mapped_smiles_for_topology(topologies[topology_id], maps),
+        )
+
+    source_participants = [
+        participant(side, source_topology_id, source_maps)
+        for side in (
+            LogicalReactionParticipantSide.REACTANT,
+            LogicalReactionParticipantSide.PRODUCT,
+        )
+    ]
+    target_participants = [
+        participant(
+            LogicalReactionParticipantSide.REACTANT, target_topology_id, translated_maps[::-1]
+        ),
+        participant(LogicalReactionParticipantSide.PRODUCT, source_topology_id, translated_maps),
+    ]
+    source_reaction = ">>".join(participant.mapped_smiles for participant in source_participants)
+    target_reaction = ">>".join(participant.mapped_smiles for participant in target_participants)
+    session = Session()
+    monkeypatch.setattr(session, "get", lambda _model, topology_id: topologies[topology_id])
+    geometry_maps = [4, 2, 1, 3]
+    geometry = SimpleNamespace(id=uuid4(), mol=Chem.RenumberAtoms(source_molecule, [3, 1, 0, 2]))
+    inherited_maps = _validated_target_ts_geometry_atom_maps(
+        session,
+        source_mapped_reaction=SimpleNamespace(id=uuid4(), mapped_reaction_smiles=source_reaction),
+        target_mapped_reaction=SimpleNamespace(id=uuid4(), mapped_reaction_smiles=target_reaction),
+        source_participants=source_participants,
+        target_participants=target_participants,
+        source_mapping=SimpleNamespace(
+            verified=True,
+            mapping_method=REACTION_TS_GEOMETRY_LINK_METHOD,
+            mapping_version=REACTION_TS_GEOMETRY_LINK_POLICY_VERSION,
+            geometry_atom_map_numbers=geometry_maps,
+        ),
+        geometry=geometry,
+    )
+    assert inherited_maps == [2, 1, 3, 4]
+
+
+@pytest.mark.parametrize("cross_project", [False, True])
+def test_ts_inheritance_rejects_other_logical_reactions_or_projects(cross_project: bool) -> None:
+    source_project_id, source_logical_id = uuid4(), uuid4()
+    source = SimpleNamespace(
+        id=uuid4(), project_id=source_project_id, logical_reaction_id=source_logical_id
+    )
+    target = SimpleNamespace(
+        id=uuid4(),
+        project_id=uuid4() if cross_project else source_project_id,
+        logical_reaction_id=source_logical_id if cross_project else uuid4(),
+    )
+    with pytest.raises(ValueError, match="project boundaries|same logical reaction"):
+        share_mapped_reaction_evidence(
+            Session(), source_mapped_reaction=source, target_mapped_reaction=target
+        )
 
 
 def test_mapped_reaction_projection_rejects_same_element_map_link_mismatch() -> None:

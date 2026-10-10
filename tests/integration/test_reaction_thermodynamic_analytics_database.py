@@ -190,3 +190,167 @@ async def test_statistics_and_export_share_logical_reaction_filters(
             with Session(engine) as source_session:
                 _delete_domain_sample(source_session, source_sample)
         engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_export_filters_each_mapping_and_profile_within_one_logical_reaction(
+    development_query_principal: object,
+) -> None:
+    del development_query_principal
+    suffix = uuid4().hex
+    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    logical_id = uuid4()
+    mapped_ids = [uuid4() for _ in range(3)]
+    source_sample = None
+    try:
+        with Session(engine, expire_on_commit=False) as source_session:
+            source_sample = _create_domain_sample(source_session)
+            source_geometry = source_sample[4]
+            state = {"topologies": [{"geometry_id": str(source_geometry.id)}]}
+        async with session_factory() as session:
+            session.add(
+                LogicalReaction(
+                    id=logical_id,
+                    project_id=SYSTEM_PROJECT_ID,
+                    reaction_key=f"export-siblings:{suffix}",
+                    reaction_hash=hashlib.sha256(suffix.encode()).hexdigest(),
+                )
+            )
+            await session.flush()
+            for index, smiles in enumerate(
+                [
+                    "[CH4:1]>>[CH4:1]",
+                    "[NH3:1]>>[NH3:1]",
+                    "[CH4:1]>>[CH4:1]",
+                ]
+            ):
+                session.add(
+                    MappedReaction(
+                        id=mapped_ids[index],
+                        project_id=SYSTEM_PROJECT_ID,
+                        logical_reaction_id=logical_id,
+                        mapped_reaction_key=f"export-siblings:{suffix}:{index}",
+                        label=f"export-siblings:{suffix}:{index}",
+                        mapped_reaction_kind=MappedReactionKind.OTHER,
+                        mapped_reaction_smiles=smiles,
+                        mapping_hash=hashlib.sha256(f"{suffix}:{index}".encode()).hexdigest(),
+                    )
+                )
+                await session.flush()
+                # Two profiles of the first mapping straddle the energy range.
+                # The other mappings lack different energy fields.
+                for ordinal in range(2 if index == 0 else 1):
+                    session.add(
+                        MappedReactionThermodynamicProfile(
+                            mapped_reaction_id=mapped_ids[index],
+                            policy_version=MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION,
+                            source_key_hash=hashlib.sha256(
+                                f"profile:{suffix}:{index}:{ordinal}".encode()
+                            ).hexdigest(),
+                            electronic_level=["test"],
+                            thermochemistry_level=["test"],
+                            temperature_kelvin=298.15 + ordinal,
+                            pressure_atm=1.0,
+                            reactants=state,
+                            transition_state=state if index != 1 else None,
+                            products=state if index != 2 else None,
+                            reactants_gibbs_free_energy_hartree=-10.0,
+                            transition_state_gibbs_free_energy_hartree=-9.9 if index != 1 else None,
+                            products_gibbs_free_energy_hartree=(
+                                None
+                                if index == 2
+                                else -10.1
+                                if index == 0 and ordinal == 0
+                                else -9.7
+                            ),
+                        )
+                    )
+            await session.commit()
+
+        carbon = {"field": "reaction_smarts", "value": "C>>C"}
+        nitrogen = {"field": "reaction_smarts", "value": "N>>N"}
+        identity = {"field": "reaction_hash", "value": hashlib.sha256(suffix.encode()).hexdigest()}
+
+        async def check(
+            condition: dict[str, object] | None,
+            expected: set[UUID],
+            expected_rows: int,
+            **options: bool,
+        ) -> None:
+            expression = json.dumps(
+                {
+                    "operator": "and",
+                    "conditions": [identity, *([condition] if condition is not None else [])],
+                }
+            )
+            stream = await ReactionThermodynamicAnalyticsService.export_csv(
+                SYSTEM_PROJECT_ID,
+                filter_expression=expression,
+                **options,
+            )
+            rows = list(csv.DictReader(io.StringIO("".join([chunk async for chunk in stream]))))
+            stats = await ReactionThermodynamicAnalyticsService.statistics(
+                SYSTEM_PROJECT_ID,
+                filter_expression=expression,
+                **options,
+            )
+            assert len(rows) == stats.profile_count == expected_rows
+            assert {UUID(row["mapped_reaction_id"]) for row in rows} == expected
+            assert stats.mapped_reaction_count == len(expected)
+
+        await check(carbon, {mapped_ids[0], mapped_ids[2]}, 3)
+        await check({"operator": "and", "conditions": [carbon, nitrogen]}, set(), 0)
+        await check({"operator": "not", "conditions": [carbon]}, {mapped_ids[1]}, 1)
+        await check({**carbon, "negated": True}, {mapped_ids[1]}, 1)
+        await check({"operator": "or", "conditions": [carbon, nitrogen]}, set(mapped_ids), 4)
+        await check(
+            None,
+            {mapped_ids[0]},
+            2,
+            has_activation_gibbs_free_energy=True,
+            has_reaction_gibbs_free_energy=True,
+        )
+        await check(
+            {
+                "operator": "and",
+                "conditions": [
+                    carbon,
+                    {
+                        "field": "minimum_reaction_gibbs_free_energy_kcal_mol",
+                        "value": 0,
+                    },
+                ],
+            },
+            {mapped_ids[0]},
+            1,
+        )
+        await check(
+            {
+                "operator": "and",
+                "conditions": [
+                    carbon,
+                    {
+                        "field": "minimum_reaction_gibbs_free_energy_kcal_mol",
+                        "value": 0,
+                    },
+                    {
+                        "field": "maximum_reaction_gibbs_free_energy_kcal_mol",
+                        "value": 100,
+                    },
+                ],
+            },
+            set(),
+            0,
+        )
+        await check(
+            {"field": "has_activation_gibbs_free_energy", "value": False}, {mapped_ids[1]}, 1
+        )
+        await check({"field": "label", "value": f"export-siblings:{suffix}:1"}, {mapped_ids[1]}, 1)
+    finally:
+        async with session_factory() as session:
+            await session.execute(delete(LogicalReaction).where(LogicalReaction.id == logical_id))
+            await session.commit()
+        if source_sample is not None:
+            with Session(engine) as source_session:
+                _delete_domain_sample(source_session, source_sample)
+        engine.dispose()

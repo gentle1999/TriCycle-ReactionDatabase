@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ChevronDown, Download, FileText, Network, Shapes } from "@lucide/vue";
+import { ChevronDown, Download, FileText, GitBranch, Network, Shapes } from "@lucide/vue";
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 
@@ -16,10 +16,12 @@ const props = defineProps<{
   frame: CalculationFrameDetail;
   projectId?: string;
 }>();
+const emit = defineEmits<{ navigate: [] }>();
 
 const route = useRoute();
 
 const navigationQuery = computed(() => withoutAccessState(route.query));
+const mappedReactionIds = computed(() => props.frame.transition_state_mapped_reaction_ids ?? []);
 const protocolEntries = computed(() => displayEntries(props.frame.protocol));
 const energyEntries = computed(() => displayEntries(props.frame.energy));
 const thermochemistryEntries = computed(() => displayEntries(props.frame.thermochemistry));
@@ -248,6 +250,17 @@ onBeforeUnmount(() => previewController?.abort());
       <RouterLink :to="{ name: 'geometry-detail', params: { geometryId: frame.geometry_id }, query: navigationQuery }" title="查看几何构象" aria-label="查看几何构象">
         <Shapes :size="15" aria-hidden="true" />
         <span>几何构象</span>
+      </RouterLink>
+      <RouterLink
+        v-for="mappedReactionId in mappedReactionIds"
+        :key="mappedReactionId"
+        :to="{ name: 'mapped-reaction-detail', params: { mappedReactionId }, query: { ...navigationQuery, ...(projectId ? { project_id: projectId } : {}) } }"
+        :title="`查看 TS 所属映射反应 ${mappedReactionId}`"
+        :aria-label="`查看 TS 所属映射反应 ${mappedReactionId}`"
+        @click="emit('navigate')"
+      >
+        <GitBranch :size="15" aria-hidden="true" />
+        <span>所属映射反应<span v-if="mappedReactionIds.length > 1"> · {{ shortId(mappedReactionId) }}</span></span>
       </RouterLink>
     </nav>
 

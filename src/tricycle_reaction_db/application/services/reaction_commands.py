@@ -22,8 +22,6 @@ from tricycle_reaction_db.application.dtos import (
 )
 from tricycle_reaction_db.application.query_cost import enforce_structure_input_budget
 from tricycle_reaction_db.application.services._persistence import (
-    LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
-    SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY,
     _project_owner_predicate,
     _require_id,
     source_atom_mapping_is_authoritative,
@@ -509,9 +507,7 @@ def _logicalize_components(
             labile_atom_maps,
             context=topology_context,
             rule_ids=reaction_rule_ids,
-            backfill_existing_downstreams=not session.info.get(
-                SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY, False
-            ),
+            backfill_existing_downstreams=not source_atom_mapping_is_authoritative(session),
         )
         logical_components.append(replace(component, logical_topology=logical_topology))
     return logical_components
@@ -604,6 +600,10 @@ def _create_reaction(
         raise ValueError(
             "project-scoped reaction creation requires a project-bound topology context"
         )
+    if reconciliation_cache is None and topology_context is not None:
+        context_cache = topology_context.reconciliation_cache
+        if isinstance(context_cache, ReconciliationBatchCache):
+            reconciliation_cache = context_cache
     definition = (
         None
         if precomputed_topology_records is not None
@@ -650,23 +650,14 @@ def _create_reaction(
             for component in components
         ]
 
-    if session.info.get(LEGACY_BULK_IMPORT_SESSION_INFO_KEY, False):
-        # The previous batch importer used the MolGR endpoint topologies as
-        # the logical reaction identities. Keep its hot path for durable
-        # reparses; stereo abstraction/membership expansion remains enabled
-        # for ordinary reaction creation.
-        logical_components = [
-            replace(component, logical_topology=component.topology) for component in components
-        ]
-    else:
-        # Source atom order is authoritative mapping evidence, not logical
-        # reaction identity. Apply the same reaction-wide labile-stereo
-        # projection while retaining the canonical atom maps selected above.
-        logical_components = _logicalize_components(
-            session,
-            components,
-            topology_context=topology_context,
-        )
+    # Every ingestion mode uses the same logical identity. Source authority,
+    # including the legacy bulk flag, preserves atom order and mapping evidence;
+    # it must not create a second stereo-specific logical reaction.
+    logical_components = _logicalize_components(
+        session,
+        components,
+        topology_context=topology_context,
+    )
     identities = [
         (component.side, component.logical_topology or component.topology, 1)
         for component in logical_components
@@ -796,9 +787,7 @@ def _create_reaction(
     # whenever the caller is not deferring the batch barrier.  The deferred
     # path performs the same reaction-level pass after all pending rows are
     # flushed, because fast insertion deliberately hides them from SQL reads.
-    if not defer_geometry_reconciliation and not session.info.get(
-        SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY, False
-    ):
+    if not defer_geometry_reconciliation and not source_atom_mapping_is_authoritative(session):
         from tricycle_reaction_db.application.services.reaction_mapping_resolution import (
             ensure_mapped_reactions_for_logical_reaction,
         )
@@ -815,11 +804,10 @@ def _create_reaction(
             raise ValueError("deferred Geometry reconciliation requires a topology context")
         if source_atom_mapping_is_authoritative(session):
             topology_context.source_atom_order_authoritative = True
-        else:
-            logical_reaction_id = _require_id(logical_reaction, label="LogicalReaction")
-            topology_context.logical_reactions_to_resolve_mappings[logical_reaction_id] = (
-                logical_reaction
-            )
+        logical_reaction_id = _require_id(logical_reaction, label="LogicalReaction")
+        topology_context.logical_reactions_to_resolve_mappings[logical_reaction_id] = (
+            logical_reaction
+        )
     reactant_node = resolve_endpoint_node(
         session,
         mapped_reaction,

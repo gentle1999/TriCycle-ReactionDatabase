@@ -12,6 +12,7 @@ from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics im
 )
 from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics_persistence import (
     _index_calculation_source_rows,
+    _materialize_profile_rows,
     _runtime_for_geometry_ids,
 )
 
@@ -140,6 +141,19 @@ def test_mapped_reaction_thermodynamics_uses_lowest_gibbs_geometry_per_component
     assert profile.reaction.enthalpy_kcal_mol == pytest.approx(-627.509474)
     assert profile.reaction.gibbs_free_energy_kcal_mol == pytest.approx(-627.509474)
     assert profile.reaction.entropy_cal_mol_k == pytest.approx(1.0)
+
+    # The minima select energies, while runtime includes the non-winning
+    # precursor and TS candidates as well.
+    runtime = {
+        "reactants_running_time_seconds": 100.0,
+        "transition_state_running_time_seconds": 200.0,
+        "products_running_time_seconds": 300.0,
+        "total_running_time_seconds": 600.0,
+    }
+    materialized, rows, _ = _materialize_profile_rows(result, runtime, frozenset())
+    assert materialized.profiles[0].transition_state == profile.transition_state
+    assert rows[0].transition_state_running_time_seconds == 200.0
+    assert rows[0].total_running_time_seconds == 600.0
 
 
 def test_mapped_reaction_thermodynamics_rejects_incomplete_or_incompatible_sources() -> None:

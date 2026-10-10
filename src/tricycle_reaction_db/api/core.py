@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.background import BackgroundTask
 
 from tricycle_reaction_db.api.authentication import get_optional_principal
+from tricycle_reaction_db.api.routes.auth import _frontend_url
 from tricycle_reaction_db.application.dtos import (
     ArtifactPage,
     ArtifactPreview,
@@ -105,7 +106,7 @@ OptionalPrincipal = Annotated[
 
 
 class ReactionThermodynamicAnalyticsQuery(BaseModel):
-    """Project-scoped logical-reaction filters for thermodynamic analytics.
+    """Project-scoped mapping/profile filters for thermodynamic analytics.
 
     The CSV export always restricts rows to mapped reactions with complete,
     visible calculation-frame source evidence. That database-side cleaning
@@ -118,7 +119,8 @@ class ReactionThermodynamicAnalyticsQuery(BaseModel):
     filter_expression: str | None = Field(
         default=None,
         description=(
-            "Database-supported JSON logical filter. Leaf nodes use field/value; for example "
+            "Database-supported JSON boolean filter applied to each mapped reaction/profile. "
+            "Leaf nodes use field/value; for example "
             '{"field":"reaction_smarts","value":"<reaction SMARTS>"}.'
         ),
     )
@@ -763,9 +765,13 @@ async def query_mapped_reaction_thermodynamic_statistics(
     response_class=StreamingResponse,
 )
 async def export_mapped_reaction_thermodynamics(
+    request: Request,
     project_id: ProjectQueryId,
 ) -> StreamingResponse:
-    stream = await ReactionThermodynamicAnalyticsService.export_csv(project_id=project_id)
+    stream = await ReactionThermodynamicAnalyticsService.export_csv(
+        project_id=project_id,
+        frontend_base_url=_frontend_url("/", request),
+    )
     return StreamingResponse(
         stream,
         media_type="text/csv; charset=utf-8",
@@ -788,10 +794,15 @@ async def export_mapped_reaction_thermodynamics(
         "and whose individual frame is complete. Incomplete or hidden source profiles are "
         "excluded. This endpoint always applies that cleaned-source rule; it does not accept a "
         "cleaned_only request field. Energy values are in kcal/mol and phase runtimes are "
-        "in seconds."
+        "in seconds and include all attributable precursor, TS and product candidate files "
+        "of the mapping, independently of which energy minima were selected. Files are "
+        "deduplicated across the whole path. Each row includes a project-scoped "
+        "mapped_reaction_url to the frontend "
+        "reaction detail page."
     ),
 )
 async def export_filtered_mapped_reaction_thermodynamics(
+    request: Request,
     query: ReactionThermodynamicAnalyticsQuery,
 ) -> StreamingResponse:
     try:
@@ -800,6 +811,7 @@ async def export_filtered_mapped_reaction_thermodynamics(
             filter_expression=query.filter_expression,
             has_activation_gibbs_free_energy=query.has_activation_gibbs_free_energy,
             has_reaction_gibbs_free_energy=query.has_reaction_gibbs_free_energy,
+            frontend_base_url=_frontend_url("/", request),
         )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error

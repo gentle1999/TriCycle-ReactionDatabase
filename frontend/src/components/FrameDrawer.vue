@@ -60,7 +60,7 @@ onBeforeUnmount(() => {
         <div v-if="loading" class="drawer-loading"><div class="loading-block"></div><div class="loading-block is-wide"></div></div>
         <div v-else-if="error" class="drawer-error">{{ error }}</div>
         <div v-else-if="!frame" class="drawer-error">计算帧不存在或当前项目不可见</div>
-        <FrameDetailContent v-else class="drawer-content" :frame="frame" :project-id="projectId" />
+        <FrameDetailContent v-else class="drawer-content" :frame="frame" :project-id="projectId" @navigate="emit('close')" />
       </aside>
     </Transition>
   </Teleport>

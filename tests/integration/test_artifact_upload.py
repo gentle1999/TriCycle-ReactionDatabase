@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 import pytest
@@ -14,6 +15,7 @@ from sqlmodel import Session, col, select
 
 from tricycle_reaction_db.application.dtos import ArtifactFileRecord, CreateReactionCommand
 from tricycle_reaction_db.application.services import _persistence
+from tricycle_reaction_db.application.services import artifact_uploads as upload_module
 from tricycle_reaction_db.application.services.artifact_upload_types import _FailedInference
 from tricycle_reaction_db.application.services.artifact_uploads import (
     _create_pending_ingestion,
@@ -49,6 +51,7 @@ from tricycle_reaction_db.db.models import (
     MappedReactionNode,
     MappedReactionNodeGeometry,
     ParseRevision,
+    Project,
     TransitionStateEndpoint,
     TransitionStateInference,
 )
@@ -139,7 +142,35 @@ def test_gzip_upload_tracks_artifact_and_decoded_source_identities_separately() 
         engine.dispose()
 
 
-def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> None:
+def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The standalone path used to reconcile frames before inferring TS
+    # reactions and leave the new concrete mappings/evidence unprocessed.
+    reconciled_ts_sources: set[object] = set()
+    original_reconcile = upload_module.reconcile_molop_geometry_context
+
+    def reconcile_after_inference(session, context, **kwargs):
+        cache = context.reconciliation_cache
+        if cache is not None:
+            for source_id in cache.transition_state_sources_by_id:
+                if (
+                    session.exec(
+                        select(MappedReactionNodeGeometry.id)
+                        .join(MappedReactionNode)
+                        .where(
+                            MappedReactionNode.mapped_reaction_id == source_id,
+                            MappedReactionNode.role == MappedReactionNodeRole.TRANSITION_STATE,
+                        )
+                    ).first()
+                    is not None
+                ):
+                    reconciled_ts_sources.add(source_id)
+        return original_reconcile(session, context, **kwargs)
+
+    monkeypatch.setattr(
+        upload_module, "reconcile_molop_geometry_context", reconcile_after_inference
+    )
     payload = gzip.decompress(FIXTURE.read_bytes()) + b"\n"
     digest = sha256(payload).hexdigest()
     parsed = _parse_calculation_output(payload, FIXTURE.name.removesuffix(".gz"))
@@ -149,10 +180,21 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
     transaction = connection.begin()
     try:
         with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
+            parent_project = session.get(Project, SYSTEM_PROJECT_ID)
+            assert parent_project is not None
+            project = Project(
+                organization_id=parent_project.organization_id,
+                slug=f"ts-inheritance-test-{uuid4().hex}",
+                name="Isolated TS import regression",
+                owner_user_id=DEVELOPMENT_USER_ID,
+                created_by_user_id=DEVELOPMENT_USER_ID,
+            )
+            session.add(project)
+            session.flush()
             artifact = persist_artifact_file(
                 session,
                 record=ArtifactFileRecord(
-                    project_id=SYSTEM_PROJECT_ID,
+                    project_id=project.id,
                     created_by_user_id=DEVELOPMENT_USER_ID,
                     visibility=ArtifactVisibility.PROJECT,
                     bucket="integration-test",
@@ -240,6 +282,7 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction() -> Non
                 .options(undefer(CalculationFrame.observed_coordinates))
             ).one()
             assert inference.calculation_frame_id == ts_frame.id
+            assert inference.mapped_reaction_id in reconciled_ts_sources
             assert ts_frame.geometry_assignment_kind in {
                 GeometryAssignmentKind.PARSED_EXACT,
                 GeometryAssignmentKind.MATCHED_EXISTING_GEOMETRY,
@@ -745,10 +788,21 @@ def test_nonconverged_ts_binds_geometry_and_converged_reparse_adds_evidence() ->
     transaction = connection.begin()
     try:
         with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
+            parent_project = session.get(Project, SYSTEM_PROJECT_ID)
+            assert parent_project is not None
+            project = Project(
+                organization_id=parent_project.organization_id,
+                slug=f"ts-inheritance-test-{uuid4().hex}",
+                name="Isolated TS import regression",
+                owner_user_id=DEVELOPMENT_USER_ID,
+                created_by_user_id=DEVELOPMENT_USER_ID,
+            )
+            session.add(project)
+            session.flush()
             artifact = persist_artifact_file(
                 session,
                 record=ArtifactFileRecord(
-                    project_id=SYSTEM_PROJECT_ID,
+                    project_id=project.id,
                     created_by_user_id=DEVELOPMENT_USER_ID,
                     visibility=ArtifactVisibility.PROJECT,
                     bucket="integration-test",

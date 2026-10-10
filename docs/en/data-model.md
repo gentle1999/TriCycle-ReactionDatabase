@@ -131,6 +131,18 @@ The relation is a lazily materialized DAG, not a stereoisomer generator:
 - the system never expands the power set of all theoretical stereo features or
   creates an unrequested hypothetical configuration.
 
+Source-order imports defer relation discovery to the flushed reconciliation
+barrier. Expansion validates links from existing strict topologies to abstract
+roots before reading the current concrete memberships; an empty cache from an
+earlier precursor-only import cannot hide a newly created reaction. Equivalent
+legacy traversals proven by a stereo-aware atom bijection contribute one
+expansion candidate, preferring a Geometry-backed row. Source topologies,
+coordinates and atom-map arrays are retained.
+
+Ordinary, source-order and legacy bulk imports use the same abstract logical
+identity. Import flags affect mapping authority and reconciliation timing;
+they cannot create a second logical reaction keyed by a strict configuration.
+
 For example, two independent stereo centres may form a diamond: a two-centre
 concrete topology connects to one-centre-A and one-centre-B topologies, which
 both connect to a common no-centre-specific topology. A concrete topology can
@@ -418,6 +430,16 @@ project must materialize its own derived rows from an authorized `ArtifactFile`;
 TS/endpoint/Geometry/reaction rows never cross that project boundary, and the
 process does not invent or duplicate new calculation facts.
 
+Concrete stereochemical variants inherit verified TS associations from their
+logical reaction template. Inheritance rebases TS Geometry atom maps using both
+complete reaction graphs and their atom correspondence, disregarding endpoint
+stereo differences. It preserves the raw Geometry, frames, and endpoint topologies.
+Unverified TS maps or different cross-side atom links cannot be inherited.
+Both batch and single-file imports expand concrete mappings and propagate evidence
+after persisting TS inferences, including imports that preserve source atom order.
+Pending TS sources are tracked separately from thermodynamic dirty records so a
+profile refresh cannot discard evidence before propagation.
+
 ### Bidirectional Geometry/reaction binding
 
 Geometry must bind a concrete topology:
@@ -482,9 +504,24 @@ rewrite original observations.
 
 Each mapped-reaction thermodynamic profile also stores file-level runtimes for
 reactants, transition state, products, and the full path. Values are summed
-over distinct `ArtifactFile` ids referenced by the selected calculation frames;
-the full-path value uses the union across the three states. The CSV export
+over distinct `ArtifactFile` ids for all recorded candidates of the mapping,
+independently of the minimum-energy profile selection. Endpoints use their
+exact concrete topologies; TS files come from mapping bindings and inference
+sources. Attributable non-converged candidates also contribute. The latest
+represented parse revision supplies each file's runtime. The full-path value
+uses the union across the three stages. Profiles of the same mapping repeat
+this search cost, so their runtime columns must not be summed across rows.
+Unknown candidate runtimes remain null rather than being treated as zero. The CSV export
 contains these four runtime columns. Per-frame runtime sums are not used.
+The `mapped_reaction_url` column provides an absolute link to the mapped reaction detail page,
+including its `project_id` scope.
+
+Thermodynamic statistics and CSV exports apply structure, concrete topology,
+and endpoint compatibility filters to each `MappedReaction`. All conditions
+in a boolean expression must hold for the current mapping; sibling mappings
+cannot satisfy separate conditions on its behalf. Energy ranges and presence
+filters apply to the current profile row. Logical reaction key/hash/class
+fields remain parent metadata filters and do not include unmatched siblings.
 
 ## Storage and Deletion
 

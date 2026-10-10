@@ -26,6 +26,9 @@ from tricycle_reaction_db.application.services.geometry_energy import (
     GeometryEnergyComposite,
     geometry_energy_composites,
 )
+from tricycle_reaction_db.application.services.mapped_reaction_runtime import (
+    load_mapped_reaction_runtimes,
+)
 from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics import (
     MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION,
     EndpointComponentRequirement,
@@ -104,7 +107,7 @@ class _MappedReactionThermodynamicsInput:
     endpoint_geometries_by_participant: dict[UUID, tuple[Geometry, ...]]
     transition_state_node_ids: frozenset[UUID]
     composites: dict[UUID, GeometryEnergyComposite]
-    runtimes_by_geometry: dict[UUID, dict[UUID, tuple[int, float | None]]]
+    running_times: dict[str, float | None]
     eligible_source_frame_ids: frozenset[UUID]
 
 
@@ -405,7 +408,9 @@ def _load_mapped_reaction_thermodynamics_input(
             source_frame_ids_by_geometry=source_frame_ids_by_geometry,
             thermodynamic_only_geometry_ids=transition_state_geometry_ids,
         ),
-        runtimes_by_geometry=runtimes_by_geometry,
+        running_times=load_mapped_reaction_runtimes(session, [mapped_reaction_id])[
+            mapped_reaction_id
+        ],
         eligible_source_frame_ids=eligible_source_frame_ids,
     )
 
@@ -545,7 +550,7 @@ def _profile_source_references(
 
 def _materialize_profile_rows(
     result: MappedReactionThermodynamics,
-    runtimes_by_geometry: dict[UUID, dict[UUID, tuple[int, float | None]]],
+    runtime_values: dict[str, float | None],
     eligible_source_frame_ids: frozenset[UUID],
 ) -> tuple[
     MappedReactionThermodynamics,
@@ -560,42 +565,8 @@ def _materialize_profile_rows(
     for profile in result.profiles:
         transition_state = profile.transition_state
         products = profile.products
-        reactant_geometry_ids = (
-            {selection.geometry_id for selection in profile.reactants.topologies}
-            if profile.reactants is not None
-            else set()
-        )
-        transition_state_geometry_ids = (
-            {selection.geometry_id for selection in transition_state.topologies}
-            if transition_state is not None
-            else set()
-        )
-        product_geometry_ids = (
-            {selection.geometry_id for selection in products.topologies}
-            if products is not None
-            else set()
-        )
-        all_geometry_ids = (
-            reactant_geometry_ids | transition_state_geometry_ids | product_geometry_ids
-        )
-        runtime_values = {
-            "reactants_running_time_seconds": _runtime_for_geometry_ids(
-                reactant_geometry_ids,
-                runtimes_by_geometry,
-            ),
-            "transition_state_running_time_seconds": _runtime_for_geometry_ids(
-                transition_state_geometry_ids,
-                runtimes_by_geometry,
-            ),
-            "products_running_time_seconds": _runtime_for_geometry_ids(
-                product_geometry_ids,
-                runtimes_by_geometry,
-            ),
-            "total_running_time_seconds": _runtime_for_geometry_ids(
-                all_geometry_ids,
-                runtimes_by_geometry,
-            ),
-        }
+        # Energy selects minima; runtime is the cost of the complete mapping
+        # search, shared by every profile regardless of which candidates won.
         profile = profile.model_copy(update=runtime_values)
         profiles_with_runtime.append(profile)
         source_evidence_complete, source_references = _profile_source_references(profile)
@@ -792,7 +763,6 @@ def refresh_mapped_reaction_thermodynamics(
     binding_rows = refresh_input.binding_rows
     transition_state_node_ids = refresh_input.transition_state_node_ids
     composites = refresh_input.composites
-    runtimes_by_geometry = refresh_input.runtimes_by_geometry
     _bind_profile_endpoint_geometries(
         session,
         mapped_reaction,
@@ -815,7 +785,7 @@ def refresh_mapped_reaction_thermodynamics(
     )
     result, profile_rows, source_references_by_profile = _materialize_profile_rows(
         result,
-        runtimes_by_geometry,
+        refresh_input.running_times,
         refresh_input.eligible_source_frame_ids,
     )
     session.add_all(profile_rows)
@@ -1155,6 +1125,7 @@ def refresh_mapped_reactions_thermodynamics(
     results: list[MappedReactionThermodynamics] = []
     profile_rows: list[MappedReactionThermodynamicProfile] = []
     source_references_by_profile: list[tuple[_ProfileSourceReference, ...]] = []
+    running_times = load_mapped_reaction_runtimes(session, mapped_reaction_ids)
     for mapped_reaction_id, _mapped_reaction in mapped_reactions_by_id.items():
         _bind_profile_endpoint_geometries(
             session,
@@ -1175,7 +1146,7 @@ def refresh_mapped_reactions_thermodynamics(
         )
         result, reaction_profile_rows, reaction_source_references = _materialize_profile_rows(
             result,
-            runtimes_by_geometry,
+            running_times[mapped_reaction_id],
             eligible_source_frame_ids,
         )
         results.append(result)

@@ -465,6 +465,79 @@ def _reaction_geometry_counts(session: Session, mapped_reaction_id: UUID) -> tup
     return total, transition_states
 
 
+def test_frame_detail_links_only_reactions_with_a_bound_transition_state(
+    development_query_principal: object,
+) -> None:
+    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    sample: tuple[Any, ...] | None = None
+    try:
+        with Session(engine, expire_on_commit=False) as session:
+            sample = _create_domain_sample(session)
+            frame = sample[1]
+            geometry = sample[4]
+            mapped_reaction = sample[6]
+            node = session.execute(
+                select(MappedReactionNode).where(
+                    col(MappedReactionNode.mapped_reaction_id) == mapped_reaction.id
+                )
+            ).scalar_one()
+            # Multiple TS nodes bound to this geometry must still produce one link.
+            second_node = MappedReactionNode(
+                id=uuid4(),
+                mapped_reaction_id=mapped_reaction.id,
+                node_key="transition-state-copy",
+                node_index=1,
+                role=MappedReactionNodeRole.TRANSITION_STATE,
+            )
+            session.add(second_node)
+            session.flush()
+            assert second_node.id is not None
+            session.add(
+                MappedReactionNodeGeometry(
+                    mapped_reaction_node_id=second_node.id,
+                    geometry_id=geometry.id,
+                    component_key="transition-state-copy",
+                    component_index=1,
+                    coordinate_index=1,
+                    is_primary=False,
+                )
+            )
+            session.commit()
+
+        detail = asyncio.run(
+            CalculationQueryService.get_calculation_frame(
+                project_id=SYSTEM_PROJECT_ID,
+                frame_id=frame.id,
+            )
+        )
+        assert detail is not None
+        assert detail.transition_state_mapped_reaction_ids == [mapped_reaction.id]
+
+        with Session(engine) as session:
+            for node_id in (node.id, second_node.id):
+                stored_node = session.get(MappedReactionNode, node_id)
+                assert stored_node is not None
+                stored_node.role = MappedReactionNodeRole.REACTANT
+            session.commit()
+
+        detail = asyncio.run(
+            CalculationQueryService.get_calculation_frame(
+                project_id=SYSTEM_PROJECT_ID,
+                frame_id=frame.id,
+            )
+        )
+        assert detail is not None
+        # The inference still refers to this reaction, but its geometry is no
+        # longer bound as a TS. Reactant/product bindings must not yield links.
+        assert detail.transition_state_mapped_reaction_ids == []
+    finally:
+        if sample is not None:
+            with Session(engine) as session:
+                _delete_domain_sample(session, sample)
+        engine.dispose()
+        asyncio.run(dispose_engine())
+
+
 def test_domain_filters_compose_and_preserve_pagination_totals(
     development_query_principal: object,
 ) -> None:
@@ -696,6 +769,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         mapped_reaction_gibbs_page = asyncio.run(
             MappedReactionQueryService.list_mapped_reactions(
                 project_id=SYSTEM_PROJECT_ID,
+                logical_reaction_id=logical_reaction.id,
                 minimum_reaction_gibbs_free_energy_kcal_mol=reaction_gibbs - 0.01,
                 maximum_reaction_gibbs_free_energy_kcal_mol=reaction_gibbs + 0.01,
                 limit=1,
@@ -848,6 +922,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         logical_reaction_gibbs_page = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
                 project_id=SYSTEM_PROJECT_ID,
+                reaction_hash=logical_reaction.reaction_hash,
                 minimum_reaction_gibbs_free_energy_kcal_mol=reaction_gibbs - 0.01,
                 maximum_reaction_gibbs_free_energy_kcal_mol=reaction_gibbs + 0.01,
                 limit=1,

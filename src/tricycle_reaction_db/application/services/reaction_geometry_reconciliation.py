@@ -125,6 +125,9 @@ class ReconciliationBatchCache:
     new_node_geometry_ids: set[UUID] = field(default_factory=set)
     thermodynamic_property_geometry_ids: set[UUID] = field(default_factory=set)
     affected_reactions_by_id: dict[UUID, MappedReaction] = field(default_factory=dict)
+    # Profile refresh clears the dirty set before the final geometry barrier;
+    # pending TS propagation must survive that refresh independently.
+    transition_state_sources_by_id: dict[UUID, MappedReaction] = field(default_factory=dict)
     # These fallback lookups depend only on the source topology during one
     # reconciliation phase.  The preload barrier marks the topology set as
     # complete after all deferred reaction rows have been flushed.
@@ -888,13 +891,22 @@ def _target_ts_geometry_atom_maps(
     target_participants: Iterable[MappedReactionParticipant],
     source_geometry_atom_maps: Iterable[int],
 ) -> list[int] | None:
-    """Translate TS Geometry maps by complete reaction identity, not array position."""
+    """Translate TS maps through the complete abstract reaction correspondence.
+
+    Concrete stereochemical variants inherit the template's TS relationship.
+    Endpoint stereo therefore does not constrain this inheritance; both
+    labelled reaction graphs must still agree on connectivity and atom links.
+    """
 
     source_components = _reaction_components_from_participants(session, source_participants)
     target_components = _reaction_components_from_participants(session, target_participants)
     if source_components is None or target_components is None:
         return None
-    translation = canonical_reaction_atom_map_translation(source_components, target_components)
+    translation = canonical_reaction_atom_map_translation(
+        source_components,
+        target_components,
+        include_stereochemistry=False,
+    )
     if translation is None:
         return None
     try:
@@ -1026,6 +1038,8 @@ def share_mapped_reaction_evidence(
     )
     if source_project_id != target_project_id:
         raise ValueError("reaction evidence cannot cross project boundaries")
+    if source_mapped_reaction.logical_reaction_id != target_mapped_reaction.logical_reaction_id:
+        raise ValueError("reaction evidence must belong to the same logical reaction")
 
     target_participants = {
         (participant.side, participant.template_index): participant
@@ -2230,6 +2244,7 @@ def bind_transition_state_frame(
     mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
     if cache is not None:
         cache.affected_reactions_by_id[mapped_reaction_id] = mapped_reaction
+        cache.transition_state_sources_by_id[mapped_reaction_id] = mapped_reaction
     if not source_atom_mapping_is_authoritative(session):
         sibling_reactions = session.exec(
             select(MappedReaction).where(

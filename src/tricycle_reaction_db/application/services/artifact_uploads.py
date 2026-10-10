@@ -2975,6 +2975,7 @@ _RECONCILIATION_CACHE_MUTABLE_FIELDS = (
     "new_node_geometry_ids",
     "thermodynamic_property_geometry_ids",
     "affected_reactions_by_id",
+    "transition_state_sources_by_id",
     "logical_member_reactions_by_topology",
     "endpoint_compatible_reactions_by_topology",
     "reaction_lookup_topologies_loaded",
@@ -3418,6 +3419,16 @@ def _persist_parsed_artifact(
             topology_context=active_geometry_context,
             defer_thermodynamic_refresh=defer_thermodynamic_refresh,
         )
+        if not defer_reconciliation:
+            # Single-file imports infer TS reactions after frame persistence
+            # has already run its geometry barrier. Reconcile the new reaction
+            # and TS evidence as well; batch callers do this at their shared
+            # barrier after the deferred inferences have been persisted.
+            reconcile_molop_geometry_context(
+                session,
+                active_geometry_context,
+                refresh_thermodynamics=not defer_thermodynamic_refresh,
+            )
     else:
         deferred_inferences.append(inference_work)
 

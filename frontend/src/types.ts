@@ -416,6 +416,7 @@ export interface CalculationFrameDetail extends CalculationFrameSummary {
     strict_validation_passed?: boolean;
     provenance_json?: string;
   }>;
+  transition_state_mapped_reaction_ids: string[];
   thermochemistry: Record<string, number | null> | null;
   calculation_status: Record<string, boolean | null> | null;
   scientific_arrays: ScientificArraySummary[];

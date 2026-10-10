@@ -15,6 +15,9 @@ from tricycle_reaction_db.application.services._persistence import (
     _attach_pending_entities,
     _require_id,
 )
+from tricycle_reaction_db.application.services.canonical_atom_mapping import (
+    canonical_atom_index_mapping,
+)
 from tricycle_reaction_db.application.services.canonical_reaction_identity import (
     canonical_reaction_identity,
 )
@@ -37,7 +40,12 @@ from tricycle_reaction_db.application.services.reactions import (
     persist_mapped_reaction,
     transfer_mapped_reaction_to_concrete_topologies,
 )
+from tricycle_reaction_db.application.services.topology_abstraction import (
+    backfill_stereo_abstraction_downstreams,
+    ensure_topology_upstreams,
+)
 from tricycle_reaction_db.db.models import (
+    Geometry,
     LogicalParticipantConcreteTopology,
     LogicalReaction,
     LogicalReactionParticipant,
@@ -227,14 +235,18 @@ def _memberships_for_concrete_topology(
     *,
     project_id: UUID,
     topology_context: Any | None = None,
+    logical_reaction_id: UUID | None = None,
 ) -> tuple[LogicalParticipantConcreteTopology, ...]:
     """Load concrete memberships, including fast-path rows not flushed yet."""
 
-    if topology_context is not None:
+    # A precursor-only barrier may cache an empty membership set before the
+    # logical reaction exists. Reaction expansion has just added memberships;
+    # its scoped read must see those new rows rather than that earlier cache.
+    if topology_context is not None and logical_reaction_id is None:
         cached = topology_context.memberships_by_concrete_topology.get(concrete_topology_id)
         if cached is not None:
             return cast(tuple[LogicalParticipantConcreteTopology, ...], cached)
-    persisted_rows = session.exec(
+    statement = (
         select(
             LogicalParticipantConcreteTopology,
             LogicalReactionParticipant,
@@ -261,7 +273,10 @@ def _memberships_for_concrete_topology(
             col(LogicalReaction.project_id) == project_id,
             col(MolecularTopology.project_id).is_not(None),
         )
-    ).all()
+    )
+    if logical_reaction_id is not None:
+        statement = statement.where(col(LogicalReaction.id) == logical_reaction_id)
+    persisted_rows = session.exec(statement).all()
     persisted_entities: list[LogicalParticipantConcreteTopology] = []
     for membership, logical_participant, logical_reaction in persisted_rows:
         # A concrete topology can be shared by many logical reactions within
@@ -297,7 +312,7 @@ def _memberships_for_concrete_topology(
         if isinstance(membership.id, UUID)
     }
     result = tuple(by_id.values())
-    if topology_context is not None:
+    if topology_context is not None and logical_reaction_id is None:
         topology_context.memberships_by_concrete_topology[concrete_topology_id] = result
     return result
 
@@ -585,6 +600,40 @@ def _mapped_reaction_has_selected_topology(
     return False
 
 
+def _strict_topology_representatives(
+    session: Session,
+    topologies: tuple[MolecularTopology, ...],
+) -> tuple[MolecularTopology, ...]:
+    """Collapse equivalent stored traversals, preferring real Geometry evidence.
+
+    Older normalization versions can store two serializations of a symmetric
+    E/Z configuration under different topology hashes. A verified stereo-aware
+    canonical atom bijection, rather than the hash alone, proves equivalence.
+    The source rows and their atom orders remain untouched.
+    """
+
+    if not topologies:
+        return ()
+    observed_ids = set(
+        session.exec(
+            select(col(Geometry.topology_id))
+            .where(col(Geometry.topology_id).in_([topology.id for topology in topologies]))
+            .distinct()
+        ).all()
+    )
+    representatives: list[MolecularTopology] = []
+    for topology in sorted(topologies, key=lambda row: (row.id not in observed_ids, str(row.id))):
+        if any(
+            topology.project_id == existing.project_id
+            and topology.stereo_agnostic_graph_hash == existing.stereo_agnostic_graph_hash
+            and canonical_atom_index_mapping(topology.mol, existing.mol) is not None
+            for existing in representatives
+        ):
+            continue
+        representatives.append(topology)
+    return tuple(representatives)
+
+
 def ensure_mapped_reactions_for_concrete_topology(
     session: Session,
     concrete_topology: MolecularTopology,
@@ -593,6 +642,8 @@ def ensure_mapped_reactions_for_concrete_topology(
     reconciliation_cache: ReconciliationBatchCache | None = None,
     refresh_thermodynamics: bool = True,
     skip_topology_ids: set[UUID] | None = None,
+    logical_reaction_id: UUID | None = None,
+    _processed_transfers: set[tuple[UUID, UUID, UUID]] | None = None,
 ) -> tuple[MappedReaction, ...]:
     """Create strict mapped reactions for a newly discovered concrete member.
 
@@ -606,8 +657,15 @@ def ensure_mapped_reactions_for_concrete_topology(
     project_id = _require_project_owner(concrete_topology, label="MolecularTopology")
     if skip_topology_ids is not None and concrete_topology_id in skip_topology_ids:
         return ()
-    ensured_memberships = ensure_concrete_topology_memberships(session, concrete_topology)
-    if topology_context is not None:
+    # Raw source-order ingestion defers graph discovery. At this flushed
+    # barrier, validate only derived relations; never reorder source atoms.
+    ensured_memberships: tuple[LogicalParticipantConcreteTopology, ...] = ()
+    if logical_reaction_id is None:
+        ensure_topology_upstreams(session, concrete_topology, project_id=project_id)
+        ensured_memberships = ensure_concrete_topology_memberships(session, concrete_topology)
+    if concrete_topology.is_stereo_abstraction_upstream:
+        return ()
+    if topology_context is not None and logical_reaction_id is None:
         # ``ensure_concrete_topology_memberships`` has just enumerated the
         # complete membership set for this topology. Reuse those ORM objects
         # instead of querying the same set again before expansion.
@@ -619,6 +677,7 @@ def ensure_mapped_reactions_for_concrete_topology(
         concrete_topology_id,
         project_id=project_id,
         topology_context=topology_context,
+        logical_reaction_id=logical_reaction_id,
     )
     created_or_reused: dict[UUID, MappedReaction] = {}
     for membership in memberships:
@@ -632,14 +691,25 @@ def ensure_mapped_reactions_for_concrete_topology(
             label="LogicalReactionParticipant",
         )
         logical_reaction = logical_participant.logical_reaction
-        logical_reaction_id = _require_id(logical_reaction, label="LogicalReaction")
+        owner_reaction_id = _require_id(logical_reaction, label="LogicalReaction")
+        if logical_reaction_id is not None and owner_reaction_id != logical_reaction_id:
+            continue
         mapped_reactions = _mapped_reactions_for_logical_reaction(
             session,
-            logical_reaction_id,
+            owner_reaction_id,
             project_id=project_id,
             topology_context=topology_context,
         )
         for source_mapped_reaction in mapped_reactions:
+            transfer_key = (
+                _require_id(source_mapped_reaction, label="MappedReaction"),
+                logical_participant_id,
+                concrete_topology_id,
+            )
+            if _processed_transfers is not None:
+                if transfer_key in _processed_transfers:
+                    continue
+                _processed_transfers.add(transfer_key)
             source_participants = _source_participants(
                 session,
                 source_mapped_reaction,
@@ -734,11 +804,11 @@ def ensure_mapped_reactions_for_concrete_topology(
             created_or_reused[mapped_reaction_id] = mapped_reaction
             if topology_context is not None:
                 current_reactions = topology_context.mapped_reactions_by_logical_reaction.get(
-                    logical_reaction_id,
+                    owner_reaction_id,
                     (),
                 )
                 if all(existing.id != mapped_reaction_id for existing in current_reactions):
-                    topology_context.mapped_reactions_by_logical_reaction[logical_reaction_id] = (
+                    topology_context.mapped_reactions_by_logical_reaction[owner_reaction_id] = (
                         *current_reactions,
                         mapped_reaction,
                     )
@@ -782,7 +852,6 @@ def ensure_mapped_reactions_for_logical_reaction(
     topology_context: Any | None = None,
     reconciliation_cache: ReconciliationBatchCache | None = None,
     refresh_thermodynamics: bool = True,
-    processed_topology_ids: set[UUID] | None = None,
 ) -> tuple[MappedReaction, ...]:
     """Materialize mappings for every already-known concrete reaction member.
 
@@ -809,7 +878,6 @@ def ensure_mapped_reactions_for_logical_reaction(
                 topology_context=topology_context,
                 reconciliation_cache=reconciliation_cache,
                 refresh_thermodynamics=refresh_thermodynamics,
-                processed_topology_ids=processed_topology_ids,
             )
         finally:
             session.info["tricycle_fast_insert"] = previous_fast_insert
@@ -853,7 +921,12 @@ def ensure_mapped_reactions_for_logical_reaction(
                 )
             }
         )
+    discovered_roots: set[UUID] = set()
     for participant in participants:
+        topology = participant.topology
+        if topology.is_stereo_abstraction_upstream and topology.id not in discovered_roots:
+            backfill_stereo_abstraction_downstreams(session, topology, project_id=project_id)
+            discovered_roots.add(_require_id(topology, label="MolecularTopology"))
         ensure_logical_participant_concrete_memberships(session, participant)
 
     participant_by_id = {
@@ -900,14 +973,19 @@ def ensure_mapped_reactions_for_logical_reaction(
             continue
         # An abstract participant topology is the query root, not a strict
         # reaction instance.  Its actual downstream rows are the candidates.
-        if (
-            logical_participant.topology.is_stereo_abstraction_upstream
-            and membership.concrete_topology_id == logical_participant.topology_id
-        ):
+        if membership.concrete_topology.is_stereo_abstraction_upstream:
             continue
         concrete_topology_ids.add(membership.concrete_topology_id)
     if not concrete_topology_ids:
         return ()
+    concrete_topologies = tuple(
+        _resolve_topology_value(session, topology_id)
+        for topology_id in sorted(concrete_topology_ids, key=str)
+    )
+    concrete_topology_ids = {
+        _require_id(topology, label="MolecularTopology")
+        for topology in _strict_topology_representatives(session, concrete_topologies)
+    }
 
     known_ids = {
         _require_id(mapped_reaction, label="MappedReaction")
@@ -919,6 +997,7 @@ def ensure_mapped_reactions_for_logical_reaction(
         )
     }
     created: dict[UUID, MappedReaction] = {}
+    processed_transfers: set[tuple[UUID, UUID, UUID]] = set()
 
     # Keep revisiting the materialized candidates until every newly-created
     # source mapping has been used.  This covers concrete combinations across
@@ -940,9 +1019,9 @@ def ensure_mapped_reactions_for_logical_reaction(
                 topology_context=topology_context,
                 reconciliation_cache=reconciliation_cache,
                 refresh_thermodynamics=refresh_thermodynamics,
+                logical_reaction_id=logical_reaction_id,
+                _processed_transfers=processed_transfers,
             )
-            if processed_topology_ids is not None:
-                processed_topology_ids.add(concrete_topology_id)
             for mapped_reaction in materialized_reactions:
                 if mapped_reaction.logical_reaction_id != logical_reaction_id:
                     continue

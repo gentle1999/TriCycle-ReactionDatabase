@@ -379,7 +379,7 @@ def _logical_reaction_ids_for_mapped_match(scope: Any, match: Any) -> Any:
     )
 
 
-def _logical_reaction_mapped_structure_predicate(
+def _reaction_structure_predicate(
     field: str,
     value: object,
     scope: Any,
@@ -426,8 +426,17 @@ def _logical_reaction_mapped_structure_predicate(
             reaction_from_smarts(cast(CString, sql_cast(reaction_smarts, CString)))
         )
     structure_predicates.append(structure_predicate)
-    mapped_structure_ids = _logical_reaction_ids_for_mapped_match(scope, structure_predicate)
-    return col(LogicalReaction.id).in_(mapped_structure_ids)
+    return structure_predicate
+
+
+def _logical_reaction_mapped_structure_predicate(
+    field: str,
+    value: object,
+    scope: Any,
+    structure_predicates: list[Any],
+) -> Any:
+    match = _reaction_structure_predicate(field, value, scope, structure_predicates)
+    return col(LogicalReaction.id).in_(_logical_reaction_ids_for_mapped_match(scope, match))
 
 
 def _reaction_topology_side_signature(
@@ -721,11 +730,85 @@ def _logical_reaction_query_leaf_predicate(
     raise AssertionError(f"unhandled logical reaction query field: {field_name}")
 
 
+def _mapped_profile_query_leaf_predicate(
+    field: object,
+    value: object,
+    scope: Any,
+    structure_predicates: list[Any],
+) -> Any:
+    """Keep every expression leaf on the current mapping/profile export row."""
+
+    if isinstance(field, str) and field in {
+        "smarts",
+        "reactant_smarts",
+        "product_smarts",
+        "reaction_smarts",
+        "rxn_smarts",
+        "reactant_mol_block",
+        "product_mol_block",
+    }:
+        return _reaction_structure_predicate(str(field), value, scope, structure_predicates)
+    # Reuse the public expression's validation and retain logical identity fields
+    # (reaction_key/hash/class and mapping counts) as metadata of this mapping.
+    logical_predicate = _logical_reaction_query_leaf_predicate(
+        field, value, scope, structure_predicates
+    )
+    profile = MappedReactionThermodynamicProfile
+    if isinstance(field, str) and field.startswith(("minimum_", "maximum_")):
+        energy_columns = {
+            "activation_gibbs_free_energy_kcal_mol": profile.activation_gibbs_free_energy_kcal_mol,
+            "reaction_gibbs_free_energy_kcal_mol": profile.reaction_gibbs_free_energy_kcal_mol,
+        }
+        energy_column = energy_columns.get(field.split("_", 1)[1])
+        if energy_column is not None:
+            comparison = (
+                col(energy_column) >= float(str(value))
+                if field.startswith("minimum_")
+                else col(energy_column) <= float(str(value))
+            )
+            return func.coalesce(comparison, False)
+    if field in {"has_activation_gibbs_free_energy", "has_reaction_gibbs_free_energy"}:
+        energy_column = (
+            profile.activation_gibbs_free_energy_kcal_mol
+            if field == "has_activation_gibbs_free_energy"
+            else profile.reaction_gibbs_free_energy_kcal_mol
+        )
+        return col(energy_column).is_not(None) if value else col(energy_column).is_(None)
+    if field == "topology_id":
+        mapped_ids = (
+            select(col(MappedReactionParticipant.mapped_reaction_id))
+            .join(LogicalReactionParticipant)
+            .where(
+                or_(
+                    col(MappedReactionParticipant.concrete_topology_id) == UUID(str(value)),
+                    col(LogicalReactionParticipant.topology_id) == UUID(str(value)),
+                )
+            )
+        )
+        return col(MappedReaction.id).in_(mapped_ids)
+    if field == "label":
+        return col(MappedReaction.label) == value
+    if field in {"created_after", "created_before"}:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return (
+            col(MappedReaction.created_at) >= parsed
+            if field == "created_after"
+            else col(MappedReaction.created_at) <= parsed
+        )
+    if field in FALLBACK_FILTERS:
+        return fallback_predicate(str(field), mapped=True) == value
+    return col(MappedReaction.logical_reaction_id).in_(
+        select(col(LogicalReaction.id)).where(logical_predicate).correlate(None)
+    )
+
+
 def _logical_reaction_query_expression_predicate(
     node: object,
     scope: Any,
     structure_predicates: list[Any],
     depth: int = 0,
+    *,
+    mapped_profile: bool = False,
 ) -> Any:
     if depth > 12:
         raise ValueError("logical reaction query expression is too deeply nested")
@@ -744,6 +827,7 @@ def _logical_reaction_query_expression_predicate(
                 scope,
                 structure_predicates,
                 depth + 1,
+                mapped_profile=mapped_profile,
             )
             for child in children
         ]
@@ -754,7 +838,12 @@ def _logical_reaction_query_expression_predicate(
         return not_(predicates[0])
     if "field" not in node or "value" not in node:
         raise ValueError("leaf nodes require field and value")
-    predicate = _logical_reaction_query_leaf_predicate(
+    leaf_predicate = (
+        _mapped_profile_query_leaf_predicate
+        if mapped_profile
+        else _logical_reaction_query_leaf_predicate
+    )
+    predicate = leaf_predicate(
         node.get("field"),
         node.get("value"),
         scope,
@@ -771,6 +860,8 @@ def logical_reaction_filter_expression_predicate(
     filter_expression: str,
     scope: Any,
     structure_predicates: list[Any],
+    *,
+    mapped_profile: bool = False,
 ) -> Any:
     """Parse one public filter expression with the logical-reaction query rules."""
 
@@ -784,6 +875,7 @@ def logical_reaction_filter_expression_predicate(
         expression,
         scope,
         structure_predicates,
+        mapped_profile=mapped_profile,
     )
 
 
@@ -3954,6 +4046,30 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
                 .scalars()
                 .all()
             )
+            transition_state_mapped_reaction_ids = (
+                (
+                    await session.execute(
+                        select(col(MappedReactionNode.mapped_reaction_id))
+                        .join(
+                            MappedReactionNodeGeometry,
+                            col(MappedReactionNodeGeometry.mapped_reaction_node_id)
+                            == col(MappedReactionNode.id),
+                        )
+                        .where(
+                            col(MappedReactionNodeGeometry.geometry_id) == frame.geometry_id,
+                            col(MappedReactionNode.role) == "transition_state",
+                            mapped_reaction_id_is_visible(
+                                scope,
+                                col(MappedReactionNode.mapped_reaction_id),
+                            ),
+                        )
+                        .distinct()
+                        .order_by(col(MappedReactionNode.mapped_reaction_id))
+                    )
+                )
+                .scalars()
+                .all()
+            )
 
         summary = _frame_summary(
             frame,
@@ -4049,6 +4165,7 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
                 if vibration is not None
                 else None
             ),
+            transition_state_mapped_reaction_ids=list(transition_state_mapped_reaction_ids),
             transition_state_endpoints=[
                 TransitionStateEndpointView(
                     direction=_enum_value(endpoint.direction),

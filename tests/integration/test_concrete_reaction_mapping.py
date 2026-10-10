@@ -3,6 +3,7 @@
 import os
 from hashlib import sha256
 from typing import Any
+from uuid import UUID, uuid4
 
 import numpy as np
 import pytest
@@ -19,6 +20,7 @@ from tricycle_reaction_db.application.dtos.reactions import (
     MappedReactionRecord,
 )
 from tricycle_reaction_db.application.services._persistence import (
+    LEGACY_BULK_IMPORT_SESSION_INFO_KEY,
     source_atom_order_authoritative,
 )
 from tricycle_reaction_db.application.services.canonical_reaction_identity import (
@@ -36,15 +38,20 @@ from tricycle_reaction_db.application.services.molecular_geometry import (
 from tricycle_reaction_db.application.services.molecular_geometry import (
     persist_molecular_topology as _persist_molecular_topology_impl,
 )
+from tricycle_reaction_db.application.services.molop_artifact_ingestion import (
+    reconcile_molop_geometry_context,
+)
 from tricycle_reaction_db.application.services.reaction_commands import (
     _create_reaction,
     _logicalize_components,
     _ResolvedComponent,
 )
 from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
+    ReconciliationBatchCache,
     ensure_transition_state_path,
     persist_mapped_reaction_node_geometry,
     resolve_endpoint_node,
+    share_mapped_reaction_evidence,
 )
 from tricycle_reaction_db.application.services.reaction_mapping_resolution import (
     ensure_mapped_reactions_for_concrete_topology,
@@ -73,16 +80,18 @@ from tricycle_reaction_db.db.models import (
     MappedReactionEdge,
     MappedReactionNode,
     MappedReactionNodeGeometry,
+    MappedReactionNodeGeometryMapping,
     MappedReactionParticipant,
     MolecularTopology,
     MolecularTopologyAbstraction,
+    Project,
 )
 from tricycle_reaction_db.domain.enums import (
     LogicalReactionParticipantSide,
     MappedReactionKind,
     MappedReactionNodeRole,
 )
-from tricycle_reaction_db.domain.identity import SYSTEM_PROJECT_ID
+from tricycle_reaction_db.domain.identity import DEVELOPMENT_USER_ID, SYSTEM_PROJECT_ID
 from tricycle_reaction_db.ingestion.normalization import (
     normalize_molecule,
     normalize_topology,
@@ -134,6 +143,8 @@ def _strict_stereo_topology(
 
 def _mapped_reaction_fixture(
     session: Session,
+    *,
+    backfill_existing_downstreams: bool = True,
 ) -> tuple[MolecularTopology, MolecularTopology, MolecularTopology, MappedReaction]:
     source = _strict_stereo_topology(
         session,
@@ -150,6 +161,7 @@ def _mapped_reaction_fixture(
         source,
         assigned_stereo_features(source.mol),
         context=GeometryPersistenceContext(project_id=SYSTEM_PROJECT_ID),
+        backfill_existing_downstreams=backfill_existing_downstreams,
     )
     session.flush()
 
@@ -282,20 +294,23 @@ def test_new_concrete_topology_gets_mapping_via_logical_graph() -> None:
         engine.dispose()
 
 
-def test_logical_reaction_expands_existing_concrete_members() -> None:
+@pytest.mark.parametrize("disconnected", [False, True])
+def test_logical_reaction_expands_existing_concrete_members(disconnected: bool) -> None:
     engine = create_engine(get_settings().database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
         with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
-            source, target, logical_topology, source_mapping = _mapped_reaction_fixture(session)
+            source, target, logical_topology, source_mapping = _mapped_reaction_fixture(
+                session, backfill_existing_downstreams=not disconnected
+            )
             target_edge = session.exec(
                 select(MolecularTopologyAbstraction).where(
                     MolecularTopologyAbstraction.specific_topology_id == target.id,
                     MolecularTopologyAbstraction.general_topology_id == logical_topology.id,
                 )
             ).first()
-            assert target_edge is not None
+            assert (target_edge is None) == disconnected
 
             created = ensure_mapped_reactions_for_logical_reaction(
                 session,
@@ -330,9 +345,134 @@ def test_logical_reaction_expands_existing_concrete_members() -> None:
         engine.dispose()
 
 
+@pytest.mark.parametrize("precursors_arrive_first", [False, True])
+@pytest.mark.parametrize("authority_mode", ["source_order", "legacy_bulk"])
+def test_source_order_import_materializes_three_observed_imine_configurations(
+    precursors_arrive_first: bool,
+    authority_mode: str,
+) -> None:
+    reaction_smiles = (
+        "[H:1][C:2]([H:3])=[C:4]([H:5])[H:6]."
+        "[H:7][O:8]/[N:9]=[C:10]([Cl:11])/[C:12]([Cl:13])=[N:14]/[O:15][H:16]>>"
+        "[H:1][C:2]1([H:3])[C:4]([H:5])([H:6])[N:14]([O:15][H:16])"
+        "[C:12]([Cl:13])=[C:10]([Cl:11])[N:9]1[O:8][H:7]"
+    )
+    precursor_smiles = (
+        "[H][O]/[N]=[C]([Cl])/[C]([Cl])=[N]/[O][H]",
+        "[H][O]/[N]=[C]([Cl])\\[C]([Cl])=[N]/[O][H]",
+        "[H][O]/[N]=[C]([Cl])\\[C]([Cl])=[N]\\[O][H]",
+    )
+    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    connection = engine.connect()
+    transaction = connection.begin()
+    try:
+        with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
+            parent = session.get(Project, SYSTEM_PROJECT_ID)
+            assert parent is not None
+            project = Project(
+                organization_id=parent.organization_id,
+                slug=f"imine-expansion-{uuid4().hex}",
+                name="Isolated imine expansion regression",
+                owner_user_id=DEVELOPMENT_USER_ID,
+                created_by_user_id=DEVELOPMENT_USER_ID,
+            )
+            session.add(project)
+            session.flush()
+            context = GeometryPersistenceContext(
+                project_id=project.id, source_atom_order_authoritative=True
+            )
+            observed_ids: set[UUID] = set()
+
+            def import_precursors() -> None:
+                for index, smiles in enumerate(precursor_smiles):
+                    molecule = Chem.AddHs(Chem.MolFromSmiles(smiles))
+                    coordinates = np.random.default_rng(42).normal(size=(molecule.GetNumAtoms(), 3))
+                    persisted = persist_molecular_geometry(
+                        session,
+                        normalize_molecule(
+                            molecule,
+                            coordinates + index * 0.1,
+                            charge=0,
+                            multiplicity=1,
+                            reconstruction_method="tests/observed-imine",
+                            reconstruction_version="1",
+                        ),
+                        context=context,
+                    )
+                    assert persisted.topology.id is not None
+                    observed_ids.add(persisted.topology.id)
+
+            if precursors_arrive_first:
+                import_precursors()
+                reconcile_molop_geometry_context(session, context, refresh_thermodynamics=False)
+            with source_atom_order_authoritative(session):
+                session.info[LEGACY_BULK_IMPORT_SESSION_INFO_KEY] = authority_mode == "legacy_bulk"
+                try:
+                    created = _create_reaction(
+                        session,
+                        CreateReactionCommand(reaction=reaction_smiles),
+                        topology_context=context,
+                    )
+                finally:
+                    session.info.pop(LEGACY_BULK_IMPORT_SESSION_INFO_KEY)
+            source = session.get(MappedReaction, created.mapped_reaction_id)
+            assert source is not None
+            assert any(
+                participant.topology.is_stereo_abstraction_upstream
+                for participant in source.logical_reaction.participants
+            )
+            source_smiles = source.mapped_reaction_smiles
+            source_maps = {p.id: list(p.atom_map_numbers) for p in source.participants}
+            reconcile_molop_geometry_context(session, context, refresh_thermodynamics=False)
+            if not precursors_arrive_first:
+                import_precursors()
+                reconcile_molop_geometry_context(session, context, refresh_thermodynamics=False)
+            mappings = session.exec(
+                select(MappedReaction).where(
+                    MappedReaction.logical_reaction_id == source.logical_reaction_id
+                )
+            ).all()
+            assert len(mappings) == 3
+            assert observed_ids == {
+                p.concrete_topology_id
+                for mapping in mappings
+                for p in mapping.participants
+                if p.side == LogicalReactionParticipantSide.REACTANT
+                and p.concrete_topology_id in observed_ids
+            }
+            assert source.mapped_reaction_smiles == source_smiles
+            assert {p.id: list(p.atom_map_numbers) for p in source.participants} == source_maps
+            assert (
+                ensure_mapped_reactions_for_logical_reaction(
+                    session, source.logical_reaction, refresh_thermodynamics=False
+                )
+                == ()
+            )
+            # The other authority mode must reuse both identities.
+            with source_atom_order_authoritative(session):
+                session.info[LEGACY_BULK_IMPORT_SESSION_INFO_KEY] = authority_mode == "source_order"
+                try:
+                    repeated = _create_reaction(
+                        session,
+                        CreateReactionCommand(reaction=reaction_smiles),
+                        topology_context=context,
+                    )
+                finally:
+                    session.info.pop(LEGACY_BULK_IMPORT_SESSION_INFO_KEY)
+            assert repeated.logical_reaction_id == source.logical_reaction_id
+            assert repeated.mapped_reaction_id == source.id
+            reconcile_molop_geometry_context(session, context, refresh_thermodynamics=False)
+    finally:
+        transaction.rollback()
+        connection.close()
+        engine.dispose()
+
+
+@pytest.mark.parametrize("source_authoritative", [False, True])
 @pytest.mark.parametrize("trusted_source_mapping", [False, True])
-def test_derived_stereoisomer_keeps_endpoints_without_borrowing_source_ts(
+def test_derived_stereoisomer_inherits_verified_source_ts_and_unchanged_endpoints(
     trusted_source_mapping: bool,
+    source_authoritative: bool,
 ) -> None:
     engine = create_engine(get_settings().database_url, pool_pre_ping=True)
     connection = engine.connect()
@@ -452,11 +592,54 @@ def test_derived_stereoisomer_keeps_endpoints_without_borrowing_source_ts(
                 ),
             )
 
-            ensure_mapped_reactions_for_concrete_topology(
-                session,
-                target,
-                refresh_thermodynamics=False,
-            )
+            if source_authoritative:
+                context = GeometryPersistenceContext(
+                    project_id=SYSTEM_PROJECT_ID,
+                    source_atom_order_authoritative=True,
+                )
+                context.logical_reactions_to_resolve_mappings[
+                    source_mapping.logical_reaction_id
+                ] = source_mapping.logical_reaction
+                context.reconciliation_cache = ReconciliationBatchCache()
+                context.reconciliation_cache.transition_state_sources_by_id[source_mapping.id] = (
+                    source_mapping
+                )
+                reconcile_molop_geometry_context(session, context, refresh_thermodynamics=False)
+                # A new source TS can arrive after the concrete siblings exist.
+                # Removing one inherited binding simulates that deferred source
+                # evidence and verifies that a barrier with no expansion work
+                # still restores it without changing the source atom maps.
+                inherited_binding = session.exec(
+                    select(MappedReactionNodeGeometry)
+                    .join(MappedReactionNode)
+                    .where(
+                        MappedReactionNode.mapped_reaction_id != source_mapping.id,
+                        MappedReactionNodeGeometry.geometry_id == ts_geometry.id,
+                        MappedReactionNode.role == MappedReactionNodeRole.TRANSITION_STATE,
+                    )
+                ).first()
+                if trusted_source_mapping:
+                    assert inherited_binding is not None
+                    session.delete(inherited_binding)
+                    session.flush()
+                    context.reconciliation_cache = ReconciliationBatchCache()
+                    context.reconciliation_cache.transition_state_sources_by_id[
+                        source_mapping.id
+                    ] = source_mapping
+                    reconcile_molop_geometry_context(session, context, refresh_thermodynamics=False)
+                preserved = session.exec(
+                    select(MappedReactionNodeGeometryMapping).where(
+                        MappedReactionNodeGeometryMapping.mapped_reaction_node_geometry_id
+                        == ts_binding.id
+                    )
+                ).one()
+                assert preserved.geometry_atom_map_numbers == atom_maps
+            else:
+                ensure_mapped_reactions_for_concrete_topology(
+                    session,
+                    target,
+                    refresh_thermodynamics=False,
+                )
             mappings = session.exec(
                 select(MappedReaction).where(
                     MappedReaction.logical_reaction_id == source_mapping.logical_reaction_id
@@ -480,11 +663,37 @@ def test_derived_stereoisomer_keeps_endpoints_without_borrowing_source_ts(
                     )
                 ).all()
                 assert len(edges) == 1
-                # A concrete stereoisomer does not have the source TS's inferred
-                # endpoints. Sharing a logical graph alone is not TS evidence,
-                # even when the source association uses the current policy.
-                expected = {ts_geometry.id} if mapping.id == source_mapping.id else set()
+                expected = (
+                    {ts_geometry.id}
+                    if trusted_source_mapping or mapping.id == source_mapping.id
+                    else set()
+                )
                 assert {binding.geometry_id for binding in ts_bindings} == expected
+                if trusted_source_mapping and mapping.id != source_mapping.id:
+                    original_binding_ids = {binding.id for binding in ts_bindings}
+                    share_mapped_reaction_evidence(
+                        session,
+                        source_mapped_reaction=source_mapping,
+                        target_mapped_reaction=mapping,
+                    )
+                    repeated_bindings = session.exec(
+                        select(MappedReactionNodeGeometry)
+                        .join(MappedReactionNode)
+                        .where(
+                            MappedReactionNode.mapped_reaction_id == mapping.id,
+                            MappedReactionNode.role == MappedReactionNodeRole.TRANSITION_STATE,
+                        )
+                    ).all()
+                    assert {binding.id for binding in repeated_bindings} == original_binding_ids
+                    for binding in repeated_bindings:
+                        inherited = session.exec(
+                            select(MappedReactionNodeGeometryMapping).where(
+                                MappedReactionNodeGeometryMapping.mapped_reaction_node_geometry_id
+                                == binding.id
+                            )
+                        ).one()
+                        assert inherited.verified
+                        assert inherited.mapping_version == REACTION_TS_GEOMETRY_LINK_POLICY_VERSION
 
             reactant_variant = next(
                 mapping

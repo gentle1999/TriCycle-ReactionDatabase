@@ -52,7 +52,11 @@ from tricycle_reaction_db.application.services.reaction_geometry_reconciliation 
     ReconciliationBatchCache,
 )
 from tricycle_reaction_db.core.config import Settings
-from tricycle_reaction_db.db.models import LogicalReaction, MappedReactionNodeGeometry
+from tricycle_reaction_db.db.models import (
+    LogicalReaction,
+    MappedReaction,
+    MappedReactionNodeGeometry,
+)
 from tricycle_reaction_db.domain.enums import (
     ArtifactKind,
 )
@@ -121,6 +125,8 @@ def test_inference_context_snapshot_restores_nested_reconciliation_cache_lists()
     cache.node_geometries_by_node[node_id] = [original_binding]
     cache.loaded_node_geometries.add(node_id)
     cache.new_mapped_reaction_ids.add(node_id)
+    original_source = MappedReaction(id=node_id, project_id=SYSTEM_PROJECT_ID)
+    cache.transition_state_sources_by_id[node_id] = original_source
 
     snapshot = _snapshot_inference_context(context)
     cache.node_geometries_by_node[node_id].append(
@@ -134,12 +140,16 @@ def test_inference_context_snapshot_restores_nested_reconciliation_cache_lists()
         )
     )
     cache.loaded_node_geometries.clear()
+    cache.transition_state_sources_by_id.clear()
+    failed_source_id = UUID(int=4)
+    cache.transition_state_sources_by_id[failed_source_id] = MappedReaction(id=failed_source_id)
 
     _restore_inference_context(context, snapshot)
 
     assert cache.node_geometries_by_node[node_id] == [original_binding]
     assert node_id in cache.loaded_node_geometries
     assert node_id in cache.new_mapped_reaction_ids
+    assert cache.transition_state_sources_by_id == {node_id: original_source}
 
 
 def test_inference_context_snapshot_does_not_copy_pure_topology_preparation_cache() -> None:

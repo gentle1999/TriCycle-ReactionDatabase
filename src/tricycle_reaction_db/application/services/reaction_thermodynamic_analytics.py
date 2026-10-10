@@ -24,16 +24,14 @@ from tricycle_reaction_db.application.services.mapped_reaction_thermodynamics im
 from tricycle_reaction_db.application.services.queries import (
     _enforce_candidate_limit,
     logical_reaction_filter_expression_predicate,
-    mapped_reaction_has_thermodynamic_profile,
 )
 from tricycle_reaction_db.application.services.query_visibility import (
-    logical_reaction_id_is_visible,
     mapped_reaction_id_is_visible,
     query_visibility_scope,
     thermodynamic_profile_is_visible,
 )
+from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
-    LogicalReaction,
     MappedReaction,
     MappedReactionThermodynamicProfile,
 )
@@ -63,6 +61,7 @@ _PROFILE_COLUMNS = (
     "activation_gibbs_free_energy_kcal_mol",
     "reaction_enthalpy_kcal_mol",
     "reaction_gibbs_free_energy_kcal_mol",
+    "mapped_reaction_url",
 )
 
 
@@ -84,14 +83,15 @@ async def _profile_predicate(
     ):
         return and_(mapped_visibility, profile_visibility)
 
-    logical_predicates: list[Any] = [logical_reaction_id_is_visible(scope, col(LogicalReaction.id))]
+    predicates: list[Any] = [mapped_visibility, profile_visibility]
     structure_predicates: list[Any] = []
     if filter_expression is not None:
-        logical_predicates.append(
+        predicates.append(
             logical_reaction_filter_expression_predicate(
                 filter_expression,
                 scope,
                 structure_predicates,
+                mapped_profile=True,
             )
         )
     for structure_predicate in structure_predicates:
@@ -104,26 +104,11 @@ async def _profile_predicate(
             session=session,
         )
 
-    if has_activation_gibbs_free_energy or has_reaction_gibbs_free_energy:
-        matching_mapped_ids = select(col(MappedReaction.logical_reaction_id)).where(
-            mapped_visibility
-        )
-        matching_mapped_ids = matching_mapped_ids.where(
-            mapped_reaction_has_thermodynamic_profile(
-                scope,
-                col(MappedReaction.id),
-                has_activation_gibbs_free_energy=bool(has_activation_gibbs_free_energy),
-                has_reaction_gibbs_free_energy=bool(has_reaction_gibbs_free_energy),
-            )
-        )
-        logical_predicates.append(col(LogicalReaction.id).in_(matching_mapped_ids))
-
-    matching_logical_ids = select(col(LogicalReaction.id)).where(*logical_predicates)
-    return and_(
-        mapped_visibility,
-        profile_visibility,
-        col(MappedReaction.logical_reaction_id).in_(matching_logical_ids),
-    )
+    if has_activation_gibbs_free_energy:
+        predicates.append(col(profile.activation_gibbs_free_energy_kcal_mol).is_not(None))
+    if has_reaction_gibbs_free_energy:
+        predicates.append(col(profile.reaction_gibbs_free_energy_kcal_mol).is_not(None))
+    return and_(*predicates)
 
 
 def _level_label(electronic_level: list[Any], thermochemistry_level: list[Any]) -> str:
@@ -360,6 +345,7 @@ class ReactionThermodynamicAnalyticsService:
         has_reaction_gibbs_free_energy: bool | None = None,
         limit: int | None = None,
         offset: int = 0,
+        frontend_base_url: str | None = None,
     ) -> AsyncIterator[str]:
         """Capture request visibility before response body streaming begins."""
 
@@ -378,6 +364,8 @@ class ReactionThermodynamicAnalyticsService:
             )
         return ReactionThermodynamicAnalyticsService._export_csv_rows(
             predicate,
+            project_id=project_id,
+            frontend_base_url=frontend_base_url or get_settings().oidc_frontend_url,
             limit=limit,
             offset=offset,
         )
@@ -386,6 +374,8 @@ class ReactionThermodynamicAnalyticsService:
     async def _export_csv_rows(
         predicate: Any,
         *,
+        project_id: UUID,
+        frontend_base_url: str,
         limit: int | None = None,
         offset: int = 0,
     ) -> AsyncIterator[str]:
@@ -500,6 +490,8 @@ class ReactionThermodynamicAnalyticsService:
                         activation_gibbs,
                         reaction_enthalpy,
                         reaction_gibbs,
+                        f"{frontend_base_url.rstrip('/')}/mapped-reactions/{mapped_id}"
+                        f"?project_id={project_id}",
                     ]
                 )
 

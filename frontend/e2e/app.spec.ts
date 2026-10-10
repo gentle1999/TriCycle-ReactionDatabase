@@ -454,7 +454,7 @@ test("reaction cards render paths and open mapped/frame detail", async ({ page }
   });
 
   await page.setViewportSize({ width: 1440, height: 960 });
-  await page.goto("/");
+  await page.goto("/?project_id=00000000-0000-7000-8000-000000000201");
   await expect(page.locator("#reaction-view-title")).toBeVisible();
   await expect(page.locator(".metrics-band > div")).toHaveCount(5);
   await expect(page.locator(".reaction-path-card").first()).toBeVisible();
@@ -634,13 +634,15 @@ test("TS frame detail interpolates persisted signed mode anchors", async ({ page
   });
 
   await page.setViewportSize({ width: 1440, height: 960 });
-  await page.goto("/");
+  await page.goto("/?project_id=00000000-0000-7000-8000-000000000201");
   const reactionCard = page.locator(".reaction-path-card").first();
   await reactionCard.locator(".reaction-card-direct-link").click();
   await expect(page).toHaveURL(/\/reactions\/[0-9a-f-]+/);
   const mappingCard = page.locator(".mapped-summary-card").first();
   await mappingCard.locator("summary").click();
   await mappingCard.getByRole("link", { name: "打开映射反应详情" }).click();
+  await expect(page).toHaveURL(/\/mapped-reactions\/[0-9a-f-]+/);
+  const mappedReactionUrl = new URL(page.url());
   const expansion = page.locator(".mapped-reaction-expansion");
   await expect(expansion).toBeVisible();
   const transitionStateStep = expansion.locator(".node-step").filter({ hasText: "过渡态" });
@@ -662,6 +664,12 @@ test("TS frame detail interpolates persisted signed mode anchors", async ({ page
     await expect(page.getByRole("heading", { name: "帧详情" })).toHaveCount(0);
   }
   expect(openedModeFrame).toBe(true);
+  const mappedReactionLink = page.locator(".detail-drawer .frame-resource-links")
+    .getByRole("link", { name: `查看 TS 所属映射反应 ${mappedReactionUrl.pathname.split("/").at(-1)}` });
+  await expect(mappedReactionLink).toHaveAttribute(
+    "href",
+    `${mappedReactionUrl.pathname}${mappedReactionUrl.search}`,
+  );
   await expect(modeRenderer).toBeVisible();
   const dofModeRenderer = page.locator('[data-renderer="rdkit-dof-ts-mode"]');
   await expect(dofModeRenderer).toBeVisible();
@@ -698,6 +706,9 @@ test("TS frame detail interpolates persisted signed mode anchors", async ({ page
   await forceWebGlRecovery(modeRenderer);
   expect(await webGlCanvasHasDrawing(modeRenderer)).toBe(true);
   expect(runtimeErrors).toEqual([]);
+  await mappedReactionLink.click();
+  await expect(page.getByRole("heading", { name: "帧详情" })).toHaveCount(0);
+  await expect(page).toHaveURL(mappedReactionUrl.href);
 });
 
 test("artifact deep link keeps its visible filter in the sidebar", async ({ page }) => {
