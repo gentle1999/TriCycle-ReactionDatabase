@@ -22,8 +22,13 @@ from tricycle_reaction_db.application.services._persistence import (
     _flush_new_entity,
     _new_entity,
     _require_id,
+    source_atom_mapping_is_authoritative,
+)
+from tricycle_reaction_db.application.services.canonical_atom_mapping import (
+    canonical_atom_index_mapping,
 )
 from tricycle_reaction_db.application.services.topology_abstraction import (
+    find_stereo_abstraction_match,
     find_topology_matches,
     specialized_topologies,
     topology_abstraction_mapping_witness,
@@ -168,6 +173,7 @@ def _match_metadata(
     matches: tuple[tuple[int, ...], ...],
     *,
     all_mappings_enumerated: bool = True,
+    match_method: str | None = None,
 ) -> dict[str, Any]:
     return {
         "match_schema_version": LOGICAL_PARTICIPANT_CONCRETE_MATCH_SCHEMA_VERSION,
@@ -187,8 +193,40 @@ def _match_metadata(
             list(matches[0]) if matches and not all_mappings_enumerated else None
         ),
         "all_candidate_mappings_enumerated": all_mappings_enumerated,
-        "match_method": "stereo_abstraction_dag" if not all_mappings_enumerated else "graph_match",
+        "match_method": match_method
+        or ("stereo_abstraction_dag" if not all_mappings_enumerated else "graph_match"),
     }
+
+
+def _topology_mapping_evidence(
+    session: Session,
+    concrete_topology: MolecularTopology,
+    logical_topology: MolecularTopology,
+) -> tuple[tuple[tuple[int, ...], ...], bool, str]:
+    """Reuse verified atom correspondence without searching source-import graphs.
+
+    A canonical witness is one validated correspondence, not an enumeration
+    of symmetry-equivalent matches or a replacement for source atom labels.
+    """
+
+    dag_mapping = topology_abstraction_mapping_witness(session, concrete_topology, logical_topology)
+    if dag_mapping is not None:
+        return (dag_mapping,), False, "stereo_abstraction_dag"
+    if source_atom_mapping_is_authoritative(session):
+        canonical_mapping = canonical_atom_index_mapping(
+            logical_topology.mol, concrete_topology.mol
+        )
+        if canonical_mapping is not None:
+            return (canonical_mapping,), False, "canonical_atom_order"
+        abstraction = find_stereo_abstraction_match(concrete_topology.mol, logical_topology.mol)
+        if abstraction is not None:
+            return (abstraction.general_to_specific_atom_indices,), False, "canonical_abstraction"
+        return (), False, "canonical_atom_order"
+    return (
+        find_topology_matches(concrete_topology.mol, logical_topology.mol),
+        True,
+        "graph_match",
+    )
 
 
 def _find_pending_membership(
@@ -252,16 +290,8 @@ def persist_logical_participant_concrete_topology(
         raise ConcreteTopologyMembershipError(
             "concrete topology differs in formula, atom count, or formal charge"
         )
-    dag_mapping = topology_abstraction_mapping_witness(
-        session,
-        concrete_topology,
-        logical_topology,
-    )
-    all_mappings_enumerated = dag_mapping is None
-    matches = (
-        find_topology_matches(concrete_topology.mol, logical_topology.mol)
-        if dag_mapping is None
-        else (dag_mapping,)
+    matches, all_mappings_enumerated, match_method = _topology_mapping_evidence(
+        session, concrete_topology, logical_topology
     )
     if not matches:
         raise ConcreteTopologyMembershipError(
@@ -300,6 +330,7 @@ def persist_logical_participant_concrete_topology(
         concrete_topology,
         matches,
         all_mappings_enumerated=all_mappings_enumerated,
+        match_method=match_method,
     )
     if match_metadata:
         metadata["caller_metadata"] = dict(match_metadata)
@@ -512,15 +543,8 @@ def logical_participant_matches_for_concrete_topology(
             str(_require_id(item, label="LogicalReactionParticipant")),
         ),
     ):
-        dag_mapping = topology_abstraction_mapping_witness(
-            session,
-            concrete_topology,
-            participant.topology,
-        )
-        topology_matches = (
-            find_topology_matches(concrete_topology.mol, participant.topology.mol)
-            if dag_mapping is None
-            else (dag_mapping,)
+        topology_matches, _all_enumerated, _method = _topology_mapping_evidence(
+            session, concrete_topology, participant.topology
         )
         if topology_matches:
             matches.append((participant, topology_matches))

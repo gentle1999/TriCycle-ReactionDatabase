@@ -350,7 +350,19 @@ def test_logical_reaction_expands_existing_concrete_members(disconnected: bool) 
 def test_source_order_import_materializes_three_observed_imine_configurations(
     precursors_arrive_first: bool,
     authority_mode: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from tricycle_reaction_db.application.services import (
+        rdkit_graph_matching,
+        topology_abstraction,
+        topology_compatibility,
+    )
+
+    def forbidden_graph_search(*_args, **_kwargs):
+        raise AssertionError("source imports must never search RDKit graph matches")
+
+    for module in (rdkit_graph_matching, topology_abstraction, topology_compatibility):
+        monkeypatch.setattr(module, "get_substruct_matches", forbidden_graph_search)
     reaction_smiles = (
         "[H:1][C:2]([H:3])=[C:4]([H:5])[H:6]."
         "[H:7][O:8]/[N:9]=[C:10]([Cl:11])/[C:12]([Cl:13])=[N:14]/[O:15][H:16]>>"
@@ -473,6 +485,7 @@ def test_source_order_import_materializes_three_observed_imine_configurations(
 def test_derived_stereoisomer_inherits_verified_source_ts_and_unchanged_endpoints(
     trusted_source_mapping: bool,
     source_authoritative: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine = create_engine(get_settings().database_url, pool_pre_ping=True)
     connection = engine.connect()
@@ -593,6 +606,17 @@ def test_derived_stereoisomer_inherits_verified_source_ts_and_unchanged_endpoint
             )
 
             if source_authoritative:
+                from tricycle_reaction_db.application.services import (
+                    rdkit_graph_matching,
+                    topology_abstraction,
+                    topology_compatibility,
+                )
+
+                def forbidden_graph_search(*_args, **_kwargs):
+                    raise AssertionError("TS inheritance must not search RDKit graph matches")
+
+                for module in (rdkit_graph_matching, topology_abstraction, topology_compatibility):
+                    monkeypatch.setattr(module, "get_substruct_matches", forbidden_graph_search)
                 context = GeometryPersistenceContext(
                     project_id=SYSTEM_PROJECT_ID,
                     source_atom_order_authoritative=True,

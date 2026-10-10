@@ -293,6 +293,14 @@ creates an `UploadBatch`, and stages verified raw objects in RustFS. The CLI
 does not run MolOP; the independent `upload-worker` claims the staged items and
 uses the same shared parser and persistence path as remote uploads.
 
+Imports with authoritative source atom order must not call RDKit full-graph or
+substructure searches during reconciliation, concrete reaction expansion, or TS
+evidence inheritance. Reuse verified stereo-abstraction DAG mappings first;
+otherwise validate canonical atom correspondence and retained stereo atom by
+atom and bond by bond. This derived witness neither enumerates symmetric
+matches nor replaces source labels. Fully explicit-H graphs with the same
+actual implicit H counts remain compatible despite different `NoImplicit` flags.
+
 ### Unified file-upload sequence and data flow
 
 The sequence below covers remote single-file uploads, remote batches, the local

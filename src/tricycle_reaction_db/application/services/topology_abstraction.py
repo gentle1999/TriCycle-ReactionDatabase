@@ -431,13 +431,16 @@ def _stereo_abstraction_match_for_known_atom_mapping(
     for general_index, specific_index in enumerate(general_to_specific_atom_indices):
         general_atom = general.GetAtomWithIdx(general_index)
         specific_atom = specific.GetAtomWithIdx(specific_index)
+        # Fully explicit-H source graphs can retain different NoImplicit
+        # parser flags while describing the same atom inventory. Validate
+        # actual implicit H counts, not that serialization-control flag.
         general_signature = (
             general_atom.GetAtomicNum(),
             general_atom.GetIsotope(),
             general_atom.GetFormalCharge(),
             general_atom.GetNumRadicalElectrons(),
             general_atom.GetNumExplicitHs(),
-            general_atom.GetNoImplicit(),
+            general_atom.GetNumImplicitHs(),
             general_atom.GetIsAromatic(),
         )
         specific_signature = (
@@ -446,7 +449,7 @@ def _stereo_abstraction_match_for_known_atom_mapping(
             specific_atom.GetFormalCharge(),
             specific_atom.GetNumRadicalElectrons(),
             specific_atom.GetNumExplicitHs(),
-            specific_atom.GetNoImplicit(),
+            specific_atom.GetNumImplicitHs(),
             specific_atom.GetIsAromatic(),
         )
         if general_signature != specific_signature:
