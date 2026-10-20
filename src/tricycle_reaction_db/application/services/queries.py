@@ -1223,6 +1223,10 @@ def _frame_select(*, lightweight: bool = False) -> Any:
                 frame_orm.frequency_count,
                 frame_orm.negative_frequency_count,
                 frame_orm.running_time_seconds,
+                frame_orm.wall_time_seconds,
+                frame_orm.cpu_time_seconds,
+                frame_orm.cpu_time_source,
+                frame_orm.cpu_time_num_processes,
             ),
             load_only(
                 segment_orm.id,

@@ -115,7 +115,11 @@ def test_da_bench_seed_is_idempotent_across_postgres_and_rustfs(tmp_path: Path) 
                     "transition_state": 23,
                     "product": 10,
                 }
-                assert sum(first.array_counts.values()) == 227
+                manifest = json.loads((fixture_root / "manifest.json").read_text(encoding="utf-8"))
+                assert first.array_counts == manifest["expected_array_counts"]
+                assert (
+                    sum(first.array_counts.values()) == manifest["expected_molop_totals"]["arrays"]
+                )
                 assert set(first.node_ids) == {"reactants", "transition-state", "product"}
                 mapped_reaction = session.get(MappedReaction, first.mapped_reaction_id)
                 assert mapped_reaction is not None

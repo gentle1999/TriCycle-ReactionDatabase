@@ -241,6 +241,11 @@ def _create_domain_sample(session: Session) -> tuple[Any, ...]:
         frequency_count=1,
         negative_frequency_count=1,
         lowest_frequency_cm1=-100.0,
+        running_time_seconds=12.5,
+        wall_time_seconds=12.5,
+        cpu_time_seconds=48.0,
+        cpu_time_source="observed",
+        cpu_time_num_processes=4,
     )
     session.add(frame)
     session.flush()
@@ -623,6 +628,13 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         )
         assert frame_page.page.total == 1
         assert [item.id for item in frame_page.items] == [frame.id]
+        # List summaries are serialized after the query session is closed.
+        # Every new clock/provenance field must be in the lightweight projection.
+        summary = frame_page.items[0]
+        assert summary.running_time_seconds == summary.wall_time_seconds == 12.5
+        assert summary.cpu_time_seconds == 48.0
+        assert summary.cpu_time_source == "observed"
+        assert summary.cpu_time_num_processes == 4
 
         array_page = asyncio.run(
             ScientificArrayQueryService.list_scientific_arrays(

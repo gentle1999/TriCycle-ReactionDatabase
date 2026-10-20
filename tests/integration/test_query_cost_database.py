@@ -122,6 +122,9 @@ def test_representative_query_plans_execute_with_buffers_and_expected_indexes() 
         "geometry topology": {
             "ix_geometry_topology_id",
             "ix_geometry_match_candidates",
+            # PostgreSQL can use the project-scoped composite index for
+            # this topology predicate too, especially on small fixtures.
+            "ix_geometry_project_match_candidates",
         },
         "frame topology derivation": {"ix_calculation_frame_topology_derivation_id"},
         "artifact filename contains": {"ix_artifact_file_original_filename_trgm"},

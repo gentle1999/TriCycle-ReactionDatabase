@@ -70,8 +70,8 @@ dev = [
 packages = ["src/tricycle_reaction_db"]
 
 [tool.uv]
-# Security floor for botocore's transitive HTTP dependency.
-constraint-dependencies = ["urllib3>=2.8,<3"]
+# Security floors for botocore's HTTP dependency and FastMCP's MCP SDK.
+constraint-dependencies = ["urllib3>=2.8,<3", "mcp>=1.30,<2"]
 # Keep the uv package cache inside the repository so `uv run` works in
 # environments where the user cache directory (~/.cache/uv) is not writable
 # (for example sandboxed developer shells).  Path is relative to this file.
