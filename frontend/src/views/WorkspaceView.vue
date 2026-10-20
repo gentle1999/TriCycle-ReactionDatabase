@@ -361,6 +361,8 @@ function jumpArtifactPage(offset: number): void { setArtifactPage(offset); }
       :querying="querying"
       :project-id="currentProjectId"
       :total="reactionPage.total"
+      :mapped-reaction-total="queries.reactionTotals.data.value?.mapped_reaction_total ?? undefined"
+      :transition-state-total="queries.reactionTotals.data.value?.transition_state_total ?? undefined"
       :page="reactionPage"
       :page-size="reactionPageSize"
       :query-filters="reactionFilters"

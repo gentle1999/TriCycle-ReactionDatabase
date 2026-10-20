@@ -219,16 +219,15 @@ async function mockReactionCatalog(page: Page, total: number): Promise<void> {
   }));
   await page.route("**/api/logical-reactions?*", async (route) => {
     const url = new URL(route.request().url());
-    if (url.searchParams.get("limit") !== "12") {
-      await route.continue();
-      return;
-    }
+    const limit = Number(url.searchParams.get("limit") ?? "12");
     const offset = Number(url.searchParams.get("offset") ?? "0");
     await route.fulfill({
       contentType: "application/json",
       body: JSON.stringify({
-        items: fixtures.slice(offset, offset + 12),
-        page: { total, limit: 12, offset },
+        items: url.searchParams.get("totals_only") === "true" ? [] : fixtures.slice(offset, offset + limit),
+        page: { total, limit, offset },
+        mapped_reaction_total: total * 2,
+        transition_state_total: total * 3,
       }),
     });
   });
@@ -1015,6 +1014,10 @@ test("catalog pagination jumps directly to a requested page", async ({ page }) =
   await mockReactionCatalog(page, 24);
   await page.goto("/");
   await expect(page.locator(".reaction-path-card").first()).toBeVisible();
+  const summary = page.getByLabel("筛选后数量统计");
+  await expect(summary).toContainText("24个逻辑反应");
+  await expect(summary).toContainText("48个映射反应");
+  await expect(summary).toContainText("72个 TS");
   await expect(page.getByRole("spinbutton", { name: "页码" }).first()).toHaveValue("1");
 
   await page.getByRole("spinbutton", { name: "页码" }).first().fill("2");
@@ -1022,6 +1025,8 @@ test("catalog pagination jumps directly to a requested page", async ({ page }) =
   await page.getByRole("button", { name: "跳转" }).first().click();
   await pageChangePromise;
   await expect(page.getByRole("heading", { name: "E2E catalog reaction 13" })).toBeVisible();
+  await expect(summary).toContainText("48个映射反应");
+  await expect(summary).toContainText("72个 TS");
   await expect(page.getByRole("spinbutton", { name: "页码" }).first()).toHaveValue("2");
   await expect(page.getByRole("spinbutton", { name: "页码" }).nth(1)).toHaveValue("2");
   await expect(page.getByRole("button", { name: "首页" }).first()).toBeEnabled();
@@ -1072,6 +1077,9 @@ test("catalog page size settings enforce view-specific maximums", async ({ page 
   });
   const reactions = Array.from({ length: 20 }, (_, index) => reactionFixture(index + 1));
   const reactionLimits: number[] = [];
+  let totalsRequestCount = 0;
+  let releaseTotals!: () => void;
+  const totalsGate = new Promise<void>((resolve) => { releaseTotals = resolve; });
   await page.route("**/api/auth/me", async (route) => {
     await route.fulfill({
       contentType: "application/json",
@@ -1100,16 +1108,29 @@ test("catalog page size settings enforce view-specific maximums", async ({ page 
     const limit = Number(url.searchParams.get("limit") ?? "0");
     const offset = Number(url.searchParams.get("offset") ?? "0");
     reactionLimits.push(limit);
+    const totalsOnly = url.searchParams.get("totals_only") === "true";
+    if (totalsOnly && ++totalsRequestCount === 1) await totalsGate;
+    const matches = url.searchParams.get("has_activation_gibbs_free_energy") === "true"
+      ? reactions.slice(0, 2) : reactions;
     await route.fulfill({
       contentType: "application/json",
       body: JSON.stringify({
-        items: reactions.slice(offset, offset + limit),
-        page: { total: reactions.length, limit, offset },
+        items: totalsOnly ? [] : matches.slice(offset, offset + limit),
+        page: { total: matches.length, limit, offset },
+        mapped_reaction_total: totalsOnly ? matches.length * 2 : null,
+        transition_state_total: totalsOnly ? matches.length * 3 : null,
       }),
     });
   });
 
   await page.goto(`/reactions?project_id=${projectId}`);
+  const summary = page.getByLabel("筛选后数量统计");
+  await expect(page.locator(".reaction-path-card")).toHaveCount(12);
+  await expect(summary).toContainText("—个映射反应");
+  releaseTotals();
+  await expect(summary).toContainText("20个逻辑反应");
+  await expect(summary).toContainText("40个映射反应");
+  await expect(summary).toContainText("60个 TS");
   const reactionPageSize = page.getByRole("spinbutton", { name: "每页数量" }).first();
   await expect(reactionPageSize).toHaveAttribute("max", "12");
   await expect(reactionPageSize).toHaveValue("12");
@@ -1120,6 +1141,23 @@ test("catalog page size settings enforce view-specific maximums", async ({ page 
   await reactionPageSize.press("Enter");
   await expect.poll(() => reactionLimits).toContain(6);
   await expect(page.locator(".reaction-path-card")).toHaveCount(6);
+  await page.getByRole("button", { name: "下一页" }).first().click();
+  await expect(page.getByRole("heading", { name: "Page size reaction 7", exact: true })).toBeVisible();
+  await expect(summary).toContainText("20个逻辑反应");
+  await expect(summary).toContainText("40个映射反应");
+  await expect(summary).toContainText("60个 TS");
+
+  expect(totalsRequestCount).toBe(1);
+  const activationFilter = page.getByRole("checkbox", { name: "仅显示含有活化自由能的反应路径" });
+  await activationFilter.check();
+  await expect(summary).toContainText("2个逻辑反应");
+  await expect(summary).toContainText("4个映射反应");
+  await expect(summary).toContainText("6个 TS");
+  expect(totalsRequestCount).toBe(2);
+  await activationFilter.uncheck();
+  await expect(summary).toContainText("40个映射反应");
+  await expect(summary).toContainText("60个 TS");
+  expect(totalsRequestCount).toBe(2);
 
   const artifacts = [{
     id: "00000000-0000-7000-8000-000000000301",
@@ -1160,6 +1198,27 @@ test("catalog page size settings enforce view-specific maximums", async ({ page 
   await artifactPageSize.press("Enter");
   await expect(artifactPageSize).toHaveValue("500");
   await expect.poll(() => artifactLimits).toContain(500);
+
+  const geometryExpressions: Array<{ conditions: Array<{ field: string; value: string }> }> = [];
+  await page.route("**/api/geometry_query_service/list_geometries", async (route) => {
+    const payload = route.request().postDataJSON() as { filter_expression?: string; limit: number; offset: number };
+    if (payload.filter_expression) geometryExpressions.push(JSON.parse(payload.filter_expression));
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ items: [], page: { total: 0, limit: payload.limit, offset: payload.offset } }),
+    });
+  });
+  await page.goto(`/geometries?project_id=${projectId}`);
+  await page.getByRole("button", { name: "高级查询", exact: true }).click();
+  const geometryDialog = page.getByRole("dialog", { name: "高级查询" });
+  await geometryDialog.locator('select[id^="advanced-query-field-"]').selectOption("imaginary_frequency_status");
+  await geometryDialog.getByRole("combobox", { name: "虚频状态条件" }).selectOption({ label: "过渡态" });
+  await geometryDialog.getByRole("button", { name: "应用高级查询" }).click();
+  await expect.poll(() => geometryExpressions.at(-1)?.conditions).toEqual([
+    { field: "imaginary_frequency_status", value: "transition_state" },
+  ]);
+  await expect(page.locator(".advanced-query-active")).toContainText("1 个条件");
+
 });
 
 test("mapped reaction shows every partial thermodynamic profile and level", async ({ page }, testInfo) => {

@@ -382,6 +382,7 @@ watch(
                   <option value="true">仅有热力学属性</option>
                 </select>
                 <select v-else-if="fieldKind(condition) === 'status'" v-model="condition.value" aria-label="虚频状态条件">
+                  <option value="transition_state">过渡态</option>
                   <option value="present">包含虚频</option>
                   <option value="absent">无虚频</option>
                   <option value="unavailable">未提供频率</option>

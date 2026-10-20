@@ -64,6 +64,11 @@ export interface LogicalReactionSummary {
   maximum_reaction_gibbs_free_energy_kcal_mol: number | null;
 }
 
+export interface LogicalReactionPage extends Page<LogicalReactionSummary> {
+  mapped_reaction_total: number | null;
+  transition_state_total: number | null;
+}
+
 export interface LogicalReactionParticipant {
   id: string;
   side: "reactant" | "product" | string;

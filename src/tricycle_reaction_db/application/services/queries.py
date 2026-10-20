@@ -526,6 +526,60 @@ def _mapped_reaction_count_expression(scope: Any) -> Any:
     )
 
 
+def _logical_reaction_totals_statement(scope: Any, predicates: Sequence[Any]) -> Any:
+    """Aggregate all children of matched paths without per-geometry visibility probes."""
+
+    matched_logical_ids = (
+        select(col(LogicalReaction.id)).where(*predicates).cte("matched_logical_ids")
+    )
+    matched_mapped_ids = (
+        select(col(MappedReaction.id))
+        .where(
+            col(MappedReaction.logical_reaction_id).in_(select(matched_logical_ids.c.id)),
+            (
+                col(MappedReaction.project_id) == scope.requested_project_id
+                if scope.uses_project_owned_fast_path
+                else mapped_reaction_id_is_visible(scope, col(MappedReaction.id))
+            ),
+        )
+        .cte("matched_mapped_ids")
+    )
+    transition_state_count = (
+        select(func.count())
+        .select_from(MappedReactionNodeGeometry)
+        .join(
+            MappedReactionNode,
+            col(MappedReactionNodeGeometry.mapped_reaction_node_id) == col(MappedReactionNode.id),
+        )
+        .where(
+            col(MappedReactionNode.mapped_reaction_id).in_(select(matched_mapped_ids.c.id)),
+            col(MappedReactionNode.role) == "transition_state",
+            geometry_has_thermodynamic_property_predicate(
+                col(MappedReactionNodeGeometry.geometry_id)
+            ),
+        )
+    )
+    if scope.uses_project_owned_fast_path:
+        # The authorized mapped rows and the project-boundary guards from
+        # migrations 0035--0037 already prove that each bound Geometry,
+        # topology and formula has this immutable project owner. Only catalog
+        # membership still needs checking here; re-reading those wide tables
+        # for every TS would repeat the same ownership proof 90,000 times.
+        transition_state_count = transition_state_count.join(
+            ProjectGeometryCatalog,
+            col(ProjectGeometryCatalog.geometry_id) == col(MappedReactionNodeGeometry.geometry_id),
+        ).where(col(ProjectGeometryCatalog.project_id) == scope.requested_project_id)
+    else:
+        transition_state_count = transition_state_count.where(
+            geometry_id_is_visible(scope, col(MappedReactionNodeGeometry.geometry_id))
+        )
+    return select(
+        select(func.count()).select_from(matched_logical_ids).scalar_subquery(),
+        select(func.count()).select_from(matched_mapped_ids).scalar_subquery(),
+        transition_state_count.scalar_subquery(),
+    )
+
+
 def mapped_reaction_has_thermodynamic_profile(
     scope: Any,
     mapped_reaction_id: Any,
@@ -2105,6 +2159,8 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
         filter_expression: str | None = None,
         sort_by: str = "default",
         sort_direction: str = "asc",
+        include_totals: bool = True,
+        totals_only: bool = False,
     ) -> LogicalReactionPage:
         """List logical paths, matching reaction structures on mapped reactions first.
 
@@ -2386,13 +2442,24 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                     label="reaction structure query",
                     session=session,
                 )
-            total = int(
-                (
+            mapped_reaction_total = transition_state_total = None
+            if include_totals or totals_only:
+                total, mapped_reaction_total, transition_state_total = (
+                    await session.execute(_logical_reaction_totals_statement(scope, predicates))
+                ).one()
+            else:
+                total = (
                     await session.execute(
                         select(func.count()).select_from(LogicalReaction).where(*predicates)
                     )
                 ).scalar_one()
-            )
+            if totals_only:
+                return LogicalReactionPage(
+                    items=[],
+                    page=PageInfo(total=int(total), limit=limit, offset=offset),
+                    mapped_reaction_total=mapped_reaction_total,
+                    transition_state_total=transition_state_total,
+                )
             if similarity_rank is not None and sort_by in {"default", "similarity"}:
                 reaction_statement = (
                     select(LogicalReaction, similarity_rank.c.similarity_score)
@@ -2653,7 +2720,9 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
                 )
                 for reaction in reactions
             ],
-            page=PageInfo(total=total, limit=limit, offset=offset),
+            page=PageInfo(total=int(total), limit=limit, offset=offset),
+            mapped_reaction_total=mapped_reaction_total,
+            transition_state_total=transition_state_total,
         )
 
         return await annotate_reaction_compatibility(result)

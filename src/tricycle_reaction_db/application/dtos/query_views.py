@@ -267,6 +267,10 @@ class LogicalReactionSummary(QueryView):
 class LogicalReactionPage(QueryView):
     items: list[LogicalReactionSummary]
     page: PageInfo
+    # Totals cover all matched logical paths, before pagination, and all their
+    # visible mapped reactions. TS bindings use the same eligibility as details.
+    mapped_reaction_total: int | None = Field(default=None, ge=0)
+    transition_state_total: int | None = Field(default=None, ge=0)
 
 
 class LogicalReactionParticipantView(QueryView):

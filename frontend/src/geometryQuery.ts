@@ -13,7 +13,7 @@ export type GeometryQueryField =
   | "minimum_atom_count"
   | "maximum_atom_count";
 
-export type GeometryImaginaryFrequencyStatus = "present" | "absent" | "unavailable";
+export type GeometryImaginaryFrequencyStatus = "present" | "absent" | "unavailable" | "transition_state";
 
 export type GeometrySortBy =
   | "default"

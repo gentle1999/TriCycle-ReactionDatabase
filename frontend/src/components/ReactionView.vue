@@ -19,6 +19,8 @@ const props = defineProps<{
   querying: boolean;
   projectId: string | null;
   total: number;
+  mappedReactionTotal?: number;
+  transitionStateTotal?: number;
   page: PageInfo;
   pageSize: number;
   queryFilters: ReactionQueryFilters;
@@ -348,7 +350,11 @@ onBeforeUnmount(() => {
         <span>高级查询</span><strong>{{ advancedConditionCount }} 个条件</strong>
         <button class="icon-button" type="button" title="清除高级查询" aria-label="清除高级查询" @click="clearFilters"><X :size="14" aria-hidden="true" /></button>
       </div>
-      <div class="filter-summary"><strong>{{ total }}</strong><span>个匹配反应</span></div>
+      <div class="filter-summary reaction-filter-summary" aria-label="筛选后数量统计">
+        <div><strong>{{ total }}</strong><span>个逻辑反应</span></div>
+        <div><strong>{{ mappedReactionTotal ?? "—" }}</strong><span>个映射反应</span></div>
+        <div><strong>{{ transitionStateTotal ?? "—" }}</strong><span>个 TS</span></div>
+      </div>
     </aside>
 
     <section class="reaction-results" aria-labelledby="reaction-results-title" :aria-busy="querying">

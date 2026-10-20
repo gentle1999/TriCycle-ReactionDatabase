@@ -5,11 +5,11 @@ import type { Page } from "@/types";
 
 const DEFAULT_PAGE_PREFETCH_RADIUS = 3;
 
-interface PaginatedQueryOptions<T> {
+interface PaginatedQueryOptions<TPage extends Page<unknown>> {
   queryKey: ComputedRef<QueryKey>;
   enabled: ComputedRef<boolean>;
   offset: Ref<number>;
-  fetchPage: (offset: number, signal: AbortSignal) => Promise<Page<T>>;
+  fetchPage: (offset: number, signal: AbortSignal) => Promise<TPage>;
   queryKeyForOffset: (offset: number) => QueryKey;
   staleTime: number;
   prefetchRadius?: number;
@@ -17,9 +17,9 @@ interface PaginatedQueryOptions<T> {
 }
 
 /** Keep the active page visible and warm a bounded window on either side. */
-export function usePaginatedQuery<T>(options: PaginatedQueryOptions<T>) {
+export function usePaginatedQuery<TPage extends Page<unknown>>(options: PaginatedQueryOptions<TPage>) {
   const queryClient = useQueryClient();
-  const query = useQuery<Page<T>>({
+  const query = useQuery<TPage>({
     queryKey: options.queryKey,
     queryFn: ({ signal }) => options.fetchPage(options.offset.value, signal),
     enabled: options.enabled,

@@ -673,6 +673,8 @@ async def list_logical_reactions(
     offset: CoreOffset = 0,
     sort_by: str = "default",
     sort_direction: str = "asc",
+    include_totals: bool = True,
+    totals_only: bool = False,
 ) -> LogicalReactionPage:
     """Return logical paths whose reaction-structure filters match MappedReaction rows."""
 
@@ -711,6 +713,8 @@ async def list_logical_reactions(
                 offset=offset,
                 sort_by=sort_by,
                 sort_direction=sort_direction,
+                include_totals=include_totals,
+                totals_only=totals_only,
             ),
         )
     except ValueError as exc:

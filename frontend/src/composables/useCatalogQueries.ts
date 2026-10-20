@@ -122,6 +122,25 @@ export function useCatalogQueries(options: CatalogQueryOptions) {
     staleTime: 30_000,
   });
 
+  // A filter's child totals are shared by every page and sort order. Load
+  // them separately so pagination and prefetch never wait for aggregation.
+  const reactionTotals = useQuery({
+    queryKey: computed(() => ["catalog", "reactions", {
+      projectId: options.projectId.value,
+      reactionFilters: options.reactionFilters.value,
+      totals: true,
+    }]),
+    queryFn: ({ signal }) => api.reactions({
+      projectId: options.projectId.value ?? undefined,
+      ...options.reactionFilters.value,
+      totalsOnly: true,
+      limit: 1,
+      offset: 0,
+    }, signal),
+    enabled: computed(() => options.activeView.value === "reactions" && options.projectId.value !== null),
+    staleTime: 30_000,
+  });
+
   const artifactFrames = useQuery({
     queryKey: computed(() => ["catalog", "artifact-frames", { projectId: options.projectId.value, artifactId: options.expandedArtifactId.value, all: true }]),
     queryFn: ({ signal }) => loadAllArtifactFrames(
@@ -192,6 +211,7 @@ export function useCatalogQueries(options: CatalogQueryOptions) {
   return {
     databaseTotals,
     reactions,
+    reactionTotals,
     artifactFrames,
     frame,
     artifacts,

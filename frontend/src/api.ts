@@ -12,7 +12,7 @@ import type {
   McpAccessTokenCreateResult,
   McpAccessTokenView,
   LogicalReactionDetail,
-  LogicalReactionSummary,
+  LogicalReactionPage,
   MappedReactionDetail,
   MappedReactionSummary,
   MappedReactionThermodynamicStatistics,
@@ -623,13 +623,13 @@ export const api = {
     requestMutation<ProjectInvitationView>(`/api/auth/invitations/${encodeURIComponent(token)}/accept`, "POST", {}, signal),
   projectAudit: (id: string, options: { limit?: number; offset?: number } = {}, signal?: AbortSignal) =>
     request<AuditEventView[]>(`/api/projects/${encodeURIComponent(id)}/audit?limit=${options.limit ?? 50}&offset=${options.offset ?? 0}`, signal),
-  reactions: (options: ReactionQueryFilters & Partial<ReactionSort> & { limit?: number; offset?: number } = {}, signal?: AbortSignal) => {
+  reactions: (options: ReactionQueryFilters & Partial<ReactionSort> & { limit?: number; offset?: number; includeTotals?: boolean; totalsOnly?: boolean } = {}, signal?: AbortSignal) => {
     const limit = options.limit ?? 50;
     const offset = options.offset ?? 0;
     if (options.filterExpression || options.hasCompatibilityEndpoints !== undefined
       || options.hasSingleEndpointFallback !== undefined || options.hasDualEndpointFallback !== undefined) {
       const filterExpression = reactionFilterExpression(options);
-      return requestJson<Page<LogicalReactionSummary>>(
+      return requestJson<LogicalReactionPage>(
         "/api/logical_reaction_query_service/list_logical_reactions",
         {
           project_id: options.projectId ?? null,
@@ -657,14 +657,18 @@ export const api = {
           sort_direction: options.sortDirection ?? "asc",
           limit,
           offset,
+          include_totals: options.includeTotals ?? false,
+          totals_only: options.totalsOnly ?? false,
         },
         signal,
       );
     }
-    return request<Page<LogicalReactionSummary>>(
+    return request<LogicalReactionPage>(
       `/api/logical-reactions?${new URLSearchParams({
         limit: String(limit),
         offset: String(offset),
+        include_totals: String(options.includeTotals ?? false),
+        totals_only: String(options.totalsOnly ?? false),
         ...(options.projectId ? { project_id: options.projectId } : {}),
         ...(options.topologyId ? { topology_id: options.topologyId } : {}),
         ...(options.reactionClass ? { reaction_class: options.reactionClass } : {}),

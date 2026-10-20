@@ -30,6 +30,7 @@ import { RouterLink } from "vue-router";
     <section class="query-help-section">
       <header><span class="eyebrow">03 · Metadata</span><h2>元数据与逻辑</h2></header>
       <p>高级查询还支持拓扑 ID、几何 hash、坐标 hash、规范化版本、派生 ID、反应节点角色、热力学属性、虚频状态和原子数范围。条件可用 AND、OR 组合，并可单独勾选 NOT。</p>
+      <p>虚频状态中的“过渡态”筛选已关联反应路径 TS 节点的构象，与构象卡片上的过渡态标记一致。</p>
       <a class="query-help-doc-link" href="https://www.rdkit.org/docs/RDKit_Book.html#smarts-support" target="_blank" rel="noreferrer">RDKit SMARTS 参考 <ExternalLink :size="14" aria-hidden="true" /></a>
     </section>
   </main>

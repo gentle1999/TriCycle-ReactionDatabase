@@ -10,7 +10,7 @@ from molalchemy.rdkit.functions import dice_sml, mol_from_smiles, morganbv_fp, t
 from molalchemy.types import CString
 from nexusx import UseCaseService, query  # type: ignore[import-untyped]
 from rdkit import Chem
-from sqlalchemy import Text, and_, desc, func, literal, not_, or_, select
+from sqlalchemy import Text, and_, desc, func, literal, not_, or_, select, true
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.orm import defer
 from sqlmodel import col
@@ -254,6 +254,72 @@ def _geometry_is_transition_state_predicate(scope: Any, geometry_id: Any) -> Any
     )
 
 
+def _transition_state_geometry_ids(scope: Any) -> Any:
+    """Build the narrow TS candidate set before searching the geometry directory."""
+
+    statement = (
+        select(col(MappedReactionNodeGeometry.geometry_id))
+        .join(
+            MappedReactionNode,
+            col(MappedReactionNodeGeometry.mapped_reaction_node_id) == col(MappedReactionNode.id),
+        )
+        .where(col(MappedReactionNode.role) == MappedReactionNodeRole.TRANSITION_STATE)
+    )
+    if scope.uses_project_owned_fast_path:
+        # Parent/project ownership is enforced by the database write guards.
+        statement = statement.join(
+            MappedReaction,
+            col(MappedReactionNode.mapped_reaction_id) == col(MappedReaction.id),
+        ).where(col(MappedReaction.project_id) == scope.requested_project_id)
+    else:
+        statement = statement.where(
+            mapped_reaction_id_is_visible(scope, col(MappedReactionNode.mapped_reaction_id))
+        )
+    return statement.distinct()
+
+
+def _transition_state_catalog_page(
+    scope: Any, thermodynamic_only: bool, limit: int, offset: int
+) -> Any:
+    """Count and page TS catalog members in one scan of the candidate set."""
+
+    candidates = _transition_state_geometry_ids(scope).cte("ts_geometry_candidates")
+    member = (
+        select(
+            col(ProjectGeometryCatalog.geometry_id),
+            col(ProjectGeometryCatalog.geometry_created_at),
+            col(ProjectGeometryCatalog.has_thermodynamic_property),
+        )
+        .where(
+            col(ProjectGeometryCatalog.project_id) == scope.requested_project_id,
+            col(ProjectGeometryCatalog.geometry_id) == candidates.c.geometry_id,
+            col(ProjectGeometryCatalog.has_thermodynamic_property)
+            if thermodynamic_only
+            else true(),
+        )
+        # Keep the lookup on the composite catalog PK. Flattening this lateral
+        # lookup made PostgreSQL scan the 18-million-row directory for 90k TSs.
+        .offset(0)
+        .lateral("ts_catalog_member")
+    )
+    matches = select(member).select_from(candidates).join(member, true()).cte("matched_ts_catalog")
+    page_ids = (
+        select(matches.c.geometry_id)
+        .order_by(
+            matches.c.has_thermodynamic_property.desc(),
+            matches.c.geometry_created_at,
+            matches.c.geometry_id,
+        )
+        .offset(offset)
+        .limit(limit)
+        .cte("ts_catalog_page")
+    )
+    return select(
+        select(func.count()).select_from(matches).scalar_subquery(),
+        select(func.array_agg(page_ids.c.geometry_id)).scalar_subquery(),
+    )
+
+
 _GEOMETRY_QUERY_EXPRESSION_FIELDS = frozenset(
     {
         "topology_id",
@@ -360,8 +426,13 @@ def _geometry_query_leaf_predicate(field: object, value: object, scope: Any) -> 
             raise ValueError("thermodynamic_only expression must be true")
         return geometry_has_thermodynamic_property_predicate(col(Geometry.id))
     if field_name == "imaginary_frequency_status":
-        if value not in {"present", "absent", "unavailable"}:
-            raise ValueError("imaginary_frequency_status must be present, absent, or unavailable")
+        if value not in {"present", "absent", "unavailable", "transition_state"}:
+            raise ValueError(
+                "imaginary_frequency_status must be present, absent, unavailable, "
+                "or transition_state"
+            )
+        if value == "transition_state":
+            return col(Geometry.id).in_(_transition_state_geometry_ids(scope))
         has_frequency_data = _geometry_has_frequency_data_predicate(scope, col(Geometry.id))
         has_imaginary_frequency = _geometry_has_imaginary_frequency_predicate(
             scope,
@@ -417,6 +488,19 @@ def _geometry_query_expression_predicate(node: object, scope: Any, depth: int = 
     if node.get("negated", False) not in {False, None}:
         raise ValueError("negated must be a boolean")
     return predicate
+
+
+def _expression_selects_transition_states(node: Mapping[str, Any]) -> bool:
+    """Recognize validated expressions equivalent to the positive TS filter."""
+
+    if node.get("operator") in {"and", "or"}:
+        return all(_expression_selects_transition_states(child) for child in node["conditions"])
+    return (
+        node.get("operator") is None
+        and node.get("field") == "imaginary_frequency_status"
+        and node.get("value") == "transition_state"
+        and not node.get("negated")
+    )
 
 
 def _ingestion_summary(ingestion: ArtifactIngestion) -> ArtifactIngestionSummary:
@@ -735,8 +819,17 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
             structure_inputs,
             maximum_characters=get_settings().structure_query_max_characters,
         )
-        if imaginary_frequency_status not in {None, "present", "absent", "unavailable"}:
-            raise ValueError("imaginary_frequency_status must be present, absent, or unavailable")
+        if imaginary_frequency_status not in {
+            None,
+            "present",
+            "absent",
+            "unavailable",
+            "transition_state",
+        }:
+            raise ValueError(
+                "imaginary_frequency_status must be present, absent, unavailable, "
+                "or transition_state"
+            )
         flat_filter_values = (
             topology_id,
             geometry_hash,
@@ -774,6 +867,7 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
         topology_predicates: list[Any] = []
         requires_geometry_count_join = False
         requires_topology_count_join = False
+        positive_transition_state_filter = imaginary_frequency_status == "transition_state"
         if uses_catalog_summary:
             has_frequency_data = col(ProjectGeometryCatalog.has_frequency_data)
             has_imaginary_frequency = col(ProjectGeometryCatalog.has_imaginary_frequency)
@@ -790,12 +884,19 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                 expression = json.loads(filter_expression)
             except json.JSONDecodeError as error:
                 raise ValueError("filter_expression must contain valid JSON") from error
-            predicates.append(_geometry_query_expression_predicate(expression, scope))
-            requires_geometry_count_join = True
-            # A composable expression can refer to MolecularTopology fields;
-            # retain the join for its count query even when the expression is
-            # otherwise represented as a single SQL predicate.
-            requires_topology_count_join = True
+            expression_predicate = _geometry_query_expression_predicate(expression, scope)
+            positive_transition_state_filter = (
+                uses_catalog_summary and _expression_selects_transition_states(expression)
+            )
+            if positive_transition_state_filter:
+                expression_predicate = col(ProjectGeometryCatalog.geometry_id).in_(
+                    _transition_state_geometry_ids(scope)
+                )
+            predicates.append(expression_predicate)
+            # Pure positive TS expressions need only catalog membership; mixed
+            # metadata/structure expressions retain the Geometry/topology joins.
+            requires_geometry_count_join = not positive_transition_state_filter
+            requires_topology_count_join = not positive_transition_state_filter
         for field, value in (
             (Geometry.topology_id, topology_id),
             (Geometry.geometry_hash, geometry_hash),
@@ -845,7 +946,16 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                 else geometry_has_thermodynamic_property_predicate(col(Geometry.id))
             )
             requires_geometry_count_join = requires_geometry_count_join or not uses_catalog_summary
-        if imaginary_frequency_status == "present":
+        if imaginary_frequency_status == "transition_state":
+            predicates.append(
+                (
+                    col(ProjectGeometryCatalog.geometry_id)
+                    if uses_catalog_summary
+                    else col(Geometry.id)
+                ).in_(_transition_state_geometry_ids(scope))
+            )
+            requires_geometry_count_join = requires_geometry_count_join or not uses_catalog_summary
+        elif imaginary_frequency_status == "present":
             predicates.append(has_imaginary_frequency)
         elif imaginary_frequency_status == "absent":
             predicates.extend((has_frequency_data, ~has_imaginary_frequency))
@@ -1022,9 +1132,39 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
             and similarity_fingerprint is None
         )
         async with session_factory() as session:
-            total_value = (await session.execute(count_statement)).scalar_one_or_none()
+            ts_page_geometry_ids = None
+            if (
+                uses_catalog_summary
+                and positive_transition_state_filter
+                and sort_by == "default"
+                and not requires_geometry_count_join
+                and not requires_topology_count_join
+                and not topology_predicates
+            ):
+                total_value, ts_page_geometry_ids = (
+                    await session.execute(
+                        _transition_state_catalog_page(scope, thermodynamic_only, limit, offset)
+                    )
+                ).one()
+                ts_page_geometry_ids = ts_page_geometry_ids or []
+            else:
+                total_value = (await session.execute(count_statement)).scalar_one_or_none()
             total = int(total_value or 0)
-            if fast_catalogue_page and uses_catalog_summary:
+            if ts_page_geometry_ids is not None:
+                rows = list(
+                    (
+                        await session.execute(
+                            base_statement.where(
+                                listing_visibility_criterion,
+                                col(Geometry.id).in_(ts_page_geometry_ids),
+                            ).order_by(
+                                desc(col(ProjectGeometryCatalog.has_thermodynamic_property)),
+                                *catalogue_order_by,
+                            )
+                        )
+                    ).all()
+                )
+            elif fast_catalogue_page and uses_catalog_summary:
                 # Page the narrow catalogue index first. Joining Geometry before
                 # applying OFFSET makes PostgreSQL sort/scan the multi-GB table
                 # for deep pages.

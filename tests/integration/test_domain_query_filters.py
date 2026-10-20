@@ -658,7 +658,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
                 geometry_hash=geometry.geometry_hash,
                 topology_derivation_id=frame.topology_derivation_id,
                 reaction_node_role=MappedReactionNodeRole.TRANSITION_STATE.value,
-                imaginary_frequency_status="present",
+                imaginary_frequency_status="transition_state",
                 minimum_atom_count=topology.atom_count,
                 maximum_atom_count=topology.atom_count,
                 limit=1,
@@ -669,6 +669,39 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         assert [item.id for item in geometry_page.items] == [geometry.id]
         assert geometry_page.items[0].is_transition_state is True
         assert geometry_page.items[0].imaginary_frequency_status == "present"
+
+        # Compare the narrow TS candidate page with the ordinary expression
+        # path, including pages beyond the result set and identical ordering.
+        for page_offset in (0, 1, 10):
+            ts_page = asyncio.run(
+                GeometryQueryService.list_geometries(
+                    project_id=SYSTEM_PROJECT_ID,
+                    imaginary_frequency_status="transition_state",
+                    limit=1,
+                    offset=page_offset,
+                )
+            )
+            reference_page = asyncio.run(
+                GeometryQueryService.list_geometries(
+                    project_id=SYSTEM_PROJECT_ID,
+                    filter_expression=json.dumps(
+                        {
+                            "operator": "and",
+                            "conditions": [
+                                {
+                                    "field": "imaginary_frequency_status",
+                                    "value": "transition_state",
+                                },
+                                {"field": "minimum_atom_count", "value": 1},
+                            ],
+                        }
+                    ),
+                    limit=1,
+                    offset=page_offset,
+                )
+            )
+            assert ts_page.page.total == reference_page.page.total
+            assert [item.id for item in ts_page.items] == [item.id for item in reference_page.items]
 
         geometry_detail = asyncio.run(
             GeometryQueryService.get_geometry(
@@ -691,7 +724,7 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
                             {"field": "geometry_hash", "value": geometry.geometry_hash},
                             {
                                 "field": "imaginary_frequency_status",
-                                "value": "present",
+                                "value": "transition_state",
                             },
                             {"field": "minimum_atom_count", "value": topology.atom_count},
                         ],
@@ -826,6 +859,36 @@ def test_domain_filters_compose_and_preserve_pagination_totals(
         assert non_transition_state_detail is not None
         assert non_transition_state_detail.is_transition_state is False
         assert non_transition_state_detail.imaginary_frequency_status == "present"
+
+        non_transition_state_page = asyncio.run(
+            GeometryQueryService.list_geometries(
+                project_id=SYSTEM_PROJECT_ID,
+                geometry_hash=geometry.geometry_hash,
+                imaginary_frequency_status="transition_state",
+                limit=1,
+            )
+        )
+        assert non_transition_state_page.page.total == 0
+        negated_transition_state_page = asyncio.run(
+            GeometryQueryService.list_geometries(
+                project_id=SYSTEM_PROJECT_ID,
+                filter_expression=json.dumps(
+                    {
+                        "operator": "and",
+                        "conditions": [
+                            {"field": "geometry_hash", "value": geometry.geometry_hash},
+                            {
+                                "field": "imaginary_frequency_status",
+                                "value": "transition_state",
+                                "negated": True,
+                            },
+                        ],
+                    }
+                ),
+                limit=1,
+            )
+        )
+        assert [item.id for item in negated_transition_state_page.items] == [geometry.id]
 
         logical_page = asyncio.run(
             LogicalReactionQueryService.list_logical_reactions(
@@ -1746,3 +1809,157 @@ def test_domain_filter_bounds_are_validated(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         asyncio.run(method(project_id=SYSTEM_PROJECT_ID, **parameters))
+
+
+@pytest.mark.asyncio
+async def test_logical_reaction_totals_include_all_child_paths_before_pagination(
+    development_query_principal: object,
+) -> None:
+    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    samples: list[tuple[Any, ...]] = []
+    try:
+        with Session(engine, expire_on_commit=False) as session:
+            samples.extend(_create_domain_sample(session) for _ in range(2))
+            geometry = samples[0][4]
+            logical = samples[0][7]
+            alternate = MappedReaction(
+                id=uuid4(),
+                project_id=SYSTEM_PROJECT_ID,
+                logical_reaction_id=logical.id,
+                mapped_reaction_key="alternate-totals-path",
+                mapped_reaction_kind=MappedReactionKind.OTHER,
+                # This child does not match the structure query below, but is
+                # still part of the matched logical path's totals.
+                mapped_reaction_smiles="[H:1][H:2]>>[H:1].[H:2]",
+                mapping_hash=_fixture_hash(f"totals-alternate:{uuid4()}"),
+            )
+            session.add(alternate)
+            session.flush()
+            for index, role in enumerate(
+                (MappedReactionNodeRole.TRANSITION_STATE, MappedReactionNodeRole.REACTANT)
+            ):
+                node = MappedReactionNode(
+                    id=uuid4(),
+                    mapped_reaction_id=alternate.id,
+                    node_key=f"totals-node-{index}",
+                    node_index=index,
+                    role=role,
+                )
+                session.add(node)
+                session.flush()
+                session.add(
+                    MappedReactionNodeGeometry(
+                        mapped_reaction_node_id=node.id,
+                        geometry_id=geometry.id,
+                        component_key="totals-geometry",
+                        component_index=0,
+                    )
+                )
+            session.commit()
+
+        expression = json.dumps(
+            {
+                "operator": "or",
+                "conditions": [
+                    {"field": "reaction_hash", "value": sample[7].reaction_hash}
+                    for sample in samples
+                ],
+            }
+        )
+        for offset in (0, 1, 10):
+            result = await LogicalReactionQueryService.list_logical_reactions(
+                project_id=SYSTEM_PROJECT_ID,
+                filter_expression=expression,
+                limit=1,
+                offset=offset,
+            )
+            assert result.page.total == 2
+            assert result.mapped_reaction_total == 3
+            # The same geometry bound to two mapped paths counts under each
+            # path; the reactant binding contributes no TS.
+            assert result.transition_state_total == 3
+            assert len(result.items) == (1 if offset < 2 else 0)
+
+        totals = await LogicalReactionQueryService.list_logical_reactions(
+            project_id=SYSTEM_PROJECT_ID,
+            filter_expression=expression,
+            include_totals=False,
+            totals_only=True,
+            limit=1,
+        )
+        assert totals.items == []
+        assert (totals.page.total, totals.mapped_reaction_total, totals.transition_state_total) == (
+            2,
+            3,
+            3,
+        )
+        # A page fetch must neither execute aggregation nor claim zero totals.
+        fast_page = await LogicalReactionQueryService.list_logical_reactions(
+            project_id=SYSTEM_PROJECT_ID,
+            filter_expression=expression,
+            include_totals=False,
+            limit=1,
+        )
+        assert fast_page.page.total == 2
+        assert len(fast_page.items) == 1
+        assert fast_page.mapped_reaction_total is None
+        assert fast_page.transition_state_total is None
+
+        structure = await LogicalReactionQueryService.list_logical_reactions(
+            project_id=SYSTEM_PROJECT_ID,
+            reaction_hash=samples[0][7].reaction_hash,
+            reaction_smarts="[H:1][H:2]>>[H:1][H:2]",
+        )
+        assert structure.page.total == 1
+        assert structure.mapped_reaction_total == 2
+        assert structure.transition_state_total == 2
+
+        empty = await LogicalReactionQueryService.list_logical_reactions(
+            project_id=SYSTEM_PROJECT_ID,
+            reaction_hash=_fixture_hash(f"totals-missing:{uuid4()}"),
+        )
+        assert empty.page.total == empty.mapped_reaction_total == empty.transition_state_total == 0
+
+        # Keep the totals consistent with the TS geometry admission policy.
+        with Session(engine) as session:
+            thermochemistry = session.execute(
+                select(ThermochemistryResult).where(
+                    col(ThermochemistryResult.frame_id) == samples[0][1].id
+                )
+            ).scalar_one()
+            session.delete(thermochemistry)
+            session.commit()
+        result = await LogicalReactionQueryService.list_logical_reactions(
+            project_id=SYSTEM_PROJECT_ID,
+            filter_expression=expression,
+        )
+        assert result.mapped_reaction_total == 3
+        assert result.transition_state_total == 1
+        # Retiring the remaining source removes catalog membership, so the
+        # fast ownership path must still exclude its TS from the aggregate.
+        with Session(engine) as session:
+            artifact = session.get(ArtifactFile, samples[1][10].id)
+            assert artifact is not None
+            artifact.storage_status = StorageStatus.RETIRED
+            session.add(artifact)
+            session.commit()
+        retired = await LogicalReactionQueryService.list_logical_reactions(
+            project_id=SYSTEM_PROJECT_ID,
+            filter_expression=expression,
+            totals_only=True,
+        )
+        assert retired.mapped_reaction_total == 3
+        assert retired.transition_state_total == 0
+
+        denied = await LogicalReactionQueryService.list_logical_reactions(
+            project_id=uuid4(),
+            totals_only=True,
+        )
+        assert (
+            denied.page.total == denied.mapped_reaction_total == denied.transition_state_total == 0
+        )
+    finally:
+        with Session(engine) as session:
+            for sample in samples:
+                _delete_domain_sample(session, sample)
+        engine.dispose()
