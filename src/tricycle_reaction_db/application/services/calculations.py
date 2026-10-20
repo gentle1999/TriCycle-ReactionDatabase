@@ -227,6 +227,10 @@ def _validate_scientific_array_shape(
         ScientificArrayKind.REDUCED_MASSES,
         ScientificArrayKind.VIBRATIONAL_FORCE_CONSTANTS,
         ScientificArrayKind.IR_INTENSITIES,
+        ScientificArrayKind.RAMAN_ACTIVITIES,
+        ScientificArrayKind.RAMAN_DEPOLARIZATION_RATIOS,
+        ScientificArrayKind.RAMAN_DEPOLARIZATION_RATIOS_POLARIZED,
+        ScientificArrayKind.RAMAN_DEPOLARIZATION_RATIOS_UNPOLARIZED,
     }:
         if frame.frequency_count is None:
             raise ValueError(f"{record.kind.value} requires a CalculationFrame frequency summary")
@@ -339,6 +343,10 @@ def persist_parse_revision(
             "source_size_bytes",
             "source_compression",
             "running_time_seconds",
+            "wall_time_seconds",
+            "cpu_time_seconds",
+            "cpu_time_source",
+            "cpu_time_num_processes",
         )
         source_identity_changed = False
         for field_name in source_identity_fields:
@@ -779,13 +787,10 @@ def persist_thermochemistry_result(
     """Insert or reuse the optional one-to-one thermochemistry result for a frame."""
 
     frame_id = _require_id(frame, label="CalculationFrame")
-    if frame.frequency_count is None or frame.frequency_count <= 0:
-        raise ValueError("ThermochemistryResult requires a frame with frequency evidence")
     segment = frame.segment
-    # Some Gaussian checkpoint follow-up segments expose frequency-derived
-    # thermochemistry while MolOP marks the route's freq request disabled.
-    # The frame's parsed frequency evidence is the authoritative admission
-    # signal; retain the protocol as supplied for provenance.
+    # Printed thermal totals/corrections are source evidence in their own right.
+    # FCHK and partial outputs may omit frequencies or thermodynamic conditions.
+    # Preserve those results without inventing missing arrays or conditions.
     if record.source_schema_version != segment.parse_revision.export_schema_version:
         raise ValueError("thermochemistry source schema must match its ParseRevision export schema")
     if _fast_insert_enabled(session):

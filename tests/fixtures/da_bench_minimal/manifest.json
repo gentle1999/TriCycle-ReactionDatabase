@@ -326,7 +326,7 @@
   "expected_molop_totals": {
     "frames": 45,
     "segments": 9,
-    "arrays": 227,
+    "arrays": 241,
     "thermochemistry": 4,
     "energies": 45,
     "energy_observations": 49,
@@ -337,7 +337,7 @@
     "population_results": 14,
     "population_series": 18,
     "polarizabilities": 14,
-    "array_assignments": 106,
+    "array_assignments": 120,
     "running_times": 45
   },
   "expected_array_counts": {
@@ -359,6 +359,8 @@
     "quadrupole": 14,
     "traceless_quadrupole": 14,
     "octapole": 14,
-    "hexadecapole": 14
-  }
+    "hexadecapole": 14,
+    "orbital_beta_energies": 14
+  },
+  "expected_molop_version": "0.2.21"
 }

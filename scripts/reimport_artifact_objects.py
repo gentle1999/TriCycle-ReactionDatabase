@@ -13,11 +13,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import tempfile
+import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from hashlib import sha256
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
@@ -84,6 +87,11 @@ def _parser() -> argparse.ArgumentParser:
         help="append-only resumability checkpoint",
     )
     parser.add_argument(
+        "--progress-file",
+        type=Path,
+        help="atomically updated batch phase and progress for migration monitoring",
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=4,
@@ -100,6 +108,19 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         default=16,
         help="maximum concurrent RustFS inventory shard listings",
+    )
+    parser.add_argument(
+        "--catalogue-only",
+        action="store_true",
+        help=(
+            "read exact catalogued object keys and versions; "
+            "verify bytes on download, without listing RustFS"
+        ),
+    )
+    parser.add_argument(
+        "--force-reparse",
+        action="store_true",
+        help="replace existing parsed results after downloading and verifying each batch",
     )
     parser.add_argument(
         "--inventory-only",
@@ -247,16 +268,20 @@ async def _load_partial_artifact_ids(artifact_ids: Sequence[UUID]) -> set[UUID]:
 
     if not artifact_ids:
         return set()
-    statement = select(col(ArtifactIngestion.artifact_file_id)).where(
-        col(ArtifactIngestion.artifact_file_id).in_(artifact_ids),
-        col(ArtifactIngestion.status) == ArtifactIngestionStatus.PARTIAL,
-    )
+    partial: set[UUID] = set()
     async with session_factory() as session:
-        return {
-            artifact_id
-            for artifact_id in (await session.execute(statement)).scalars().all()
-            if isinstance(artifact_id, UUID)
-        }
+        # Large migrations can exceed PostgreSQL's 65,535 bind-parameter limit.
+        for offset in range(0, len(artifact_ids), 4096):
+            statement = select(col(ArtifactIngestion.artifact_file_id)).where(
+                col(ArtifactIngestion.artifact_file_id).in_(artifact_ids[offset : offset + 4096]),
+                col(ArtifactIngestion.status) == ArtifactIngestionStatus.PARTIAL,
+            )
+            partial.update(
+                artifact_id
+                for artifact_id in (await session.execute(statement)).scalars().all()
+                if isinstance(artifact_id, UUID)
+            )
+    return partial
 
 
 def _content_sha256_from_object_key(object_key: str) -> str | None:
@@ -492,75 +517,107 @@ async def _run(args: argparse.Namespace) -> int:
         raise ValueError("limit must be positive")
 
     settings = get_settings()
+    if args.force_reparse and args.user_id is None:
+        raise ValueError("--force-reparse requires an explicit --user-id")
     user_id = args.user_id or settings.development_user_id
     state_file: Path = args.state_file
     artifacts = await _load_artifacts(
         args.project_ids,
         filename_contains=args.filename_contains,
     )
-    known_content_hashes = await _load_known_object_keys()
-    buckets = {bucket for bucket, _content_sha256 in known_content_hashes}
-    if not buckets:
-        buckets = {RustFSSettings().bucket}
-    inventory = await _build_storage_inventory(
-        buckets,
-        list_concurrency=args.list_concurrency,
-    )
-    inventory_digest = _inventory_digest(inventory)
-    inventory_by_hash = _inventory_by_content_hash(inventory)
-    inventory_hashes = set(inventory_by_hash)
-    unmapped = [
-        (listed.bucket, listed.key)
-        for listed in inventory.values()
-        if (
-            (digest := _content_sha256_from_object_key(listed.key)) is None
-            or (listed.bucket, digest) not in known_content_hashes
+    if args.catalogue_only:
+        # The catalogue pins keys and object versions. Every downloaded payload
+        # is still checked against its persisted size and SHA-256 before the
+        # replacement path can clear existing parsed results.
+        identity = {
+            "mode": "catalogue-reparse-v1",
+            "molop_version": version("molop"),
+            "mapping_version": "molop-calculation-mapping-v3",
+            "force_reparse": args.force_reparse,
+            "artifacts": [asdict(artifact) for artifact in artifacts],
+        }
+        inventory_digest = sha256(
+            json.dumps(identity, default=str, sort_keys=True).encode()
+        ).hexdigest()
+        storage_object_count = len({(a.bucket, a.object_key) for a in artifacts})
+        project_counts: dict[str, int] = {}
+        for artifact in artifacts:
+            key = str(artifact.project_id)
+            project_counts[key] = project_counts.get(key, 0) + 1
+        inventory_summary = {
+            "inventory_source": "artifact_catalogue",
+            "inventory_digest": inventory_digest,
+            "storage_objects": storage_object_count,
+            "catalogued_calculation_objects": len(artifacts),
+            "catalogued_project_counts": project_counts,
+        }
+    else:
+        known_content_hashes = await _load_known_object_keys()
+        buckets = {bucket for bucket, _content_sha256 in known_content_hashes}
+        if not buckets:
+            buckets = {RustFSSettings().bucket}
+        inventory = await _build_storage_inventory(
+            buckets,
+            list_concurrency=args.list_concurrency,
         )
-    ]
-    if unmapped and not args.allow_unowned_object:
-        sample = sorted(unmapped)[:3]
-        raise RuntimeError(
-            f"{len(unmapped)} current RustFS objects have no ArtifactFile project owner; "
-            f"sample={sample}; pass --allow-unowned-object only after auditing them"
+        storage_object_count = len(inventory)
+        inventory_digest = _inventory_digest(inventory)
+        inventory_by_hash = _inventory_by_content_hash(inventory)
+        inventory_hashes = set(inventory_by_hash)
+        unmapped = [
+            (listed.bucket, listed.key)
+            for listed in inventory.values()
+            if (
+                (digest := _content_sha256_from_object_key(listed.key)) is None
+                or (listed.bucket, digest) not in known_content_hashes
+            )
+        ]
+        if unmapped and not args.allow_unowned_object:
+            sample = sorted(unmapped)[:3]
+            raise RuntimeError(
+                f"{len(unmapped)} current RustFS objects have no ArtifactFile project owner; "
+                f"sample={sample}; pass --allow-unowned-object only after auditing them"
+            )
+        if unmapped:
+            print(
+                f"ignoring {len(unmapped)} unowned RustFS cache object(s); "
+                f"sample={sorted(unmapped)[:3]}",
+                file=sys.stderr,
+                flush=True,
+            )
+        artifacts, binding_summary = _bind_artifact_objects_to_inventory(
+            artifacts,
+            inventory=inventory,
         )
-    if unmapped:
-        print(
-            f"ignoring {len(unmapped)} unowned RustFS cache object(s); "
-            f"sample={sorted(unmapped)[:3]}",
-            file=sys.stderr,
-            flush=True,
-        )
-    artifacts, binding_summary = _bind_artifact_objects_to_inventory(
-        artifacts,
-        inventory=inventory,
-    )
-    calculation_hashes = {
-        (artifact.bucket, artifact.content_sha256.lower()) for artifact in artifacts
-    }
-    project_counts: dict[str, int] = {}
-    for artifact in artifacts:
-        project_key = str(artifact.project_id)
-        project_counts[project_key] = project_counts.get(project_key, 0) + 1
-    inventory_summary = {
-        "inventory_digest": inventory_digest,
-        "storage_objects": len(inventory),
-        "storage_content_hashes": len(inventory_hashes),
-        "duplicate_storage_objects": len(inventory) - len(inventory_hashes),
-        "catalogued_calculation_objects": len(artifacts),
-        "catalogued_project_counts": project_counts,
-        "unowned_storage_objects": len(unmapped),
-        "unowned_storage_object_sample": sorted(unmapped)[:3],
-        **binding_summary,
-        "catalogued_non_calculation_objects_present": len(
-            (inventory_hashes & known_content_hashes) - calculation_hashes
-        ),
-    }
+        calculation_hashes = {
+            (artifact.bucket, artifact.content_sha256.lower()) for artifact in artifacts
+        }
+        project_counts = {}
+        for artifact in artifacts:
+            project_key = str(artifact.project_id)
+            project_counts[project_key] = project_counts.get(project_key, 0) + 1
+        inventory_summary = {
+            "inventory_digest": inventory_digest,
+            "storage_objects": len(inventory),
+            "storage_content_hashes": len(inventory_hashes),
+            "duplicate_storage_objects": len(inventory) - len(inventory_hashes),
+            "catalogued_calculation_objects": len(artifacts),
+            "catalogued_project_counts": project_counts,
+            "unowned_storage_objects": len(unmapped),
+            "unowned_storage_object_sample": sorted(unmapped)[:3],
+            **binding_summary,
+            "catalogued_non_calculation_objects_present": len(
+                (inventory_hashes & known_content_hashes) - calculation_hashes
+            ),
+        }
     if args.inventory_only:
         print(json.dumps(inventory_summary, ensure_ascii=False, sort_keys=True))
         return 0
 
     completed = _load_completed(state_file, inventory_digest=inventory_digest)
-    partial_artifact_ids = await _load_partial_artifact_ids([artifact.id for artifact in artifacts])
+    partial_artifact_ids = await _load_partial_artifact_ids(
+        [artifact_id for artifact_id, _ in completed]
+    )
     completed = {
         (artifact_id, content_sha256)
         for artifact_id, content_sha256 in completed
@@ -581,7 +638,7 @@ async def _run(args: argparse.Namespace) -> int:
     stores: dict[str, RustFSObjectStore] = {}
     totals: dict[str, Any] = {
         "catalogued": len(artifacts),
-        "storage_objects": len(inventory),
+        "storage_objects": storage_object_count,
         "inventory_digest": inventory_digest,
         "catalogued_project_counts": project_counts,
         "checkpointed_before_run": len(completed),
@@ -594,6 +651,27 @@ async def _run(args: argparse.Namespace) -> int:
         "ts_frames": 0,
         "inferred_reactions": 0,
     }
+
+    def report_progress(phase: str, batch: Sequence[ArtifactObject] = ()) -> None:
+        if args.progress_file is None:
+            return
+        path: Path = args.progress_file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(
+                {
+                    **totals,
+                    "phase": phase,
+                    "pid": os.getpid(),
+                    "updated_at_epoch": time.time(),
+                    "batch_artifact_ids": [str(artifact.id) for artifact in batch],
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        temporary.replace(path)
 
     async def fetch_batch(batch: list[ArtifactObject], directory: Path) -> list[Path]:
         semaphore = asyncio.Semaphore(args.fetch_concurrency)
@@ -618,11 +696,13 @@ async def _run(args: argparse.Namespace) -> int:
             for offset in range(0, len(project_pending), args.batch_size):
                 batch = project_pending[offset : offset + args.batch_size]
                 try:
+                    report_progress("downloading", batch)
                     with tempfile.TemporaryDirectory(
                         prefix="tricycle-object-reimport-"
                     ) as temporary_directory:
                         directory = Path(temporary_directory)
                         paths = await fetch_batch(batch, directory)
+                        report_progress("parsing_and_persisting", batch)
                         payloads = [
                             ArtifactUploadPayload(
                                 filename=artifact.original_filename,
@@ -641,6 +721,7 @@ async def _run(args: argparse.Namespace) -> int:
                             persistence_batch_files=args.batch_size,
                             enforce_batch_file_limit=False,
                             reparse_failed_ingestions=True,
+                            force_reparse=args.force_reparse,
                         )
                         for artifact, item in zip(batch, result.items, strict=True):
                             item_result = item.result
@@ -765,6 +846,8 @@ async def _run(args: argparse.Namespace) -> int:
                         flush=True,
                     )
                 processed += len(batch)
+                report_progress("batch_complete")
+            report_progress("project_statistics")
             await refresh_project_statistics(
                 (project_id,),
                 reason="artifact-object-reimport-complete",
@@ -775,6 +858,7 @@ async def _run(args: argparse.Namespace) -> int:
         await close_molop_process_pool()
 
     print(json.dumps(totals, ensure_ascii=False, sort_keys=True))
+    report_progress("failed" if totals["failed"] or totals["partial"] else "complete")
     return 1 if totals["failed"] or totals["partial"] else 0
 
 

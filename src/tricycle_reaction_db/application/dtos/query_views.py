@@ -368,6 +368,10 @@ class CalculationFrameSummary(QueryView):
     frequency_count: int | None = None
     negative_frequency_count: int | None = None
     running_time_seconds: float | None = None
+    wall_time_seconds: float | None = None
+    cpu_time_seconds: float | None = None
+    cpu_time_source: str | None = None
+    cpu_time_num_processes: int | None = None
 
 
 class CalculationFramePage(QueryView):
@@ -439,11 +443,16 @@ class ParseRevisionSummary(QueryView):
     parser_name: str
     parser_version: str
     molop_version: str
+    ingestion_mapping_version: str | None = None
     source_format: str
     parse_completeness: str
     status: str
     record_sha256: str | None = None
     running_time_seconds: float | None = None
+    wall_time_seconds: float | None = None
+    cpu_time_seconds: float | None = None
+    cpu_time_source: str | None = None
+    cpu_time_num_processes: int | None = None
     error_code: str | None = None
     error_message: str | None = None
     error_metadata_json: str | None = None
@@ -540,6 +549,11 @@ class VibrationView(QueryView):
     imaginary_mode_count: int
     lowest_frequency_cm1: float | None = None
     mode_indices: list[int]
+    source_mode_indices: list[int | None] | None = None
+    source_program: str | None = None
+    frequency_method: str | None = None
+    raman_activity_method: str | None = None
+    orientation: str | None = None
     axis_order: list[str] | None = None
     atom_order: str | None = None
     normalization: str | None = None
@@ -547,8 +561,15 @@ class VibrationView(QueryView):
 
 
 class ThermochemistryView(QueryView):
-    temperature_kelvin: float
-    pressure_atm: float
+    temperature_kelvin: float | None = None
+    pressure_atm: float | None = None
+    source_program: str | None = None
+    entropy_model: str | None = None
+    frequency_scale_factor: float | None = None
+    low_frequency_cutoff_cm1: float | None = None
+    rotor_reference_frequency_cm1: float | None = None
+    imaginary_frequency_cutoff_cm1: float | None = None
+    derivations_json: str = "{}"
     zpe_correction_hartree: EnergyHartree | None = None
     thermal_energy_correction_hartree: EnergyHartree | None = None
     thermal_enthalpy_correction_hartree: EnergyHartree | None = None
@@ -583,6 +604,8 @@ class ScientificArraySummary(QueryView):
     slot_ordinal: int | None = None
     # Scalar provenance fields keep the NexusX schema portable (it does not
     # expose arbitrary JSON mappings) while retaining MolOP population names.
+    metadata_schema_version: str | None = None
+    metadata_json: str = "{}"
     source_field: str | None = None
     source_unit: str | None = None
     population_name: str | None = None
@@ -611,6 +634,11 @@ class ScientificArrayPage(QueryView):
 class MolecularOrbitalResultView(QueryView):
     id: UUID
     electronic_state: str | None = None
+    orbital_basis: str | None = None
+    occupancy_origin: str | None = None
+    total_occupancies: list[float | None] | None = None
+    reported_homo_index: int | None = None
+    reported_lumo_index: int | None = None
     alpha_orbital_count: int
     beta_orbital_count: int
     coefficient_count: int
@@ -710,6 +738,7 @@ class ElectronicStateView(QueryView):
     id: UUID
     state_ordinal: int
     state_index: int | None = None
+    is_ground_state: bool | None = None
     root: int | None = None
     label: str | None = None
     multiplicity: int | None = None

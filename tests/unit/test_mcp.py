@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -325,12 +326,17 @@ async def test_mcp_thermodynamics_csv_export_has_bounded_offset_pages(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("payload_size", [7, 512 * 1024 + 1])
 async def test_mcp_artifact_and_scientific_array_content_tools(
     monkeypatch: pytest.MonkeyPatch,
+    payload_size: int,
 ) -> None:
     project_id = UUID("00000000-0000-7000-8000-000000000792")
     artifact_id = UUID("00000000-0000-7000-8000-000000000791")
     array_id = UUID("00000000-0000-7000-8000-000000000790")
+    second_artifact_id = UUID("00000000-0000-7000-8000-000000000789")
+    payload = b"x" * payload_size
+    npy_payload = b"npy-payload" + payload
 
     async def require_permission(
         user_id: UUID,
@@ -363,8 +369,8 @@ async def test_mcp_artifact_and_scientific_array_content_tools(
             id=requested_artifact_id,
             original_filename="sample.txt",
             media_type="text/plain",
-            size_bytes=7,
-            content_sha256="payload-hash",
+            size_bytes=len(payload),
+            content_sha256=hashlib.sha256(payload).hexdigest(),
             bucket="bucket",
             object_key="object-key",
             version_id=None,
@@ -390,13 +396,14 @@ async def test_mcp_artifact_and_scientific_array_content_tools(
     async def load_array(
         requested_array_id: UUID,
         *,
-        max_bytes: int,
+        max_bytes: int | None,
         project_id: UUID,
     ) -> Any:
+        assert max_bytes is None
         return SimpleNamespace(
             array_id=requested_array_id,
             filename="coordinates.npy",
-            content=b"npy-payload",
+            content=npy_payload,
             payload_sha256="array-hash",
             unit="angstrom",
             dtype="float32",
@@ -419,7 +426,9 @@ async def test_mcp_artifact_and_scientific_array_content_tools(
         staticmethod(download_artifact),
     )
     monkeypatch.setattr(
-        mcp_module, "_read_artifact_payload", lambda download, max_bytes: b"payload"
+        mcp_module,
+        "iter_artifact_download",
+        lambda download: iter((payload[:100], payload[100:])),
     )
     monkeypatch.setattr(
         mcp_module.ScientificArrayContentService,
@@ -442,7 +451,10 @@ async def test_mcp_artifact_and_scientific_array_content_tools(
     )
     batch_result = await _call_as_development_user(
         "download_artifacts_batch",
-        {"artifact_ids": [str(artifact_id)], "project_id": str(project_id)},
+        {
+            "artifact_ids": [str(artifact_id), str(second_artifact_id)],
+            "project_id": str(project_id),
+        },
     )
     array_preview_result = await _call_as_development_user(
         "preview_scientific_array",
@@ -454,14 +466,37 @@ async def test_mcp_artifact_and_scientific_array_content_tools(
     )
 
     assert preview_result["data"]["preview_text"] == "sample"
-    assert artifact_result["data"]["content_base64"] == base64.b64encode(b"payload").decode()
-    assert (
-        batch_result["data"]["files"][0]["content_base64"] == base64.b64encode(b"payload").decode()
-    )
+    assert base64.b64decode(artifact_result["data"]["content_base64"]) == payload
+    assert artifact_result["data"]["size_bytes"] == len(payload)
+    assert batch_result["data"]["total_bytes"] == 2 * len(payload)
+    assert len(batch_result["data"]["files"]) == 2
+    for file in batch_result["data"]["files"]:
+        assert base64.b64decode(file["content_base64"]) == payload
     assert array_preview_result["data"]["shape"] == [2, 3]
-    assert (
-        array_download_result["data"]["content_base64"] == base64.b64encode(b"npy-payload").decode()
+    assert base64.b64decode(array_download_result["data"]["content_base64"]) == npy_payload
+
+
+@pytest.mark.parametrize("actual_payload", [b"short", b"corrupt", b"payload-extra"])
+def test_mcp_artifact_download_still_verifies_integrity(
+    monkeypatch: pytest.MonkeyPatch,
+    actual_payload: bytes,
+) -> None:
+    expected_payload = b"payload"
+    download = mcp_module.ArtifactDownload(
+        id=UUID("00000000-0000-7000-8000-000000000791"),
+        original_filename="sample.txt",
+        media_type="text/plain",
+        size_bytes=len(expected_payload),
+        content_sha256=hashlib.sha256(expected_payload).hexdigest(),
+        bucket="bucket",
+        object_key="object-key",
+        version_id=None,
     )
+    monkeypatch.setattr(
+        mcp_module, "iter_artifact_download", lambda download: iter((actual_payload,))
+    )
+    with pytest.raises(mcp_module.ArtifactObjectIntegrityError):
+        mcp_module._read_artifact_payload(download)
 
 
 @pytest.mark.asyncio

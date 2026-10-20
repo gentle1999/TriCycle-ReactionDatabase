@@ -101,9 +101,17 @@ def test_da_bench_exports_every_supported_molop_array(
         assert record.payload_sha256 == summary.sha256
         assert record.data.flags.c_contiguous
         assert record.data.dtype == np.dtype("<f8")
-        assert np.isfinite(record.data).all()
+        assert not np.isinf(record.data).any()
         assert record.array_metadata is not None
         assert record.array_metadata["unit"] == record.unit
+        assert record.array_metadata["missing_value_count"] == np.count_nonzero(
+            np.isnan(record.data)
+        )
+        if record.kind is ScientificArrayKind.ORBITAL_BETA_ENERGIES:
+            # MolOP distinguishes shared spatial energies from an unreported channel.
+            assert np.isnan(record.data).all() or np.isfinite(record.data).all()
+        else:
+            assert np.isfinite(record.data).all()
 
 
 def test_ts_vibrational_temperatures_map_only_positive_frequency_modes(

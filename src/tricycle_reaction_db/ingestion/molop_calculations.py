@@ -128,6 +128,10 @@ _FRAME_RECORD_PAYLOAD_FIELDS = {
     "status",
     "geometry_optimization_status",
     "running_time",
+    "wall_time",
+    "cpu_time",
+    "cpu_time_source",
+    "cpu_time_num_processes",
     "frame_role",
     "force_source_field",
     "force_transformation",
@@ -286,13 +290,14 @@ def parse_revision_record_from_molop(
         raise ValueError("MolOP source evidence is required: no source segments were captured")
     source_evidence_captured = True
     provenance["source_evidence_captured"] = source_evidence_captured
+    provenance["tricycle_ingestion_mapping_version"] = "molop-calculation-mapping-v3"
     source_format = {
         "g16log": SourceFormat.GAUSSIAN_LOG,
         "orcalog": SourceFormat.ORCA_OUTPUT,
         "orcaout": SourceFormat.ORCA_OUTPUT,
     }.get(file_payload["source_format"], SourceFormat.OTHER)
     reconstruction_config = {
-        "tricycle_ingestion_mapping_version": "molop-calculation-mapping-v2",
+        "tricycle_ingestion_mapping_version": provenance["tricycle_ingestion_mapping_version"],
         "molop_version": provenance["molop_version"],
         "molgr_version": provenance["molgr_version"],
         "molop": provenance["effective_config"].get("molop", {}),
@@ -322,7 +327,7 @@ def parse_revision_record_from_molop(
         ),
         source_compression=source_compression,
         comments=_comments_payload(getattr(chem_file, "comments", file_payload.get("comments"))),
-        running_time_seconds=_quantity(file_payload.get("running_time"), "second"),
+        **_calculation_timings(file_payload),
         source_complete=file_payload.get("source_complete"),
         parse_completeness=ParseCompleteness(
             _enum_value(file_payload.get("parse_completeness") or ParseCompleteness.NOT_ASSESSED)
@@ -634,6 +639,19 @@ def _optimization_record(
     )
 
 
+def _calculation_timings(payload: dict[str, Any]) -> dict[str, Any]:
+    """Persist independent clocks; legacy running_time is never evidence of wall time."""
+    wall = _quantity(payload.get("wall_time"), "second")
+    cpu = _quantity(payload.get("cpu_time"), "second")
+    return {
+        "running_time_seconds": wall,
+        "wall_time_seconds": wall,
+        "cpu_time_seconds": cpu,
+        "cpu_time_source": payload.get("cpu_time_source"),
+        "cpu_time_num_processes": payload.get("cpu_time_num_processes"),
+    }
+
+
 def _vibration_record(
     vibrations: dict[str, Any] | None,
     schema_version: str,
@@ -641,18 +659,27 @@ def _vibration_record(
     if vibrations is None:
         return None
     frequencies = np.asarray(
-        magnitude_in(vibrations["frequencies"], CM_INVERSE),
+        (
+            magnitude_in(vibrations["frequencies"], CM_INVERSE)
+            if vibrations.get("frequencies") is not None
+            else []
+        ),
         dtype=np.float64,
     )
     return VibrationResultRecord(
         mode_count=int(frequencies.size),
         imaginary_mode_count=int(np.count_nonzero(frequencies < 0)),
         lowest_frequency_cm1=float(frequencies.min()) if frequencies.size else None,
-        mode_indices=list(vibrations["mode_indices"]),
-        axis_order=list(vibrations["axis_order"]) if vibrations["axis_order"] is not None else None,
-        atom_order=vibrations["atom_order"],
-        normalization=vibrations["normalization"],
-        mass_weighting=vibrations["mass_weighting"],
+        mode_indices=list(vibrations.get("mode_indices", [])),
+        source_mode_indices=list(vibrations.get("source_mode_indices", [])),
+        source_program=vibrations.get("source_program"),
+        frequency_method=vibrations.get("frequency_method"),
+        raman_activity_method=vibrations.get("raman_activity_method"),
+        orientation=vibrations.get("orientation"),
+        axis_order=list(vibrations["axis_order"]) if vibrations.get("axis_order") else None,
+        atom_order=vibrations.get("atom_order"),
+        normalization=vibrations.get("normalization"),
+        mass_weighting=vibrations.get("mass_weighting"),
         source_schema_version=schema_version,
     )
 
@@ -664,27 +691,46 @@ def _thermochemistry_record(
     thermal = frame["thermal_informations"]
     if thermal is None:
         return None
-    if frame["temperature"] is None or frame["pressure"] is None:
-        raise ValueError("MolOP thermochemistry requires explicit temperature and pressure")
-    temperature_kelvin = _quantity(frame["temperature"], "kelvin")
-    pressure_atm = _quantity(frame["pressure"], "standard_atmosphere")
-    if temperature_kelvin is None or pressure_atm is None:
-        raise RuntimeError("MolOP thermochemistry units did not produce scalar values")
+
+    def condition(name: str, unit: str) -> float | None:
+        thermal_value = _quantity(thermal.get(name), unit)
+        frame_value = _quantity(frame.get(name), unit)
+        if (
+            thermal_value is not None
+            and frame_value is not None
+            and not np.isclose(thermal_value, frame_value, rtol=1e-8, atol=1e-8)
+        ):
+            raise ValueError(f"MolOP thermochemistry {name} disagrees with frame conditions")
+        return thermal_value if thermal_value is not None else frame_value
+
+    temperature_kelvin = condition("temperature", "kelvin")
+    pressure_atm = condition("pressure", "standard_atmosphere")
     return ThermochemistryResultRecord(
         temperature_kelvin=temperature_kelvin,
         pressure_atm=pressure_atm,
-        zpe_correction_hartree=_quantity(thermal["ZPVE"], "hartree/particle"),
-        thermal_energy_correction_hartree=_quantity(thermal["TCE"], "hartree/particle"),
-        thermal_enthalpy_correction_hartree=_quantity(thermal["TCH"], "hartree/particle"),
-        thermal_gibbs_correction_hartree=_quantity(thermal["TCG"], "hartree/particle"),
-        zero_point_energy_hartree=_quantity(thermal["U_0"], "hartree/particle"),
-        thermal_internal_energy_hartree=_quantity(thermal["U_T"], "hartree/particle"),
-        enthalpy_hartree=_quantity(thermal["H_T"], "hartree/particle"),
-        gibbs_free_energy_hartree=_quantity(thermal["G_T"], "hartree/particle"),
-        entropy_cal_mol_k=_quantity(thermal["S"], "calorie/mole/kelvin"),
-        heat_capacity_cv_cal_mol_k=_quantity(thermal["C_V"], "calorie/mole/kelvin"),
-        molecular_mass_amu=_quantity(thermal["molecular_mass"], "amu"),
-        rotational_symmetry_number=thermal["rotational_symmetry_number"],
+        source_program=thermal.get("source_program"),
+        entropy_model=thermal.get("entropy_model"),
+        frequency_scale_factor=thermal.get("frequency_scale_factor"),
+        low_frequency_cutoff_cm1=_quantity(thermal.get("low_frequency_cutoff"), "1 / centimeter"),
+        rotor_reference_frequency_cm1=_quantity(
+            thermal.get("rotor_reference_frequency"), "1 / centimeter"
+        ),
+        imaginary_frequency_cutoff_cm1=_quantity(
+            thermal.get("imaginary_frequency_cutoff"), "1 / centimeter"
+        ),
+        derivations=thermal.get("derivations", {}),
+        zpe_correction_hartree=_quantity(thermal.get("ZPVE"), "hartree/particle"),
+        thermal_energy_correction_hartree=_quantity(thermal.get("TCE"), "hartree/particle"),
+        thermal_enthalpy_correction_hartree=_quantity(thermal.get("TCH"), "hartree/particle"),
+        thermal_gibbs_correction_hartree=_quantity(thermal.get("TCG"), "hartree/particle"),
+        zero_point_energy_hartree=_quantity(thermal.get("U_0"), "hartree/particle"),
+        thermal_internal_energy_hartree=_quantity(thermal.get("U_T"), "hartree/particle"),
+        enthalpy_hartree=_quantity(thermal.get("H_T"), "hartree/particle"),
+        gibbs_free_energy_hartree=_quantity(thermal.get("G_T"), "hartree/particle"),
+        entropy_cal_mol_k=_quantity(thermal.get("S"), "calorie/mole/kelvin"),
+        heat_capacity_cv_cal_mol_k=_quantity(thermal.get("C_V"), "calorie/mole/kelvin"),
+        molecular_mass_amu=_quantity(thermal.get("molecular_mass"), "amu"),
+        rotational_symmetry_number=thermal.get("rotational_symmetry_number"),
         source_schema_version=schema_version,
     )
 
@@ -710,6 +756,11 @@ def _molecular_orbital_record(
         return None
     return MolecularOrbitalResultRecord(
         electronic_state=molecular_orbitals["electronic_state"],
+        orbital_basis=molecular_orbitals.get("orbital_basis"),
+        occupancy_origin=molecular_orbitals.get("occupancy_origin"),
+        total_occupancies=molecular_orbitals.get("total_occupancies"),
+        reported_homo_index=molecular_orbitals.get("reported_homo_index"),
+        reported_lumo_index=molecular_orbitals.get("reported_lumo_index"),
         alpha_orbital_count=len(molecular_orbitals["alpha_energies"]),
         beta_orbital_count=len(molecular_orbitals["beta_energies"]),
         coefficient_count=sum(value is not None for value in molecular_orbitals["coefficients"]),
@@ -806,18 +857,7 @@ def _bond_order_record(
 ) -> BondOrderResultRecord | None:
     if bond_orders is None:
         return None
-    matrix_count = sum(
-        np.asarray(bond_orders[field_name]).size > 0
-        for field_name in (
-            "wiberg_bond_order",
-            "mo_bond_order",
-            "mayer_bond_order",
-            "atom_atom_overlap_bond_order",
-            "nbo_bond_order",
-            "nbo_bond_order_for_alpha_spin",
-            "nbo_bond_order_for_beta_spin",
-        )
-    )
+    matrix_count = len(bond_orders.get("bond_orders", {}))
     return BondOrderResultRecord(matrix_count=matrix_count, source_schema_version=schema_version)
 
 
@@ -883,6 +923,7 @@ def _electronic_state_records(
                     set_kind=set_kind,
                     state_ordinal=state_ordinal,
                     state_index=state["state_index"],
+                    is_ground_state=state.get("is_ground_state"),
                     root=state["root"],
                     label=state["label"],
                     multiplicity=state["multiplicity"],
@@ -1056,7 +1097,7 @@ def _frame_record(
         frequency_count=vibration.mode_count if vibration else None,
         negative_frequency_count=vibration.imaginary_mode_count if vibration else None,
         lowest_frequency_cm1=vibration.lowest_frequency_cm1 if vibration else None,
-        running_time_seconds=_quantity(frame["running_time"], "second"),
+        **_calculation_timings(frame),
         program_metadata_schema_version="molop-frame-evidence-v1",
         program_metadata={
             "molop_frame_id": frame.get("frame_id", fallback_index),

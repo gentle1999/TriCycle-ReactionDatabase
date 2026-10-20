@@ -147,8 +147,8 @@ These tools provide MCP access to REST streaming/file operations. Use the corres
 | Mapped-reaction TS geometry JSONL | `export_mapped_reaction_transition_state_geometries` | Project `artifact:download`; up to 100 records and 512 KiB per page; continue with the binding ID |
 | Thermodynamics CSV | `export_mapped_reaction_thermodynamics_csv` | Project `artifact:read`; supports filters, up to 100 rows and 512 KiB per page; the first offset page includes the CSV header |
 | Artifact preview | `preview_artifact_content` | Private files require project `artifact:read`; text previews are capped at 256 KiB; unsupported media types return `unsupported_media_type` |
-| Artifact download/batch download | `download_artifact_content`, `download_artifacts_batch` | Project download access; Base64 content capped at 512 KiB per file or batch, up to 100 files; batch returns individual files rather than a ZIP |
-| Scientific-array preview/NPY | `preview_scientific_array`, `download_scientific_array_npy` | Project `artifact:download`; previews up to 4,096 values and NPY payloads up to 512 KiB |
+| Artifact download/batch download | `download_artifact_content`, `download_artifacts_batch` | Project download access; no per-file or total byte limit for Base64 content, up to 100 files; batch returns individual files rather than a ZIP |
+| Scientific-array preview/NPY | `preview_scientific_array`, `download_scientific_array_npy` | Project `artifact:download`; previews up to 4,096 values and NPY downloads without a byte limit |
 
 `upload_calculation_log` accepts standard Base64 in `content_base64` (without a
 Data URL prefix). The per-file limit is `TRICYCLE_MAX_UPLOAD_BYTES` (64 MiB by
@@ -627,7 +627,7 @@ The Makefile equivalents are `IMPORT_INCLUDE_SUFFIXES`,
 
 ## Dependency Upgrades
 
-MolOP `>=0.2.20` and MolGR `>=0.1.8` are installed from PyPI. MolOP's unified
+MolOP `>=0.2.21,<0.3` and MolGR `>=0.1.8` are installed from PyPI. MolOP's unified
 file- and frame-level `comments` containers are persisted in
 `ParseRevision.comments` and `CalculationFrame.comments`; artifact and frame
 detail pages expose them as read-only parsed provenance, separate from editable
@@ -645,3 +645,62 @@ uv run python -c "import molop, molgr, openbabel, rdkit"
 make check
 make test-db
 ```
+
+### MolOP 0.2.21 adaptation contract
+
+The lockfile selects `0.2.21`. Upstream still exports
+`molop-calculation-export-v1`; our mapping is `molop-calculation-mapping-v3`
+and array metadata uses `molop-array-source-v2`. Revision identity includes
+both the upstream version and mapping version.
+The mapping version is also stored in
+`parser_provenance.tricycle_ingestion_mapping_version` and exposed as
+`ingestion_mapping_version` in revision queries; legacy records return null.
+
+| Result | Persistence and query contract |
+| --- | --- |
+| Timing | File and frame records retain independent wall and CPU seconds, CPU source and process count. New `running_time_seconds` aliases only explicit wall time. Never sum clocks or infer wall time from legacy running time. |
+| Bond orders | Read the dynamic `bond_orders.bond_orders` dictionary. Preserve its key as the assignment slot and store dimensionless matrices with scheme, spin channel, source label, threshold, missing reason and upstream metadata. |
+| Orbitals | Preserve basis, occupation origin, total occupations and reported HOMO/LUMO indices. Keep upstream channel alignment, NaN energies and null occupations without inventing values for the other spin channel. |
+| Vibrations / Raman | Keep internal mode identifiers and nullable printed mode numbers separately, preserving array order. Retain program, methods and orientation. Raman activity uses `angstrom^4/amu`; all three depolarization ratios are dimensionless. Arrays must match the mode count. |
+| Thermochemistry | Retain source, RRHO/QRRHO, frequency scaling, cutoffs, rotor reference and per-field derivations. Normalize temperature to kelvin, pressure to atm, frequency to cm^-1 and energy to hartree. Partial results and unknown conditions are valid; conflicting frame/container conditions are rejected. |
+| Electronic states | Preserve three-valued `is_ground_state`; an index alone does not establish ground-state identity. |
+
+Arrays use float64 NPY with NaN for missing values, including masked entries.
+Zero and negative values remain unchanged. Metadata records missing-value
+encoding and count. JSON previews encode NaN as null; NPY downloads preserve NaN.
+Positive and negative infinity retain the JSON strings `inf` and `-inf`.
+Array queries expose `metadata_schema_version` and `metadata_json`;
+thermochemistry queries expose `derivations_json`.
+
+Migration `0063_molop_result_semantics` adds columns, permits unknown conditions,
+and extends array kinds and units. It does not rewrite historical values or
+delete sources or old revisions. New legacy-row fields remain null and
+derivations default to an empty object. Old running times may still combine
+clocks and must not be relabelled as reliable wall time. Historical repair
+directly replaces parsed results across all projects, preserving ArtifactFile
+records and original objects while removing old ParseRevision rows.
+Use `scripts/reimport_artifact_objects.py --catalogue-only --force-reparse
+--user-id <UUID> --state-file <dedicated checkpoint>` to read exact catalogued
+keys and versions. Every batch is downloaded and checked for size and SHA-256
+before replacement. Checkpoints bind the catalogue, MolOP version and mapping
+version; completed files are skipped on resume. Download/integrity failures
+do not enter replacement; parse failures and partial results remain retryable.
+For a full migration, use `scripts/run_catalogue_migration.py --user-id <UUID>
+--state-directory <dedicated directory>` to submit remaining files to the existing
+`upload-worker`. The script neither parses files nor clears results. It freezes
+a candidate manifest excluding successful results for the current MolOP and
+mapping versions, then submits fixed pages of 256 files through
+`UploadBatchService.enqueue_reparse_batch`. Stable request identities prevent
+duplicate tasks even if a checkpoint write fails after the database commit.
+`queue-manifest.json` stores the fixed candidate list; `queue-submissions.jsonl`
+stores durable queue batch IDs; `queue-progress.json` measures submission only.
+`submitted` does not mean parsing is complete. Read pending, processing, success
+and failure states from the normal database/UI. Keep upload-worker and
+profile-refresh-worker running for leases, recovery and derived-data refreshes.
+Downgrade requires a backup restore to avoid dropping scientific provenance.
+`geometry-energy-view-v3` and `mapped-reaction-thermodynamics-v6` include source
+program, entropy model, frequency scaling and cutoffs in compatibility checks.
+Unknown values cannot match known values, and Gibbs minimization cannot merge
+different assumptions. Thermal levels retain the method/basis prefix and append
+an assumptions JSON component used for profile grouping and identity hashes.
+The schema migration does not rebuild profiles; refresh them after reparsing.

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -815,6 +815,178 @@ class UploadBatchService:
                     ),
                 ),
             )
+
+    @staticmethod
+    async def enqueue_reparse_batch(
+        artifact_ids: Sequence[UUID],
+        *,
+        user_id: UUID,
+        request_key: str,
+    ) -> list[UploadBatchView]:
+        """Stage existing artifacts for the normal worker, without parsing.
+
+        A stable request key makes even completed batches replay-safe. Preserve
+        source-authoritative import metadata by grouping it with the project.
+        Old revisions remain intact until the worker claims each file.
+        """
+
+        ordered_ids = sorted(set(artifact_ids), key=str)
+        if not ordered_ids:
+            return []
+        if len(ordered_ids) > 512 or not request_key.strip():
+            raise UploadBatchLimitError("reparse batches require 1-512 files and a request key")
+        async with session_factory() as session:
+            artifacts = (
+                await session.exec(
+                    select(ArtifactFile)
+                    .where(col(ArtifactFile.id).in_(ordered_ids))
+                    .order_by(col(ArtifactFile.id))
+                    .with_for_update()
+                )
+            ).all()
+            if len(artifacts) != len(ordered_ids):
+                raise UploadBatchNotFoundError("artifact not found")
+            for project_id in sorted({artifact.project_id for artifact in artifacts}, key=str):
+                await AuthorizationService.require_project_permission(
+                    user_id, project_id, ProjectPermission.ARTIFACT_UPLOAD
+                )
+            if any(
+                artifact.artifact_kind is not ArtifactKind.CALCULATION_OUTPUT
+                or artifact.storage_status is not StorageStatus.AVAILABLE
+                for artifact in artifacts
+            ):
+                raise UploadBatchConflictError(
+                    "only available calculation artifacts can be reparsed"
+                )
+
+            source_rows = (
+                await session.exec(
+                    select(UploadBatchItem.artifact_file_id, UploadBatch)
+                    .join(UploadBatch, col(UploadBatch.id) == col(UploadBatchItem.batch_id))
+                    .where(col(UploadBatchItem.artifact_file_id).in_(ordered_ids))
+                    .order_by(col(UploadBatch.created_at).desc(), col(UploadBatch.id).desc())
+                )
+            ).all()
+            source_metadata: dict[UUID, dict[str, object]] = {}
+            for artifact_id, batch in source_rows:
+                if (
+                    artifact_id is not None
+                    and artifact_id not in source_metadata
+                    and _batch_source_atom_order_is_authoritative(batch)
+                ):
+                    source_metadata[artifact_id] = dict(batch.shared_metadata)
+            groups: dict[tuple[UUID, str], list[ArtifactFile]] = {}
+            for artifact in artifacts:
+                artifact_id = _required_uuid(artifact.id, "ArtifactFile")
+                metadata = json.dumps(source_metadata.get(artifact_id, {}), sort_keys=True)
+                groups.setdefault((artifact.project_id, metadata), []).append(artifact)
+
+            views: list[UploadBatchView] = []
+            now = datetime.now(UTC)
+            for (project_id, metadata), group in groups.items():
+                group_ids = [_required_uuid(artifact.id, "ArtifactFile") for artifact in group]
+                digest = sha256(
+                    json.dumps(
+                        ["reparse-queue-v1", request_key, str(user_id), list(map(str, group_ids))]
+                    ).encode()
+                ).hexdigest()
+                existing = (
+                    await session.exec(
+                        select(UploadBatch).where(
+                            col(UploadBatch.project_id) == project_id,
+                            col(UploadBatch.manifest_sha256) == digest,
+                        )
+                    )
+                ).first()
+                if existing is not None:
+                    views.append(_batch_view(existing))
+                    continue
+                active_ids = set(
+                    (
+                        await session.exec(
+                            select(UploadBatchItem.artifact_file_id).where(
+                                col(UploadBatchItem.artifact_file_id).in_(group_ids),
+                                col(UploadBatchItem.status).in_(
+                                    (
+                                        UploadBatchItemStatus.UPLOADING,
+                                        UploadBatchItemStatus.STAGED,
+                                        UploadBatchItemStatus.PROCESSING,
+                                    )
+                                ),
+                            )
+                        )
+                    ).all()
+                )
+                if active_ids:
+                    # Replaying a different request must not silently exclude
+                    # files from this migration's durable manifest.
+                    raise UploadBatchConflictError("artifact already has an active upload task")
+                # Publish the same state as _queue_ingestion_for_reparse in
+                # one statement; per-row ORM updates dominate large remote
+                # database migrations even inside a single transaction.
+                await session.exec(
+                    update(ArtifactIngestion)
+                    .where(
+                        col(ArtifactIngestion.artifact_file_id).in_(group_ids),
+                        col(ArtifactIngestion.status) != ArtifactIngestionStatus.PROCESSING,
+                    )
+                    .values(
+                        status=ArtifactIngestionStatus.PENDING,
+                        source_frame_count=None,
+                        transition_state_frame_count=None,
+                        started_at=None,
+                        completed_at=None,
+                        worker_lease_id=None,
+                        worker_lease_expires_at=None,
+                        error_code=None,
+                        error_message=None,
+                        parser_metadata={"reparse_queued": True, "queued_at": now.isoformat()},
+                    )
+                )
+                batch = UploadBatch(
+                    project_id=project_id,
+                    created_by_user_id=user_id,
+                    artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+                    shared_metadata=json.loads(metadata),
+                    manifest_sha256=digest,
+                    manifest_schema_version="reparse-queue-v1",
+                    status=UploadBatchStatus.ACTIVE,
+                    total_count=len(group),
+                    total_bytes=sum(artifact.size_bytes for artifact in group),
+                    staged_count=len(group),
+                    updated_at=now,
+                )
+                session.add(batch)
+                await session.flush()
+                batch_id = _required_uuid(batch.id, "UploadBatch")
+                for position, artifact in enumerate(group):
+                    session.add(
+                        UploadBatchItem(
+                            batch_id=batch_id,
+                            client_file_id=uuid4(),
+                            position=position,
+                            original_filename=artifact.original_filename,
+                            relative_path=artifact.source_relative_path
+                            or artifact.original_filename,
+                            size_bytes=artifact.size_bytes,
+                            media_type=artifact.media_type,
+                            content_sha256=artifact.content_sha256,
+                            status=UploadBatchItemStatus.STAGED,
+                            parse_status=ImportParseStatus.PENDING.value,
+                            materialization_status=ImportMaterializationStatus.SUCCEEDED.value,
+                            artifact_file_id=artifact.id,
+                            metadata_json=_with_upload_progress(
+                                {"reparse": True, "request_key": request_key},
+                                phase="staged",
+                                completed=0,
+                                total=1,
+                            ),
+                            updated_at=now,
+                        )
+                    )
+                views.append(_batch_view(batch))
+            await session.commit()
+            return views
 
     @staticmethod
     async def list_batches(

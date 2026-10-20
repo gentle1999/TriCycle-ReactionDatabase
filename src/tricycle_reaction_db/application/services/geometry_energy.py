@@ -290,6 +290,30 @@ def _protocol_identity(protocol: CalculationProtocol | None) -> tuple[object, ..
     )
 
 
+def _thermochemistry_identity(result: ThermochemistryResult | None) -> tuple[object, ...]:
+    """Exact thermal assumptions; an unknown field never matches a known value."""
+    if result is None:
+        return ()
+    return (
+        result.source_program,
+        result.entropy_model,
+        result.frequency_scale_factor,
+        result.low_frequency_cutoff_cm1,
+        result.rotor_reference_frequency_cm1,
+        result.imaginary_frequency_cutoff_cm1,
+    )
+
+
+def _thermochemistry_level(candidate: GeometryEnergyCandidate) -> tuple[object, ...] | None:
+    level = _protocol_identity(candidate.protocol)
+    assumptions = _thermochemistry_identity(candidate.thermochemistry)
+    if level is None or not any(value is not None for value in assumptions):
+        return level
+    # Keep the method/basis prefix used by display and filtering; the final
+    # component participates in profile grouping and persisted identity hashes.
+    return (*level, json.dumps({"thermal_assumptions_v1": assumptions}, separators=(",", ":")))
+
+
 def _protocol_selection_identity(protocol: CalculationProtocol | None) -> tuple[object, ...] | None:
     """Return calculation-semantic identity used for scientific equivalence.
 
@@ -446,6 +470,7 @@ def geometry_energy_composite(
             candidate.thermochemistry.pressure_atm
             if candidate.thermochemistry is not None
             else None,
+            _thermochemistry_identity(candidate.thermochemistry),
         ),
     )
     electronic_energy = (
@@ -456,7 +481,7 @@ def geometry_energy_composite(
         _protocol_identity(electronic_source.protocol) if electronic_source is not None else None
     )
     thermochemistry_level = (
-        _protocol_identity(thermal_source.protocol) if thermal_source is not None else None
+        _thermochemistry_level(thermal_source) if thermal_source is not None else None
     )
 
     def corrected(correction: float | None) -> float | None:
@@ -581,6 +606,17 @@ def _thermodynamic_only_composite(
     ]
     if not complete_candidates:
         return geometry_energy_composite(geometry_id, candidates)
+    thermal_contexts = {
+        (
+            item.thermochemistry.temperature_kelvin,
+            item.thermochemistry.pressure_atm,
+            _thermochemistry_identity(item.thermochemistry),
+        )
+        for item in complete_candidates
+        if item.thermochemistry is not None
+    }
+    if len(thermal_contexts) > 1:
+        return geometry_energy_composite(geometry_id, complete_candidates)
 
     def candidate_sort_key(
         item: GeometryEnergyCandidate,
@@ -618,7 +654,7 @@ def _thermodynamic_only_composite(
             "thermochemistry_protocol_id": (
                 candidate.protocol.id if candidate.protocol is not None else None
             ),
-            "thermochemistry_level": _level_view(protocol_identity),
+            "thermochemistry_level": _level_view(_thermochemistry_level(candidate)),
             "temperature_kelvin": thermochemistry.temperature_kelvin,
             "pressure_atm": thermochemistry.pressure_atm,
             "enthalpy_hartree": float(thermochemistry.enthalpy_hartree),
@@ -629,7 +665,7 @@ def _thermodynamic_only_composite(
     return GeometryEnergyComposite(
         view=view,
         electronic_level=base.electronic_level or protocol_identity,
-        thermochemistry_level=protocol_identity,
+        thermochemistry_level=_thermochemistry_level(candidate),
         thermodynamic_only=True,
     )
 

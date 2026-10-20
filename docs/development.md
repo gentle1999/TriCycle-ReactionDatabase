@@ -242,8 +242,8 @@ MCP token 是用户级凭据，不绑定固定组织、项目或静态 scope。�
 | 映射反应 TS 几何 JSONL | `export_mapped_reaction_transition_state_geometries` | 项目 `artifact:download`；每页最多 100 条、512 KiB，可用绑定 ID 续页 |
 | 热力学 CSV | `export_mapped_reaction_thermodynamics_csv` | 项目 `artifact:read`；支持筛选、最多 100 行/页和 512 KiB；首个 offset 页带 CSV 表头 |
 | Artifact 预览 | `preview_artifact_content` | 私有文件需要项目 `artifact:read`；文本预览最多 256 KiB，不可预览的媒体类型返回 `unsupported_media_type` |
-| Artifact 下载/批量下载 | `download_artifact_content`、`download_artifacts_batch` | 需要项目下载权限；Base64 内容单项或总量最多 512 KiB，批量最多 100 个文件；批量工具返回逐文件内容而非 ZIP |
-| 科学数组预览/NPY | `preview_scientific_array`、`download_scientific_array_npy` | 项目 `artifact:download`；预览最多 4096 个值，NPY 内容最多 512 KiB |
+| Artifact 下载/批量下载 | `download_artifact_content`、`download_artifacts_batch` | 需要项目下载权限；Base64 内容无单项或总量字节限制，批量最多 100 个文件；批量工具返回逐文件内容而非 ZIP |
+| 科学数组预览/NPY | `preview_scientific_array`、`download_scientific_array_npy` | 项目 `artifact:download`；预览最多 4096 个值，NPY 下载无字节限制 |
 
 `upload_calculation_log` 接收标准 Base64 的 `content_base64`，不接受 Data URL 前缀，单文件上限
 沿用 `TRICYCLE_MAX_UPLOAD_BYTES`（默认 64 MiB）。调用返回的是 durable `UploadBatch` 和
@@ -961,8 +961,9 @@ ORDER BY a.original_filename, f.file_frame_index;
 频率摘要，以及 MolOP 实际解析到的全部受支持数组。MolOP 子模型分别写入 45 个
 FrameEnergyResult、49 个 EnergyObservation、40 个 GeometryOptimizationResult、
 40 个 CalculationStatusResult、4 个 VibrationResult 和 4 个 ThermochemistryResult。
-当前 fixture 共写入 227 条
-`ScientificArray`：40 组 forces、45 组 rotational constants、14 组 orbital energies、
+当前 fixture 共写入 241 条
+`ScientificArray`：40 组 forces、45 组 rotational constants、28 组 orbital energies
+（包括 14 组 beta 通道；其中未知值以 NaN 保持对齐）、
 18 组 population values、74 组 polarizability/multipole 数组，以及各 4 组 Hessian、
 frequencies、reduced masses、vibrational force constants、IR intensities、
 normal modes、moments of inertia、rotational temperatures 和 vibrational
@@ -975,9 +976,62 @@ payload hash 和 metadata。
 
 ## 依赖约束
 
-MolOP `>=0.2.20` 与 MolGR `>=0.1.8` 直接从官方 PyPI 安装；`pyproject.toml` 声明最低
+MolOP `>=0.2.21,<0.3` 与 MolGR `>=0.1.8` 直接从官方 PyPI 安装；`pyproject.toml` 声明
 兼容版本，`uv.lock` 记录当前解析版本。项目不再使用内网 Git source 或
 `override-dependencies`。
+
+### MolOP 0.2.21 数据适配协议
+
+当前锁定版本为 `0.2.21`。上游导出格式仍为 `molop-calculation-export-v1`；
+本地映射版本为 `molop-calculation-mapping-v3`，数组 metadata 版本为
+`molop-array-source-v2`。解析版本的身份同时包含上游版本和本地映射版本，
+不能仅凭上游 schema 字符串判断语义兼容性。
+本地映射版本同时写入 `parser_provenance.tricycle_ingestion_mapping_version`，
+解析版本查询通过 `ingestion_mapping_version` 返回；旧记录未声明时返回 null。
+
+| 数据 | 存储与查询约定 |
+| --- | --- |
+| 计时 | 文件、帧分别保存 `wall_time_seconds`、`cpu_time_seconds`、`cpu_time_source` 和 `cpu_time_num_processes`。新解析的 `running_time_seconds` 仅是墙钟时间别名；不将 CPU 时间相加，也不从旧 running_time 推断墙钟时间。 |
+| 键级 | 遍历 `bond_orders.bond_orders` 动态字典；矩阵保存为 dimensionless 数组，assignment 的 slot 保留原始名称。metadata 保留 scheme、spin_channel、source_label、print_threshold、missing_reason 和上游 metadata。 |
+| 轨道 | 保留 `orbital_basis`、`occupancy_origin`、总占据数和原文 HOMO/LUMO 索引。能量通道按上游长度对齐；未知占据数为 null，不复制另一自旋通道或补零。 |
+| 振动 / Raman | `mode_indices` 是内部模态标识，`source_mode_indices` 是原文编号，可含 null；保留原始排列，不按编号重排数组。保存程序、频率方法、Raman 方法及坐标取向。Raman activity 单位为 `angstrom^4/amu`，三类退偏比为 dimensionless；数组长度必须等于模态数。 |
+| 热化学 | 保存来源、RRHO/QRRHO、频率缩放、低频截断、转子参考频率、虚频截断和逐字段 derivations。温度统一 kelvin、压力 atm、频率 cm^-1、能量 hartree；允许只有部分结果或未知条件，缺失不补为默认温压。容器与帧同时给出且相互冲突的条件拒绝入库。 |
+| 电子态 | `is_ground_state` 为 true / false / null，不能仅由 state_index 推断基态。 |
+
+数组以 float64 NPY 保存；NaN 表示未知，零和负数保留其物理含义。MaskedArray
+先将掩码位置转换为 NaN。metadata 记录 `missing_value_encoding` 和
+`missing_value_count`。JSON 预览将 NaN 转为 null，NPY 下载保留 NaN；
+正负无穷沿用字符串 `inf` / `-inf` 的 JSON 表示。数组查询提供
+`metadata_schema_version` 与 `metadata_json`，热化学查询提供 `derivations_json`。
+
+迁移 `0063_molop_result_semantics` 仅增加字段、放宽缺失条件并扩展数组类型及单位约束，
+不重写历史数值或删除原始文件、旧解析版本。旧记录的新字段保持 null，
+derivations 默认为空对象。历史 `running_time_seconds` 仍可能具有旧版混合计时语义；
+在原始文件重解析之前，不能将它作为可靠墙钟时间。
+历史修复采用直接替换：覆盖全部项目的可用计算文件，保留 ArtifactFile 与原始对象，
+删除旧解析结果并使用新版重新生成，不保留历史 ParseRevision。
+`scripts/reimport_artifact_objects.py --catalogue-only --force-reparse --user-id <UUID>
+--state-file <独立检查点路径>` 按目录中记录的对象键和版本读取，
+每批先校验原始字节大小及 SHA-256，再进入替换流程。无需列举整个 RustFS 桶；
+检查点绑定文件目录、MolOP 版本和适配版本，成功文件不会在续跑时重复替换。
+读取或完整性校验失败的批次不进入替换；解析失败或 partial 会记录为待处理项。
+全量迁移使用 `scripts/run_catalogue_migration.py --user-id <UUID>
+--state-directory <独立状态目录>` 将剩余文件交给现有 `upload-worker`，
+脚本本身不运行解析器、不清理旧结果，也不另起解析进程。
+首次执行冻结待迁移清单，排除已有当前 MolOP 和适配版本成功结果的文件，
+每页 256 个文件通过 `UploadBatchService.enqueue_reparse_batch` 入队；
+请求标识保证即使提交后检查点写入失败，重试也不会重复建立任务。
+`queue-manifest.json` 保存固定清单，`queue-submissions.jsonl` 保存队列批次 ID，
+`queue-progress.json` 只记录入队进度，`submitted` 不表示解析完成。
+文件解析进度以数据库和页面的待解析、正在解析、成功或失败状态为准。
+正常启动 upload-worker 和 profile-refresh-worker，由它们管理租约、
+故障恢复和派生数据刷新；不要在迁移期间停用常驻 worker。
+迁移不提供丢弃新语义字段的 downgrade，回退需恢复备份。
+`geometry-energy-view-v3` 与 `mapped-reaction-thermodynamics-v6` 将来源程序、
+entropy_model、频率缩放及截断条件纳入兼容性判定，未知值不能匹配已知值。
+不同条件也不能通过选择最低 Gibbs 能而合并。热化学级别保留方法/基组前缀，
+末尾追加条件 JSON，参与 profile 分组和身份哈希。结构迁移本身不重建 profile；
+数据重建完成后需刷新派生热化学结果。
 
 所有计算文件解析入口通过 `ParseOptions(source_decode_errors="surrogateescape")`
 启用 MolOP 原生局部编码容忍，同时保留 source evidence 与原始字节哈希。

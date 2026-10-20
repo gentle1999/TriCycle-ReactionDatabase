@@ -153,7 +153,6 @@ MCP_TS_GEOMETRY_EXPORT_MAX_BYTES = 512 * 1024
 MCP_EXPORT_MAX_RECORDS = 100
 MCP_EXPORT_MAX_BYTES = 512 * 1024
 MCP_ARTIFACT_PREVIEW_MAX_BYTES = 256 * 1024
-MCP_BINARY_MAX_BYTES = 512 * 1024
 MCP_BATCH_MAX_FILES = 100
 MCP_ARRAY_PREVIEW_MAX_ELEMENTS = 4096
 
@@ -162,18 +161,12 @@ class MCPContentTooLargeError(RuntimeError):
     """A binary or streamed payload exceeds the MCP response budget."""
 
 
-def _read_artifact_payload(download: ArtifactDownload, max_bytes: int) -> bytes:
-    if download.size_bytes > max_bytes:
-        raise MCPContentTooLargeError(
-            f"artifact is {download.size_bytes} bytes; MCP limit is {max_bytes}"
-        )
+def _read_artifact_payload(download: ArtifactDownload) -> bytes:
     chunks: list[bytes] = []
     digest = hashlib.sha256()
     total_bytes = 0
     for chunk in iter_artifact_download(download):
         total_bytes += len(chunk)
-        if total_bytes > max_bytes:
-            raise MCPContentTooLargeError(f"artifact exceeds the {max_bytes}-byte MCP limit")
         digest.update(chunk)
         chunks.append(chunk)
     if total_bytes != download.size_bytes or digest.hexdigest() != download.content_sha256:
@@ -1227,20 +1220,17 @@ async def preview_artifact_content(
 async def download_artifact_content(
     artifact_id: str,
     project_id: str,
-    max_bytes: int = 128 * 1024,
 ) -> dict[str, Any]:
-    """Download one bounded artifact and return its verified bytes as Base64."""
+    """Download one artifact without a byte limit and return its verified bytes as Base64."""
 
     try:
         principal = _require_mcp_principal()
-        if not 1 <= max_bytes <= MCP_BINARY_MAX_BYTES:
-            raise ValueError(f"max_bytes must be between 1 and {MCP_BINARY_MAX_BYTES}")
         download = await ArtifactContentService.download(
             UUID(artifact_id),
             user_id=principal.user_id,
             project_id=UUID(project_id),
         )
-        payload = await asyncio.to_thread(_read_artifact_payload, download, max_bytes)
+        payload = await asyncio.to_thread(_read_artifact_payload, download)
         return _mcp_success(
             {
                 "artifact_id": download.id,
@@ -1259,9 +1249,8 @@ async def download_artifact_content(
 async def download_artifacts_batch(
     artifact_ids: list[str],
     project_id: str,
-    max_total_bytes: int = 256 * 1024,
 ) -> dict[str, Any]:
-    """Download a bounded batch of artifact contents as individually encoded Base64 files."""
+    """Download up to 100 artifacts as individual Base64 files without a byte limit."""
 
     try:
         principal = _require_mcp_principal()
@@ -1270,8 +1259,6 @@ async def download_artifacts_batch(
         requested_ids = [UUID(artifact_id) for artifact_id in artifact_ids]
         if len(set(requested_ids)) != len(requested_ids):
             raise ValueError("artifact_ids must be unique")
-        if not 1 <= max_total_bytes <= MCP_BINARY_MAX_BYTES:
-            raise ValueError(f"max_total_bytes must be between 1 and {MCP_BINARY_MAX_BYTES}")
         requested_project_id = UUID(project_id)
         slots = asyncio.Semaphore(16)
 
@@ -1287,18 +1274,10 @@ async def download_artifacts_batch(
             await asyncio.gather(*(resolve(artifact_id) for artifact_id in requested_ids))
         )
         total_bytes = sum(download.size_bytes for download in downloads)
-        if total_bytes > max_total_bytes:
-            raise MCPContentTooLargeError(
-                f"artifact batch is {total_bytes} bytes; MCP limit is {max_total_bytes}"
-            )
 
         files: list[dict[str, Any]] = []
         for download in downloads:
-            payload = await asyncio.to_thread(
-                _read_artifact_payload,
-                download,
-                max_total_bytes,
-            )
+            payload = await asyncio.to_thread(_read_artifact_payload, download)
             files.append(
                 {
                     "artifact_id": download.id,
@@ -1363,15 +1342,12 @@ async def preview_scientific_array(
 async def download_scientific_array_npy(
     array_id: str,
     project_id: str,
-    max_bytes: int = 128 * 1024,
 ) -> dict[str, Any]:
-    """Download one bounded scientific array as a Base64-encoded NPY payload."""
+    """Download one scientific array as a Base64-encoded NPY payload without a byte limit."""
 
     try:
         principal = _require_mcp_principal()
         requested_project_id = UUID(project_id)
-        if not 1 <= max_bytes <= MCP_BINARY_MAX_BYTES:
-            raise ValueError(f"max_bytes must be between 1 and {MCP_BINARY_MAX_BYTES}")
         await AuthorizationService.require_project_permission(
             principal.user_id,
             requested_project_id,
@@ -1379,13 +1355,9 @@ async def download_scientific_array_npy(
         )
         download = await ScientificArrayContentService.load_npy(
             UUID(array_id),
-            max_bytes=max_bytes,
+            max_bytes=None,
             project_id=requested_project_id,
         )
-        if len(download.content) > max_bytes:
-            raise MCPContentTooLargeError(
-                f"serialized NPY is {len(download.content)} bytes; MCP limit is {max_bytes}"
-            )
         return _mcp_success(
             {
                 "array_id": download.array_id,

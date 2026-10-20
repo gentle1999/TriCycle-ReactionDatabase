@@ -20,7 +20,7 @@ from tricycle_reaction_db.domain.enums import (
     ScientificArrayOwnerKind,
 )
 
-_ARRAY_METADATA_SCHEMA_VERSION = "molop-array-source-v1"
+_ARRAY_METADATA_SCHEMA_VERSION = "molop-array-source-v2"
 _ROTATIONAL_CONSTANT_TOLERANCE_GHZ = 5.5e-6
 
 
@@ -57,13 +57,15 @@ def _rotational_constant_difference(
     return float(np.max(differences))
 
 
+def _float_array(value: Any) -> npt.NDArray[np.float64]:
+    result = np.array(value, dtype=np.float64, copy=True, order="C")
+    if isinstance(value, np.ma.MaskedArray):
+        result[np.asarray(value.mask)] = np.nan
+    return result
+
+
 def _quantity_array(quantity: Any, unit: str) -> npt.NDArray[np.float64]:
-    return np.array(
-        magnitude_in(quantity, unit),
-        dtype="<f8",
-        copy=True,
-        order="C",
-    )
+    return _float_array(magnitude_in(quantity, unit))
 
 
 def _record(
@@ -76,6 +78,7 @@ def _record(
     ordinal: int = 0,
     metadata: dict[str, Any] | None = None,
 ) -> ScientificArrayRecord:
+    data = _float_array(data)
     encoded_data, _ = encode_numpy_array(data)
     encoded_data.setflags(write=False)
     summary = summarize_numpy_array(encoded_data)
@@ -86,6 +89,8 @@ def _record(
         # Keep the normalized unit alongside the column for clients consuming
         # provenance without hydrating the ScientificArray row itself.
         "unit": unit,
+        "missing_value_encoding": "nan",
+        "missing_value_count": int(np.count_nonzero(np.isnan(data))),
     }
     if metadata:
         array_metadata.update(metadata)
@@ -171,7 +176,13 @@ def _scientific_array_export_from_molop_frame(
         },
     )
     rotation_metadata: dict[str, Any] = {}
-    if thermal is not None and thermal.get("rotational_constants") is not None:
+    rotation_constants = frame_payload.get("rotation_constants")
+    rotation_source = "rotation_constants"
+    if (
+        thermal is not None
+        and thermal.get("rotational_constants") is not None
+        and rotation_constants is not None
+    ):
         frame_constants = _quantity_array(frame_payload["rotation_constants"], "gigahertz")
         thermal_constants = _quantity_array(thermal["rotational_constants"], "gigahertz")
         rotation_metadata = {
@@ -181,51 +192,98 @@ def _scientific_array_export_from_molop_frame(
             ),
             "thermal_duplicate_source_field": "thermal_informations.rotational_constants",
         }
+    elif rotation_constants is None and thermal is not None:
+        rotation_constants = thermal.get("rotational_constants")
+        rotation_source = "thermal_informations.rotational_constants"
     _append_quantity(
         records,
-        frame_payload["rotation_constants"],
+        rotation_constants,
         kind=ScientificArrayKind.ROTATIONAL_CONSTANTS,
         pint_unit="gigahertz",
         database_unit="gigahertz",
-        source_field="rotation_constants",
+        source_field=rotation_source,
         metadata=rotation_metadata,
     )
 
     vibrations = frame_payload["vibrations"]
     if vibrations is not None:
+        mode_metadata = {
+            key: vibrations.get(key)
+            for key in (
+                "mode_indices",
+                "source_mode_indices",
+                "source_program",
+                "frequency_method",
+                "raman_activity_method",
+                "orientation",
+                "normalization",
+                "mass_weighting",
+            )
+        }
         _append_quantity(
             records,
-            vibrations["frequencies"],
+            vibrations.get("frequencies"),
             kind=ScientificArrayKind.VIBRATIONAL_FREQUENCIES,
             pint_unit="1 / centimeter",
             database_unit="cm^-1",
             source_field="vibrations.frequencies",
+            metadata=mode_metadata,
         )
         _append_quantity(
             records,
-            vibrations["reduced_masses"],
+            vibrations.get("reduced_masses"),
             kind=ScientificArrayKind.REDUCED_MASSES,
             pint_unit="unified_atomic_mass_unit",
             database_unit="amu",
             source_field="vibrations.reduced_masses",
+            metadata=mode_metadata,
         )
         _append_quantity(
             records,
-            vibrations["force_constants"],
+            vibrations.get("force_constants"),
             kind=ScientificArrayKind.VIBRATIONAL_FORCE_CONSTANTS,
             pint_unit="millidyne / angstrom",
             database_unit="mdyne/angstrom",
             source_field="vibrations.force_constants",
+            metadata=mode_metadata,
         )
         _append_quantity(
             records,
-            vibrations["IR_intensities"],
+            vibrations.get("IR_intensities"),
             kind=ScientificArrayKind.IR_INTENSITIES,
             pint_unit="kilometer / mole",
             database_unit="km/mol",
             source_field="vibrations.IR_intensities",
+            metadata=mode_metadata,
         )
-        if vibrations["vibration_modes"]:
+        for field_name, kind, unit in (
+            ("raman_activities", ScientificArrayKind.RAMAN_ACTIVITIES, "angstrom^4/amu"),
+            (
+                "raman_depolarization_ratios",
+                ScientificArrayKind.RAMAN_DEPOLARIZATION_RATIOS,
+                "dimensionless",
+            ),
+            (
+                "raman_depolarization_ratios_polarized",
+                ScientificArrayKind.RAMAN_DEPOLARIZATION_RATIOS_POLARIZED,
+                "dimensionless",
+            ),
+            (
+                "raman_depolarization_ratios_unpolarized",
+                ScientificArrayKind.RAMAN_DEPOLARIZATION_RATIOS_UNPOLARIZED,
+                "dimensionless",
+            ),
+        ):
+            _append_quantity(
+                records,
+                vibrations.get(field_name),
+                kind=kind,
+                pint_unit=unit,
+                database_unit=unit,
+                source_field=f"vibrations.{field_name}",
+                metadata=mode_metadata,
+            )
+        if vibrations.get("vibration_modes"):
             normal_modes = np.stack(
                 [_quantity_array(mode, "angstrom") for mode in vibrations["vibration_modes"]]
             )
@@ -238,6 +296,7 @@ def _scientific_array_export_from_molop_frame(
                     source_unit=str(vibrations["vibration_modes"][0].units),
                     metadata={
                         "atom_order": "geometry_source_atom_order",
+                        **mode_metadata,
                         "axis_order": ["mode", "source_atom", "xyz"],
                         "coordinate_reference": "molop.frame.coords",
                     },
@@ -494,24 +553,26 @@ def _scientific_array_export_from_molop_frame(
 
     bond_orders = frame_payload["bond_orders"]
     if bond_orders is not None:
-        for field_name in (
-            "wiberg_bond_order",
-            "mo_bond_order",
-            "mayer_bond_order",
-            "atom_atom_overlap_bond_order",
-            "nbo_bond_order",
-            "nbo_bond_order_for_alpha_spin",
-            "nbo_bond_order_for_beta_spin",
-        ):
-            value = np.asarray(bond_orders.get(field_name, []), dtype=np.float64)
+        for name, matrix in bond_orders.get("bond_orders", {}).items():
             append_owned(
                 kind=ScientificArrayKind.BOND_ORDER_MATRIX,
                 unit="dimensionless",
-                data=value,
-                source_field=f"bond_orders.{field_name}",
+                data=_float_array(matrix["values"]),
+                source_field=f"bond_orders.bond_orders.{name}.values",
                 source_unit="dimensionless",
                 owner_kind=ScientificArrayOwnerKind.BOND_ORDER_RESULT,
-                slot=field_name,
+                slot=name,
+                metadata={
+                    "bond_order_name": name,
+                    "scheme": matrix["scheme"],
+                    "spin_channel": matrix.get("spin_channel"),
+                    "source_label": matrix.get("source_label"),
+                    "print_threshold": matrix.get("print_threshold"),
+                    "missing_reason": matrix.get("missing_reason"),
+                    "source_metadata": matrix.get("metadata", {}),
+                    "atom_order": "geometry_source_atom_order",
+                    "axis_order": ["source_atom", "source_atom"],
+                },
             )
 
     single_point = frame_payload["single_point_properties"]

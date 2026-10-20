@@ -302,6 +302,74 @@ async def test_explicit_reparse_after_acknowledgment_remains_pending(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_bulk_reparse_reuses_worker_claim_and_preserves_source_metadata(monkeypatch):
+    async with queue_case(monkeypatch, status=ArtifactIngestionStatus.SUCCEEDED) as case:
+        factory, artifact, ingestion, batch, items, revision = case
+        assert await UploadBatchService.reconcile_completed_staged_items() == 1
+        async with factory() as session:
+            source = await session.get(UploadBatch, batch.id)
+            source.shared_metadata = {"source_atom_order_authoritative": True, "source": "fixture"}
+            session.add(source)
+            await session.commit()
+        queued = await UploadBatchService.enqueue_reparse_batch(
+            [artifact.id, artifact.id], user_id=DEVELOPMENT_USER_ID, request_key="migration-test"
+        )
+        assert len(queued) == 1 and queued[0].total_count == 1
+        async with factory() as session:
+            current = await session.get(ArtifactIngestion, ingestion.id)
+            assert current.status is ArtifactIngestionStatus.PENDING
+            assert await session.get(ParseRevision, revision.id) is not None
+        jobs = await UploadBatchService.claim_processing(limit=1)
+        assert len(jobs) == 1
+        assert jobs[0].batch_id == queued[0].id
+        assert jobs[0].source_atom_order_authoritative is True
+        replay = await UploadBatchService.enqueue_reparse_batch(
+            [artifact.id], user_id=DEVELOPMENT_USER_ID, request_key="migration-test"
+        )
+        assert replay[0].id == queued[0].id
+        async with factory() as session:
+            current = await session.get(ArtifactIngestion, ingestion.id)
+            assert current.status is ArtifactIngestionStatus.PROCESSING
+            assert current.worker_lease_id == jobs[0].lease_id
+            current.status = ArtifactIngestionStatus.SUCCEEDED
+            current.completed_at = datetime.now(UTC)
+            session.add(current)
+            await session.commit()
+        result = ArtifactUploadResult(
+            artifact_id=artifact.id,
+            artifact_kind=ArtifactKind.CALCULATION_OUTPUT,
+            storage_status=StorageStatus.AVAILABLE,
+            ingestion_id=ingestion.id,
+            parse_revision_id=revision.id,
+            ingestion_status=ArtifactIngestionStatus.SUCCEEDED,
+            inferred_reaction_count=0,
+            inferences=[],
+        )
+        assert await UploadBatchService.finish_processing_batch(jobs, {artifact.id: result}) == 1
+        completed = await UploadBatchService.enqueue_reparse_batch(
+            [artifact.id], user_id=DEVELOPMENT_USER_ID, request_key="migration-test"
+        )
+        assert completed[0].id == queued[0].id
+        assert completed[0].status is UploadBatchStatus.COMPLETED
+        assert await UploadBatchService.claim_processing(limit=1) == []
+
+
+@pytest.mark.asyncio
+async def test_bulk_reparse_rejects_other_active_tasks_without_resetting_ingestion(monkeypatch):
+    async with queue_case(monkeypatch, status=ArtifactIngestionStatus.SUCCEEDED) as case:
+        factory, artifact, ingestion, batch, items, revision = case
+        with pytest.raises(module.UploadBatchConflictError, match="active upload task"):
+            await UploadBatchService.enqueue_reparse_batch(
+                [artifact.id], user_id=DEVELOPMENT_USER_ID, request_key="migration-test"
+            )
+        async with factory() as session:
+            assert (
+                await session.get(ArtifactIngestion, ingestion.id)
+            ).status is ArtifactIngestionStatus.SUCCEEDED
+            assert await session.get(ParseRevision, revision.id) is not None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("locked_table", ["ingestion", "queue_item"])
 async def test_upload_heartbeat_skips_persistence_locks_and_renews_after_release(
     monkeypatch, locked_table

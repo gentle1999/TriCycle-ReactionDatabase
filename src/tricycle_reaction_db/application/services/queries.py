@@ -1109,6 +1109,10 @@ def _frame_summary(
         frequency_count=frame.frequency_count,
         negative_frequency_count=frame.negative_frequency_count,
         running_time_seconds=frame.running_time_seconds,
+        wall_time_seconds=frame.wall_time_seconds,
+        cpu_time_seconds=frame.cpu_time_seconds,
+        cpu_time_source=frame.cpu_time_source,
+        cpu_time_num_processes=frame.cpu_time_num_processes,
     )
 
 
@@ -4191,7 +4195,13 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
                 for endpoint in endpoint_rows
             ],
             thermochemistry=(
-                ThermochemistryView.model_validate(thermochemistry, from_attributes=True)
+                ThermochemistryView.model_validate(
+                    thermochemistry, from_attributes=True
+                ).model_copy(
+                    update={
+                        "derivations_json": json.dumps(thermochemistry.derivations, sort_keys=True)
+                    }
+                )
                 if thermochemistry is not None
                 else None
             ),
@@ -4214,6 +4224,10 @@ class CalculationQueryService(UseCaseService):  # type: ignore[misc]
                     owner_id=_array_assignment_owner(assignment)[1],
                     slot=assignment.slot if assignment is not None else None,
                     slot_ordinal=(assignment.slot_ordinal if assignment is not None else None),
+                    metadata_schema_version=array.metadata_schema_version,
+                    metadata_json=json.dumps(
+                        array.array_metadata or {}, sort_keys=True, allow_nan=False
+                    ),
                     source_field=(array.array_metadata or {}).get("source_field"),
                     source_unit=(array.array_metadata or {}).get("source_unit") or array.unit,
                     population_name=_array_population_name(array),

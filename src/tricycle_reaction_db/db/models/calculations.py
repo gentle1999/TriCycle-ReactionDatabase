@@ -166,6 +166,10 @@ class ParseRevision(SQLModel, table=True):
     # Runtime reported by the quantum-chemistry file as a file-level fact.
     # Frame-level ``running_time_seconds`` remains the per-frame counterpart.
     running_time_seconds: float | None = Field(default=None, sa_type=Float)
+    wall_time_seconds: float | None = Field(default=None, sa_type=Float)
+    cpu_time_seconds: float | None = Field(default=None, sa_type=Float)
+    cpu_time_source: str | None = Field(default=None, max_length=16)
+    cpu_time_num_processes: int | None = Field(default=None)
     source_complete: bool | None = Field(default=None)
     parse_completeness: ParseCompleteness = Field(
         default=ParseCompleteness.NOT_ASSESSED,
@@ -708,6 +712,10 @@ class CalculationFrame(SQLModel, table=True):
     max_displacement_threshold_bohr: float | None = Field(default=None, sa_type=Float)
     max_displacement_converged: bool | None = Field(default=None)
     running_time_seconds: float | None = Field(default=None, sa_type=Float)
+    wall_time_seconds: float | None = Field(default=None, sa_type=Float)
+    cpu_time_seconds: float | None = Field(default=None, sa_type=Float)
+    cpu_time_source: str | None = Field(default=None, max_length=16)
+    cpu_time_num_processes: int | None = Field(default=None)
     frequency_count: int | None = Field(default=None)
     negative_frequency_count: int | None = Field(default=None)
     lowest_frequency_cm1: float | None = Field(default=None, sa_type=Float)
@@ -1019,6 +1027,13 @@ class VibrationResult(SQLModel, table=True):
     imaginary_mode_count: int = Field(nullable=False)
     lowest_frequency_cm1: float | None = Field(default=None, sa_type=Float)
     mode_indices: list[int] = Field(sa_column=Column(ARRAY(Integer, dimensions=1), nullable=False))
+    source_mode_indices: list[int | None] | None = Field(
+        default=None, sa_column=Column(ARRAY(Integer, dimensions=1), nullable=True)
+    )
+    source_program: str | None = Field(default=None, max_length=128)
+    frequency_method: str | None = Field(default=None, max_length=128)
+    raman_activity_method: str | None = Field(default=None, max_length=128)
+    orientation: str | None = Field(default=None, max_length=32)
     axis_order: list[str] | None = Field(
         default=None,
         sa_column=Column(ARRAY(String(32), dimensions=1), nullable=True),
@@ -1085,6 +1100,9 @@ class ScientificArray(SQLModel, table=True):
             "(kind = 'reduced_masses' AND unit = 'amu') OR "
             "(kind = 'vibrational_force_constants' AND unit = 'mdyne/angstrom') OR "
             "(kind = 'ir_intensities' AND unit = 'km/mol') OR "
+            "(kind = 'raman_activities' AND unit = 'angstrom^4/amu') OR "
+            "(kind IN ('raman_depolarization_ratios', 'raman_depolarization_ratios_polarized', "
+            "'raman_depolarization_ratios_unpolarized') AND unit = 'dimensionless') OR "
             "(kind = 'normal_modes' AND unit = 'angstrom') OR "
             "(kind = 'moments_of_inertia' AND unit = 'amu*bohr^2') OR "
             "(kind = 'rotational_temperatures' AND unit = 'kelvin') OR "
@@ -1148,7 +1166,7 @@ class ScientificArray(SQLModel, table=True):
 
 
 class ThermochemistryResult(SQLModel, table=True):
-    """Canonical thermochemistry scalars for a frequency calculation frame."""
+    """Canonical printed thermochemistry scalars, including partial output."""
 
     __tablename__ = "thermochemistry_result"  # pyright: ignore[reportAssignmentType]
     __table_args__ = (
@@ -1190,8 +1208,18 @@ class ThermochemistryResult(SQLModel, table=True):
         unique=True,
         nullable=False,
     )
-    temperature_kelvin: float = Field(sa_type=Float, nullable=False)
-    pressure_atm: float = Field(sa_type=Float, nullable=False)
+    temperature_kelvin: float | None = Field(default=None, sa_type=Float)
+    pressure_atm: float | None = Field(default=None, sa_type=Float)
+    source_program: str | None = Field(default=None, max_length=128)
+    entropy_model: str | None = Field(default=None, max_length=16)
+    frequency_scale_factor: float | None = Field(default=None, sa_type=Float)
+    low_frequency_cutoff_cm1: float | None = Field(default=None, sa_type=Float)
+    rotor_reference_frequency_cm1: float | None = Field(default=None, sa_type=Float)
+    imaginary_frequency_cutoff_cm1: float | None = Field(default=None, sa_type=Float)
+    derivations: dict[str, str] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'::jsonb")),
+    )
     zpe_correction_hartree: float | None = Field(default=None, sa_type=ScalarHartree)
     thermal_energy_correction_hartree: float | None = Field(default=None, sa_type=ScalarHartree)
     thermal_enthalpy_correction_hartree: float | None = Field(
@@ -1228,6 +1256,13 @@ class MolecularOrbitalResult(SQLModel, table=True):
         foreign_key="calculation_frame.id", ondelete="CASCADE", unique=True, nullable=False
     )
     electronic_state: str | None = Field(default=None, max_length=128)
+    orbital_basis: str | None = Field(default=None, max_length=32)
+    occupancy_origin: str | None = Field(default=None, max_length=32)
+    total_occupancies: list[float | None] | None = Field(
+        default=None, sa_column=Column(ARRAY(Float, dimensions=1), nullable=True)
+    )
+    reported_homo_index: int | None = Field(default=None)
+    reported_lumo_index: int | None = Field(default=None)
     alpha_orbital_count: int = Field(default=0, nullable=False)
     beta_orbital_count: int = Field(default=0, nullable=False)
     coefficient_count: int = Field(default=0, nullable=False)
@@ -1495,6 +1530,7 @@ class ElectronicState(SQLModel, table=True):
     )
     state_ordinal: int = Field(nullable=False)
     state_index: int | None = Field(default=None)
+    is_ground_state: bool | None = Field(default=None)
     root: int | None = Field(default=None)
     label: str | None = Field(default=None, max_length=256)
     multiplicity: int | None = Field(default=None)

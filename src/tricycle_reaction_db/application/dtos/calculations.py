@@ -2,7 +2,7 @@
 
 from hashlib import sha256
 from math import isnan
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 import numpy as np
 import numpy.typing as npt
@@ -35,6 +35,10 @@ _SCIENTIFIC_ARRAY_UNITS = {
     ScientificArrayKind.REDUCED_MASSES: "amu",
     ScientificArrayKind.VIBRATIONAL_FORCE_CONSTANTS: "mdyne/angstrom",
     ScientificArrayKind.IR_INTENSITIES: "km/mol",
+    ScientificArrayKind.RAMAN_ACTIVITIES: "angstrom^4/amu",
+    ScientificArrayKind.RAMAN_DEPOLARIZATION_RATIOS: "dimensionless",
+    ScientificArrayKind.RAMAN_DEPOLARIZATION_RATIOS_POLARIZED: "dimensionless",
+    ScientificArrayKind.RAMAN_DEPOLARIZATION_RATIOS_UNPOLARIZED: "dimensionless",
     ScientificArrayKind.NORMAL_MODES: "angstrom",
     ScientificArrayKind.MOMENTS_OF_INERTIA: "amu*bohr^2",
     ScientificArrayKind.ROTATIONAL_TEMPERATURES: "kelvin",
@@ -128,6 +132,15 @@ def _same_float(left: float, right: float) -> bool:
     return left == right or (isnan(left) and isnan(right))
 
 
+def _validate_clocks(record: Any) -> None:
+    if record.wall_time_seconds is not None and (
+        record.running_time_seconds != record.wall_time_seconds
+    ):
+        raise ValueError("running_time_seconds must alias wall_time_seconds")
+    if record.cpu_time_source is not None and record.cpu_time_seconds is None:
+        raise ValueError("cpu_time_source requires cpu_time_seconds")
+
+
 class ParseRevisionRecord(BaseModel):
     """Immutable inputs and outcome for one reproducible parse attempt."""
 
@@ -151,7 +164,12 @@ class ParseRevisionRecord(BaseModel):
     source_content_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     source_size_bytes: int | None = Field(default=None, ge=0)
     source_compression: str | None = Field(default=None, min_length=1, max_length=32)
-    running_time_seconds: float | None = Field(default=None, ge=0)
+    # The compatibility field contains wall time only for the v3 adapter.
+    running_time_seconds: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    wall_time_seconds: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    cpu_time_seconds: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    cpu_time_source: Literal["observed", "estimated"] | None = None
+    cpu_time_num_processes: int | None = Field(default=None, ge=1)
     source_complete: bool | None = None
     parse_completeness: ParseCompleteness = ParseCompleteness.NOT_ASSESSED
     comments: dict[str, Any] = Field(default_factory=lambda: {"items": []})
@@ -166,6 +184,7 @@ class ParseRevisionRecord(BaseModel):
 
     @model_validator(mode="after")
     def validate_lifecycle(self) -> Self:
+        _validate_clocks(self)
         projected_values = {
             "parser_id": self.parser_id,
             "parser_version": self.parser_version,
@@ -325,7 +344,12 @@ class CalculationFrameRecord(BaseModel):
     frequency_count: int | None = Field(default=None, ge=0)
     negative_frequency_count: int | None = Field(default=None, ge=0)
     lowest_frequency_cm1: float | None = None
-    running_time_seconds: float | None = Field(default=None, ge=0)
+    # The compatibility field contains wall time only for the v3 adapter.
+    running_time_seconds: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    wall_time_seconds: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    cpu_time_seconds: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    cpu_time_source: Literal["observed", "estimated"] | None = None
+    cpu_time_num_processes: int | None = Field(default=None, ge=1)
     program_metadata_schema_version: str = Field(
         default="calculation-frame-metadata-v1",
         min_length=1,
@@ -335,6 +359,7 @@ class CalculationFrameRecord(BaseModel):
 
     @model_validator(mode="after")
     def validate_frame(self) -> Self:
+        _validate_clocks(self)
         span_values = (
             self.source_start_byte,
             self.source_end_byte,
@@ -539,6 +564,11 @@ class VibrationResultRecord(BaseModel):
     imaginary_mode_count: int = Field(ge=0)
     lowest_frequency_cm1: float | None = None
     mode_indices: list[int]
+    source_mode_indices: list[int | None] | None = None
+    source_program: str | None = Field(default=None, max_length=128)
+    frequency_method: str | None = Field(default=None, max_length=128)
+    raman_activity_method: str | None = Field(default=None, max_length=128)
+    orientation: Literal["input", "standard", "source", "unknown"] | None = None
     axis_order: list[str] | None = None
     atom_order: str | None = Field(default=None, max_length=32)
     normalization: str | None = Field(default=None, max_length=64)
@@ -550,9 +580,16 @@ class VibrationResultRecord(BaseModel):
         if self.imaginary_mode_count > self.mode_count:
             raise ValueError("imaginary_mode_count cannot exceed mode_count")
         if len(self.mode_indices) != self.mode_count:
-            raise ValueError("mode_indices must contain one source index per mode")
-        if self.mode_indices != sorted(set(self.mode_indices)):
-            raise ValueError("mode_indices must be sorted and unique")
+            raise ValueError("mode_indices must contain one internal index per mode")
+        if len(set(self.mode_indices)) != self.mode_count or any(i < 0 for i in self.mode_indices):
+            raise ValueError("mode_indices must be unique and non-negative")
+        if self.source_mode_indices is not None and (
+            len(self.source_mode_indices) != self.mode_count
+            or any(i is not None and i < 0 for i in self.source_mode_indices)
+        ):
+            raise ValueError(
+                "source_mode_indices must contain one non-negative or unknown index per mode"
+            )
         if self.mode_count == 0 and self.lowest_frequency_cm1 is not None:
             raise ValueError("an empty vibration result cannot have a lowest frequency")
         if self.mode_count > 0 and self.lowest_frequency_cm1 is None:
@@ -577,12 +614,19 @@ class CalculationStatusResultRecord(BaseModel):
 
 
 class ThermochemistryResultRecord(BaseModel):
-    """Canonical scalar thermochemistry at explicit temperature and pressure."""
+    """Canonical scalar thermochemistry with source conditions when available."""
 
     model_config = ConfigDict(frozen=True)
 
-    temperature_kelvin: float = Field(gt=0)
-    pressure_atm: float = Field(gt=0)
+    temperature_kelvin: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    pressure_atm: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    source_program: str | None = Field(default=None, max_length=128)
+    entropy_model: Literal["RRHO", "QRRHO"] | None = None
+    frequency_scale_factor: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    low_frequency_cutoff_cm1: float | None = Field(default=None, allow_inf_nan=False)
+    rotor_reference_frequency_cm1: float | None = Field(default=None, allow_inf_nan=False)
+    imaginary_frequency_cutoff_cm1: float | None = Field(default=None, allow_inf_nan=False)
+    derivations: dict[str, str] = Field(default_factory=dict)
     zpe_correction_hartree: EnergyHartree | None = None
     thermal_energy_correction_hartree: EnergyHartree | None = None
     thermal_enthalpy_correction_hartree: EnergyHartree | None = None
@@ -610,6 +654,14 @@ class MolecularOrbitalResultRecord(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     electronic_state: str | None = Field(default=None, max_length=128)
+    orbital_basis: Literal["shared_spatial", "spin_resolved", "unknown"] | None = None
+    occupancy_origin: (
+        Literal["observed", "electron_counts", "restricted_equal_split", "high_spin", "unknown"]
+        | None
+    ) = None
+    total_occupancies: list[float | None] | None = None
+    reported_homo_index: int | None = Field(default=None, ge=0)
+    reported_lumo_index: int | None = Field(default=None, ge=0)
     alpha_orbital_count: int = Field(ge=0)
     beta_orbital_count: int = Field(ge=0)
     coefficient_count: int = Field(ge=0)
@@ -618,6 +670,17 @@ class MolecularOrbitalResultRecord(BaseModel):
     alpha_symmetries: list[str | None] = Field(default_factory=list)
     beta_symmetries: list[str | None] = Field(default_factory=list)
     source_schema_version: str = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_orbital_identity(self) -> Self:
+        if self.total_occupancies and len(self.total_occupancies) != max(
+            self.alpha_orbital_count, self.beta_orbital_count
+        ):
+            raise ValueError("total_occupancies must match the orbital count")
+        for index in (self.reported_homo_index, self.reported_lumo_index):
+            if index is not None and index >= self.alpha_orbital_count:
+                raise ValueError("reported frontier index must identify an orbital")
+        return self
 
 
 class ChargeSpinPopulationResultRecord(BaseModel):
@@ -714,6 +777,7 @@ class ElectronicStateRecord(BaseModel):
     set_kind: ElectronicStateSetKind
     state_ordinal: int = Field(ge=0)
     state_index: int | None = Field(default=None, ge=0)
+    is_ground_state: bool | None = None
     root: int | None = Field(default=None, ge=0)
     label: str | None = Field(default=None, max_length=256)
     multiplicity: int | None = Field(default=None, gt=0)

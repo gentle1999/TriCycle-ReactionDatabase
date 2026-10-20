@@ -445,11 +445,18 @@ def _parse_revision_summary(revision: ParseRevision) -> ParseRevisionSummary:
         parser_name=revision.parser_name,
         parser_version=revision.parser_version,
         molop_version=revision.molop_version,
+        ingestion_mapping_version=revision.parser_provenance.get(
+            "tricycle_ingestion_mapping_version"
+        ),
         source_format=_enum_value(revision.source_format),
         parse_completeness=_enum_value(revision.parse_completeness),
         status=_enum_value(revision.status),
         record_sha256=revision.record_sha256,
         running_time_seconds=revision.running_time_seconds,
+        wall_time_seconds=revision.wall_time_seconds,
+        cpu_time_seconds=revision.cpu_time_seconds,
+        cpu_time_source=revision.cpu_time_source,
+        cpu_time_num_processes=revision.cpu_time_num_processes,
         error_code=revision.error_code,
         error_message=revision.error_message,
         error_metadata_json=(
@@ -525,6 +532,8 @@ def _array_summary(
         owner_id=owner_id,
         slot=assignment.slot if assignment is not None else None,
         slot_ordinal=assignment.slot_ordinal if assignment is not None else None,
+        metadata_schema_version=array.metadata_schema_version,
+        metadata_json=json.dumps(array.array_metadata or {}, sort_keys=True, allow_nan=False),
         source_field=(array.array_metadata or {}).get("source_field"),
         source_unit=(array.array_metadata or {}).get("source_unit") or array.unit,
         population_name=_array_population_name(array),

@@ -100,11 +100,12 @@ class ScientificArrayContentService:
         cls,
         array_id: UUID,
         *,
-        max_bytes: int,
+        max_bytes: int | None,
         project_id: UUID,
     ) -> ScientificArrayDownload:
+        """Serialize an array, optionally limiting its raw bytes for the calling transport."""
         array = await cls._load_array(array_id, project_id=project_id)
-        if array.array_nbytes > max_bytes:
+        if max_bytes is not None and array.array_nbytes > max_bytes:
             raise ScientificArrayPayloadTooLargeError(
                 f"array payload is {array.array_nbytes} bytes; limit is {max_bytes}"
             )
@@ -150,6 +151,8 @@ def _json_value(value: Any) -> Any:
         value = value.item()
     if isinstance(value, complex):
         return {"real": value.real, "imag": value.imag}
+    if isinstance(value, float) and np.isnan(value):
+        return None
     if isinstance(value, float) and not np.isfinite(value):
         return str(value)
     if value is None or isinstance(value, (str, int, float, bool)):

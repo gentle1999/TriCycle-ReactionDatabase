@@ -245,6 +245,47 @@ def test_ts_thermodynamic_only_composite_chooses_complete_lowest_gibbs_frame() -
     assert composite.view.entropy_cal_mol_k == pytest.approx(11.0)
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"entropy_model": "QRRHO"},
+        {"entropy_model": None},
+        {"frequency_scale_factor": 0.98},
+        {"low_frequency_cutoff_cm1": 100.0},
+        {"rotor_reference_frequency_cm1": 50.0},
+        {"imaginary_frequency_cutoff_cm1": -20.0},
+    ],
+)
+def test_thermal_assumptions_prevent_combining_and_minimizing_incompatible_results(change):
+    geometry_id = uuid4()
+    protocol = _protocol("B3LYP", "def2-SVP", software="gaussian")
+    first = ThermochemistryResult(
+        temperature_kelvin=298.15,
+        pressure_atm=1.0,
+        entropy_model="RRHO",
+        frequency_scale_factor=1.0,
+        enthalpy_hartree=-99.9,
+        gibbs_free_energy_hartree=-99.95,
+        thermal_enthalpy_correction_hartree=0.1,
+        thermal_gibbs_correction_hartree=0.05,
+        entropy_cal_mol_k=10.0,
+    )
+    second = first.model_copy(update=change)
+    rows = [
+        (_frame(geometry_id, -100.0), protocol, first),
+        (_frame(geometry_id, -100.0), protocol, second),
+    ]
+    for ts_only in ((), (geometry_id,)):
+        result = geometry_energy_composites(
+            [geometry_id], rows, thermodynamic_only_geometry_ids=ts_only
+        )[geometry_id]
+        assert result.view.thermochemistry_selection_status == "ambiguous"
+    separate = [
+        geometry_energy_composite(geometry_id, [GeometryEnergyCandidate(*row)]) for row in rows
+    ]
+    assert separate[0].thermochemistry_level != separate[1].thermochemistry_level
+
+
 def test_protocol_version_difference_is_equivalent_for_energy_selection() -> None:
     geometry_id = uuid4()
     first_protocol = _protocol("B3LYP", "def2-SVP", software="gaussian")

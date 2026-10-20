@@ -198,6 +198,11 @@ def test_calculation_facts_round_trip_through_relationships(tmp_path) -> None:
                 reconstruction_config_hash="3" * 64,
                 source_format=SourceFormat.GAUSSIAN_LOG,
                 source_encoding="ascii",
+                running_time_seconds=10,
+                wall_time_seconds=10,
+                cpu_time_seconds=40,
+                cpu_time_source="estimated",
+                cpu_time_num_processes=4,
                 comments={
                     "items": [
                         {
@@ -264,6 +269,10 @@ def test_calculation_facts_round_trip_through_relationships(tmp_path) -> None:
                 frequency_count=1,
                 negative_frequency_count=0,
                 lowest_frequency_cm1=812.0,
+                running_time_seconds=2,
+                wall_time_seconds=2,
+                cpu_time_seconds=8,
+                cpu_time_source="observed",
                 comments={
                     "items": [
                         {
@@ -330,6 +339,23 @@ def test_calculation_facts_round_trip_through_relationships(tmp_path) -> None:
                     ),
                 )
             scientific_array = persist_scientific_array(session, frame, array_record)
+            raman = np.array([np.nan])
+            raman_summary = summarize_numpy_array(raman)
+            raman_record = ScientificArrayRecord(
+                kind=ScientificArrayKind.RAMAN_DEPOLARIZATION_RATIOS_UNPOLARIZED,
+                ordinal=0,
+                unit="dimensionless",
+                dtype=raman_summary.dtype,
+                shape=list(raman_summary.shape),
+                array_nbytes=raman_summary.nbytes,
+                payload_sha256=raman_summary.sha256,
+                data=raman,
+            )
+            raman_array = persist_scientific_array(session, frame, raman_record)
+            with pytest.raises(ValueError, match="shape must be"):
+                persist_scientific_array(
+                    session, frame, raman_record.model_copy(update={"shape": [2]})
+                )
             population_result_record = ChargeSpinPopulationResultRecord(
                 series_count=1,
                 source_schema_version="molop-calculation-v1",
@@ -388,7 +414,12 @@ def test_calculation_facts_round_trip_through_relationships(tmp_path) -> None:
             )
             thermochemistry_record = ThermochemistryResultRecord(
                 temperature_kelvin=298.15,
-                pressure_atm=1.0,
+                pressure_atm=None,
+                entropy_model="QRRHO",
+                source_program="ORCA",
+                frequency_scale_factor=0.98,
+                low_frequency_cutoff_cm1=100,
+                derivations={"TCG": "G_T minus electronic energy"},
                 thermal_gibbs_correction_hartree=0.0123,
                 source_schema_version="molop-calculation-v1",
             )
@@ -455,6 +486,7 @@ def test_calculation_facts_round_trip_through_relationships(tmp_path) -> None:
             geometry_id = geometry.id
             revision_id = revision.id
             scientific_array_id = scientific_array.id
+            raman_array_id = raman_array.id
 
         with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
             loaded_revision = session.exec(
@@ -463,16 +495,29 @@ def test_calculation_facts_round_trip_through_relationships(tmp_path) -> None:
             loaded_segment = loaded_revision.segments[0]
             loaded_frame = loaded_segment.frames[0]
             assert loaded_revision.artifact_file.id == artifact_id
+            assert loaded_revision.wall_time_seconds == loaded_revision.running_time_seconds == 10
+            assert loaded_revision.cpu_time_seconds == 40
+            assert loaded_revision.cpu_time_source == "estimated"
+            assert loaded_revision.cpu_time_num_processes == 4
             assert loaded_revision.comments["items"][0]["text"] == "relationship-level title"
             assert loaded_segment.protocol.id == protocol_id
             assert loaded_frame.geometry.id == geometry_id
             assert loaded_frame.comments["items"][0]["text"] == "frame-level title"
             assert loaded_frame.coordinate_decimal_places == 8
+            assert loaded_frame.wall_time_seconds == loaded_frame.running_time_seconds == 2
+            assert loaded_frame.cpu_time_seconds == 8
+            assert loaded_frame.cpu_time_source == "observed"
             assert loaded_frame.topology_derivation.provenance_hash == (
                 molecule_record.topology_derivation.provenance_hash
             )
             assert loaded_frame.thermochemistry_result is not None
             assert loaded_frame.thermochemistry_result.gibbs_free_energy_hartree is None
+            assert loaded_frame.thermochemistry_result.pressure_atm is None
+            assert loaded_frame.thermochemistry_result.entropy_model == "QRRHO"
+            assert loaded_frame.thermochemistry_result.frequency_scale_factor == 0.98
+            assert loaded_frame.thermochemistry_result.derivations == {
+                "TCG": "G_T minus electronic energy"
+            }
 
             unloaded_array = loaded_frame.scientific_arrays[0]
             assert "data" in inspect(unloaded_array).unloaded
@@ -486,6 +531,13 @@ def test_calculation_facts_round_trip_through_relationships(tmp_path) -> None:
             ).one()
             np.testing.assert_array_equal(loaded_array.data, forces)
             assert not loaded_array.data.flags.writeable
+            loaded_raman = session.exec(
+                select(ScientificArray)
+                .where(ScientificArray.id == raman_array_id)
+                .options(undefer(ScientificArray.data))
+            ).one()
+            assert loaded_raman.kind is ScientificArrayKind.RAMAN_DEPOLARIZATION_RATIOS_UNPOLARIZED
+            assert np.isnan(loaded_raman.data).all()
     finally:
         transaction.rollback()
         connection.close()

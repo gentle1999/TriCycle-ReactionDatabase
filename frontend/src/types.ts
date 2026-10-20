@@ -137,6 +137,10 @@ export interface CalculationFrameSummary {
   frequency_count: number | null;
   negative_frequency_count: number | null;
   running_time_seconds: number | null;
+  wall_time_seconds?: number | null;
+  cpu_time_seconds?: number | null;
+  cpu_time_source?: "observed" | "estimated" | null;
+  cpu_time_num_processes?: number | null;
   protocol_id?: string | null;
   protocol_level: (string | null)[];
 }
@@ -402,6 +406,11 @@ export interface CalculationFrameDetail extends CalculationFrameSummary {
     imaginary_mode_count: number;
     lowest_frequency_cm1: number | null;
     mode_indices: number[];
+    source_mode_indices?: (number | null)[] | null;
+    source_program?: string | null;
+    frequency_method?: string | null;
+    raman_activity_method?: string | null;
+    orientation?: "input" | "standard" | "source" | "unknown" | null;
   } | null;
   transition_state_endpoints: Array<{
     direction: "negative" | "positive";
@@ -417,7 +426,7 @@ export interface CalculationFrameDetail extends CalculationFrameSummary {
     provenance_json?: string;
   }>;
   transition_state_mapped_reaction_ids: string[];
-  thermochemistry: Record<string, number | null> | null;
+  thermochemistry: Record<string, number | string | null> | null;
   calculation_status: Record<string, boolean | null> | null;
   scientific_arrays: ScientificArraySummary[];
 }
@@ -473,6 +482,8 @@ export interface ScientificArraySummary {
   population_quantity?: string | null;
   population_spin_channel?: string | null;
   population_source_label?: string | null;
+  metadata_schema_version?: string | null;
+  metadata_json?: string;
 }
 
 export interface ArtifactSummary {
@@ -508,11 +519,16 @@ export interface ParseRevisionSummary {
   parser_name: string;
   parser_version: string;
   molop_version: string;
+  ingestion_mapping_version?: string | null;
   source_format: string;
   parse_completeness: string;
   status: string;
   record_sha256: string | null;
   running_time_seconds: number | null;
+  wall_time_seconds?: number | null;
+  cpu_time_seconds?: number | null;
+  cpu_time_source?: "observed" | "estimated" | null;
+  cpu_time_num_processes?: number | null;
   error_code: string | null;
   error_message: string | null;
   error_metadata_json?: string | null;
