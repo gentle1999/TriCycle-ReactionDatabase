@@ -39,6 +39,9 @@ from tricycle_reaction_db.application.services.reaction_geometry_policy import (
     geometry_has_no_imaginary_frequency_predicate,
     geometry_has_thermodynamic_property_predicate,
 )
+from tricycle_reaction_db.application.services.reaction_topology_representatives import (
+    prefer_observed_participant_topologies,
+)
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
@@ -754,6 +757,8 @@ def refresh_mapped_reaction_thermodynamics(
     mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
     if _input is not None and source_frame_ids_by_geometry is not None:
         raise ValueError("cannot combine a prepared thermodynamics input with source frame IDs")
+    if _input is None:
+        prefer_observed_participant_topologies(session, [mapped_reaction_id])
     refresh_input = _input or _load_mapped_reaction_thermodynamics_input(
         session,
         mapped_reaction,
@@ -863,7 +868,10 @@ def enqueue_mapped_reaction_profile_refresh(
     persisted_reactions = session.exec(
         select(MappedReaction)
         .where(col(MappedReaction.id).in_(mapped_reaction_ids))
-        .with_for_update()
+        .order_by(col(MappedReaction.id))
+        # Only generation fields change. FOR UPDATE would conflict with the
+        # KEY SHARE locks taken by concurrent profile/source foreign keys.
+        .with_for_update(key_share=True)
     ).all()
     persisted_by_id = {
         mapped_reaction.id: mapped_reaction
@@ -892,6 +900,7 @@ def enqueue_mapped_reaction_profile_refresh(
                     mapped_reaction_ids
                 )
             )
+            .order_by(col(MappedReactionThermodynamicProfileRefreshJob.mapped_reaction_id))
             .with_for_update()
         ).all()
     }
@@ -960,6 +969,7 @@ def refresh_mapped_reactions_thermodynamics(
         mapped_reactions_by_id.setdefault(mapped_reaction_id, canonical)
     mapped_reaction_ids = tuple(mapped_reactions_by_id)
     _attach_pending_entities(session)
+    prefer_observed_participant_topologies(session, mapped_reaction_ids)
 
     participant_rows = session.exec(
         select(MappedReactionParticipant, LogicalReactionParticipant)

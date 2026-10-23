@@ -118,6 +118,7 @@ class Settings(BaseSettings):
         gt=0.05,
         le=300.0,
     )
+    profile_refresh_worker_audit_batch_size: int = Field(default=256, ge=1, le=2_048)
     units_dataset_worker_poll_interval_seconds: float = Field(
         default=2.0,
         gt=0.05,

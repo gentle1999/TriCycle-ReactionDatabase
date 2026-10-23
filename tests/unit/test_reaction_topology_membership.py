@@ -81,7 +81,7 @@ def test_source_memberships_use_verified_correspondence_without_graph_search(
     def forbidden(*_args, **_kwargs):
         raise AssertionError("source imports must never search RDKit graph matches")
 
-    monkeypatch.setattr(reaction_topology_membership, "find_topology_matches", forbidden)
+    monkeypatch.setattr(Chem.Mol, "GetSubstructMatches", forbidden)
     matches, enumerated, method = reaction_topology_membership._topology_mapping_evidence(
         SimpleNamespace(info={authority_key: True}),
         SimpleNamespace(mol=specific),
@@ -116,7 +116,7 @@ def test_source_membership_prefers_existing_dag_mapping(
     def forbidden(*_args, **_kwargs):
         raise AssertionError("verified DAG evidence must be reused")
 
-    monkeypatch.setattr(reaction_topology_membership, "find_topology_matches", forbidden)
+    monkeypatch.setattr(Chem.Mol, "GetSubstructMatches", forbidden)
     monkeypatch.setattr(reaction_topology_membership, "canonical_atom_index_mapping", forbidden)
     assert reaction_topology_membership._topology_mapping_evidence(
         SimpleNamespace(info={SOURCE_ATOM_ORDER_AUTHORITATIVE_SESSION_INFO_KEY: True}),

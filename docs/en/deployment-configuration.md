@@ -164,6 +164,19 @@ topology-DAG construction, concrete/logical membership, and reverse
 reconciliation before it enqueues profile refresh work; it no longer enters
 the previous legacy bulk bypass.
 
+Run the independent `profile-refresh-worker` to consume the durable profile queue.
+It also audits all mapped reactions in ID-ordered pages, including when the queue
+is empty. `TRICYCLE_PROFILE_REFRESH_WORKER_AUDIT_BATCH_SIZE` defaults to 256.
+Canonical-equivalent legacy topology references, unmaterialized generations, and
+outdated policy versions recover missing queue entries. Each iteration processes
+at most four refresh microbatches (32 reactions each by default), then waits for
+the poll interval (2 seconds by default), so continuous imports cannot starve the
+audit. Logs report completed audit cycles, recovered jobs, and retry failures.
+Audit failures retain the cursor and do not block existing queue consumption.
+References and profiles update in the same refresh transaction. Empty queues
+alone do not prove reference consistency; null energies caused only by incomplete
+sources do not trigger repeated refreshes.
+
 This model recommends exactly one `upload-worker` instance in production: it is
 the boundary for the shared MolOP process pool and the single active persistence
 consumer. API nodes may scale horizontally, but upload-worker should not be

@@ -140,6 +140,34 @@ async def _delete_lock_test_graph(
 
 
 @pytest.mark.asyncio
+async def test_enqueue_generation_does_not_block_on_source_foreign_key_lock() -> None:
+    """Profile/source FK checks must not deadlock a generation lock upgrade."""
+    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    organization_id, project_id, logical_reaction_id, mapped_reaction_id = _create_lock_test_graph(
+        engine
+    )
+    try:
+        # A second transaction models the FK lock retained by a profile
+        # writer. The former FOR UPDATE enqueue blocked on this key-share
+        # lock while that writer could be waiting for upload source rows.
+        with engine.connect() as source_writer:
+            source_writer.execute(
+                text("SELECT id FROM mapped_reaction WHERE id = :id FOR KEY SHARE"),
+                {"id": mapped_reaction_id},
+            )
+            with Session(engine, expire_on_commit=False) as session:
+                session.execute(text("SET LOCAL lock_timeout = '500ms'"))
+                reaction = session.get(MappedReaction, mapped_reaction_id)
+                assert reaction is not None
+                enqueue_mapped_reaction_profile_refresh(session, [reaction], immediate=True)
+                session.commit()
+                assert reaction.thermodynamic_profile_generation == 2
+    finally:
+        await _delete_lock_test_graph(organization_id, project_id, logical_reaction_id)
+        engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_profile_calculation_does_not_hold_upload_generation_lock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

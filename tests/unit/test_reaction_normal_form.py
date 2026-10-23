@@ -18,7 +18,7 @@ from tricycle_reaction_db.domain.enums import LogicalReactionParticipantSide as 
 from tricycle_reaction_db.domain.enums import MappedReactionKind
 
 
-@pytest.mark.parametrize("reuse", [False, True])
+@pytest.mark.parametrize("reuse", [False, True, "previous_policy"])
 def test_persistence_remembers_selected_form_without_recanonicalizing(monkeypatch, reuse):
     smiles = "[He:1]>>[He:1]"
     identity = CanonicalReactionIdentity(smiles, {1: 1})
@@ -39,7 +39,13 @@ def test_persistence_remembers_selected_form_without_recanonicalizing(monkeypatc
         ],
     )
     existing = SimpleNamespace(
-        id=uuid4(), mapped_reaction_smiles=smiles, normalization_metadata=None
+        id=uuid4(),
+        mapped_reaction_smiles=smiles,
+        normalization_metadata=(
+            {"policy": "previous", "selected_mapped_reaction_smiles": smiles}
+            if reuse == "previous_policy"
+            else None
+        ),
     )
     added = []
     session = SimpleNamespace(

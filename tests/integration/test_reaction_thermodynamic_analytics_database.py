@@ -92,6 +92,7 @@ async def test_statistics_and_export_share_logical_reaction_filters(
                     project_id=SYSTEM_PROJECT_ID,
                     mapped_reaction_key=f"analytics-filter-path-{suffix}-{index}",
                     mapped_reaction_kind=MappedReactionKind.OTHER,
+                    thermodynamic_profile_policy_version=MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION,
                     mapped_reaction_smiles="[H:1][H:2]>>[H:1][H:2]",
                     mapping_hash=hashlib.sha256(f"mapping:{suffix}:{index}".encode()).hexdigest(),
                 )
@@ -232,6 +233,9 @@ async def test_export_filters_each_mapping_and_profile_within_one_logical_reacti
                         mapped_reaction_key=f"export-siblings:{suffix}:{index}",
                         label=f"export-siblings:{suffix}:{index}",
                         mapped_reaction_kind=MappedReactionKind.OTHER,
+                        # These profiles are intentionally materialized by the fixture.
+                        # The independent recovery worker must not replace them.
+                        thermodynamic_profile_policy_version=MAPPED_REACTION_THERMODYNAMICS_POLICY_VERSION,
                         mapped_reaction_smiles=smiles,
                         mapping_hash=hashlib.sha256(f"{suffix}:{index}".encode()).hexdigest(),
                     )

@@ -4,7 +4,12 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from psycopg.errors import InvalidTextRepresentation, OutOfMemory
+from psycopg.errors import (
+    DeadlockDetected,
+    InvalidTextRepresentation,
+    OutOfMemory,
+    SerializationFailure,
+)
 from sqlalchemy.exc import OperationalError
 
 from tricycle_reaction_db.application.services.artifact_upload_types import ParsedArtifactTask
@@ -150,6 +155,49 @@ async def test_empty_batch_does_not_open_transaction(monkeypatch):
         )
         == {}
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cause_type", [DeadlockDetected, SerializationFailure])
+async def test_transaction_conflict_retries_only_uncommitted_files(monkeypatch, cause_type):
+    entries = tasks(4)
+    committed = object()
+    calls = []
+
+    async def once(subset, **kwargs):
+        calls.append(subset)
+        if len(calls) == 1:
+            kwargs["_completed_results"][entries[0].artifact_id] = committed
+            raise OperationalError("persist", {}, cause_type("transaction aborted"))
+        assert subset == entries[1:]
+        return {task.artifact_id: object() for task in subset}
+
+    monkeypatch.setattr(ArtifactUploadService, "_persist_parsed_microbatch_once", once)
+    result = await ArtifactUploadService.persist_parsed_microbatch(
+        entries, project_id=uuid4(), user_id=uuid4()
+    )
+    assert len(calls) == 2
+    assert len(result) == 4
+    assert result[entries[0].artifact_id] is committed
+    assert not any(isinstance(value, Exception) for value in result.values())
+
+
+@pytest.mark.asyncio
+async def test_repeated_deadlock_has_bounded_retries_without_bisection(monkeypatch):
+    entries = tasks(3)
+    error = OperationalError("persist", {}, DeadlockDetected("deadlock"))
+    calls = []
+
+    async def once(subset, **kwargs):
+        calls.append(subset)
+        raise error
+
+    monkeypatch.setattr(ArtifactUploadService, "_persist_parsed_microbatch_once", once)
+    result = await ArtifactUploadService.persist_parsed_microbatch(
+        entries, project_id=uuid4(), user_id=uuid4()
+    )
+    assert calls == [entries] * 4
+    assert all(result[task.artifact_id] is error for task in entries)
 
 
 @pytest.mark.asyncio

@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import logging
+from itertools import combinations
 
 from rdkit import Chem
 
-from tricycle_reaction_db.application.services.rdkit_graph_matching import (
-    MolecularGraphMatchTimeoutError,
-    get_substruct_matches,
+from tricycle_reaction_db.application.services.canonical_atom_mapping import (
+    canonical_atom_index_mapping,
 )
-
-logger = logging.getLogger(__name__)
 
 
 def _electronic_graph_projection(molecule: Chem.Mol) -> Chem.Mol:
@@ -28,6 +25,9 @@ def _electronic_graph_projection(molecule: Chem.Mol) -> Chem.Mol:
     for atom in normalized.GetAtoms():  # type: ignore[no-untyped-call]
         atom.SetAtomMapNum(0)
         atom.SetFormalCharge(0)
+        atom.SetNumRadicalElectrons(0)
+        atom.SetNumExplicitHs(0)
+        atom.SetNoImplicit(True)
         atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
         atom.SetIsAromatic(False)
         for property_name in ("_CIPCode", "_CIPRank"):
@@ -36,8 +36,11 @@ def _electronic_graph_projection(molecule: Chem.Mol) -> Chem.Mol:
     for bond in normalized.GetBonds():  # type: ignore[no-untyped-call]
         bond.SetBondType(Chem.BondType.SINGLE)
         bond.SetIsAromatic(False)
+        bond.SetIsConjugated(False)
         bond.SetStereo(Chem.BondStereo.STEREONONE)
         bond.SetBondDir(Chem.BondDir.NONE)
+    normalized.RemoveAllConformers()
+    normalized.UpdatePropertyCache(strict=False)
     return normalized.GetMol()
 
 
@@ -51,10 +54,10 @@ def source_geometry_compatible_topology(
 
     MolOP endpoint reconstruction can retain an endpoint-only bond in
     addition to changing bond orders and formal-charge placement.  The source
-    geometry is therefore treated as a full subgraph of the endpoint after a
-    charge/bond-order/stereo-free projection, with at most one endpoint-only
-    bond.  Element identity, explicit hydrogens, isotope identity, atom count,
-    and all source connectivity remain constrained.
+    comparison therefore removes the allowed endpoint-only bonds and compares
+    complete canonical charge/bond-order/stereo-free graphs. No subgraph
+    search or partial-graph atom assignment is used. Element identity, explicit
+    hydrogens, isotope identity, atom count, and source connectivity are constrained.
 
     Callers must additionally enforce project, formula, charge, and candidate
     uniqueness constraints; this predicate alone is not permission to bind
@@ -70,22 +73,17 @@ def source_geometry_compatible_topology(
     extra_bonds = endpoint_graph.GetNumBonds() - source_graph.GetNumBonds()
     if extra_bonds < 0 or extra_bonds > max_endpoint_extra_bonds:
         return False
-    try:
-        return bool(
-            get_substruct_matches(
-                endpoint_graph,
-                source_graph,
-                use_chirality=False,
-                max_matches=1,
-                hard_timeout_for_large_molecules=True,
-            )
-        )
-    except MolecularGraphMatchTimeoutError:
-        # Compatibility is a conservative source-selection predicate. A
-        # timed-out candidate is not eligible, while the surrounding upload or
-        # profile refresh can continue with the remaining DAG candidates.
-        logger.warning("Skipping source geometry compatibility after an RDKit graph-match timeout")
-        return False
+    endpoint_edges = [(b.GetBeginAtomIdx(), b.GetEndAtomIdx()) for b in endpoint_graph.GetBonds()]
+    for removed_edges in combinations(endpoint_edges, extra_bonds):
+        candidate = Chem.RWMol(endpoint_graph)
+        for begin, end in removed_edges:
+            candidate.RemoveBond(begin, end)
+        candidate.UpdatePropertyCache(strict=False)
+        # Stereo is already removed; keep isomeric serialization enabled so
+        # isotope identity remains part of the canonical graph comparison.
+        if canonical_atom_index_mapping(source_graph, candidate.GetMol()) is not None:
+            return True
+    return False
 
 
 __all__ = ["source_geometry_compatible_topology"]

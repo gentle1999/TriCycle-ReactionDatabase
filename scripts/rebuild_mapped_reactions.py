@@ -675,6 +675,23 @@ def _reparent_distinct_mapping(
     return (old_logical_id,)
 
 
+def _verified_target_geometry_ids(
+    session: Session, state: dict[str, Any], target_reaction_ids: set[UUID]
+) -> set[UUID]:
+    """Include shared TS evidence only when its own source rebuild was verified."""
+    geometry_ids: set[UUID] = set()
+    for source in state["plan"]["inferences"]:
+        inference = session.get(TransitionStateInference, UUID(source["id"]))
+        if inference is None or inference.mapped_reaction_id not in target_reaction_ids:
+            continue
+        if not _resume_complete(session, inference, source, state):
+            continue
+        frame = session.get(CalculationFrame, inference.calculation_frame_id)
+        if frame is not None:
+            geometry_ids.add(frame.geometry_id)
+    return geometry_ids
+
+
 def _cleanup_one(session: Session, entry: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     reaction_id = UUID(entry["id"])
     reaction = session.exec(
@@ -860,6 +877,11 @@ def _cleanup_one(session: Session, entry: dict[str, Any], state: dict[str, Any])
             mapped_reaction_thermodynamics_persistence.enqueue_mapped_reaction_profile_refresh(
                 session, list(refresh_targets.values())
             )
+    # Symmetric legacy rows may share TS evidence originating from another
+    # row in the same rebuild. Its verified source can now converge on the
+    # same destination; requiring it to have originated on this row prevents
+    # retiring a duplicate despite complete evidence on the destination.
+    target_geometry_ids.update(_verified_target_geometry_ids(session, state, target_reaction_ids))
     old_ts_geometries = set(
         session.exec(
             select(MappedReactionNodeGeometry.geometry_id)

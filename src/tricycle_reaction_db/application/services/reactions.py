@@ -44,6 +44,7 @@ from tricycle_reaction_db.application.services.canonical_atom_mapping import (
     canonical_reaction_atom_map_translation,
 )
 from tricycle_reaction_db.application.services.canonical_reaction_identity import (
+    REACTION_INDEX_POLICY,
     CanonicalReactionIdentity,
     canonical_reaction_identity,
 )
@@ -1601,6 +1602,12 @@ def persist_mapped_reaction(
             != mapped_reaction.mapped_reaction_smiles
         ):
             raise ValueError("existing reaction normal-form provenance is inconsistent")
+        elif mapped_reaction.normalization_metadata.get("policy") != REACTION_INDEX_POLICY:
+            # The incoming identity was computed under the current policy and
+            # reproduces this exact stored form. Refresh its provenance so a
+            # source rebuild can retain it instead of treating it as obsolete.
+            mapped_reaction.normalization_metadata = dict(normalization_metadata)
+            session.add(mapped_reaction)
 
     reaction_id = _require_id(reaction, label="LogicalReaction")
     project_id = reaction.project_id
@@ -2451,18 +2458,10 @@ def persist_mapped_reaction_node_geometry_mapping(
     transition_state_mapping = node.role is MappedReactionNodeRole.TRANSITION_STATE
     if len(record.geometry_atom_map_numbers) != node_geometry.geometry.atom_count:
         raise ValueError("Geometry atom-map count must match the bound Geometry")
-    expected_smiles = (
-        mapped_smiles_for_geometry(
-            node_geometry.geometry,
-            record.geometry_atom_map_numbers,
-            include_stereochemistry=False,
-        )
-        if transition_state_mapping
-        else mapped_smiles_for_topology(
-            node_geometry.geometry.topology,
-            record.geometry_atom_map_numbers,
-            include_stereochemistry=True,
-        )
+    expected_smiles = mapped_smiles_for_geometry(
+        node_geometry.geometry,
+        record.geometry_atom_map_numbers,
+        include_stereochemistry=not transition_state_mapping,
     )
     if record.mapped_smiles != expected_smiles:
         raise ValueError("mapped_smiles does not match the converted coordinate mapping")

@@ -6,11 +6,11 @@ import csv
 import io
 import json
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy import and_, func, select
-from sqlmodel import col
+from sqlmodel import Session, col
 
 from tricycle_reaction_db.application.dtos import (
     MappedReactionThermodynamicStatistics,
@@ -29,6 +29,11 @@ from tricycle_reaction_db.application.services.query_visibility import (
     mapped_reaction_id_is_visible,
     query_visibility_scope,
     thermodynamic_profile_is_visible,
+)
+from tricycle_reaction_db.application.services.reaction_cpu_time_export import (
+    CPU_TIME_COLUMNS,
+    SUBSTRATE_TIME_COLUMNS,
+    ReactionCpuTimeExport,
 )
 from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
@@ -53,10 +58,8 @@ _PROFILE_COLUMNS = (
     "level_of_theory",
     "temperature_kelvin",
     "pressure_atm",
-    "reactants_running_time_seconds",
-    "transition_state_running_time_seconds",
-    "products_running_time_seconds",
-    "total_running_time_seconds",
+    *CPU_TIME_COLUMNS,
+    *SUBSTRATE_TIME_COLUMNS,
     "activation_enthalpy_kcal_mol",
     "activation_gibbs_free_energy_kcal_mol",
     "reaction_enthalpy_kcal_mol",
@@ -364,6 +367,7 @@ class ReactionThermodynamicAnalyticsService:
             )
         return ReactionThermodynamicAnalyticsService._export_csv_rows(
             predicate,
+            visible_mappings=mapped_reaction_id_is_visible(scope, col(MappedReaction.id)),
             project_id=project_id,
             frontend_base_url=frontend_base_url or get_settings().oidc_frontend_url,
             limit=limit,
@@ -374,6 +378,7 @@ class ReactionThermodynamicAnalyticsService:
     async def _export_csv_rows(
         predicate: Any,
         *,
+        visible_mappings: Any,
         project_id: UUID,
         frontend_base_url: str,
         limit: int | None = None,
@@ -395,10 +400,6 @@ class ReactionThermodynamicAnalyticsService:
                 col(profile.thermochemistry_level),
                 col(profile.temperature_kelvin),
                 col(profile.pressure_atm),
-                col(profile.reactants_running_time_seconds),
-                col(profile.transition_state_running_time_seconds),
-                col(profile.products_running_time_seconds),
-                col(profile.total_running_time_seconds),
                 col(profile.activation_enthalpy_kcal_mol),
                 col(profile.activation_gibbs_free_energy_kcal_mol),
                 col(profile.reaction_enthalpy_kcal_mol),
@@ -422,78 +423,64 @@ class ReactionThermodynamicAnalyticsService:
         yield encode(list(_PROFILE_COLUMNS))
         async with session_factory() as session:
             result = await session.stream(statement)
-            async for row in result:
-                # Keep the encoder tolerant of small test doubles and older
-                # callers that supplied the pre-runtime 15-column row shape.
-                values = tuple(row)
-                if len(values) == 15:
-                    (
-                        mapped_id,
-                        logical_id,
-                        mapped_key,
-                        mapped_kind,
-                        mapped_smiles,
-                        mapping_hash,
-                        policy_version,
-                        electronic_level,
-                        thermochemistry_level,
-                        temperature,
-                        pressure,
-                        activation_enthalpy,
-                        activation_gibbs,
-                        reaction_enthalpy,
-                        reaction_gibbs,
-                    ) = values
-                    reactants_runtime = transition_state_runtime = None
-                    products_runtime = total_runtime = None
-                else:
-                    (
-                        mapped_id,
-                        logical_id,
-                        mapped_key,
-                        mapped_kind,
-                        mapped_smiles,
-                        mapping_hash,
-                        policy_version,
-                        electronic_level,
-                        thermochemistry_level,
-                        temperature,
-                        pressure,
-                        reactants_runtime,
-                        transition_state_runtime,
-                        products_runtime,
-                        total_runtime,
-                        activation_enthalpy,
-                        activation_gibbs,
-                        reaction_enthalpy,
-                        reaction_gibbs,
-                    ) = values
-                yield encode(
-                    [
-                        mapped_id,
-                        logical_id,
-                        mapped_key,
-                        getattr(mapped_kind, "value", mapped_kind),
-                        mapped_smiles,
-                        mapping_hash,
-                        policy_version,
-                        json.dumps(electronic_level, ensure_ascii=True, separators=(",", ":")),
-                        json.dumps(thermochemistry_level, ensure_ascii=True, separators=(",", ":")),
-                        _level_label(list(electronic_level), list(thermochemistry_level)),
-                        temperature,
-                        pressure,
-                        reactants_runtime,
-                        transition_state_runtime,
-                        products_runtime,
-                        total_runtime,
-                        activation_enthalpy,
-                        activation_gibbs,
-                        reaction_enthalpy,
-                        reaction_gibbs,
-                        f"{frontend_base_url.rstrip('/')}/mapped-reactions/{mapped_id}"
-                        f"?project_id={project_id}",
-                    ]
+            costs: ReactionCpuTimeExport | None = None
+            async for partition in result.partitions(128):
+                if costs is None:
+                    costs = await session.run_sync(
+                        lambda sync_session: ReactionCpuTimeExport(
+                            cast(Session, sync_session), project_id, visible_mappings
+                        )
+                    )
+                mapped_ids = list(dict.fromkeys(row[0] for row in partition))
+                times = await session.run_sync(
+                    lambda sync_session, cache=costs, ids=mapped_ids: cache.load(
+                        cast(Session, sync_session), ids
+                    )
                 )
+                for row in partition:
+                    (
+                        mapped_id,
+                        logical_id,
+                        mapped_key,
+                        mapped_kind,
+                        mapped_smiles,
+                        mapping_hash,
+                        policy_version,
+                        electronic_level,
+                        thermochemistry_level,
+                        temperature,
+                        pressure,
+                        activation_enthalpy,
+                        activation_gibbs,
+                        reaction_enthalpy,
+                        reaction_gibbs,
+                    ) = row
+                    yield encode(
+                        [
+                            mapped_id,
+                            logical_id,
+                            mapped_key,
+                            getattr(mapped_kind, "value", mapped_kind),
+                            mapped_smiles,
+                            mapping_hash,
+                            policy_version,
+                            json.dumps(electronic_level, ensure_ascii=True, separators=(",", ":")),
+                            json.dumps(
+                                thermochemistry_level, ensure_ascii=True, separators=(",", ":")
+                            ),
+                            _level_label(list(electronic_level), list(thermochemistry_level)),
+                            temperature,
+                            pressure,
+                            *(times[mapped_id][column] for column in CPU_TIME_COLUMNS),
+                            *(times[mapped_id][column] for column in SUBSTRATE_TIME_COLUMNS),
+                            activation_enthalpy,
+                            activation_gibbs,
+                            reaction_enthalpy,
+                            reaction_gibbs,
+                            f"{frontend_base_url.rstrip('/')}/mapped-reactions/{mapped_id}"
+                            f"?project_id={project_id}",
+                        ]
+                    )
 
 
 __all__ = ["ReactionThermodynamicAnalyticsService"]

@@ -126,7 +126,7 @@ async def _claim_profile_refresh_jobs(
                     col(MappedReactionThermodynamicProfileRefreshJob.requested_at),
                     col(MappedReactionThermodynamicProfileRefreshJob.mapped_reaction_id),
                 )
-                .with_for_update(skip_locked=True)
+                .with_for_update(skip_locked=True, of=MappedReactionThermodynamicProfileRefreshJob)
                 .limit(limit)
             )
         ).all()
@@ -280,11 +280,18 @@ async def _process_profile_refresh_batch(
     # rather than leaving a permanently stale visible/hidden state.
     async with session_factory() as session:
         await _refresh_source_visibility(session, refreshed_ids)
+        await session.commit()
+
+    # Visibility writes lock profiles. Release those locks before locking
+    # reactions/jobs: source writes can already hold reaction FK locks when
+    # their visibility triggers need the same profiles.
+    async with session_factory() as session:
         current_reactions = (
             await session.exec(
                 select(MappedReaction)
                 .where(col(MappedReaction.id).in_(mapped_reaction_ids))
-                .with_for_update()
+                .order_by(col(MappedReaction.id))
+                .with_for_update(key_share=True)
             )
         ).all()
         jobs = (
@@ -297,6 +304,7 @@ async def _process_profile_refresh_batch(
                     col(MappedReactionThermodynamicProfileRefreshJob.status)
                     == ThermodynamicProfileRefreshJobStatus.PROCESSING,
                 )
+                .order_by(col(MappedReactionThermodynamicProfileRefreshJob.mapped_reaction_id))
                 .with_for_update()
             )
         ).all()

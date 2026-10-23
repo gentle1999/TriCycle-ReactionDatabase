@@ -1,5 +1,6 @@
 """Reactant traversal defines reaction maps; source labels are provenance only."""
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from rdkit import Chem, rdBase
@@ -13,7 +14,33 @@ from tricycle_reaction_db.application.services.canonical_atom_mapping import (
 from tricycle_reaction_db.domain.enums import LogicalReactionParticipantSide as Side
 from tricycle_reaction_db.ingestion.normalization import serialize_molecule_smiles
 
-REACTION_INDEX_POLICY = "canonical-reactant-joint-correspondence-v1"
+REACTION_INDEX_POLICY = "canonical-reactant-joint-correspondence-v2"
+
+
+def derived_reaction_variant_key(
+    components: Mapping[tuple[Side, int], tuple[Chem.Mol, Sequence[int]]],
+) -> tuple[tuple[tuple[str, int, str], ...], str]:
+    """Identify a generated variant, never an independently observed reaction.
+
+    Expansion selects concrete stereo topologies for existing logical slots.
+    Do not manufacture another atom-to-stereocentre assignment for a combination
+    already represented. Preserve complete connectivity correspondence, so equal
+    endpoint graphs alone cannot collapse distinct atom-transfer mechanisms.
+    Direct TS ingestion still uses the strict stereo reaction identity below.
+    """
+    endpoint_keys = []
+    connectivity = {Side.REACTANT: [], Side.PRODUCT: []}
+    for (side, index), (molecule, maps) in components.items():
+        projection = _canonical_smiles(
+            molecule, include_stereochemistry=True, preserve_assigned_stereo=True
+        )
+        if projection is None:
+            raise ValueError("derived reaction requires a lossless concrete stereo topology")
+        endpoint_keys.append((side.value, index, projection[0]))
+        molecule = _map_free(molecule)
+        Chem.RemoveStereochemistry(molecule)
+        connectivity[side].append((molecule, maps))
+    return tuple(sorted(endpoint_keys)), canonical_reaction_identity(connectivity).smiles
 
 
 @dataclass(frozen=True)
@@ -44,6 +71,44 @@ def serialize_reaction_components(components: ReactionComponents) -> str:
             serialize_molecule_smiles(molecule, preserve_atom_maps=True, all_hs_explicit=True)
         )
     return ">>".join(rendered)
+
+
+def _ranking_projection(molecule: Chem.Mol) -> Chem.Mol:
+    """Use one stereo representation for ranking, retaining source atom indices.
+
+    Stored MOLs can encode the same double bond with different control atoms
+    (and therefore opposite E/Z enum values). RDKit ranks and joint bond colours
+    consume those values directly. A lossless labelled SMILES round trip gives
+    the ranking graph consistent controls without changing the source molecule.
+    Parsing is unsanitized so trusted metal valence and electron assignments are
+    not replaced by RDKit's valence inference.
+    """
+    labelled = _map_free(molecule)
+    for atom in labelled.GetAtoms():  # type: ignore[no-untyped-call]
+        atom.SetAtomMapNum(atom.GetIdx() + 1)
+    smiles = serialize_molecule_smiles(labelled, preserve_atom_maps=True, all_hs_explicit=True)
+    parser = Chem.SmilesParserParams()
+    parser.removeHs = False
+    parser.sanitize = False
+    parsed = Chem.MolFromSmiles(smiles, parser)
+    if parsed is None:
+        raise ValueError("reaction ranking requires a lossless stereo projection")
+    indices = {
+        atom.GetAtomMapNum(): atom.GetIdx()
+        for atom in parsed.GetAtoms()  # type: ignore[no-untyped-call]
+    }
+    if set(indices) != set(range(1, molecule.GetNumAtoms() + 1)):
+        raise ValueError("reaction ranking projection changed atom identities")
+    projected = Chem.RenumberAtoms(
+        parsed, [indices[index + 1] for index in range(molecule.GetNumAtoms())]
+    )
+    for atom, source in zip(projected.GetAtoms(), molecule.GetAtoms(), strict=True):  # type: ignore[no-untyped-call]
+        atom.SetAtomMapNum(0)
+        atom.SetNumRadicalElectrons(source.GetNumRadicalElectrons())
+    projected.UpdatePropertyCache(strict=False)
+    Chem.FastFindRings(projected)
+    Chem.AssignStereochemistry(projected, cleanIt=True, force=True)
+    return projected
 
 
 def _joint_order(reactant: Chem.Mol, product: Chem.Mol) -> list[int]:
@@ -123,8 +188,10 @@ def canonical_reaction_identity(components: ReactionComponents) -> CanonicalReac
     ]:
         raise ValueError("reaction correspondence changes element or isotope")
 
-    joint_order = _joint_order(reactant, product)
-    precursor = Chem.RenumberAtoms(_map_free(reactant), joint_order)
+    ranking_reactant = _ranking_projection(reactant)
+    ranking_product = _ranking_projection(product)
+    joint_order = _joint_order(ranking_reactant, ranking_product)
+    precursor = Chem.RenumberAtoms(ranking_reactant, joint_order)
     canonical = _canonical_smiles(precursor, include_stereochemistry=True)
     if canonical is None:
         raise ValueError("reactant cannot establish a lossless canonical atom traversal")

@@ -47,7 +47,7 @@ def test_large_full_graph_match_can_be_hard_stopped() -> None:
         )
 
 
-def test_large_graph_timeout_is_a_conservative_compatibility_miss(
+def test_large_graph_compatibility_does_not_use_subgraph_search(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     endpoint = Chem.MolFromSmiles("C" * 49)
@@ -63,14 +63,14 @@ def test_large_graph_timeout_is_a_conservative_compatibility_miss(
         )
 
     monkeypatch.setattr(
-        "tricycle_reaction_db.application.services.topology_compatibility.get_substruct_matches",
+        "tricycle_reaction_db.application.services.rdkit_graph_matching.get_substruct_matches",
         timeout,
     )
     from tricycle_reaction_db.application.services.topology_compatibility import (
         source_geometry_compatible_topology,
     )
 
-    assert not source_geometry_compatible_topology(endpoint, source)
+    assert source_geometry_compatible_topology(endpoint, source)
 
 
 def test_match_result_count_is_explicitly_bounded() -> None:

@@ -399,6 +399,12 @@ Both creation orders are supported:
 
 ### Mapping transfer for a new concrete configuration
 
+All mapping normalization and transfer compose atom-order permutations through
+canonical representations. Subgraph matching is prohibited, including fallback
+paths. Canonical witnesses must pass complete graph and stereo validation; an
+unverifiable correspondence is rejected. Symmetry witnesses are not claimed to
+enumerate every possible assignment.
+
 A new concrete topology does not need to carry a new atom-map text. If it is a
 member of a logical participant and a complete strict mapping template exists
 under that LogicalReaction, mapping is transferred through two graph
@@ -416,12 +422,21 @@ those correspondences yields complete target atom maps. The target SMILES is
 serialized from the target 3D topology only after mapping is complete and is
 never used as the mapping source.
 
-If symmetry or stereo constraints produce multiple complete assignments, the
-service records/raises mapping ambiguity and does not choose one arbitrarily.
+Symmetric atoms use the representative selected by canonical traversal. The
+composed correspondence must preserve both complete reaction graphs; if it cannot
+be validated, transfer fails without searching alternative subgraph embeddings.
 After a successful transfer, `mapping_hash` is computed from the target strict
 mapped SMILES. Within one LogicalReaction, `(logical_reaction_id,
 mapping_hash)` is the strict text identity; the same canonical mapped text must
 not create a second mapped-reaction row.
+
+Automatic expansion first reuses a mapping with the same concrete stereo topology
+in each participant slot and the same complete connectivity atom correspondence.
+It does not manufacture alternative atom-to-stereocentre assignments for an
+already represented configuration. Direct TS ingestion retains strict mapped
+identity: independently observed assignments remain separate. Cleanup may retire
+a redundant derived assignment only if no TS inference references it, preserving
+verified geometry evidence on the retained mapping.
 
 A template-derived mapped reaction may reuse the source mapped reaction's TS,
 endpoint evidence, and Geometry links only within the same project, while
@@ -502,6 +517,21 @@ thermodynamic profiles are versioned derived read models that select a source
 Frame/Protocol and report `selected`, `missing`, or `ambiguous`; they never
 rewrite original observations.
 
+Before profile refresh, a participant still referencing a no-frame legacy topology
+may switch to a calculation-backed, strictly equivalent member of the same logical
+slot. Canonical atom-order composition must preserve its labelled stereo graph.
+Different stereoisomers are never substitutes. Existing calculation-backed
+participants, raw geometries, frames, and signed TS endpoints remain unchanged.
+Coordinate mappings are validated against Geometry atom order.
+
+The independent profile worker continuously audits all mapped reactions in
+ID-ordered pages, even when the refresh queue is empty. For unqueued reactions,
+canonical-verified legacy references, unmaterialized generations, or outdated
+policy versions enqueue durable refresh work. References, atom maps, and profiles
+are updated together in the actual refresh transaction. Existing jobs retain
+their lease and retry behavior. Null energies caused by incomplete sources alone
+do not trigger repeated refreshes.
+
 Each mapped-reaction thermodynamic profile also stores file-level runtimes for
 reactants, transition state, products, and the full path. Values are summed
 over distinct `ArtifactFile` ids for all recorded candidates of the mapping,
@@ -511,8 +541,28 @@ sources. Attributable non-converged candidates also contribute. The latest
 represented parse revision supplies each file's runtime. The full-path value
 uses the union across the three stages. Profiles of the same mapping repeat
 this search cost, so their runtime columns must not be summed across rows.
-Unknown candidate runtimes remain null rather than being treated as zero. The CSV export
-contains these four runtime columns. Per-frame runtime sums are not used.
+Unknown candidate runtimes remain null rather than being treated as zero. These
+wall-time caches remain available for detail reads. Reaction CSV exports instead
+read file-level `ParseRevision.cpu_time_seconds` directly and divide by 3600.
+The four former seconds columns are replaced with `reactants_cpu_time_hours`,
+`transition_state_cpu_time_hours`, `products_cpu_time_hours`, and
+`total_cpu_time_hours`. Neither wall time nor sums of frame times substitute for
+missing file CPU time. A missing candidate value makes the corresponding stage
+and union total unknown. Reparses take effect on the next export without waiting
+for a profile refresh.
+
+Exports also include `substrate_pair_key`, `substrate_pair_reaction_count`, and
+the same four CPU-hour columns prefixed with `substrate_pair_`. The group is the
+unordered multiset of canonical stereo reactant topologies and stoichiometric
+coefficients, scoped to all accessible mappings in the current project. Atom
+maps, reactant order, and legacy topology IDs do not affect grouping; stereo
+does. Stage totals union source files across all group members before deduplication,
+and the overall total unions files across stages. They are not sums of mapping
+totals. All group rows share the same values regardless of export filters, energy
+conditions, profile count, or pagination; do not sum these repeated values across
+rows. Incomplete reactant definitions leave group fields empty while preserving
+individual costs. Export only reads data and does not modify signed TS endpoints
+or other source records.
 The `mapped_reaction_url` column provides an absolute link to the mapped reaction detail page,
 including its `project_id` scope.
 

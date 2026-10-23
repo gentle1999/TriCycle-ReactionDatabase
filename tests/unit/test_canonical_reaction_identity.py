@@ -1,6 +1,9 @@
 """Reaction identity must survive a simultaneous permutation of both endpoints."""
 
+import base64
+import json
 import random
+from pathlib import Path
 
 import pytest
 from rdkit import Chem
@@ -189,3 +192,77 @@ def test_hydrogen_validation_cache_rechecks_no_implicit_flag():
     molecule.GetAtomWithIdx(0).SetNoImplicit(False)
     with pytest.raises(ValueError, match="atom vertex"):
         require_explicit_hydrogens(molecule)
+
+
+def test_stored_symmetric_reactions_share_identity_across_stereo_representations():
+    fixture = json.loads(
+        (
+            Path(__file__).parents[1] / "fixtures/reaction_normalization/symmetric_stereo.json"
+        ).read_text()
+    )
+    topologies = {
+        row["id"]: Chem.Mol(base64.b64decode(row["mol"])) for row in fixture["topologies"]
+    }
+    before = {
+        key: mol.ToBinary(Chem.PropertyPickleOptions.AllProps) for key, mol in topologies.items()
+    }
+    reactions = {}
+    for row in fixture["participants"]:
+        components = reactions.setdefault(row["mapped_reaction_id"], {})
+        components.setdefault(Side(row["side"]), []).append(
+            (topologies[row["concrete_topology_id"]], row["atom_map_numbers"])
+        )
+    expected = canonical_reaction_identity(next(iter(reactions.values()))).smiles
+    generator = random.Random(43)
+    parser = Chem.SmilesParserParams()
+    parser.removeHs = False
+    for components in reactions.values():
+        assert canonical_reaction_identity(components).smiles == expected
+        for _ in range(10):
+            permuted = {}
+            for side, entries in components.items():
+                permuted[side] = []
+                for molecule, labels in entries:
+                    order = list(range(molecule.GetNumAtoms()))
+                    generator.shuffle(order)
+                    permuted[side].append(
+                        (Chem.RenumberAtoms(molecule, order), [labels[index] for index in order])
+                    )
+            assert canonical_reaction_identity(permuted).smiles == expected
+        parsed = [Chem.MolFromSmiles(side, parser) for side in expected.split(">>")]
+        assert (
+            canonical_reaction_identity(
+                {
+                    side: [(mol, [atom.GetAtomMapNum() for atom in mol.GetAtoms()])]
+                    for side, mol in zip((Side.REACTANT, Side.PRODUCT), parsed, strict=True)
+                }
+            ).smiles
+            == expected
+        )
+    assert before == {
+        key: mol.ToBinary(Chem.PropertyPickleOptions.AllProps) for key, mol in topologies.items()
+    }
+
+
+def test_legacy_symmetric_ez_topologies_normalize_to_one_identity():
+    from tricycle_reaction_db.ingestion.normalization import normalize_topology
+
+    fixture = json.loads(
+        (
+            Path(__file__).parents[1] / "fixtures/reaction_normalization/symmetric_stereo.json"
+        ).read_text()
+    )
+    ids = {"01a0f21c-b04c-7add-a4db-f86839cd0ae4", "01a10b82-42cf-72cd-95d1-11c7d73140a7"}
+    records = [
+        normalize_topology(
+            Chem.Mol(base64.b64decode(row["mol"])),
+            add_hydrogens=False,
+            reconstruction_method="molgr/regression",
+            reconstruction_version="test",
+        ).topology
+        for row in fixture["topologies"]
+        if row["id"] in ids
+    ]
+    assert len(records) == 2
+    assert records[0].graph_hash == records[1].graph_hash
+    assert records[0].canonical_isomeric_smiles == records[1].canonical_isomeric_smiles

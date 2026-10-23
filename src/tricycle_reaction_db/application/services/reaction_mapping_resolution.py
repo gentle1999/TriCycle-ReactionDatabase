@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from hashlib import sha256
 from typing import Any, cast
 from uuid import UUID
 
+from rdkit import Chem
 from sqlalchemy.orm.attributes import set_committed_value
 from sqlmodel import Session, col, select
 
@@ -20,6 +22,7 @@ from tricycle_reaction_db.application.services.canonical_atom_mapping import (
 )
 from tricycle_reaction_db.application.services.canonical_reaction_identity import (
     canonical_reaction_identity,
+    derived_reaction_variant_key,
 )
 from tricycle_reaction_db.application.services.mapped_geometry_atom_order import (
     mapped_reaction_atom_signatures,
@@ -45,6 +48,7 @@ from tricycle_reaction_db.application.services.topology_abstraction import (
     ensure_topology_upstreams,
 )
 from tricycle_reaction_db.db.models import (
+    CalculationFrame,
     Geometry,
     LogicalParticipantConcreteTopology,
     LogicalReaction,
@@ -502,6 +506,46 @@ def _complete_mapped_reaction(
     ) and bool(side_maps.get(LogicalReactionParticipantSide.REACTANT))
 
 
+def _existing_derived_variant(
+    session: Session,
+    candidates: tuple[MappedReaction, ...],
+    target_components: Mapping[
+        tuple[LogicalReactionParticipantSide, int], tuple[Chem.Mol, Sequence[int]]
+    ],
+    *,
+    project_id: UUID,
+    topology_context: Any | None = None,
+) -> MappedReaction | None:
+    """Reuse a represented configuration only at the automatic expansion entry."""
+    target_key = derived_reaction_variant_key(target_components)
+    for candidate in sorted(candidates, key=lambda row: str(row.id)):
+        if candidate.project_id != project_id:
+            continue
+        participants = _source_participants(session, candidate, topology_context=topology_context)
+        if not _complete_mapped_reaction(
+            session, candidate, participants, topology_context=topology_context
+        ):
+            continue
+        components = {}
+        for participant in participants:
+            topology = _molecular_topology_by_id(
+                session,
+                participant.concrete_topology_id,
+                project_id=project_id,
+                topology_context=topology_context,
+            )
+            if topology is None:
+                break
+            components[(participant.side, participant.template_index)] = (
+                topology.mol,
+                participant.atom_map_numbers,
+            )
+        else:
+            if derived_reaction_variant_key(components) == target_key:
+                return candidate
+    return None
+
+
 def _logical_participant(
     session: Session,
     participant: MappedReactionParticipant,
@@ -604,11 +648,13 @@ def _strict_topology_representatives(
     session: Session,
     topologies: tuple[MolecularTopology, ...],
 ) -> tuple[MolecularTopology, ...]:
-    """Collapse equivalent stored traversals, preferring real Geometry evidence.
+    """Collapse equivalent stored traversals, preferring observed calculation frames.
 
     Older normalization versions can store two serializations of a symmetric
     E/Z configuration under different topology hashes. A verified stereo-aware
     canonical atom bijection, rather than the hash alone, proves equivalence.
+    A projected endpoint Geometry is not observed evidence: preferring it over
+    a calculation-backed equivalent can strand the actual endpoint energies.
     The source rows and their atom orders remain untouched.
     """
 
@@ -617,6 +663,7 @@ def _strict_topology_representatives(
     observed_ids = set(
         session.exec(
             select(col(Geometry.topology_id))
+            .join(CalculationFrame, col(CalculationFrame.geometry_id) == col(Geometry.id))
             .where(col(Geometry.topology_id).in_([topology.id for topology in topologies]))
             .distinct()
         ).all()
@@ -769,37 +816,53 @@ def ensure_mapped_reactions_for_concrete_topology(
                     for key, topology in transferred.concrete_topologies_by_template.items()
                 },
             )
-            mapped_reaction = persist_mapped_reaction(
+            mapped_reaction = _existing_derived_variant(
                 session,
-                logical_reaction,
-                MappedReactionRecord(
-                    mapped_reaction_key=f"mapping:{transferred.mapping_hash}",
-                    label=source_mapped_reaction.label,
-                    mapped_reaction_kind=source_mapped_reaction.mapped_reaction_kind,
-                    mapped_reaction_smiles=transferred.mapped_reaction_smiles,
-                    mapping_hash=transferred.mapping_hash,
+                _mapped_reactions_for_logical_reaction(
+                    session,
+                    owner_reaction_id,
+                    project_id=project_id,
+                    topology_context=topology_context,
                 ),
-                source_atom_maps_by_template=transferred.atom_maps_by_template,
-                topology_ids_by_template={
-                    (
-                        participant.side,
-                        participant.template_index,
-                    ): _require_id(
-                        _logical_participant(
-                            session,
-                            participant,
-                            topology_context=topology_context,
-                        ).topology,
-                        label="MolecularTopology",
-                    )
-                    for participant in source_participants
+                {
+                    key: (topology.mol, transferred.atom_maps_by_template[key])
+                    for key, topology in transferred.concrete_topologies_by_template.items()
                 },
-                concrete_topology_ids_by_template=transferred.concrete_topologies_by_template,
-                precomputed_mapped_smiles_by_template=transferred.mapped_smiles_by_template,
-                source_mapped_reaction_smiles=transferred.mapped_reaction_smiles,
+                project_id=project_id,
                 topology_context=topology_context,
-                canonical_identity=identity,
             )
+            if mapped_reaction is None:
+                mapped_reaction = persist_mapped_reaction(
+                    session,
+                    logical_reaction,
+                    MappedReactionRecord(
+                        mapped_reaction_key=f"mapping:{transferred.mapping_hash}",
+                        label=source_mapped_reaction.label,
+                        mapped_reaction_kind=source_mapped_reaction.mapped_reaction_kind,
+                        mapped_reaction_smiles=transferred.mapped_reaction_smiles,
+                        mapping_hash=transferred.mapping_hash,
+                    ),
+                    source_atom_maps_by_template=transferred.atom_maps_by_template,
+                    topology_ids_by_template={
+                        (
+                            participant.side,
+                            participant.template_index,
+                        ): _require_id(
+                            _logical_participant(
+                                session,
+                                participant,
+                                topology_context=topology_context,
+                            ).topology,
+                            label="MolecularTopology",
+                        )
+                        for participant in source_participants
+                    },
+                    concrete_topology_ids_by_template=transferred.concrete_topologies_by_template,
+                    precomputed_mapped_smiles_by_template=transferred.mapped_smiles_by_template,
+                    source_mapped_reaction_smiles=transferred.mapped_reaction_smiles,
+                    topology_context=topology_context,
+                    canonical_identity=identity,
+                )
             mapped_reaction_id = _require_id(mapped_reaction, label="MappedReaction")
             created_or_reused[mapped_reaction_id] = mapped_reaction
             if topology_context is not None:

@@ -71,6 +71,14 @@ def load_mapped_reaction_runtimes(
 
     if not mapped_reaction_ids:
         return {}
+    rows = session.exec(mapped_reaction_file_time_statement(mapped_reaction_ids)).all()
+    return aggregate_mapped_reaction_runtimes(mapped_reaction_ids, rows)
+
+
+def mapped_reaction_file_time_statement(
+    mapped_reaction_ids: Sequence[UUID], *, cpu_time: bool = False
+) -> Any:
+    """Distinct file/revision witnesses, shared by wall-time profiles and CPU exports."""
 
     def sources(mapped_id: Any, role: Any) -> tuple[Any, ...]:
         return (
@@ -78,7 +86,7 @@ def load_mapped_reaction_runtimes(
             role,
             col(ArtifactFile.id),
             col(ParseRevision.revision_number),
-            col(ParseRevision.running_time_seconds),
+            col(ParseRevision.cpu_time_seconds if cpu_time else ParseRevision.running_time_seconds),
         )
 
     def file_sources(statement: Any) -> Any:
@@ -173,5 +181,4 @@ def load_mapped_reaction_runtimes(
         )
     )
     # UNION eliminates repeated frame/Geometry witnesses of the same file.
-    rows = session.exec(endpoints.union(bindings, inferences)).all()
-    return aggregate_mapped_reaction_runtimes(mapped_reaction_ids, rows)
+    return endpoints.union(bindings, inferences)

@@ -107,6 +107,15 @@ pytestmark = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def prohibit_subgraph_mapping(monkeypatch: pytest.MonkeyPatch):
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("mapping must use canonical representations, never subgraph search")
+
+    for method in ("GetSubstructMatch", "GetSubstructMatches", "HasSubstructMatch"):
+        monkeypatch.setattr(Chem.Mol, method, forbidden)
+
+
 def persist_molecular_geometry(session: Session, record: Any, **kwargs: Any) -> Any:
     """Keep legacy mapping fixtures inside an explicit project scope."""
 
@@ -362,7 +371,7 @@ def test_source_order_import_materializes_three_observed_imine_configurations(
         raise AssertionError("source imports must never search RDKit graph matches")
 
     for module in (rdkit_graph_matching, topology_abstraction, topology_compatibility):
-        monkeypatch.setattr(module, "get_substruct_matches", forbidden_graph_search)
+        monkeypatch.setattr(module, "get_substruct_matches", forbidden_graph_search, raising=False)
     reaction_smiles = (
         "[H:1][C:2]([H:3])=[C:4]([H:5])[H:6]."
         "[H:7][O:8]/[N:9]=[C:10]([Cl:11])/[C:12]([Cl:13])=[N:14]/[O:15][H:16]>>"
@@ -616,7 +625,9 @@ def test_derived_stereoisomer_inherits_verified_source_ts_and_unchanged_endpoint
                     raise AssertionError("TS inheritance must not search RDKit graph matches")
 
                 for module in (rdkit_graph_matching, topology_abstraction, topology_compatibility):
-                    monkeypatch.setattr(module, "get_substruct_matches", forbidden_graph_search)
+                    monkeypatch.setattr(
+                        module, "get_substruct_matches", forbidden_graph_search, raising=False
+                    )
                 context = GeometryPersistenceContext(
                     project_id=SYSTEM_PROJECT_ID,
                     source_atom_order_authoritative=True,

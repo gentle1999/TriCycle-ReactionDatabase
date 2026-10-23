@@ -21,3 +21,16 @@ def test_endpoint_source_compatibility_accepts_one_endpoint_only_bond() -> None:
     assert source_geometry is not None
     assert source_geometry_compatible_topology(endpoint, source_geometry)
     assert not source_geometry_compatible_topology(source_geometry, endpoint)
+
+
+def test_compatibility_uses_canonical_graphs_and_preserves_isotopes(monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("subgraph search is forbidden")
+
+    for name in ("GetSubstructMatch", "GetSubstructMatches", "HasSubstructMatch"):
+        monkeypatch.setattr(Chem.Mol, name, forbidden)
+    molecule = Chem.MolFromSmiles("[13CH3]CO")
+    reordered = Chem.RenumberAtoms(molecule, [2, 0, 1])
+    assert source_geometry_compatible_topology(molecule, reordered)
+    assert not source_geometry_compatible_topology(molecule, Chem.MolFromSmiles("CCO"))
+    assert not source_geometry_compatible_topology(molecule, Chem.MolFromSmiles("[13CH3]OC"))

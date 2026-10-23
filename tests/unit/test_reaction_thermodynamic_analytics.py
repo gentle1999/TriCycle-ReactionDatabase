@@ -22,6 +22,11 @@ class _Stream:
     def __aiter__(self) -> AsyncIterator[tuple[Any, ...]]:
         return self
 
+    async def partitions(self, size):
+        rows = list(self._rows)
+        for start in range(0, len(rows), size):
+            yield rows[start : start + size]
+
     async def __anext__(self) -> tuple[Any, ...]:
         try:
             return next(self._rows)
@@ -35,6 +40,9 @@ class _Session:
 
     async def stream(self, _statement: object) -> _Stream:
         return _Stream(self._rows)
+
+    async def run_sync(self, callback):
+        return callback(self)
 
 
 class _SessionContext:
@@ -81,10 +89,6 @@ async def test_export_csv_preserves_profile_columns_and_quotes_smiles(
             ["DFT", "DFT", None, "B3LYP", "def2-SVP"],
             298.15,
             1.0,
-            10.0,
-            20.0,
-            30.0,
-            55.0,
             12.25,
             13.5,
             -2.0,
@@ -95,11 +99,36 @@ async def test_export_csv_preserves_profile_columns_and_quotes_smiles(
         "tricycle_reaction_db.application.services.reaction_thermodynamic_analytics.session_factory",
         lambda: _SessionContext(rows),
     )
+
+    class Costs:
+        def __init__(self, session, project, visible):
+            assert project == project_id
+            assert visible is True
+
+        def load(self, session, ids):
+            assert ids == [mapped_id]
+            return {
+                mapped_id: {
+                    "reactants_cpu_time_hours": 10.0,
+                    "transition_state_cpu_time_hours": 20.0,
+                    "products_cpu_time_hours": 30.0,
+                    "total_cpu_time_hours": 55.0,
+                    "substrate_pair_key": "shared-pair",
+                    "substrate_pair_reaction_count": 2,
+                    "substrate_pair_reactants_cpu_time_hours": 11.0,
+                    "substrate_pair_transition_state_cpu_time_hours": 40.0,
+                    "substrate_pair_products_cpu_time_hours": 35.0,
+                    "substrate_pair_total_cpu_time_hours": 80.0,
+                }
+            }
+
+    monkeypatch.setattr(analytics, "ReactionCpuTimeExport", Costs)
     payload = "".join(
         [
             chunk
             async for chunk in ReactionThermodynamicAnalyticsService._export_csv_rows(
                 True,
+                visible_mappings=True,
                 project_id=project_id,
                 frontend_base_url=frontend_base_url,
             )
@@ -111,10 +140,14 @@ async def test_export_csv_preserves_profile_columns_and_quotes_smiles(
     assert exported[0]["mapped_reaction_id"] == str(mapped_id)
     assert exported[0]["mapped_reaction_smiles"] == rows[0][4]
     assert exported[0]["level_of_theory"] == "B3LYP/def2-SVP"
-    assert exported[0]["reactants_running_time_seconds"] == "10.0"
-    assert exported[0]["transition_state_running_time_seconds"] == "20.0"
-    assert exported[0]["products_running_time_seconds"] == "30.0"
-    assert exported[0]["total_running_time_seconds"] == "55.0"
+    assert exported[0]["reactants_cpu_time_hours"] == "10.0"
+    assert exported[0]["transition_state_cpu_time_hours"] == "20.0"
+    assert exported[0]["products_cpu_time_hours"] == "30.0"
+    assert exported[0]["total_cpu_time_hours"] == "55.0"
+    assert exported[0]["substrate_pair_key"] == "shared-pair"
+    assert exported[0]["substrate_pair_reaction_count"] == "2"
+    assert exported[0]["substrate_pair_total_cpu_time_hours"] == "80.0"
+    assert not any("seconds" in column or "running_time" in column for column in exported[0])
     assert exported[0]["activation_gibbs_free_energy_kcal_mol"] == "13.5"
     assert exported[0]["reaction_gibbs_free_energy_kcal_mol"] == "-3.25"
     assert exported[0]["mapped_reaction_url"] == (
@@ -147,11 +180,13 @@ async def test_export_csv_uses_the_same_visible_profile_predicate(
     def export_rows(
         requested_predicate: object,
         *,
+        visible_mappings: object,
         project_id: object,
         frontend_base_url: str,
         limit: int | None = None,
         offset: int = 0,
     ) -> AsyncIterator[str]:
+        assert visible_mappings is scope
         observed["export"] = (requested_predicate, project_id, frontend_base_url, limit, offset)
 
         async def chunks() -> AsyncIterator[str]:
@@ -166,6 +201,7 @@ async def test_export_csv_uses_the_same_visible_profile_predicate(
         async def __aexit__(self, *_args: object) -> None:
             return None
 
+    monkeypatch.setattr(analytics, "mapped_reaction_id_is_visible", lambda scope, mid: scope)
     monkeypatch.setattr(analytics, "query_visibility_scope", resolve_scope)
     monkeypatch.setattr(analytics, "session_factory", _PredicateSessionContext)
     monkeypatch.setattr(analytics, "_profile_predicate", profile_predicate)

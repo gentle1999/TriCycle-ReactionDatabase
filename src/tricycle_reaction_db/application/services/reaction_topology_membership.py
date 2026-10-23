@@ -22,14 +22,12 @@ from tricycle_reaction_db.application.services._persistence import (
     _flush_new_entity,
     _new_entity,
     _require_id,
-    source_atom_mapping_is_authoritative,
 )
 from tricycle_reaction_db.application.services.canonical_atom_mapping import (
     canonical_atom_index_mapping,
 )
 from tricycle_reaction_db.application.services.topology_abstraction import (
     find_stereo_abstraction_match,
-    find_topology_matches,
     specialized_topologies,
     topology_abstraction_mapping_witness,
 )
@@ -212,21 +210,13 @@ def _topology_mapping_evidence(
     dag_mapping = topology_abstraction_mapping_witness(session, concrete_topology, logical_topology)
     if dag_mapping is not None:
         return (dag_mapping,), False, "stereo_abstraction_dag"
-    if source_atom_mapping_is_authoritative(session):
-        canonical_mapping = canonical_atom_index_mapping(
-            logical_topology.mol, concrete_topology.mol
-        )
-        if canonical_mapping is not None:
-            return (canonical_mapping,), False, "canonical_atom_order"
-        abstraction = find_stereo_abstraction_match(concrete_topology.mol, logical_topology.mol)
-        if abstraction is not None:
-            return (abstraction.general_to_specific_atom_indices,), False, "canonical_abstraction"
-        return (), False, "canonical_atom_order"
-    return (
-        find_topology_matches(concrete_topology.mol, logical_topology.mol),
-        True,
-        "graph_match",
-    )
+    canonical_mapping = canonical_atom_index_mapping(logical_topology.mol, concrete_topology.mol)
+    if canonical_mapping is not None:
+        return (canonical_mapping,), False, "canonical_atom_order"
+    abstraction = find_stereo_abstraction_match(concrete_topology.mol, logical_topology.mol)
+    if abstraction is not None:
+        return (abstraction.general_to_specific_atom_indices,), False, "canonical_abstraction"
+    return (), False, "canonical_atom_order"
 
 
 def _find_pending_membership(

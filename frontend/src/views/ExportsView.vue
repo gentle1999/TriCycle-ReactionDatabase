@@ -184,13 +184,13 @@ function formatDate(value: string | null | undefined): string {
           </div>
           <span class="export-format">CSV</span>
         </header>
-        <p class="export-card-description">从当前项目导出数据库中的映射反应自由能、活化自由能、各计算阶段耗时和反应详情访问链接。项目和筛选条件均可按需调整。</p>
-        <p class="export-input-help">耗时包含当前 mapping 的全部前体、TS 和后体候选日志，按文件去重；同一 mapping 的不同能量行重复显示该总成本。</p>
+        <p class="export-card-description">从当前项目导出数据库中的映射反应自由能、活化自由能、各阶段 CPU 小时、相同底物组的去重总 CPU 小时和反应详情访问链接。项目和筛选条件均可按需调整。</p>
+        <p class="export-input-help">CPU 用时按文件去重，包含全部前体、TS 和后体候选日志。相同底物组保留立体构型和计量数、忽略底物顺序，共享当前项目全部同组反应的去重总值，不随筛选或分页变化；组内多行不能再次相加。缺失 CPU 用时保留为空。</p>
 
         <dl class="export-spec-list">
           <div><dt>当前项目</dt><dd>{{ currentProject?.project_name ?? "未选择项目" }}<code v-if="currentProjectId">{{ currentProjectId }}</code></dd></div>
           <div><dt>数据条件</dt><dd>由数据库筛选清洗成功的记录</dd></div>
-          <div><dt>单位</dt><dd>能量 kcal/mol · 耗时秒</dd></div>
+          <div><dt>单位</dt><dd>能量 kcal/mol · CPU 用时 h</dd></div>
         </dl>
 
         <label class="export-input-label">

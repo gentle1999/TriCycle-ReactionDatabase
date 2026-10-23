@@ -1,8 +1,12 @@
+from types import SimpleNamespace
+from uuid import uuid4
+
 import pytest
 from rdkit import Chem
 
 from tricycle_reaction_db.application.services import reaction_geometry_reconciliation as module
 from tricycle_reaction_db.domain.enums import LogicalReactionParticipantSide as Side
+from tricycle_reaction_db.domain.enums import MappedReactionNodeRole
 
 
 def components(smiles):
@@ -40,6 +44,50 @@ def test_creation_witness_cannot_attach_a_different_stereoisomer():
         module._geometry_maps_from_creation_witness(
             source, target, list(range(5)), {i: i for i in range(1, 6)}
         )
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+def test_source_rebuild_migrates_only_legacy_ts_mapping_without_a_batch_cache(legacy):
+    molecule = Chem.AddHs(Chem.MolFromSmiles("C"))
+    geometry = SimpleNamespace(mol=molecule, atom_count=5)
+    reaction = SimpleNamespace(
+        mapped_reaction_smiles="[C:1]([H:2])([H:3])([H:4])[H:5]>>[C:1]([H:2])([H:3])([H:4])[H:5]"
+    )
+    association = SimpleNamespace(
+        id=uuid4(),
+        geometry=geometry,
+        mapped_reaction_node=SimpleNamespace(
+            role=MappedReactionNodeRole.TRANSITION_STATE, mapped_reaction=reaction
+        ),
+    )
+    existing = SimpleNamespace(
+        geometry_atom_map_numbers=[1, 2, 3, 4, 5],
+        mapped_smiles="legacy",
+        mapping_method=module.REACTION_TS_GEOMETRY_LINK_METHOD,
+        mapping_version=(
+            "reaction-ts-geometry-link-v4"
+            if legacy
+            else module.REACTION_TS_GEOMETRY_LINK_POLICY_VERSION
+        ),
+    )
+    added = []
+    session = SimpleNamespace(add=added.append)
+    # The caller has already verified this vector against both source endpoints.
+    arguments = {
+        "node_geometry": association,
+        "coordinate_atom_maps": [1, 3, 2, 4, 5],
+        "mapped_smiles": "unused for TS",
+        "existing_mapping": existing,
+    }
+    if not legacy:
+        with pytest.raises(ValueError, match="incompatible reaction mapping"):
+            module._ensure_mapping(session, **arguments)
+        assert existing.geometry_atom_map_numbers == [1, 2, 3, 4, 5]
+        return
+    assert module._ensure_mapping(session, **arguments) is existing
+    assert existing.geometry_atom_map_numbers == [1, 3, 2, 4, 5]
+    assert existing.mapping_version == module.REACTION_TS_GEOMETRY_LINK_POLICY_VERSION
+    assert added == [existing]
 
 
 def test_ring_stereo_writer_cache_does_not_change_labelled_graph_after_renumbering():

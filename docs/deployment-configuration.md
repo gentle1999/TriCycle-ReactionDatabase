@@ -458,6 +458,14 @@ OpenMP/BLAS 线程，不能用增大 native thread 数代替文件级并发。�
 
 持久化微批不会在 upload-worker 内重建 thermodynamic profile；受影响的 mapped reaction 只会递增 generation 并写入持久化刷新队列。upload-worker 不执行 profile 计算，因此大型 profile 刷新不会阻塞 MolOP 解析、数据库微批提交或租约心跳。标准 Compose 部署会同时运行独立的 `profile-refresh-worker`，默认按 32 个 reaction 的独立微批消费队列，失败任务会按租约和退避策略恢复；该值可通过 `TRICYCLE_UPLOAD_WORKER_PROFILE_REFRESH_BATCH_SIZE` 调整，建议保持在 16–32。它不是可省略的服务，否则新入库的 source evidence 只会停留在待刷新队列。单独启动或恢复该服务可执行 `docker compose up -d profile-refresh-worker`，或运行 `tricycle-profile-refresh-worker`。
 
+该 worker 每轮还按 ID 游标巡检一页映射反应，默认 256 条，可通过
+`TRICYCLE_PROFILE_REFRESH_WORKER_AUDIT_BATCH_SIZE` 调整。巡检覆盖全库后从头继续，
+即使队列为空也会检查 canonical 等价旧拓扑引用、未物化 generation 和过期策略版本，
+为缺失的刷新任务补入持久队列。每轮最多处理四个刷新微批，再等待轮询间隔（默认 2 秒），
+避免持续入库饿死巡检。日志记录整轮扫描量、补入任务和失败重试；扫描失败保留游标重试，
+不阻断已有队列消费。空队列本身不能作为引用一致性的证明，来源不完整造成的空能量也不
+单独触发刷新。引用与 profile 的更新仍在同一刷新事务中完成。
+
 Voyager 使用 NexusX 6.3 及以上版本的 `ComposedErManager` member cluster/color。当前所有数据库实体
 属于同一个 PostgreSQL 逻辑 engine，因此配置中只有一个数据库 cluster；即使
 `db-rw.internal.example` 后面有多台主备节点，也不能为每台机器创建一个 member。只有新增

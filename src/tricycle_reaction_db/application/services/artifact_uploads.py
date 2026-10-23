@@ -177,6 +177,12 @@ from tricycle_reaction_db.db.models import (
     TransitionStateInference,
 )
 from tricycle_reaction_db.db.session import session_factory
+from tricycle_reaction_db.db.transaction_retry import (
+    TRANSACTION_RETRY_LIMIT,
+    is_transaction_conflict,
+    retry_transaction,
+    wait_for_transaction_retry,
+)
 from tricycle_reaction_db.domain.enums import (
     ArtifactIngestionStatus,
     ArtifactKind,
@@ -4941,7 +4947,7 @@ class ArtifactUploadService:
 
         results: dict[UUID, ArtifactUploadResult | Exception] = {}
 
-        async def persist(tasks: list[ParsedArtifactTask]) -> None:
+        async def persist(tasks: list[ParsedArtifactTask], conflict_attempt: int = 0) -> None:
             if not tasks:
                 return
             try:
@@ -4960,6 +4966,19 @@ class ArtifactUploadService:
             except Exception as error:
                 remaining = [task for task in tasks if task.artifact_id not in results]
                 if not remaining:
+                    return
+                if is_transaction_conflict(error) and conflict_attempt < TRANSACTION_RETRY_LIMIT:
+                    # The failed session has closed. Retry only uncommitted
+                    # files using the existing parser results and fresh lease
+                    # checks; never replay an earlier committed window.
+                    logger.warning(
+                        "retrying persistence transaction project=%s files=%d attempt=%d",
+                        project_id,
+                        len(remaining),
+                        conflict_attempt + 1,
+                    )
+                    await wait_for_transaction_retry(conflict_attempt)
+                    await persist(remaining, conflict_attempt + 1)
                     return
                 driver_error = getattr(error, "orig", error)
                 sqlstate = getattr(driver_error, "sqlstate", None)
@@ -4985,7 +5004,7 @@ class ArtifactUploadService:
                         and not lock_table_exhausted
                     )
                 ):
-                    # An unavailable database, cancellation, deadlock or
+                    # An unavailable database, exhausted conflict retry or
                     # non-lock resource failure is not evidence against a
                     # specific file. Do not amplify it into identical DB
                     # attempts. PostgreSQL 53200 is split below because a
@@ -5138,46 +5157,56 @@ class ArtifactUploadService:
         ordered_ids = tuple(dict.fromkeys(artifact_ids))
         if not ordered_ids:
             return ParseCleanupSummary()
-        started_at = datetime.now(UTC)
-        async with session_factory() as session:
-            artifacts = (
-                await session.exec(
-                    select(ArtifactFile).where(col(ArtifactFile.id).in_(ordered_ids))
+
+        @retry_transaction
+        async def clear_transaction() -> tuple[ParseCleanupSummary, set[UUID]]:
+            started_at = datetime.now(UTC)
+            async with session_factory() as session:
+                artifacts = (
+                    await session.exec(
+                        select(ArtifactFile).where(col(ArtifactFile.id).in_(ordered_ids))
+                    )
+                ).all()
+                artifacts_by_id = {
+                    artifact_id: artifact
+                    for artifact in artifacts
+                    if (artifact_id := artifact.id) is not None
+                }
+                missing = [
+                    artifact_id for artifact_id in ordered_ids if artifact_id not in artifacts_by_id
+                ]
+                if missing:
+                    raise ArtifactUploadError(f"artifact not found: {missing[0]}")
+                project_ids: set[UUID] = set()
+                for artifact in artifacts_by_id.values():
+                    if artifact.artifact_kind is not ArtifactKind.CALCULATION_OUTPUT:
+                        raise ArtifactUploadError(
+                            "only calculation output artifacts can be reparsed"
+                        )
+                    if artifact.storage_status is not StorageStatus.AVAILABLE:
+                        raise ArtifactUploadError(
+                            "artifact bytes are not available for parse cleanup"
+                        )
+                    project_ids.add(artifact.project_id)
+                for project_id in project_ids:
+                    await AuthorizationService.require_project_permission(
+                        user_id,
+                        project_id,
+                        ProjectPermission.ARTIFACT_UPLOAD,
+                    )
+                cleanup = await session.run_sync(
+                    partial(
+                        _run_clear_and_reset_parse_state,
+                        artifact_file_ids=ordered_ids,
+                        started_at=started_at,
+                        worker_lease_by_artifact_id=worker_lease_by_artifact_id,
+                        defer_thermodynamic_refresh=defer_thermodynamic_refresh,
+                    )
                 )
-            ).all()
-            artifacts_by_id = {
-                artifact_id: artifact
-                for artifact in artifacts
-                if (artifact_id := artifact.id) is not None
-            }
-            missing = [
-                artifact_id for artifact_id in ordered_ids if artifact_id not in artifacts_by_id
-            ]
-            if missing:
-                raise ArtifactUploadError(f"artifact not found: {missing[0]}")
-            project_ids: set[UUID] = set()
-            for artifact in artifacts_by_id.values():
-                if artifact.artifact_kind is not ArtifactKind.CALCULATION_OUTPUT:
-                    raise ArtifactUploadError("only calculation output artifacts can be reparsed")
-                if artifact.storage_status is not StorageStatus.AVAILABLE:
-                    raise ArtifactUploadError("artifact bytes are not available for parse cleanup")
-                project_ids.add(artifact.project_id)
-            for project_id in project_ids:
-                await AuthorizationService.require_project_permission(
-                    user_id,
-                    project_id,
-                    ProjectPermission.ARTIFACT_UPLOAD,
-                )
-            cleanup = await session.run_sync(
-                partial(
-                    _run_clear_and_reset_parse_state,
-                    artifact_file_ids=ordered_ids,
-                    started_at=started_at,
-                    worker_lease_by_artifact_id=worker_lease_by_artifact_id,
-                    defer_thermodynamic_refresh=defer_thermodynamic_refresh,
-                )
-            )
-            await session.commit()
+                await session.commit()
+            return cleanup, project_ids
+
+        cleanup, project_ids = await clear_transaction()
         if refresh_statistics:
             await refresh_project_statistics(
                 project_ids,

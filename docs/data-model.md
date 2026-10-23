@@ -316,6 +316,10 @@ MappedReaction
 
 ### 新具体构型的 mapping 转移
 
+所有 mapping 归一化和转移都必须通过 canonical 表示组合原子顺序置换，禁止子图匹配，
+也不允许以其作为 fallback。Canonical 对应须通过完整图和立体约束验证，不能验证则拒绝
+关联；单个对称映射见证不代表穷举了全部候选。
+
 新具体拓扑不需要自己携带一套新的 atom-map 文本。只要它属于某个逻辑参与物，且同一逻辑
 反应下存在完整严格 mapping，就通过两次图匹配转移：
 
@@ -330,10 +334,16 @@ concrete topology 都必须匹配同一个抽象 topology，再组合两条对�
 的完整 atom maps。目标 SMILES 只在 mapping 完成后从目标三维拓扑序列化，绝不作为 mapping
 来源。
 
-如果图对称或立体约束导致多个完整 mapping 候选，系统必须记录/抛出 mapping ambiguity，
-不得任意选择一个。成功转移后，用目标 strict mapped SMILES 计算 `mapping_hash`，并在同一
+对称原子采用 canonical 遍历选定的代表对应。组合后的对应必须保留完整反应两侧的图；
+若无法验证则拒绝转移，不搜索其他子图嵌入。成功转移后，用目标 strict mapped SMILES
+计算 `mapping_hash`，并在同一
 `LogicalReaction` 下按 `(logical_reaction_id, mapping_hash)` 做严格文本幂等；相同 canonical
 mapped text 不允许重复形成两条 mapped reaction。
+
+自动扩展首先复用各参与物槽位的具体立体拓扑相同、且完整连接图原子对应相同的已有
+mapping，避免为已表示的构型继续生成不同的原子—立体中心对应。直接 TS 导入仍采用
+严格 mapped identity：具有独立计算来源的不同对应继续保留。清理仅允许移除没有任何
+TS inference 引用的冗余派生项，并将已验证的几何证据保留在存续 mapping 上。
 
 由 template 派生的 mapped reaction 只能在同一项目内共享源 mapped reaction 已有的 TS/端点
 证据和 Geometry 联系，同时保留自己的 mapped reaction、participant 和 node 记录。跨项目时
@@ -392,6 +402,16 @@ RDKit binary Mol、reaction 和 fingerprint 是查询投影，不替代权威 gr
 `GeometryEnergyView` 与反应热力学 profile 是版本化派生读模型，选择来源 Frame/Protocol 并
 标记 `selected`、`missing` 或 `ambiguous`；不会改写原始计算结果。
 
+刷新热力学前，如果参与物仍引用没有计算帧的旧具体拓扑，而同一逻辑槽位中存在有计算帧
+的严格等价拓扑，会通过 canonical 原子顺序转换更新参与物引用及 atom maps。必须保留原有
+mapped stereo graph；不能把不同立体异构体当作替代来源。已有计算帧的参与物、原始几何、
+计算帧和 TS 位移端点记录保持不动。几何映射校验始终使用 Geometry 自身的原子顺序。
+
+独立 profile worker 按 ID 分页循环核查全部映射反应，不依赖刷新队列非空。对于未入队的
+反应，若存在上述 canonical 验证通过的旧引用、未物化的 generation 或过期策略版本，
+巡检会补入持久化刷新任务；引用、atom maps 和 profile 在实际刷新事务中一起更新。
+已有任务沿用租约和重试机制。来源不完整导致的空能量不会单独触发重复刷新。
+
 每个 `MappedReaction` 热力学 profile 还记录前体、过渡态、后体和全路径文件级计算用时。
 这些值统计当前 mapping 的全部已记录候选计算，不随 profile 的最低能量选择缩小范围：
 前、后体按参与物的具体拓扑收集全部来源日志；TS 按该 mapping 的几何绑定和推断来源收集。
@@ -399,8 +419,22 @@ RDKit binary Mol、reaction 和 fingerprint 是查询投影，不替代权威 gr
 的 `ParseRevision.running_time_seconds` 相加；全路径总用时对三部分的文件并集再次去重。
 同一 mapping 的不同 profile 行重复携带这组总成本，不能跨行直接相加。
 候选文件用时缺失时保留空值，不将未知成本当作零。反应路径
-CSV 导出包含这四列，不能用逐帧用时之和替代。导出表还包含 `mapped_reaction_url` 列，
-提供带 `project_id` 的映射反应详情页完整访问链接。
+这些 wall-time 缓存用于详情读取；反应数据 CSV 导出单独读取文件级
+`ParseRevision.cpu_time_seconds`，统一除以 3600，以小时输出
+`reactants_cpu_time_hours`、`transition_state_cpu_time_hours`、
+`products_cpu_time_hours`、`total_cpu_time_hours`，替代原有秒数列。
+不累加逐帧时间，不用 wall time 补齐缺失 CPU 时间；来源文件存在未知 CPU 时间时，
+对应阶段和全路径总值保留为空。重新解析后的文件时间在下次导出时直接生效。
+
+导出还提供 `substrate_pair_key`、`substrate_pair_reaction_count`，以及上述四列加
+`substrate_pair_` 前缀后的组总值。分组覆盖当前项目有权访问的全部映射反应，按前体的
+canonical 立体拓扑及计量数构成无序多重集，忽略 atom-map 编号和底物排列顺序，保留
+立体构型；旧、新拓扑 ID 不影响分组。每个阶段跨组内反应合并文件集合，再按文件去重，
+全路径对三个阶段文件的并集去重；不能直接相加各 mapping 的成本。组内所有行共享
+相同总值，不随导出筛选、能量条件、profile 行数或分页变化，不能再次逐行相加。
+缺少完整前体定义的记录保留单条成本，组字段为空。所有统计只读取数据，不改写 TS
+位移端点或其他原始记录。导出表还包含 `mapped_reaction_url` 列，提供带 `project_id`
+的映射反应详情页完整访问链接。
 
 热力学统计与 CSV 导出的结构、具体拓扑和端点兼容性条件逐个作用于 `MappedReaction`，
 布尔表达式中的所有条件必须由当前 mapping 满足，不能由同一逻辑反应的不同 mapping

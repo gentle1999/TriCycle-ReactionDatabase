@@ -176,6 +176,33 @@ def test_concurrent_relink_is_not_overwritten():
         rebuild._rebuild_one(None, inference, object(), entry, state)
 
 
+def test_shared_geometry_coverage_requires_verified_sources_on_the_same_target(monkeypatch):
+    state = _state()
+    entries = [_entry() for _ in range(3)]
+    state["plan"]["inferences"] = entries
+    target = uuid4()
+    inferences = {
+        rebuild.UUID(entry["id"]): SimpleNamespace(
+            mapped_reaction_id=target if index < 2 else uuid4(),
+            calculation_frame_id=uuid4(),
+            complete=index != 1,
+        )
+        for index, entry in enumerate(entries)
+    }
+    frames = {
+        i.calculation_frame_id: SimpleNamespace(geometry_id=uuid4()) for i in inferences.values()
+    }
+    session = SimpleNamespace(
+        get=lambda model, key: (
+            inferences.get(key) if model is rebuild.TransitionStateInference else frames.get(key)
+        )
+    )
+    monkeypatch.setattr(rebuild, "_resume_complete", lambda s, i, e, st: i.complete)
+    assert rebuild._verified_target_geometry_ids(session, state, {target}) == {
+        frames[inferences[rebuild.UUID(entries[0]["id"])].calculation_frame_id].geometry_id
+    }
+
+
 def test_missing_source_prevents_old_record_deletion():
     entry = {
         "id": str(uuid4()),

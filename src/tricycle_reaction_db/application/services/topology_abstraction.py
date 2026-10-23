@@ -24,11 +24,11 @@ from tricycle_reaction_db.application.services._persistence import (
     _project_owner_predicate,
     _require_id,
 )
+from tricycle_reaction_db.application.services.canonical_atom_mapping import (
+    canonical_atom_index_mapping,
+)
 from tricycle_reaction_db.application.services.molecular_geometry import (
     persist_molecular_topology,
-)
-from tricycle_reaction_db.application.services.rdkit_graph_matching import (
-    get_substruct_matches,
 )
 from tricycle_reaction_db.core.chemistry_config import (
     STEREO_ABSTRACTION_MATCH_SCHEMA_VERSION,
@@ -283,19 +283,12 @@ def _find_topology_matches_on_graphs(
     specific_graph: Chem.Mol,
     general_graph: Chem.Mol,
 ) -> tuple[tuple[int, ...], ...]:
-    """Run the uncached graph operation used by the compatibility fallback."""
-
-    if specific_graph.GetNumAtoms() != general_graph.GetNumAtoms():
-        return ()
-    if specific_graph.GetNumBonds() != general_graph.GetNumBonds():
-        return ()
-    matches = get_substruct_matches(
-        specific_graph,
-        general_graph,
-        use_chirality=True,
-        hard_timeout_for_large_molecules=True,
-    )
-    return tuple(sorted(matches))
+    """Return a canonical correspondence, never enumerate graph embeddings."""
+    mapping = canonical_atom_index_mapping(general_graph, specific_graph)
+    if mapping is not None:
+        return (mapping,)
+    abstraction = find_stereo_abstraction_match(specific_graph, general_graph)
+    return (abstraction.general_to_specific_atom_indices,) if abstraction is not None else ()
 
 
 def _is_assigned_atom_stereo(atom: Chem.Atom) -> bool:
@@ -310,14 +303,10 @@ def find_topology_matches(
     specific: Chem.Mol,
     general: Chem.Mol,
 ) -> tuple[tuple[int, ...], ...]:
-    """Return stereo-aware atom matches from a general graph to a concrete graph.
+    """Return at most one validated canonical general-to-specific witness.
 
-    The returned tuple is indexed by atom order in ``general`` and contains
-    atom indices in ``specific``.  Topology identity is still constrained to
-    the same atom and bond counts: this is a graph-inclusion operation for
-    stereo abstraction, not a way to treat a different connectivity or a
-    fragment as the same reaction participant.  ``uniquify=True`` preserves
-    distinct legal matches while removing duplicate automorphism reports.
+    This does not enumerate symmetry-equivalent assignments. Exact topology
+    identity or a verified stereo abstraction must establish the correspondence.
     """
 
     # Avoid cloning/serializing molecules when the topology identity already
@@ -358,11 +347,9 @@ def find_stereo_abstraction_match(
 ) -> StereoAbstractionMatch | None:
     """Check whether ``specific`` is a strict stereo specialization of ``general``.
 
-    The general graph is the RDKit query and the specific graph is the target.
-    RDKit enforces all stereo constraints that remain specified in the query;
-    unspecified query stereo can match an assigned target.  A custom delta
-    check then requires at least one assigned target feature to be omitted from
-    the general graph.
+    Canonical connectivity traversals establish the correspondence. A linear
+    validator enforces retained stereo constraints and requires at least one
+    assigned specific feature to be omitted from the general graph.
     """
 
     specific_graph = _map_free_copy(specific)
@@ -414,8 +401,8 @@ def _stereo_abstraction_match_for_known_atom_mapping(
     This is for projections made from a known source molecule: normalization
     returns the source-to-canonical atom permutation, so there is no reason to
     ask RDKit to rediscover that correspondence with a substructure search.
-    If normalization changed any graph facts or stereo that this check cannot
-    verify directly, callers should use the bounded graph-matching fallback.
+    If any graph fact or retained stereo constraint cannot be verified, reject
+    the correspondence; no graph-matching fallback is permitted.
     """
 
     atom_count = specific.GetNumAtoms()

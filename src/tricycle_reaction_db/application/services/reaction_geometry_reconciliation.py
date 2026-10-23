@@ -26,6 +26,7 @@ from tricycle_reaction_db.application.services._persistence import (
 )
 from tricycle_reaction_db.application.services.canonical_atom_mapping import (
     ReactionComponents,
+    canonical_atom_index_mapping,
     canonical_reaction_atom_map_translation,
     reaction_atom_maps_in_geometry_order,
 )
@@ -458,6 +459,7 @@ def _ensure_mapping(
     coordinate_atom_maps: list[int],
     mapped_smiles: str,
     cache: ReconciliationBatchCache | None = None,
+    existing_mapping: MappedReactionNodeGeometryMapping | None = None,
 ) -> MappedReactionNodeGeometryMapping:
     node_geometry_id = _require_id(node_geometry, label="MappedReactionNodeGeometry")
     transition_state_mapping = (
@@ -483,7 +485,7 @@ def _ensure_mapping(
     else:
         mapping_method = REACTION_GEOMETRY_LINK_METHOD
         mapping_version = REACTION_GEOMETRY_LINK_POLICY_VERSION
-    existing = (
+    existing = existing_mapping or (
         cache.mappings_by_node_geometry_id.get(node_geometry_id)
         if cache is not None and node_geometry_id in cache.loaded_mappings
         else None
@@ -582,7 +584,6 @@ def _bind_participant_geometry(
     mapped_reaction = mapped_reaction or session.get(MappedReaction, participant.mapped_reaction_id)
     if mapped_reaction is None:
         raise RuntimeError("MappedReactionParticipant references a missing MappedReaction")
-    topology_atom_maps = list(participant.atom_map_numbers)
     component_key = f"{participant.side.value}:{participant.template_index}"
     node_geometries: list[MappedReactionNodeGeometry] = []
     for node in _endpoint_nodes(session, mapped_reaction, participant.side, cache=cache):
@@ -597,15 +598,56 @@ def _bind_participant_geometry(
             cache=cache,
             thermodynamic_property_verified=thermodynamic_property_verified,
         )
+        existing_mapping = (
+            cache.mappings_by_node_geometry_id.get(node_geometry.id)
+            if cache is not None and node_geometry.id in cache.loaded_mappings
+            else session.exec(
+                select(MappedReactionNodeGeometryMapping).where(
+                    MappedReactionNodeGeometryMapping.mapped_reaction_node_geometry_id
+                    == node_geometry.id
+                )
+            ).first()
+        )
+        coordinate_maps = _participant_geometry_atom_maps(
+            participant, geometry, existing_mapping=existing_mapping
+        )
         _ensure_mapping(
             session,
             node_geometry=node_geometry,
-            coordinate_atom_maps=topology_atom_maps,
+            coordinate_atom_maps=coordinate_maps,
             mapped_smiles=participant.mapped_smiles,
             cache=cache,
+            existing_mapping=existing_mapping,
         )
         node_geometries.append(node_geometry)
     return node_geometries
+
+
+def _participant_geometry_atom_maps(
+    participant: MappedReactionParticipant,
+    geometry: Geometry,
+    *,
+    existing_mapping: MappedReactionNodeGeometryMapping | None = None,
+) -> list[int]:
+    """Preserve a verified coordinate transform; derive new links in geometry order."""
+    if existing_mapping is not None:
+        maps = list(existing_mapping.geometry_atom_map_numbers)
+        if (
+            not existing_mapping.verified
+            or mapped_smiles_for_geometry(geometry, maps) != participant.mapped_smiles
+        ):
+            raise ValueError("existing participant Geometry mapping fails stereo graph validation")
+        return maps
+    maps = list(participant.atom_map_numbers)
+    if mapped_smiles_for_geometry(geometry, maps) == participant.mapped_smiles:
+        return maps
+    topology = participant.concrete_topology or participant.logical_reaction_participant.topology
+    witness = canonical_atom_index_mapping(geometry.mol, topology.mol)
+    if witness is not None:
+        maps = [participant.atom_map_numbers[index] for index in witness]
+        if mapped_smiles_for_geometry(geometry, maps) == participant.mapped_smiles:
+            return maps
+    raise ValueError("participant Geometry has no complete stereo graph correspondence")
 
 
 def _cache_reaction_node(
@@ -2236,6 +2278,7 @@ def bind_transition_state_frame(
             include_stereochemistry=False,
         ),
         cache=cache,
+        existing_mapping=existing_mapping,
     )
     if resolved_source_atom_maps is not None:
         resolved_source_atom_maps[:] = [
