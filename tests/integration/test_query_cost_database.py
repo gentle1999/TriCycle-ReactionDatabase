@@ -39,7 +39,7 @@ async def test_slow_query_log_omits_bound_values(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(session_module.settings, "slow_query_threshold_ms", 1)
+    monkeypatch.setattr(session_module.settings.runtime, "slow_query_threshold_ms", 1)
     sensitive = "query-secret-must-not-be-logged"
     caplog.set_level(logging.WARNING, logger=session_module.__name__)
     async with session_factory() as session:
