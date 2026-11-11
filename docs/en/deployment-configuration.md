@@ -70,6 +70,14 @@ session secret, secure cookies, verified database and object-store TLS, a
 positive bounded MolOP worker count, and production bootstrap values. Use the
 matching `TRICYCLE_*_CA_BUNDLE` settings when internal services use a private CA.
 
+With `compose.public.yaml`, copy Caddy's
+`/data/caddy/pki/authorities/local/root.crt` to a persistent host file and set
+`TRICYCLE_CADDY_ROOT_CERT_PATH` in `.env` to that absolute path. Keep the
+container's `TRICYCLE_OIDC_CA_BUNDLE` at
+`/etc/reaction-database/ca/caddy-root.crt`. Check that the bind source is a
+readable regular file before startup; Docker may create a directory at a missing
+source path, which breaks login.
+
 `TRICYCLE_OIDC_ISSUER` must exactly equal the issuer in OIDC discovery, including
 scheme, host, path, and slash convention. The error `OIDC discovery issuer does
 not match configuration` is fixed by aligning the configured issuer and identity

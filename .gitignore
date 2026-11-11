@@ -279,4 +279,5 @@ $RECYCLE.BIN/
 *.vsix
 
 .tmp
+.local/certs/caddy-root.crt
 test-results

@@ -703,6 +703,11 @@ TRICYCLE_OIDC_AUDIENCE。OIDC token 至少需要 iss、sub、exp、iat、aud；�
 email、name 或 preferred_username。项目邀请依赖 email claim，且接受邀请时邮箱必须匹配。
 使用私有 CA 时设置绝对 PEM 路径 `TRICYCLE_OIDC_CA_BUNDLE`；该证书链会同时用于 discovery、
 authorization-code token exchange 和 JWKS 下载，并验证身份服务主机名。
+使用 `compose.public.yaml` 时，先将 Caddy 的 `/data/caddy/pki/authorities/local/root.crt`
+复制到主机上的持久文件，并在 `.env` 中把 `TRICYCLE_CADDY_ROOT_CERT_PATH` 设为该文件的
+绝对路径。容器内的 `TRICYCLE_OIDC_CA_BUNDLE` 仍指向
+`/etc/reaction-database/ca/caddy-root.crt`。启动前确认挂载源是可读的普通文件；
+临时目录中的源文件丢失后，Docker 可能在同一路径创建目录，导致登录失败。
 生产运行时还会拒绝 issuer 不精确匹配、authorization/token/logout endpoint 非 HTTPS，或
 discovery 未声明 `code_challenge_methods_supported: ["S256", ...]` 的身份服务。
 
