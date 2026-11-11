@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import delete
 from sqlmodel import col, select
 
+from tests.config_helpers import application_settings
 from tricycle_reaction_db.application.dtos import ProjectCreate
 from tricycle_reaction_db.application.services import (
     AuthenticatedPrincipal,
@@ -14,7 +15,6 @@ from tricycle_reaction_db.application.services import (
     ImportJobService,
     ProjectManagementService,
 )
-from tricycle_reaction_db.core.config import Settings
 from tricycle_reaction_db.db.models import (
     AuditEvent,
     Project,
@@ -81,7 +81,7 @@ async def test_manifest_job_is_idempotent_and_project_scoped(
 ) -> None:
     owner = _principal()
     project_id = None
-    settings = Settings(_env_file=None, import_staging_root=tmp_path)
+    settings = application_settings(_env_file=None, ingestion={"import_staging_root": tmp_path})
     monkeypatch.setattr(
         "tricycle_reaction_db.application.services.import_jobs.get_settings",
         lambda: settings,

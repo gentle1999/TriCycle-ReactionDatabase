@@ -13,6 +13,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem, rdChemReactions, rdDepictor
 from sqlmodel import Session
 
+from tests.config_helpers import application_settings
 from tricycle_reaction_db.application.services import artifact_uploads as upload_module
 from tricycle_reaction_db.application.services._persistence import (
     _fast_pending_entity_count,
@@ -51,7 +52,7 @@ from tricycle_reaction_db.application.services.molecular_geometry import Geometr
 from tricycle_reaction_db.application.services.reaction_geometry_reconciliation import (
     ReconciliationBatchCache,
 )
-from tricycle_reaction_db.core.config import Settings
+from tricycle_reaction_db.core.config import ApplicationSettings
 from tricycle_reaction_db.db.models import (
     LogicalReaction,
     MappedReaction,
@@ -494,9 +495,11 @@ def test_frame_failure_diagnostic_keeps_specific_error_code_and_evidence() -> No
 def test_source_evidence_keeps_fast_ingestion_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = Settings(_env_file=None, molop_capture_source_evidence=True)
+    settings = application_settings(
+        _env_file=None, ingestion={"molop_capture_source_evidence": True}
+    )
     monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
-    assert settings.molop_capture_source_evidence
+    assert settings.ingestion.molop_capture_source_evidence
     assert _fast_molop_ingestion_enabled()
 
 
@@ -525,7 +528,9 @@ def test_storage_pool_does_not_recycle_workers(monkeypatch: pytest.MonkeyPatch) 
 
 @pytest.mark.asyncio
 async def test_file_pipeline_timeout_isolated_to_one_file(monkeypatch: pytest.MonkeyPatch) -> None:
-    settings = Settings(_env_file=None, molop_file_parse_timeout_seconds=0.01)
+    settings = application_settings(
+        _env_file=None, ingestion={"molop_file_parse_timeout_seconds": 0.01}
+    )
     monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
 
     async def slow_file(*_: object, **__: object) -> object:
@@ -539,7 +544,9 @@ async def test_file_pipeline_timeout_isolated_to_one_file(monkeypatch: pytest.Mo
 
 @pytest.mark.asyncio
 async def test_parser_queue_wait_and_multiframe_work_do_not_consume_parser_deadline(monkeypatch):
-    settings = Settings(_env_file=None, molop_file_parse_timeout_seconds=0.01)
+    settings = application_settings(
+        _env_file=None, ingestion={"molop_file_parse_timeout_seconds": 0.01}
+    )
     monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
 
     async def parse(*args, **kwargs):
@@ -576,7 +583,9 @@ def test_file_parse_timeout_scales_with_source_size(
     size_bytes: int,
     expected_seconds: float,
 ) -> None:
-    settings = Settings(_env_file=None, molop_file_parse_timeout_seconds=60.0)
+    settings = application_settings(
+        _env_file=None, ingestion={"molop_file_parse_timeout_seconds": 60.0}
+    )
     monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
 
     assert _molop_file_parse_timeout_seconds(b"0" * size_bytes) == expected_seconds
@@ -586,7 +595,9 @@ def test_file_parse_timeout_scales_path_sources(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    settings = Settings(_env_file=None, molop_file_parse_timeout_seconds=60.0)
+    settings = application_settings(
+        _env_file=None, ingestion={"molop_file_parse_timeout_seconds": 60.0}
+    )
     monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
     source = tmp_path / "large.log"
     source.write_bytes(b"0" * (30 * 1024 * 1024))
@@ -598,7 +609,9 @@ def test_file_parse_timeout_has_headroom_for_previous_large_file_boundary(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    settings = Settings(_env_file=None, molop_file_parse_timeout_seconds=60.0)
+    settings = application_settings(
+        _env_file=None, ingestion={"molop_file_parse_timeout_seconds": 60.0}
+    )
     monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
     source = tmp_path / "previously-timed-out.log"
     with source.open("wb") as stream:
@@ -625,7 +638,9 @@ def test_file_parse_timeout_uses_uncompressed_gzip_path_size(tmp_path: Path) -> 
 async def test_file_pipeline_timeout_releases_slot_for_next_file(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = Settings(_env_file=None, molop_file_parse_timeout_seconds=0.01)
+    settings = application_settings(
+        _env_file=None, ingestion={"molop_file_parse_timeout_seconds": 0.01}
+    )
     monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
     calls: list[str] = []
 
@@ -659,7 +674,9 @@ async def test_file_pipeline_timeout_releases_slot_for_next_file(
 async def test_file_timeout_does_not_shutdown_shared_molop_pool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = Settings(_env_file=None, molop_file_parse_timeout_seconds=0.01)
+    settings = application_settings(
+        _env_file=None, ingestion={"molop_file_parse_timeout_seconds": 0.01}
+    )
     monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
     shared_pool = object()
     shutdown_calls: list[object] = []
@@ -685,7 +702,9 @@ async def test_file_timeout_does_not_shutdown_shared_molop_pool(
 async def test_batch_startup_failure_recovers_committed_reservations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = Settings(_env_file=None, max_batch_files=1, max_batch_bytes=1024)
+    settings = application_settings(
+        _env_file=None, ingestion={"max_batch_files": 1, "max_batch_bytes": 1024}
+    )
     monkeypatch.setattr(upload_module, "get_settings", lambda: settings)
 
     async def allow_upload(*_: object) -> None:
@@ -1419,7 +1438,9 @@ def test_spooled_batch_budget_rejects_gzip_bomb(
     monkeypatch.setattr(
         upload_module,
         "get_settings",
-        lambda: Settings(_env_file=None, max_upload_bytes=1024, max_batch_bytes=2048),
+        lambda: application_settings(
+            _env_file=None, ingestion={"max_upload_bytes": 1024, "max_batch_bytes": 2048}
+        ),
     )
 
     with pytest.raises(ArtifactUploadLimitError, match="decompressed artifact"):
@@ -1439,7 +1460,9 @@ def test_streaming_spooled_budget_uses_per_file_limit_only(
     monkeypatch.setattr(
         upload_module,
         "get_settings",
-        lambda: Settings(_env_file=None, max_upload_bytes=1024, max_batch_bytes=1024),
+        lambda: application_settings(
+            _env_file=None, ingestion={"max_upload_bytes": 1024, "max_batch_bytes": 1024}
+        ),
     )
 
     inspected = _require_batch_upload_budget(
@@ -1663,12 +1686,12 @@ def test_retry_upload_keeps_rustfs_existence_check(
                 ArtifactUploadPayload("one.log", "text/plain", b"a"),
                 ArtifactUploadPayload("two.log", "text/plain", b"b"),
             ],
-            Settings(_env_file=None, max_batch_files=1),
+            application_settings(_env_file=None, ingestion={"max_batch_files": 1}),
             "file limit",
         ),
         (
             [ArtifactUploadPayload("one.log", "text/plain", b"a" * 1025)],
-            Settings(_env_file=None, max_upload_bytes=1024),
+            application_settings(_env_file=None, ingestion={"max_upload_bytes": 1024}),
             "byte limit",
         ),
         (
@@ -1676,7 +1699,9 @@ def test_retry_upload_keeps_rustfs_existence_check(
                 ArtifactUploadPayload("one.log", "text/plain", b"a" * 700),
                 ArtifactUploadPayload("two.log", "text/plain", b"b" * 700),
             ],
-            Settings(_env_file=None, max_upload_bytes=2048, max_batch_bytes=1024),
+            application_settings(
+                _env_file=None, ingestion={"max_upload_bytes": 2048, "max_batch_bytes": 1024}
+            ),
             "byte limit",
         ),
         (
@@ -1687,7 +1712,7 @@ def test_retry_upload_keeps_rustfs_existence_check(
                     gzip.compress(b"expanded" * 512),
                 )
             ],
-            Settings(_env_file=None, max_upload_bytes=1024),
+            application_settings(_env_file=None, ingestion={"max_upload_bytes": 1024}),
             "decompressed artifact",
         ),
     ],
@@ -1695,7 +1720,7 @@ def test_retry_upload_keeps_rustfs_existence_check(
 def test_batch_service_rejects_resource_limits_before_authorization_or_storage(
     monkeypatch: pytest.MonkeyPatch,
     files: list[ArtifactUploadPayload],
-    settings: Settings,
+    settings: ApplicationSettings,
     message: str,
 ) -> None:
     async def unexpected_authorization(*_: object) -> None:
@@ -1724,7 +1749,7 @@ def test_local_streaming_pipeline_can_exceed_http_file_count_limit(
     monkeypatch.setattr(
         upload_module,
         "get_settings",
-        lambda: Settings(_env_file=None, max_batch_files=1),
+        lambda: application_settings(_env_file=None, ingestion={"max_batch_files": 1}),
     )
 
     inspected = _require_batch_upload_budget(

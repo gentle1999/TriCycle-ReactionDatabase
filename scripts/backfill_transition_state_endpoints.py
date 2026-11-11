@@ -812,7 +812,9 @@ async def main() -> None:
     if args.graph_match_timeout_seconds is not None:
         from tricycle_reaction_db.core.config import get_settings
 
-        get_settings().molecular_graph_match_timeout_seconds = args.graph_match_timeout_seconds
+        get_settings().runtime.molecular_graph_match_timeout_seconds = (
+            args.graph_match_timeout_seconds
+        )
 
     async with session_factory() as session:
         invalid_mapped_reaction_ids: set[UUID] | None = None

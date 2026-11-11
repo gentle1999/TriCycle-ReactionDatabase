@@ -6,6 +6,7 @@ from uuid import UUID
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from tests.config_helpers import application_settings
 from tricycle_reaction_db.api.app import create_app
 from tricycle_reaction_db.application.dtos import OrganizationAccessView, OrganizationCreate
 from tricycle_reaction_db.application.services import authorization as authorization_module
@@ -18,7 +19,6 @@ from tricycle_reaction_db.application.services.email import (
     EmailDeliveryService,
     EmailDeliveryStatus,
 )
-from tricycle_reaction_db.core.config import Settings
 from tricycle_reaction_db.domain.enums import OrganizationRole, OrganizationStatus, ProjectRole
 from tricycle_reaction_db.domain.identity import DEVELOPMENT_USER_ID
 
@@ -100,7 +100,7 @@ async def test_link_delivery_is_explicit_in_development(monkeypatch: pytest.Monk
     monkeypatch.setattr(
         email_module,
         "get_settings",
-        lambda: Settings(_env_file=None, email_delivery_mode="link"),
+        lambda: application_settings(_env_file=None, identity={"email_delivery_mode": "link"}),
     )
     result = await EmailDeliveryService.send_project_invitation(
         recipient="member@example.test",
@@ -119,11 +119,13 @@ async def test_smtp_failure_is_reported_without_raising(monkeypatch: pytest.Monk
     monkeypatch.setattr(
         email_module,
         "get_settings",
-        lambda: Settings(
+        lambda: application_settings(
             _env_file=None,
-            email_delivery_mode="smtp",
-            smtp_host="smtp.example.test",
-            smtp_from_email="noreply@example.test",
+            identity={
+                "email_delivery_mode": "smtp",
+                "smtp_host": "smtp.example.test",
+                "smtp_from_email": "noreply@example.test",
+            },
         ),
     )
 
@@ -169,13 +171,15 @@ def test_smtp_delivery_passes_a_verifying_tls_context(monkeypatch: pytest.Monkey
     monkeypatch.setattr(
         email_module,
         "get_settings",
-        lambda: Settings(
+        lambda: application_settings(
             _env_file=None,
-            email_delivery_mode="smtp",
-            smtp_host="smtp.example.test",
-            smtp_username="mailer",
-            smtp_password="secret",
-            smtp_from_email="noreply@example.test",
+            identity={
+                "email_delivery_mode": "smtp",
+                "smtp_host": "smtp.example.test",
+                "smtp_username": "mailer",
+                "smtp_password": "secret",
+                "smtp_from_email": "noreply@example.test",
+            },
         ),
     )
     monkeypatch.setattr(email_module, "smtp_tls_context", lambda **_kwargs: tls_context)

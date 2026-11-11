@@ -84,7 +84,7 @@ def _shared_stage_slots() -> asyncio.Semaphore:
 
     global _stage_slots
     loop = asyncio.get_running_loop()
-    workers = max(1, get_settings().upload_max_concurrency)
+    workers = max(1, get_settings().ingestion.upload_max_concurrency)
     if _stage_slots is None or _stage_slots[0] is not loop or _stage_slots[1] != workers:
         _stage_slots = (loop, workers, asyncio.Semaphore(workers))
     return _stage_slots[2]
@@ -425,22 +425,27 @@ class UploadBatchService:
             raise UploadBatchConflictError(
                 "manifest metadata must be registered through the import-job control plane"
             )
-        if len(payload.files) > settings.max_upload_queue_files:
+        if len(payload.files) > settings.ingestion.max_upload_queue_files:
             raise UploadBatchLimitError(
-                f"upload queue exceeds the {settings.max_upload_queue_files}-file limit"
+                f"upload queue exceeds the {settings.ingestion.max_upload_queue_files}-file limit"
             )
         oversized = next(
-            (item for item in payload.files if item.size_bytes > settings.max_upload_bytes),
+            (
+                item
+                for item in payload.files
+                if item.size_bytes > settings.ingestion.max_upload_bytes
+            ),
             None,
         )
         if oversized is not None and not allow_transport_rejections:
             raise UploadBatchLimitError(
-                f"{oversized.original_filename} exceeds the {settings.max_upload_bytes}-byte limit"
+                f"{oversized.original_filename} exceeds the "
+                f"{settings.ingestion.max_upload_bytes}-byte limit"
             )
         total_bytes = sum(item.size_bytes for item in payload.files)
-        if total_bytes > settings.max_upload_queue_bytes:
+        if total_bytes > settings.ingestion.max_upload_queue_bytes:
             raise UploadBatchLimitError(
-                f"upload queue exceeds the {settings.max_upload_queue_bytes}-byte limit"
+                f"upload queue exceeds the {settings.ingestion.max_upload_queue_bytes}-byte limit"
             )
         try:
             metadata_bytes = len(
@@ -452,9 +457,10 @@ class UploadBatchService:
             )
         except (TypeError, ValueError) as error:
             raise UploadBatchConflictError("shared metadata must be JSON serializable") from error
-        if metadata_bytes > settings.max_upload_metadata_bytes:
+        if metadata_bytes > settings.ingestion.max_upload_metadata_bytes:
             raise UploadBatchLimitError(
-                f"shared metadata exceeds the {settings.max_upload_metadata_bytes}-byte limit"
+                "shared metadata exceeds the "
+                f"{settings.ingestion.max_upload_metadata_bytes}-byte limit"
             )
 
         await AuthorizationService.require_project_permission(
@@ -1362,9 +1368,9 @@ class UploadBatchService:
         if not files:
             raise UploadBatchConflictError("upload batch request contains no files")
         settings = get_settings()
-        if len(files) > settings.max_batch_files:
+        if len(files) > settings.ingestion.max_batch_files:
             raise UploadBatchLimitError(
-                f"upload batch exceeds the {settings.max_batch_files}-file limit"
+                f"upload batch exceeds the {settings.ingestion.max_batch_files}-file limit"
             )
         client_file_ids = [client_file_id for client_file_id, _ in files]
         if len(set(client_file_ids)) != len(client_file_ids):
@@ -1372,9 +1378,9 @@ class UploadBatchService:
         total_bytes = sum(
             max(0, cls._payload_size(upload)) for _, upload in files if upload.error_code is None
         )
-        if len(files) > 1 and total_bytes > settings.max_batch_bytes:
+        if len(files) > 1 and total_bytes > settings.ingestion.max_batch_bytes:
             raise UploadBatchLimitError(
-                f"upload batch exceeds the {settings.max_batch_bytes}-byte limit"
+                f"upload batch exceeds the {settings.ingestion.max_batch_bytes}-byte limit"
             )
 
         now = datetime.now(UTC)
@@ -1768,7 +1774,7 @@ class UploadBatchService:
 
         settings = get_settings()
         now = datetime.now(UTC)
-        upload_cutoff = now - timedelta(seconds=settings.upload_client_lease_seconds)
+        upload_cutoff = now - timedelta(seconds=settings.ingestion.upload_client_lease_seconds)
         processing_cutoff = now
         async with session_factory() as session:
             batch = await _owned_batch(session, batch_id, user_id, lock=True)
@@ -1827,7 +1833,7 @@ class UploadBatchService:
 
         settings = get_settings()
         now = datetime.now(UTC)
-        upload_cutoff = now - timedelta(seconds=settings.upload_client_lease_seconds)
+        upload_cutoff = now - timedelta(seconds=settings.ingestion.upload_client_lease_seconds)
         processing_recovery = (
             col(UploadBatchItem.status) == UploadBatchItemStatus.PROCESSING
             if recover_unexpired_processing
@@ -1950,9 +1956,9 @@ class UploadBatchService:
         """
 
         settings = get_settings()
-        resolved_limit = limit or settings.upload_worker_concurrency
+        resolved_limit = limit or settings.ingestion.upload_worker_concurrency
         now = datetime.now(UTC)
-        cutoff = now - timedelta(seconds=settings.upload_pending_recovery_seconds)
+        cutoff = now - timedelta(seconds=settings.ingestion.upload_pending_recovery_seconds)
         active_upload_item = (
             select(1)
             .where(
@@ -2001,7 +2007,9 @@ class UploadBatchService:
         async with session_factory() as session:
             rows = (await session.exec(statement)).all()
             lease_by_ingestion_id: dict[UUID, UUID] = {}
-            lease_expires_at = now + timedelta(seconds=settings.upload_worker_lease_seconds)
+            lease_expires_at = now + timedelta(
+                seconds=settings.ingestion.upload_worker_lease_seconds
+            )
             for ingestion, artifact in rows:
                 ingestion_id = _required_uuid(ingestion.id, "ArtifactIngestion")
                 artifact_id = _required_uuid(artifact.id, "ArtifactFile")
@@ -2062,7 +2070,7 @@ class UploadBatchService:
             if ingestion is None:
                 return False
             ingestion.worker_lease_expires_at = datetime.now(UTC) + timedelta(
-                seconds=settings.upload_worker_lease_seconds
+                seconds=settings.ingestion.upload_worker_lease_seconds
             )
             session.add(ingestion)
             await session.commit()
@@ -2086,7 +2094,7 @@ class UploadBatchService:
             return 0
         settings = get_settings()
         now = datetime.now(UTC)
-        expires_at = now + timedelta(seconds=settings.upload_worker_lease_seconds)
+        expires_at = now + timedelta(seconds=settings.ingestion.upload_worker_lease_seconds)
         predicate = or_(
             *(
                 and_(
@@ -2212,7 +2220,7 @@ class UploadBatchService:
         """Atomically lease staged artifacts to one parser worker."""
 
         settings = get_settings()
-        resolved_limit = limit or settings.upload_worker_concurrency
+        resolved_limit = limit or settings.ingestion.upload_worker_concurrency
         await cls.reconcile_completed_staged_items(limit=max(512, resolved_limit))
         now = datetime.now(UTC)
         jobs: list[UploadProcessingJob] = []
@@ -2275,7 +2283,9 @@ class UploadBatchService:
             lease_by_item_id: dict[UUID, UUID] = {}
             lease_by_artifact_id: dict[UUID, UUID] = {}
             batch_deltas: dict[UUID, list[int]] = {}
-            lease_expires_at = now + timedelta(seconds=settings.upload_worker_lease_seconds)
+            lease_expires_at = now + timedelta(
+                seconds=settings.ingestion.upload_worker_lease_seconds
+            )
             for item, batch in rows:
                 # An immutable artifact can occur in several batches. Admit
                 # only one lease; its siblings stay staged until reconciliation.
@@ -2531,7 +2541,7 @@ class UploadBatchService:
             if item is None:
                 return False
             now = datetime.now(UTC)
-            expires_at = now + timedelta(seconds=settings.upload_worker_lease_seconds)
+            expires_at = now + timedelta(seconds=settings.ingestion.upload_worker_lease_seconds)
             item.worker_lease_expires_at = expires_at
             item.updated_at = now
             if item.artifact_file_id is not None:
@@ -2569,7 +2579,7 @@ class UploadBatchService:
             return 0
         settings = get_settings()
         now = datetime.now(UTC)
-        expires_at = now + timedelta(seconds=settings.upload_worker_lease_seconds)
+        expires_at = now + timedelta(seconds=settings.ingestion.upload_worker_lease_seconds)
         item_predicate = or_(
             *(
                 and_(

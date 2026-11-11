@@ -8,6 +8,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from starlette.requests import Request
 
+from tests.config_helpers import application_settings, copied_application_settings
 from tricycle_reaction_db.api import authentication as api_authentication
 from tricycle_reaction_db.api import core
 from tricycle_reaction_db.api.app import create_app
@@ -38,7 +39,6 @@ from tricycle_reaction_db.application.services.upload_batches import (
     UploadBatchLimitError,
     UploadBatchService,
 )
-from tricycle_reaction_db.core.config import Settings
 from tricycle_reaction_db.domain.enums import (
     ArtifactIngestionStatus,
     ArtifactKind,
@@ -136,13 +136,18 @@ async def _optional_anonymous(authorization: str | None) -> None:
 
 
 def test_production_oidc_discovery_is_validated_before_endpoints_are_used() -> None:
-    settings = Settings(
-        _env_file=None,
-        auth_mode="oidc",
-        oidc_issuer="https://identity.example.test",
-        oidc_audience="reaction-database",
-        oidc_jwks_url="https://identity.example.test/jwks.json",
-    ).model_copy(update={"environment": "production"})
+    settings = copied_application_settings(
+        application_settings(
+            _env_file=None,
+            identity={
+                "auth_mode": "oidc",
+                "oidc_issuer": "https://identity.example.test",
+                "oidc_audience": "reaction-database",
+                "oidc_jwks_url": "https://identity.example.test/jwks.json",
+            },
+        ),
+        runtime={"environment": "production"},
+    )
     payload = {
         "issuer": "https://identity.example.test",
         "authorization_endpoint": "https://identity.example.test/authorize",
@@ -168,13 +173,18 @@ def test_production_oidc_discovery_rejects_unsafe_metadata(
     updates: dict[str, object],
     message: str,
 ) -> None:
-    settings = Settings(
-        _env_file=None,
-        auth_mode="oidc",
-        oidc_issuer="https://identity.example.test",
-        oidc_audience="reaction-database",
-        oidc_jwks_url="https://identity.example.test/jwks.json",
-    ).model_copy(update={"environment": "production"})
+    settings = copied_application_settings(
+        application_settings(
+            _env_file=None,
+            identity={
+                "auth_mode": "oidc",
+                "oidc_issuer": "https://identity.example.test",
+                "oidc_audience": "reaction-database",
+                "oidc_jwks_url": "https://identity.example.test/jwks.json",
+            },
+        ),
+        runtime={"environment": "production"},
+    )
     payload: dict[str, object] = {
         "issuer": "https://identity.example.test",
         "authorization_endpoint": "https://identity.example.test/authorize",
@@ -225,7 +235,7 @@ def test_development_frontend_redirect_uses_request_origin(
     headers: list[tuple[str, str]],
     expected: str,
 ) -> None:
-    monkeypatch.setattr(auth_routes, "get_settings", lambda: Settings(_env_file=None))
+    monkeypatch.setattr(auth_routes, "get_settings", lambda: application_settings(_env_file=None))
     request = Request(
         {
             "type": "http",
@@ -242,7 +252,7 @@ def test_development_frontend_redirect_uses_request_origin(
 async def test_development_login_redirect_is_relative(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(auth_routes, "get_settings", lambda: Settings(_env_file=None))
+    monkeypatch.setattr(auth_routes, "get_settings", lambda: application_settings(_env_file=None))
     async with AsyncClient(
         transport=ASGITransport(app=create_app()),
         base_url="http://remote.example.test:5173",
@@ -258,18 +268,20 @@ async def test_development_login_redirect_is_relative(
 async def test_optional_authentication_only_allows_anonymous_in_oidc_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    development = Settings(_env_file=None)
+    development = application_settings(_env_file=None)
     monkeypatch.setattr(authentication_module, "get_settings", lambda: development)
     principal = await AuthenticationService.authenticate_optional(None)
     assert principal is not None
     assert principal.user_id == DEVELOPMENT_USER_ID
 
-    oidc = Settings(
+    oidc = application_settings(
         _env_file=None,
-        auth_mode="oidc",
-        oidc_issuer="https://identity.example.test",
-        oidc_audience="reaction-database",
-        oidc_jwks_url="https://identity.example.test/jwks.json",
+        identity={
+            "auth_mode": "oidc",
+            "oidc_issuer": "https://identity.example.test",
+            "oidc_audience": "reaction-database",
+            "oidc_jwks_url": "https://identity.example.test/jwks.json",
+        },
     )
     monkeypatch.setattr(authentication_module, "get_settings", lambda: oidc)
     assert await AuthenticationService.authenticate_optional(None) is None
@@ -279,7 +291,7 @@ async def test_optional_authentication_only_allows_anonymous_in_oidc_mode(
 async def test_mcp_bearer_is_validated_before_development_shortcut(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    development = Settings(_env_file=None)
+    development = application_settings(_env_file=None)
     monkeypatch.setattr(authentication_module, "get_settings", lambda: development)
     expected = AuthenticatedPrincipal(
         user_id=DEVELOPMENT_USER_ID,
@@ -308,13 +320,15 @@ async def test_mcp_bearer_is_validated_before_development_shortcut(
 async def test_oidc_logout_url_uses_provider_end_session_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = Settings(
+    settings = application_settings(
         _env_file=None,
-        auth_mode="oidc",
-        oidc_issuer="https://identity.example.test",
-        oidc_audience="reaction-database",
-        oidc_jwks_url="https://identity.example.test/jwks.json",
-        oidc_client_id="reaction-client",
+        identity={
+            "auth_mode": "oidc",
+            "oidc_issuer": "https://identity.example.test",
+            "oidc_audience": "reaction-database",
+            "oidc_jwks_url": "https://identity.example.test/jwks.json",
+            "oidc_client_id": "reaction-client",
+        },
     )
     monkeypatch.setattr(authentication_module, "get_settings", lambda: settings)
 
@@ -341,13 +355,15 @@ async def test_oidc_logout_url_uses_provider_end_session_endpoint(
 async def test_oidc_authorization_url_requires_s256_pkce(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = Settings(
+    settings = application_settings(
         _env_file=None,
-        auth_mode="oidc",
-        oidc_issuer="https://identity.example.test",
-        oidc_audience="reaction-database",
-        oidc_jwks_url="https://identity.example.test/jwks.json",
-        oidc_client_id="reaction-client",
+        identity={
+            "auth_mode": "oidc",
+            "oidc_issuer": "https://identity.example.test",
+            "oidc_audience": "reaction-database",
+            "oidc_jwks_url": "https://identity.example.test/jwks.json",
+            "oidc_client_id": "reaction-client",
+        },
     )
     monkeypatch.setattr(authentication_module, "get_settings", lambda: settings)
 
@@ -378,14 +394,16 @@ async def test_oidc_authorization_url_requires_s256_pkce(
 async def test_oidc_code_exchange_forwards_pkce_verifier(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = Settings(
+    settings = application_settings(
         _env_file=None,
-        auth_mode="oidc",
-        oidc_issuer="https://identity.example.test",
-        oidc_audience="reaction-database",
-        oidc_jwks_url="https://identity.example.test/jwks.json",
-        oidc_client_id="reaction-client",
-        oidc_client_secret="client-secret",
+        identity={
+            "auth_mode": "oidc",
+            "oidc_issuer": "https://identity.example.test",
+            "oidc_audience": "reaction-database",
+            "oidc_jwks_url": "https://identity.example.test/jwks.json",
+            "oidc_client_id": "reaction-client",
+            "oidc_client_secret": "client-secret",
+        },
     )
     monkeypatch.setattr(authentication_module, "get_settings", lambda: settings)
 
@@ -396,7 +414,7 @@ async def test_oidc_code_exchange_forwards_pkce_verifier(
     monkeypatch.setattr(
         authentication_module,
         "_decode_oidc_token",
-        lambda token, _settings: {"sub": token, "iss": settings.oidc_issuer},
+        lambda token, _settings: {"sub": token, "iss": settings.identity.oidc_issuer},
     )
     captured: dict[str, object] = {}
 
@@ -431,7 +449,7 @@ async def test_oidc_code_exchange_forwards_pkce_verifier(
     )
 
     assert id_token is None
-    assert claims == {"sub": "signed-access-token", "iss": settings.oidc_issuer}
+    assert claims == {"sub": "signed-access-token", "iss": settings.identity.oidc_issuer}
     assert isinstance(captured.pop("verify"), ssl.SSLContext)
     assert captured == {
         "url": "https://identity.example.test/token",
@@ -458,13 +476,15 @@ async def test_oidc_callback_failure_clears_one_time_state_cookie(
     monkeypatch: pytest.MonkeyPatch,
     callback_query: str,
 ) -> None:
-    settings = Settings(
+    settings = application_settings(
         _env_file=None,
-        auth_mode="oidc",
-        oidc_issuer="https://identity.example.test",
-        oidc_audience="reaction-database",
-        oidc_jwks_url="https://identity.example.test/jwks.json",
-        oidc_frontend_url="https://app.example.test",
+        identity={
+            "auth_mode": "oidc",
+            "oidc_issuer": "https://identity.example.test",
+            "oidc_audience": "reaction-database",
+            "oidc_jwks_url": "https://identity.example.test/jwks.json",
+            "oidc_frontend_url": "https://app.example.test",
+        },
     )
     monkeypatch.setattr(auth_routes, "get_settings", lambda: settings)
 
@@ -490,13 +510,15 @@ async def test_oidc_callback_failure_clears_one_time_state_cookie(
 async def test_oidc_logout_redirect_revokes_cookie_and_returns_to_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = Settings(
+    settings = application_settings(
         _env_file=None,
-        auth_mode="oidc",
-        oidc_issuer="https://identity.example.test",
-        oidc_audience="reaction-database",
-        oidc_jwks_url="https://identity.example.test/jwks.json",
-        oidc_frontend_url="https://app.example.test",
+        identity={
+            "auth_mode": "oidc",
+            "oidc_issuer": "https://identity.example.test",
+            "oidc_audience": "reaction-database",
+            "oidc_jwks_url": "https://identity.example.test/jwks.json",
+            "oidc_frontend_url": "https://app.example.test",
+        },
     )
     revoked: list[str | None] = []
 
@@ -522,8 +544,8 @@ async def test_oidc_logout_redirect_revokes_cookie_and_returns_to_provider(
         base_url="http://test",
         follow_redirects=False,
         cookies={
-            settings.session_cookie_name: "session-token",
-            settings.csrf_cookie_name: csrf_token,
+            settings.identity.session_cookie_name: "session-token",
+            settings.identity.csrf_cookie_name: csrf_token,
         },
     ) as client:
         response = await client.get(
@@ -540,7 +562,7 @@ async def test_oidc_logout_redirect_revokes_cookie_and_returns_to_provider(
 
 
 def test_session_state_change_requires_bound_double_submit_csrf_token() -> None:
-    settings = Settings(_env_file=None)
+    settings = application_settings(_env_file=None)
     raw_session = "opaque-session"
     token = AuthenticationService.csrf_token(raw_session)
 
@@ -558,8 +580,8 @@ def test_session_state_change_requires_bound_double_submit_csrf_token() -> None:
             "method": "POST",
             "path": "/api/auth/sessions/revoke-all",
             "headers": [
-                (b"cookie", f"{settings.csrf_cookie_name}={token}".encode()),
-                (settings.csrf_header_name.encode(), token.encode()),
+                (b"cookie", f"{settings.identity.csrf_cookie_name}={token}".encode()),
+                (settings.identity.csrf_header_name.encode(), token.encode()),
             ],
         }
     )
@@ -815,11 +837,9 @@ async def test_oversized_file_does_not_reject_valid_batch_siblings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project_id = UUID("00000000-0000-7000-8000-000000000201")
-    settings = Settings(
+    settings = application_settings(
         _env_file=None,
-        max_upload_bytes=1024,
-        max_batch_files=4,
-        max_batch_bytes=2048,
+        ingestion={"max_upload_bytes": 1024, "max_batch_files": 4, "max_batch_bytes": 2048},
     )
     monkeypatch.setattr(upload_routes, "get_settings", lambda: settings)
 
@@ -927,11 +947,13 @@ async def test_authenticated_batch_upload_rejects_resource_limits(
     max_batch_bytes: int,
     expected_detail: str,
 ) -> None:
-    settings = Settings(
+    settings = application_settings(
         _env_file=None,
-        max_upload_bytes=1024,
-        max_batch_files=max_batch_files,
-        max_batch_bytes=max_batch_bytes,
+        ingestion={
+            "max_upload_bytes": 1024,
+            "max_batch_files": max_batch_files,
+            "max_batch_bytes": max_batch_bytes,
+        },
     )
     monkeypatch.setattr(upload_routes, "get_settings", lambda: settings)
 

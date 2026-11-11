@@ -9,6 +9,11 @@ interface ImportMetaEnv {
   readonly VITE_MCP_SERVER_NAME?: string;
   readonly VITE_CSRF_COOKIE_NAME?: string;
   readonly VITE_CSRF_HEADER_NAME?: string;
+  readonly VITE_REACTION_PAGE_SIZE_MAX?: string;
+  readonly VITE_CATALOG_PAGE_SIZE_MAX?: string;
+  readonly VITE_DEFAULT_REACTION_PAGE_SIZE?: string;
+  readonly VITE_DEFAULT_CATALOG_PAGE_SIZE?: string;
+  readonly VITE_PAGE_PREFETCH_RADIUS?: string;
   readonly VITE_NEXUSX_GRAPHQL_URL?: string;
   readonly VITE_NEXUSX_CORE_URL?: string;
   readonly VITE_NEXUSX_PAGINATED_GRAPHQL_URL?: string;

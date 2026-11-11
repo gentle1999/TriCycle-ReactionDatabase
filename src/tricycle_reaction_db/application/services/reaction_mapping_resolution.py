@@ -528,9 +528,12 @@ def _existing_derived_variant(
             continue
         components = {}
         for participant in participants:
+            topology_id = participant.concrete_topology_id
+            if topology_id is None:
+                break
             topology = _molecular_topology_by_id(
                 session,
-                participant.concrete_topology_id,
+                topology_id,
                 project_id=project_id,
                 topology_context=topology_context,
             )

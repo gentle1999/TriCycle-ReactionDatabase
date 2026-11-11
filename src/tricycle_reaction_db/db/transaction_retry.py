@@ -6,7 +6,8 @@ import random
 from collections.abc import Awaitable, Callable
 from functools import wraps
 
-TRANSACTION_RETRY_LIMIT = 3
+from tricycle_reaction_db.core.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -29,11 +30,12 @@ def retry_transaction[**P, T](operation: Callable[P, Awaitable[T]]) -> Callable[
 
     @wraps(operation)
     async def wrapped(*args: P.args, **kwargs: P.kwargs) -> T:
-        for attempt in range(TRANSACTION_RETRY_LIMIT + 1):
+        retry_limit = get_settings().ingestion.transaction_retry_limit
+        for attempt in range(retry_limit + 1):
             try:
                 return await operation(*args, **kwargs)
             except Exception as error:
-                if not is_transaction_conflict(error) or attempt == TRANSACTION_RETRY_LIMIT:
+                if not is_transaction_conflict(error) or attempt == retry_limit:
                     raise
                 logger.warning(
                     "retrying rolled-back transaction operation=%s attempt=%d",

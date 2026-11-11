@@ -32,12 +32,10 @@ from tricycle_reaction_db.domain.enums import ThermodynamicProfileRefreshJobStat
 
 logger = logging.getLogger(__name__)
 
-# Compatibility constant for callers that used the old refresh service. The
-# worker's durable claim and commit microbatch defaults to 32 reactions so a
-# slow topology/source selection path cannot hold one long transaction.
-THERMODYNAMIC_PROFILE_REFRESH_CHUNK_SIZE = 32
-_ERROR_MAX_LENGTH = 4_000
-_RETRY_MAX_SECONDS = 300
+# Compatibility export for callers of the old refresh service.
+THERMODYNAMIC_PROFILE_REFRESH_CHUNK_SIZE = (
+    get_settings().ingestion.upload_worker_profile_refresh_batch_size
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +68,9 @@ async def _claim_profile_refresh_jobs(
 
     now = datetime.now(UTC)
     settings = get_settings()
-    lease_expires_at = now + timedelta(seconds=settings.upload_worker_profile_refresh_lease_seconds)
+    lease_expires_at = now + timedelta(
+        seconds=settings.ingestion.upload_worker_profile_refresh_lease_seconds
+    )
     lease_id = uuid4()
     async with session_factory() as session:
         # A worker crash must not strand a job in ``processing``. Recovery is
@@ -103,7 +103,9 @@ async def _claim_profile_refresh_jobs(
         if project_ids is not None:
             predicates.append(col(MappedReaction.project_id).in_(project_ids))
         if not ignore_schedule and allow_while_busy:
-            max_delay = timedelta(seconds=settings.upload_worker_profile_refresh_max_delay_seconds)
+            max_delay = timedelta(
+                seconds=settings.ingestion.upload_worker_profile_refresh_max_delay_seconds
+            )
             predicates.append(
                 (col(MappedReactionThermodynamicProfileRefreshJob.priority) > 0)
                 | (
@@ -197,7 +199,7 @@ async def _reschedule_profile_refresh_jobs(
     lease_ids = tuple({job.lease_id for job in claimed_jobs})
     job_ids = tuple(job.mapped_reaction_id for job in claimed_jobs)
     error_text = str(error).strip() or error.__class__.__name__
-    error_text = error_text[:_ERROR_MAX_LENGTH]
+    error_text = error_text[: get_settings().ingestion.profile_refresh_error_max_length]
     async with session_factory() as session:
         jobs = (
             await session.exec(
@@ -215,7 +217,7 @@ async def _reschedule_profile_refresh_jobs(
         ).all()
         for job in jobs:
             retry_seconds = min(
-                _RETRY_MAX_SECONDS,
+                get_settings().ingestion.profile_refresh_retry_max_seconds,
                 2 ** min(max(job.attempt_count - 1, 0), 8),
             )
             job.status = ThermodynamicProfileRefreshJobStatus.PENDING
@@ -350,7 +352,7 @@ async def _process_profile_refresh_jobs(
 
     if not claimed_jobs:
         return 0
-    batch_size = get_settings().upload_worker_profile_refresh_batch_size
+    batch_size = get_settings().ingestion.upload_worker_profile_refresh_batch_size
     total_completed = 0
     for batch_start in range(0, len(claimed_jobs), batch_size):
         batch = claimed_jobs[batch_start : batch_start + batch_size]
@@ -405,7 +407,7 @@ async def refresh_pending_mapped_reaction_profiles(
     batches = 0
     try:
         while limit is None or processed < limit:
-            batch_limit = get_settings().upload_worker_profile_refresh_batch_size
+            batch_limit = get_settings().ingestion.upload_worker_profile_refresh_batch_size
             if limit is not None:
                 batch_limit = min(batch_limit, limit - processed)
             claimed = await _claim_profile_refresh_jobs(

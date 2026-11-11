@@ -9,6 +9,8 @@ import pytest
 from rdkit import Chem
 from rdkit.Geometry import Point3D
 
+from tests.config_helpers import copied_application_settings
+from tricycle_reaction_db.application.services import units_ts_dataset_export as units_export
 from tricycle_reaction_db.application.services.mapped_geometry_atom_order import (
     mapped_reaction_atom_elements,
     mapped_reaction_atom_signatures,
@@ -23,6 +25,7 @@ from tricycle_reaction_db.application.services.units_ts_dataset_export import (
     make_units_ts_sample,
     reaction_center_atom_maps,
 )
+from tricycle_reaction_db.core.config import get_settings
 
 GEOMETRY_ID = UUID("00000000-0000-7000-8000-000000000101")
 BINDING_ID = UUID("00000000-0000-7000-8000-000000000102")
@@ -51,6 +54,42 @@ def _mapped_reaction() -> SimpleNamespace:
         id=REACTION_ID,
         mapped_reaction_smiles="[CH3:2][OH:1]>>[CH2:2]=[O:1]",
     )
+
+
+@pytest.mark.asyncio
+async def test_geometry_only_export_does_not_load_scientific_arrays(monkeypatch) -> None:
+    from tricycle_reaction_db.application.services import mapped_reaction_geometry_export as module
+
+    binding = SimpleNamespace(id=BINDING_ID)
+    mapping = SimpleNamespace(geometry_atom_map_numbers=[2, 1])
+    rows = [(binding, _mapped_reaction(), _geometry(), mapping)]
+
+    class Session:
+        calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def exec(self, statement):
+            self.calls += 1
+            assert self.calls == 1, "Geometry-only export must not query frames or arrays"
+            return SimpleNamespace(all=lambda: rows)
+
+    session = Session()
+    monkeypatch.setattr(module, "session_factory", lambda: session)
+    records = [
+        json.loads(line)
+        async for line in module.iter_mapped_reaction_geometry_export(
+            REACTION_ID, max_records=1, include_calculations=False
+        )
+    ]
+    assert len(records) == 1
+    assert records[0]["value"]["calculations"] == []
+    assert [atom["atom_map_number"] for atom in records[0]["value"]["geometry"]["atoms"]] == [1, 2]
+    assert records[0]["value"]["geometry"]["geometry_binding_id"] == str(BINDING_ID)
 
 
 def _atom_map_elements(smiles: str) -> dict[int, int]:
@@ -173,6 +212,34 @@ def test_units_ts_sample_and_raw_record_use_atom_map_order() -> None:
         geometry.mol.GetConformer().GetPositions(),
         np.asarray([[10.0, 1.0, 2.0], [20.0, 3.0, 4.0]]),
     )
+
+
+def test_units_ts_configured_capacities_preserve_mapped_atom_indices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = copied_application_settings(
+        get_settings(),
+        mcp_export={
+            "units_ts_max_reactive_atoms": 4,
+            "units_ts_max_rc_bonds": 3,
+            "units_ts_max_rc_angles": 2,
+        },
+    )
+    monkeypatch.setattr(units_export, "get_settings", lambda: settings)
+
+    sample = make_units_ts_sample(
+        geometry=_geometry(),  # type: ignore[arg-type]
+        mapped_reaction=_mapped_reaction(),  # type: ignore[arg-type]
+        geometry_atom_map_numbers=[2, 1],
+        binding_id=BINDING_ID,
+    )
+
+    assert sample["geometry_atom_map_numbers"].tolist() == [1, 2]
+    assert sample["reactive_atoms"].tolist() == [0, 1]
+    assert sample["reactive_atoms_padded"].tolist() == [0, 1, -1, -1]
+    assert sample["rc_bond_indices"].shape == (3, 2)
+    assert sample["rc_bond_indices"][0].tolist() == [0, 1]
+    assert sample["rc_angle_indices"].shape == (2, 3)
 
 
 def test_mapped_geometry_jsonl_reorders_atoms_and_molblock() -> None:

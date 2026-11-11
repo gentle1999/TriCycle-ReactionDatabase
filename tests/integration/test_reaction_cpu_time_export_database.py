@@ -36,7 +36,7 @@ pytestmark = [
 async def test_cpu_export_unions_all_group_members_and_ignores_pagination(monkeypatch):
     # External transaction contains fixture commits and is always rolled back.
     service = analytics.ReactionThermodynamicAnalyticsService
-    engine = create_engine(get_settings().database_url)
+    engine = create_engine(get_settings().runtime.database_url)
     with engine.connect() as connection:
         outer = connection.begin()
         try:

@@ -883,7 +883,7 @@ class ReactionCommandService(UseCaseService):  # type: ignore[misc]
         )
         enforce_structure_input_budget(
             {"reaction": reaction},
-            maximum_characters=get_settings().structure_query_max_characters,
+            maximum_characters=get_settings().runtime.structure_query_max_characters,
         )
         command = CreateReactionCommand(
             reaction=reaction,

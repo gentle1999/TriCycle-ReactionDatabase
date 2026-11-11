@@ -70,7 +70,7 @@ def test_minimal_orca_single_point_persists_protocol_geometry_and_frame() -> Non
             "visibility": ArtifactVisibility.PROJECT,
         }
     )
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:

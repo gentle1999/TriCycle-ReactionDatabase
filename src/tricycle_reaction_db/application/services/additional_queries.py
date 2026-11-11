@@ -418,7 +418,7 @@ def _geometry_query_leaf_predicate(field: object, value: object, scope: Any) -> 
     if field_name in {"topology_smiles", "topology_mol_block", "topology_smarts"}:
         enforce_structure_input_budget(
             {field_name: cast(str | None, value) if isinstance(value, str) else None},
-            maximum_characters=get_settings().structure_query_max_characters,
+            maximum_characters=get_settings().runtime.structure_query_max_characters,
         )
         return _geometry_structure_predicate(field_name, value)
     if field_name == "thermodynamic_only":
@@ -817,7 +817,7 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
             raise ValueError("topology structure filters and similarity_smiles conflict")
         enforce_structure_input_budget(
             structure_inputs,
-            maximum_characters=get_settings().structure_query_max_characters,
+            maximum_characters=get_settings().runtime.structure_query_max_characters,
         )
         if imaginary_frequency_status not in {
             None,
@@ -878,7 +878,7 @@ class GeometryQueryService(UseCaseService):  # type: ignore[misc]
                 col(Geometry.id),
             )
         if filter_expression is not None:
-            if len(filter_expression) > get_settings().structure_query_max_characters:
+            if len(filter_expression) > get_settings().runtime.structure_query_max_characters:
                 raise ValueError("filter_expression exceeds the configured character budget")
             try:
                 expression = json.loads(filter_expression)

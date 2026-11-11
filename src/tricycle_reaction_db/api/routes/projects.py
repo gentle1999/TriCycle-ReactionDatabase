@@ -164,7 +164,7 @@ async def create_project_invitation(
             project_id,
             payload,
             principal,
-            frontend_url=get_settings().oidc_frontend_url,
+            frontend_url=get_settings().identity.oidc_frontend_url,
         )
     except (InvitationError, ProjectAccessDeniedError) as error:
         raise _management_error(error) from error
@@ -199,7 +199,7 @@ async def resend_project_invitation(
             project_id,
             invitation_id,
             principal,
-            frontend_url=get_settings().oidc_frontend_url,
+            frontend_url=get_settings().identity.oidc_frontend_url,
         )
     except (InvitationError, ProjectAccessDeniedError) as error:
         raise _management_error(error) from error

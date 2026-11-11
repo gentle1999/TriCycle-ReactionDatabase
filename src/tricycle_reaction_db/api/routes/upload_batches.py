@@ -209,7 +209,7 @@ async def upload_batch_file(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="uploaded artifact requires a filename",
         )
-    maximum = get_settings().max_upload_bytes
+    maximum = get_settings().ingestion.max_upload_bytes
     payload = await file.read(maximum + 1)
     await file.close()
     if len(payload) > maximum:
@@ -262,12 +262,12 @@ async def upload_batch_files(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="client_file_ids must contain one id per uploaded file",
         )
-    if len(files) > settings.max_batch_files:
+    if len(files) > settings.ingestion.max_batch_files:
         for file in files:
             await file.close()
         raise HTTPException(
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-            detail=f"upload batch exceeds the {settings.max_batch_files}-file limit",
+            detail=f"upload batch exceeds the {settings.ingestion.max_batch_files}-file limit",
             headers=UPLOAD_PREFLIGHT_HEADERS,
         )
     try:
@@ -288,9 +288,9 @@ async def upload_batch_files(
                     size = await _spool_upload(
                         file,
                         spool_path,
-                        maximum=settings.max_upload_bytes,
+                        maximum=settings.ingestion.max_upload_bytes,
                     )
-                    if size > settings.max_upload_bytes:
+                    if size > settings.ingestion.max_upload_bytes:
                         payloads.append(
                             (
                                 client_file_id,
@@ -301,7 +301,7 @@ async def upload_batch_files(
                                     error_code="upload_file_too_large",
                                     error_message=(
                                         "uploaded artifact exceeds the "
-                                        f"{settings.max_upload_bytes}-byte limit"
+                                        f"{settings.ingestion.max_upload_bytes}-byte limit"
                                     ),
                                     declared_size_bytes=size,
                                 ),
@@ -309,11 +309,12 @@ async def upload_batch_files(
                         )
                         continue
                     total_bytes += size
-                    if total_bytes > settings.max_batch_bytes:
+                    if total_bytes > settings.ingestion.max_batch_bytes:
                         raise HTTPException(
                             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                             detail=(
-                                f"upload batch exceeds the {settings.max_batch_bytes}-byte limit"
+                                "upload batch exceeds the "
+                                f"{settings.ingestion.max_batch_bytes}-byte limit"
                             ),
                             headers=UPLOAD_PREFLIGHT_HEADERS,
                         )

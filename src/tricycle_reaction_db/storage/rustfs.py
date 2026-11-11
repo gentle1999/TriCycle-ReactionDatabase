@@ -8,15 +8,14 @@ from hashlib import sha256
 from ipaddress import ip_address
 from pathlib import Path
 from threading import Lock
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from tricycle_reaction_db.core.config import RustFSSettings as RustFSSettings
 from tricycle_reaction_db.core.observability import STORAGE_FAILURES
 
 if TYPE_CHECKING:
@@ -28,58 +27,6 @@ if TYPE_CHECKING:
 
 _BUCKET_INITIALIZATION_LOCK = Lock()
 logger = logging.getLogger(__name__)
-
-
-class RustFSSettings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_prefix="TRICYCLE_RUSTFS_",
-        extra="ignore",
-    )
-
-    # Read the shared deployment mode even though storage-specific settings use
-    # the TRICYCLE_RUSTFS_ prefix. This keeps scheduler-only commands fail-closed.
-    environment: Literal["development", "test", "production"] = Field(
-        default="development",
-        validation_alias="TRICYCLE_ENVIRONMENT",
-    )
-    endpoint_url: str = "http://127.0.0.1:19000"
-    access_key: str = "example-local-access"
-    secret_key: str = "example-local-secret"
-    bucket: str = "example-reaction-raw-files"
-    region: str = "us-east-1"
-    verify_tls: bool = True
-    ca_bundle: str | None = None
-    connect_timeout_seconds: int = Field(default=5, ge=1, le=60)
-    read_timeout_seconds: int = Field(default=30, ge=1, le=300)
-    max_pool_connections: int = Field(default=32, ge=1, le=256)
-
-    @field_validator("endpoint_url")
-    @classmethod
-    def validate_endpoint_url(cls, value: str) -> str:
-        parsed = urlsplit(value)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("endpoint_url must be an absolute HTTP(S) URL")
-        return value.rstrip("/")
-
-    @field_validator("ca_bundle")
-    @classmethod
-    def require_absolute_ca_bundle(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        normalized = value.strip()
-        if not normalized or not Path(normalized).is_absolute():
-            raise ValueError("ca_bundle must be an absolute PEM path")
-        return normalized
-
-    @model_validator(mode="after")
-    def validate_production_transport(self) -> RustFSSettings:
-        if self.environment == "production":
-            if urlsplit(self.endpoint_url).scheme != "https":
-                raise ValueError("production RustFS requires an HTTPS endpoint")
-            if not self.verify_tls:
-                raise ValueError("production RustFS requires TLS verification")
-        return self
 
 
 @dataclass(frozen=True, slots=True)

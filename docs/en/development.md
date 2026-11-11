@@ -5,7 +5,7 @@
 ## Prerequisites
 
 - Python 3.12 and `uv 0.9` or later
-- Node.js 20 or later and npm
+- Node.js 22 or later and npm
 - Docker Engine and Docker Compose
 - Linux/amd64 for the supported local baseline
 
@@ -143,12 +143,12 @@ These tools provide MCP access to REST streaming/file operations. Use the corres
 
 | Capability | MCP tool | Permission and bounds |
 | --- | --- | --- |
-| UniTS feature JSONL | `export_units_ts_dataset_jsonl` | Project `artifact:download`; up to 100 records and 512 KiB per page; continue with `after_binding_id` |
-| Mapped-reaction TS geometry JSONL | `export_mapped_reaction_transition_state_geometries` | Project `artifact:download`; up to 100 records and 512 KiB per page; continue with the binding ID |
-| Thermodynamics CSV | `export_mapped_reaction_thermodynamics_csv` | Project `artifact:read`; supports filters, up to 100 rows and 512 KiB per page; the first offset page includes the CSV header |
-| Artifact preview | `preview_artifact_content` | Private files require project `artifact:read`; text previews are capped at 256 KiB; unsupported media types return `unsupported_media_type` |
-| Artifact download/batch download | `download_artifact_content`, `download_artifacts_batch` | Project download access; no per-file or total byte limit for Base64 content, up to 100 files; batch returns individual files rather than a ZIP |
-| Scientific-array preview/NPY | `preview_scientific_array`, `download_scientific_array_npy` | Project `artifact:download`; previews up to 4,096 values and NPY downloads without a byte limit |
+| UniTS feature JSONL | `export_units_ts_dataset_jsonl` | Project `artifact:download`; defaults to 100 records and 512 KiB per page; continue with `after_binding_id` |
+| Mapped-reaction TS geometry JSONL | `export_mapped_reaction_transition_state_geometries` | Project `artifact:download`; defaults to 100 records and 512 KiB per page; continue with the binding ID |
+| Thermodynamics CSV | `export_mapped_reaction_thermodynamics_csv` | Project `artifact:read`; supports filters, defaults to 100 rows and 512 KiB per page; the first offset page includes the CSV header |
+| Artifact preview | `preview_artifact_content` | Private files require project `artifact:read`; text previews default to a 256 KiB cap; unsupported media types return `unsupported_media_type` |
+| Artifact download/batch download | `download_artifact_content`, `download_artifacts_batch` | Project download access; no per-file or total byte limit for Base64 content, defaults to 100 files; batch returns individual files rather than a ZIP |
+| Scientific-array preview/NPY | `preview_scientific_array`, `download_scientific_array_npy` | Project `artifact:download`; previews default to 4,096 values and NPY downloads have no byte limit |
 
 `upload_calculation_log` accepts standard Base64 in `content_base64` (without a
 Data URL prefix). The per-file limit is `TRICYCLE_MAX_UPLOAD_BYTES` (64 MiB by

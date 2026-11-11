@@ -13,7 +13,7 @@ from uuid import UUID
 from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from tricycle_reaction_db.core.config import Settings, get_settings
+from tricycle_reaction_db.core.config import ApplicationSettings, get_settings
 from tricycle_reaction_db.db.models import (
     AuditEvent,
     ExternalIdentity,
@@ -63,58 +63,64 @@ class BootstrapSpec:
     system_user_display_name: str
 
     @classmethod
-    def from_settings(cls, settings: Settings, mode: BootstrapMode) -> BootstrapSpec:
+    def from_settings(cls, settings: ApplicationSettings, mode: BootstrapMode) -> BootstrapSpec:
         if mode == "development":
-            if settings.environment == "production":
+            if settings.runtime.environment == "production":
                 raise ValueError("development bootstrap is forbidden in production")
             values = {
                 "issuer": DEVELOPMENT_IDENTITY_ISSUER,
                 "subject": DEVELOPMENT_IDENTITY_SUBJECT,
-                "admin_display_name": settings.bootstrap_development_user_display_name,
-                "admin_email": settings.bootstrap_development_user_email,
-                "organization_slug": settings.bootstrap_organization_slug
+                "admin_display_name": settings.identity.bootstrap_development_user_display_name,
+                "admin_email": settings.identity.bootstrap_development_user_email,
+                "organization_slug": settings.identity.bootstrap_organization_slug
                 or "development-organization",
-                "organization_name": settings.bootstrap_organization_name
+                "organization_name": settings.identity.bootstrap_organization_name
                 or "Development Organization",
-                "project_slug": settings.bootstrap_project_slug or "reaction-database",
-                "project_name": settings.bootstrap_project_name or "Reaction Database",
+                "project_slug": settings.identity.bootstrap_project_slug or "reaction-database",
+                "project_name": settings.identity.bootstrap_project_name or "Reaction Database",
             }
         else:
-            if settings.environment != "production":
+            if settings.runtime.environment != "production":
                 raise ValueError("production bootstrap requires TRICYCLE_ENVIRONMENT=production")
             required = {
-                "issuer": ("TRICYCLE_BOOTSTRAP_OIDC_ISSUER", settings.bootstrap_oidc_issuer),
-                "subject": ("TRICYCLE_BOOTSTRAP_OIDC_SUBJECT", settings.bootstrap_oidc_subject),
+                "issuer": (
+                    "TRICYCLE_BOOTSTRAP_OIDC_ISSUER",
+                    settings.identity.bootstrap_oidc_issuer,
+                ),
+                "subject": (
+                    "TRICYCLE_BOOTSTRAP_OIDC_SUBJECT",
+                    settings.identity.bootstrap_oidc_subject,
+                ),
                 "admin_display_name": (
                     "TRICYCLE_BOOTSTRAP_ADMIN_DISPLAY_NAME",
-                    settings.bootstrap_admin_display_name,
+                    settings.identity.bootstrap_admin_display_name,
                 ),
                 "admin_email": (
                     "TRICYCLE_BOOTSTRAP_ADMIN_EMAIL",
-                    settings.bootstrap_admin_email,
+                    settings.identity.bootstrap_admin_email,
                 ),
                 "organization_slug": (
                     "TRICYCLE_BOOTSTRAP_ORGANIZATION_SLUG",
-                    settings.bootstrap_organization_slug,
+                    settings.identity.bootstrap_organization_slug,
                 ),
                 "organization_name": (
                     "TRICYCLE_BOOTSTRAP_ORGANIZATION_NAME",
-                    settings.bootstrap_organization_name,
+                    settings.identity.bootstrap_organization_name,
                 ),
                 "project_slug": (
                     "TRICYCLE_BOOTSTRAP_PROJECT_SLUG",
-                    settings.bootstrap_project_slug,
+                    settings.identity.bootstrap_project_slug,
                 ),
                 "project_name": (
                     "TRICYCLE_BOOTSTRAP_PROJECT_NAME",
-                    settings.bootstrap_project_name,
+                    settings.identity.bootstrap_project_name,
                 ),
             }
             missing = [env_name for env_name, value in required.values() if not value]
             if missing:
                 raise ValueError("production bootstrap requires " + ", ".join(missing))
             values = {name: str(value).strip() for name, (_, value) in required.items()}
-            if values["issuer"] != settings.oidc_issuer:
+            if values["issuer"] != settings.identity.oidc_issuer:
                 raise ValueError("TRICYCLE_BOOTSTRAP_OIDC_ISSUER must match TRICYCLE_OIDC_ISSUER")
 
         for field in ("organization_slug", "project_slug"):
@@ -125,7 +131,7 @@ class BootstrapSpec:
             raise ValueError("bootstrap administrator email must be valid")
         return cls(
             mode=mode,
-            system_user_display_name=settings.bootstrap_system_user_display_name,
+            system_user_display_name=settings.identity.bootstrap_system_user_display_name,
             **values,
         )
 

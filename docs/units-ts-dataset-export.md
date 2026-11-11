@@ -12,7 +12,8 @@ directory.
    `202 Accepted` and includes a job ID, a status URL, and a unique download URL.
 2. Poll the status URL until `status` is `completed` or `failed`.
 3. GET the download URL. It streams the completed `.npy` file from RustFS in
-   bounded chunks. The bearer-style URL is valid for seven days.
+   bounded chunks. The bearer-style URL is valid for seven days by default
+   (`TRICYCLE_UNITS_TS_DOWNLOAD_TTL_SECONDS`).
 
 The MCP tools are `create_units_ts_dataset(project_id)` and
 `get_units_ts_dataset_status(job_id)`. MCP returns API-relative status and
@@ -20,8 +21,11 @@ download URL paths. Both MCP tools require project download access.
 
 The mapped-reaction TS geometry JSONL export is also available as the paginated
 MCP tool `export_mapped_reaction_transition_state_geometries(project_id,
-after_binding_id?, limit?)`. It returns at most 100 records per call and caps
-each response at 512 KiB; continue with `next_after_binding_id` while
+after_binding_id?, limit?, include_calculations?)`. It returns at most 100 records
+per call and caps each response at 512 KiB by default. Set
+`TRICYCLE_MCP_TS_GEOMETRY_EXPORT_MAX_RECORDS` and
+`TRICYCLE_MCP_TS_GEOMETRY_EXPORT_MAX_BYTES` to change these caps;
+continue with `next_after_binding_id` while
 `has_more` is true. It requires the same project download permission. For full
 streaming exports, use the REST JSONL endpoint below.
 
@@ -45,7 +49,9 @@ use a lease-specific nested key and are not selected by this cleanup.
 MCP clients can use `export_units_ts_dataset_jsonl(project_id,
 after_binding_id?, limit?)` to retrieve bounded pages of the same records. The
 tool requires `artifact:download`, returns at most 100 records and 512 KiB per
-call, and provides `next_after_binding_id`/`has_more` for continuation.
+call by default (configured by `TRICYCLE_MCP_EXPORT_MAX_RECORDS` and
+`TRICYCLE_MCP_EXPORT_MAX_BYTES`), and provides `next_after_binding_id`/`has_more`
+for continuation.
 
 Use `GET /api/units-ts-datasets/export.jsonl?project_id=<UUID>` to stream the
 same UniTS feature fields as JSON Lines. It requires `artifact:download` on the
@@ -57,6 +63,11 @@ keep the UniTS order described below. The endpoint reads verified
 bindings in database pages and starts returning samples without assembling the
 full dataset first. Samples with unusable TS structures or reaction centers
 are skipped, as they are in the NPY exporter.
+
+The reactive-atom, reaction-center bond, and angle array capacities default to
+20, 25, and 25. `TRICYCLE_UNITS_TS_MAX_REACTIVE_ATOMS`,
+`TRICYCLE_UNITS_TS_MAX_RC_BONDS`, and `TRICYCLE_UNITS_TS_MAX_RC_ANGLES` can change
+their shapes; coordinate such changes with every UniTS consumer.
 
 Choose this route when the consumer can process samples incrementally. Choose
 the NPY job when the consumer specifically needs the NumPy object-array file.
@@ -97,6 +108,15 @@ Each line is one JSON object with this shape:
   }
 }
 ```
+
+The MCP `export_mapped_reaction_transition_state_geometries` tool accepts
+`include_calculations=false` for coordinate-only consumers such as RitS. This
+skips loading calculation frames and scientific arrays, avoiding the MCP page
+limit for large Hessians. Verified mappings, atom coordinates, Mol blocks,
+project authorization, and cursor pagination are unchanged. The response echoes
+this option; `value.calculations` is empty when omitted and must not be read as
+evidence that no calculations exist. The default is `true`, preserving complete
+records for existing consumers and REST JSONL exports.
 
 Both `atoms` and the Mol block are ordered by atom-map number, so map `n` is
 always at array/Mol atom index `n - 1`. The Mol block contains the same 3D

@@ -1,5 +1,5 @@
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
@@ -48,14 +48,14 @@ logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     try:
         try:
             warmed_storage_workers = await warm_storage_process_pool()
             logger.info(
                 "warmed shared RustFS storage process pool workers=%d configured=%d",
                 warmed_storage_workers,
-                get_settings().upload_max_concurrency,
+                get_settings().ingestion.upload_max_concurrency,
             )
         except Exception:
             # API startup should remain available during a transient RustFS
@@ -72,9 +72,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     settings = get_settings()
     application = FastAPI(
-        title=settings.app_name,
+        title=settings.runtime.app_name,
         version=__version__,
-        debug=settings.debug,
+        debug=settings.runtime.debug,
         lifespan=lifespan,
     )
     install_query_guards(application)
@@ -82,9 +82,9 @@ def create_app() -> FastAPI:
     application.add_middleware(AuthenticationMiddleware)
     application.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.cors_origins,
+        allow_origins=settings.identity.cors_origins,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", settings.csrf_header_name],
+        allow_headers=["Authorization", "Content-Type", settings.identity.csrf_header_name],
         allow_credentials=True,
     )
     application.include_router(health_router)
@@ -105,7 +105,7 @@ def create_app() -> FastAPI:
             playground_schema,
             prefix="/graphql-playground",
             graphiql_prefix="/graphql",
-            graphiql_title=f"Direct-list GraphQL - {settings.brand_name}",
+            graphiql_title=f"Direct-list GraphQL - {settings.runtime.brand_name}",
             default_query=DIRECT_PLAYGROUND_QUERY,
         ),
         dependencies=authenticated,

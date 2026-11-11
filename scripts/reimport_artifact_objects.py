@@ -519,7 +519,7 @@ async def _run(args: argparse.Namespace) -> int:
     settings = get_settings()
     if args.force_reparse and args.user_id is None:
         raise ValueError("--force-reparse requires an explicit --user-id")
-    user_id = args.user_id or settings.development_user_id
+    user_id = args.user_id or settings.identity.development_user_id
     state_file: Path = args.state_file
     artifacts = await _load_artifacts(
         args.project_ids,

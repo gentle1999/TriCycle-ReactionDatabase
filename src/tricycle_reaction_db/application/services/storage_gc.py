@@ -6,8 +6,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from pydantic import Field, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import Connection, text
 from sqlmodel import Session, col, select
 
@@ -15,6 +13,9 @@ from tricycle_reaction_db.application.services._persistence import (
     _acquire_identity_locks,
     _identity_lock_id,
     _require_id,
+)
+from tricycle_reaction_db.core.config import (
+    StorageGarbageCollectionSettings as StorageGarbageCollectionSettings,
 )
 from tricycle_reaction_db.db.models import (
     ArtifactFile,
@@ -26,27 +27,6 @@ from tricycle_reaction_db.domain.enums import (
     StorageStatus,
 )
 from tricycle_reaction_db.storage.rustfs import RustFSObjectStore
-
-
-class StorageGarbageCollectionSettings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_prefix="TRICYCLE_STORAGE_GC_",
-        extra="ignore",
-    )
-
-    root_prefix: str = "uploads"
-    grace_period_seconds: int = Field(default=60 * 60, ge=60)
-    initial_lookback_seconds: int = Field(default=24 * 60 * 60, ge=60)
-    partition_clock_skew_seconds: int = Field(default=60 * 60, ge=0, le=24 * 60 * 60)
-
-    @model_validator(mode="after")
-    def validate_gc_window(self) -> StorageGarbageCollectionSettings:
-        if not self.root_prefix.strip("/"):
-            raise ValueError("root_prefix must not be empty")
-        if self.initial_lookback_seconds <= self.grace_period_seconds:
-            raise ValueError("initial_lookback_seconds must exceed grace_period_seconds")
-        return self
 
 
 class StorageGarbageCollectionAlreadyRunningError(RuntimeError):

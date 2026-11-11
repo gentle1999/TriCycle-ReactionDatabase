@@ -8,7 +8,9 @@ from uuid import UUID
 
 import pytest
 
+from tests.config_helpers import application_settings, copied_application_settings
 from tricycle_reaction_db.application.services import units_ts_dataset_export as dataset_export
+from tricycle_reaction_db.core.config import ApplicationSettings
 from tricycle_reaction_db.dev import units_ts_dataset_worker as dataset_worker
 from tricycle_reaction_db.domain.enums import UnitsDatasetExportJobStatus
 
@@ -17,6 +19,10 @@ LEGACY_JOB_ID = UUID("00000000-0000-7000-8000-000000000402")
 CURRENT_JOB_ID = UUID("00000000-0000-7000-8000-000000000403")
 ORPHAN_OBJECT_ID = UUID("00000000-0000-7000-8000-000000000404")
 CURRENT_LEASE_ID = UUID("00000000-0000-7000-8000-000000000405")
+
+
+def _settings(**domains: dict[str, object]) -> ApplicationSettings:
+    return copied_application_settings(application_settings(_env_file=None), **domains)
 
 
 class _Result:
@@ -170,7 +176,12 @@ async def test_dataset_worker_purges_legacy_exports_when_it_starts(
     monkeypatch.setattr(
         dataset_worker,
         "get_settings",
-        lambda: SimpleNamespace(units_dataset_worker_poll_interval_seconds=0.01),
+        lambda: _settings(
+            mcp_export={
+                "units_dataset_worker_poll_interval_seconds": 0.01,
+                "units_ts_legacy_export_purge_interval_seconds": 300.0,
+            }
+        ),
     )
     monkeypatch.setattr(dataset_worker, "purge_legacy_units_ts_dataset_exports", purge_legacy)
     monkeypatch.setattr(dataset_worker, "expire_units_ts_dataset_exports", expire_exports)

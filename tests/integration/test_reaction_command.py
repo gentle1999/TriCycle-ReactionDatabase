@@ -111,7 +111,7 @@ _create_reaction = _project_scoped_reaction
 
 
 def test_unmapped_reaction_creates_graph_only_topologies_idempotently() -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -140,7 +140,7 @@ def test_unmapped_reaction_creates_graph_only_topologies_idempotently() -> None:
 
 
 def test_curated_role_completes_an_automatic_participant_without_overwriting_it() -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -190,7 +190,7 @@ def test_curated_role_completes_an_automatic_participant_without_overwriting_it(
 
 
 def test_fully_mapped_reaction_does_not_bind_topology_without_converged_frames() -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -247,7 +247,7 @@ def test_fully_mapped_reaction_does_not_bind_topology_without_converged_frames()
 
 
 def test_unoptimized_geometry_does_not_link_to_preexisting_reaction_endpoint() -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -294,7 +294,7 @@ def test_unoptimized_geometry_does_not_link_to_preexisting_reaction_endpoint() -
 def test_node_geometry_identity_uses_geometry_not_display_coordinate_index(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -463,7 +463,7 @@ def test_node_geometry_identity_uses_geometry_not_display_coordinate_index(
 
 
 def test_existing_node_key_can_adopt_curated_path_order() -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -532,7 +532,7 @@ def test_existing_node_key_can_adopt_curated_path_order() -> None:
 
 
 def test_partially_mapped_reaction_is_rejected() -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -551,7 +551,7 @@ def test_partially_mapped_reaction_is_rejected() -> None:
 
 
 def test_creation_method_does_not_change_mapped_reaction_identity() -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -582,7 +582,7 @@ def test_creation_method_does_not_change_mapped_reaction_identity() -> None:
 
 
 def test_logical_reaction_removes_mapping_and_keeps_distinct_mappings() -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -641,7 +641,7 @@ def test_later_converged_frame_links_to_preexisting_reaction(tmp_path) -> None:
     source_payload = b"terminal optimized frame\ncoordinates\n"
     source_path.write_bytes(source_payload)
     source_hash = sha256(source_payload).hexdigest()
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:

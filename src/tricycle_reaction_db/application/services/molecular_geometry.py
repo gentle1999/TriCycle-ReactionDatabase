@@ -32,6 +32,7 @@ from tricycle_reaction_db.application.services.reaction_geometry_reconciliation 
     reconcile_geometry_with_reactions,
 )
 from tricycle_reaction_db.core.chemistry_config import GEOMETRY_MATCH_POLICY_VERSION
+from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.core.units import radians_to_degrees
 from tricycle_reaction_db.db.models import (
     Geometry,
@@ -221,7 +222,6 @@ def _require_geometry_project_context(
 
 # Keep each set-based equivalence statement below the database statement
 # timeout even when one file batch contains many thousands of frame keys.
-GEOMETRY_MATCH_INPUT_BATCH_SIZE = 128
 
 
 class GeometryAssignmentAmbiguityError(ValueError):
@@ -1581,7 +1581,9 @@ def preload_molecular_geometry_context(
     # path; the bounded chunks remain important for interactive/non-bulk
     # requests whose input set may be much larger than one claim.
     match_batch_size = (
-        len(input_rows) if _legacy_bulk_import_enabled(session) else GEOMETRY_MATCH_INPUT_BATCH_SIZE
+        len(input_rows)
+        if _legacy_bulk_import_enabled(session)
+        else get_settings().runtime.geometry_match_input_batch_size
     )
     for start in range(0, len(input_rows), match_batch_size):
         chunk = input_rows[start : start + match_batch_size]

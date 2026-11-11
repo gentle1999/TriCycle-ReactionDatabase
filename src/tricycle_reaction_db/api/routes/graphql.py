@@ -97,10 +97,10 @@ def create_graphql_router(
         try:
             validate_graphql_query_budget(
                 payload.query,
-                maximum_characters=settings.graphql_max_query_characters,
-                maximum_tokens=settings.graphql_max_tokens,
-                maximum_depth=settings.graphql_max_depth,
-                maximum_complexity=settings.graphql_max_complexity,
+                maximum_characters=settings.runtime.graphql_max_query_characters,
+                maximum_tokens=settings.runtime.graphql_max_tokens,
+                maximum_depth=settings.runtime.graphql_max_depth,
+                maximum_complexity=settings.runtime.graphql_max_complexity,
             )
         except QueryBudgetExceeded as error:
             return JSONResponse(
@@ -148,7 +148,7 @@ def create_graphql_router(
 
     @graphql_router.get("", response_class=HTMLResponse, include_in_schema=False)
     async def graphiql(request: Request) -> HTMLResponse:
-        if get_settings().environment == "production":
+        if get_settings().runtime.environment == "production":
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
         root_path = str(request.scope.get("root_path", "")).rstrip("/")
         public_prefix = request.headers.get("x-nexusx-graphiql-prefix")
@@ -180,7 +180,7 @@ def create_graphql_router(
 router = create_graphql_router(
     config,
     schema,
-    graphiql_title=f"Paginated GraphQL - {get_settings().brand_name}",
+    graphiql_title=f"Paginated GraphQL - {get_settings().runtime.brand_name}",
     default_query=PAGINATED_QUERY,
 )
 

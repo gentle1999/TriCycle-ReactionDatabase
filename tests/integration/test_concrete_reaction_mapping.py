@@ -234,7 +234,7 @@ def _mapped_reaction_fixture(
 
 
 def test_new_concrete_topology_gets_mapping_via_logical_graph() -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -305,7 +305,7 @@ def test_new_concrete_topology_gets_mapping_via_logical_graph() -> None:
 
 @pytest.mark.parametrize("disconnected", [False, True])
 def test_logical_reaction_expands_existing_concrete_members(disconnected: bool) -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -383,7 +383,7 @@ def test_source_order_import_materializes_three_observed_imine_configurations(
         "[H][O]/[N]=[C]([Cl])\\[C]([Cl])=[N]/[O][H]",
         "[H][O]/[N]=[C]([Cl])\\[C]([Cl])=[N]\\[O][H]",
     )
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -496,7 +496,7 @@ def test_derived_stereoisomer_inherits_verified_source_ts_and_unchanged_endpoint
     source_authoritative: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -780,7 +780,7 @@ def test_derived_stereoisomer_inherits_verified_source_ts_and_unchanged_endpoint
 
 
 def test_geometry_arrival_uses_strict_topology_and_can_bind_new_mapping() -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -879,7 +879,7 @@ def test_geometry_arrival_uses_strict_topology_and_can_bind_new_mapping() -> Non
 
 
 def test_inversion_projection_clears_n_related_ez_only() -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -953,7 +953,7 @@ def test_source_authoritative_reaction_uses_product_flip_centres_for_precursor()
         "[C@:18]([H:19])([C:20]([H:21])([H:22])[O:23][H:24])"
         "[C@@:16]1([C:13]([O:12][H:11])([H:14])[H:15])[H:17]"
     )
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -1013,7 +1013,7 @@ def test_source_authoritative_reaction_uses_product_flip_centres_for_precursor()
 
 
 def test_inversion_projection_clears_sulfur_chirality() -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:

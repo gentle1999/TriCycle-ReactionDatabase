@@ -5,6 +5,7 @@
 ## 前置条件
 
 - `uv 0.9` 或更高版本
+- Node.js 22 或更高版本及 npm
 - Docker 与 Docker Compose
 - Linux/amd64 开发环境
 - 能够访问 PyPI 以安装 MolOP/MolGR 发布包
@@ -238,12 +239,12 @@ MCP token 是用户级凭据，不绑定固定组织、项目或静态 scope。�
 
 | 能力 | MCP 工具 | 权限与边界 |
 | --- | --- | --- |
-| UniTS 特征 JSONL | `export_units_ts_dataset_jsonl` | 项目 `artifact:download`；每页最多 100 条、512 KiB，可用 `after_binding_id` 续页 |
-| 映射反应 TS 几何 JSONL | `export_mapped_reaction_transition_state_geometries` | 项目 `artifact:download`；每页最多 100 条、512 KiB，可用绑定 ID 续页 |
-| 热力学 CSV | `export_mapped_reaction_thermodynamics_csv` | 项目 `artifact:read`；支持筛选、最多 100 行/页和 512 KiB；首个 offset 页带 CSV 表头 |
-| Artifact 预览 | `preview_artifact_content` | 私有文件需要项目 `artifact:read`；文本预览最多 256 KiB，不可预览的媒体类型返回 `unsupported_media_type` |
-| Artifact 下载/批量下载 | `download_artifact_content`、`download_artifacts_batch` | 需要项目下载权限；Base64 内容无单项或总量字节限制，批量最多 100 个文件；批量工具返回逐文件内容而非 ZIP |
-| 科学数组预览/NPY | `preview_scientific_array`、`download_scientific_array_npy` | 项目 `artifact:download`；预览最多 4096 个值，NPY 下载无字节限制 |
+| UniTS 特征 JSONL | `export_units_ts_dataset_jsonl` | 项目 `artifact:download`；默认每页最多 100 条、512 KiB，可用 `after_binding_id` 续页 |
+| 映射反应 TS 几何 JSONL | `export_mapped_reaction_transition_state_geometries` | 项目 `artifact:download`；默认每页最多 100 条、512 KiB，可用绑定 ID 续页 |
+| 热力学 CSV | `export_mapped_reaction_thermodynamics_csv` | 项目 `artifact:read`；支持筛选、默认最多 100 行/页和 512 KiB；首个 offset 页带 CSV 表头 |
+| Artifact 预览 | `preview_artifact_content` | 私有文件需要项目 `artifact:read`；文本预览默认最多 256 KiB，不可预览的媒体类型返回 `unsupported_media_type` |
+| Artifact 下载/批量下载 | `download_artifact_content`、`download_artifacts_batch` | 需要项目下载权限；Base64 内容无单项或总量字节限制，批量默认最多 100 个文件；批量工具返回逐文件内容而非 ZIP |
+| 科学数组预览/NPY | `preview_scientific_array`、`download_scientific_array_npy` | 项目 `artifact:download`；预览默认最多 4096 个值，NPY 下载无字节限制 |
 
 `upload_calculation_log` 接收标准 Base64 的 `content_base64`，不接受 Data URL 前缀，单文件上限
 沿用 `TRICYCLE_MAX_UPLOAD_BYTES`（默认 64 MiB）。调用返回的是 durable `UploadBatch` 和

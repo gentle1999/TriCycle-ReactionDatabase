@@ -73,7 +73,10 @@ def source_geometry_compatible_topology(
     extra_bonds = endpoint_graph.GetNumBonds() - source_graph.GetNumBonds()
     if extra_bonds < 0 or extra_bonds > max_endpoint_extra_bonds:
         return False
-    endpoint_edges = [(b.GetBeginAtomIdx(), b.GetEndAtomIdx()) for b in endpoint_graph.GetBonds()]
+    endpoint_edges = [
+        (bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+        for bond in endpoint_graph.GetBonds()  # type: ignore[no-untyped-call]
+    ]
     for removed_edges in combinations(endpoint_edges, extra_bonds):
         candidate = Chem.RWMol(endpoint_graph)
         for begin, end in removed_edges:

@@ -23,7 +23,7 @@ def _json_default(value: object) -> str:
 
 
 def main() -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     try:
         with engine.connect() as connection, RustFSObjectStore(RustFSSettings()) as store:
             store.ensure_bucket()

@@ -202,12 +202,12 @@ def get_substruct_matches(
 
     settings = get_settings()
     resolved_max_matches = (
-        settings.molecular_graph_match_max_results if max_matches is None else max_matches
+        settings.runtime.molecular_graph_match_max_results if max_matches is None else max_matches
     )
     if resolved_max_matches < 1:
         raise ValueError("max_matches must be positive")
     resolved_timeout = (
-        settings.molecular_graph_match_timeout_seconds
+        settings.runtime.molecular_graph_match_timeout_seconds
         if timeout_seconds is None
         else timeout_seconds
     )
@@ -224,7 +224,7 @@ def get_substruct_matches(
             target_atom_count,
             query_atom_count,
         )
-        >= settings.molecular_graph_match_isolation_atom_count
+        >= settings.runtime.molecular_graph_match_isolation_atom_count
     )
     if not should_isolate:
         return _run_substructure_matches(

@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlmodel import col, select
 
+from tests.config_helpers import application_settings
 from tricycle_reaction_db.application.services import (
     artifact_uploads,
     project_data_removal,
@@ -28,7 +29,6 @@ from tricycle_reaction_db.application.services.project_data_removal import (
 from tricycle_reaction_db.application.services.thermodynamic_profile_refresh import (
     refresh_dirty_mapped_reaction_profiles,
 )
-from tricycle_reaction_db.core.config import Settings
 from tricycle_reaction_db.db.models import (
     ArtifactIngestion,
     CalculationFrame,
@@ -89,16 +89,18 @@ async def test_real_extreme_files_stage_then_share_worker_microbatch_and_profile
 ) -> None:
     """Exercise real staging, shared parsing, one DB microbatch, and deferred profiles."""
 
-    settings = Settings(
+    settings = application_settings(
         _env_file=None,
-        molop_batch_n_jobs=1,
-        molop_file_parse_timeout_seconds=60.0,
-        molop_file_parse_timeout_size_multiplier=1.5,
-        upload_max_concurrency=1,
-        upload_worker_prefetch_files=1,
-        upload_worker_persistence_batch_files=2,
-        upload_worker_persistence_frame_limit=1_000,
-        upload_worker_lease_seconds=3_600,
+        ingestion={
+            "molop_batch_n_jobs": 1,
+            "molop_file_parse_timeout_seconds": 60.0,
+            "molop_file_parse_timeout_size_multiplier": 1.5,
+            "upload_max_concurrency": 1,
+            "upload_worker_prefetch_files": 1,
+            "upload_worker_persistence_batch_files": 2,
+            "upload_worker_persistence_frame_limit": 1_000,
+            "upload_worker_lease_seconds": 3_600,
+        },
     )
     monkeypatch.setattr(artifact_uploads, "get_settings", lambda: settings)
     monkeypatch.setattr(upload_worker_module, "get_settings", lambda: settings)
@@ -339,7 +341,9 @@ async def test_real_extreme_files_stage_then_share_worker_microbatch_and_profile
         # Normal ingestion requests are deliberately debounced so adjacent
         # uploads can coalesce. Exercise the real due-time instead of forcing
         # a manual high-priority refresh that would bypass queue scheduling.
-        await asyncio.sleep(settings.upload_worker_profile_refresh_debounce_seconds + 0.05)
+        await asyncio.sleep(
+            settings.ingestion.upload_worker_profile_refresh_debounce_seconds + 0.05
+        )
 
         profile_materializations: list[tuple[UUID, int, int]] = []
         original_refresh_profiles = (

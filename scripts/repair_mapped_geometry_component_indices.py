@@ -21,7 +21,7 @@ from tricycle_reaction_db.core.config import get_settings
 
 
 def _configure_database_proxy_bypass() -> None:
-    url = make_url(get_settings().database_url)
+    url = make_url(get_settings().runtime.database_url)
     hosts: set[str] = set()
     if url.host:
         hosts.add(str(url.host))
@@ -98,7 +98,7 @@ def _invalid_endpoint_binding_count(session: Session, project_id: UUID | None) -
 def run(*, project_id: UUID | None, apply: bool) -> int:
     _configure_database_proxy_bypass()
     engine = create_engine(
-        get_settings().database_url,
+        get_settings().runtime.database_url,
         pool_pre_ping=True,
         connect_args={
             "connect_timeout": 10,

@@ -47,7 +47,7 @@ def _database_internal_coordinate_match(
     candidate_decimal_places: int | None = 8,
     observed_decimal_places: int | None = 8,
 ) -> bool:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     try:
         with engine.connect() as connection:
             return bool(
@@ -152,7 +152,7 @@ def test_printing_precision_observation_reuses_one_geometry() -> None:
         reconstruction_version="v1",
     )
 
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -233,7 +233,7 @@ def test_preloaded_batch_reuses_pending_equivalent_geometry() -> None:
     )
     assert source.geometry.geometry_hash != observation.geometry.geometry_hash
 
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -294,7 +294,7 @@ def test_same_coordinates_with_different_electronic_state_are_distinct_geometrie
         reconstruction_method="geometry-state-test",
         reconstruction_version="v1",
     )
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -350,7 +350,7 @@ def test_ambiguous_geometry_match_selects_nearest_candidate() -> None:
         reconstruction_version="v1",
     )
 
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -437,7 +437,7 @@ def test_exact_geometry_preload_does_not_issue_per_row_field_queries():
         if "FROM geometry" in statement:
             statements.append(statement)
 
-    engine = create_engine(get_settings().database_url)
+    engine = create_engine(get_settings().runtime.database_url)
     try:
         with engine.connect() as connection:
             transaction = connection.begin()

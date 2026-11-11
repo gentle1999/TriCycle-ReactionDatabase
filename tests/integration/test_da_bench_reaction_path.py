@@ -266,7 +266,7 @@ def test_real_da_subset_round_trips_manifest_reaction_path_and_frame_bindings(
         role: [normalize_molop_frame(frame) for frame in frames]
         for role, frames in parsed_da_path_frames.items()
     }
-    database_engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    database_engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = database_engine.connect()
     transaction = connection.begin()
     try:
@@ -692,7 +692,7 @@ def test_manifest_revision_and_orca_source_relationships_round_trip(tmp_path: Pa
     for name, path in paths.items():
         path.write_text(f"{name}\n")
 
-    database_engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    database_engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = database_engine.connect()
     transaction = connection.begin()
     try:

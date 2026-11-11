@@ -33,7 +33,7 @@ pytestmark = [
 
 
 def test_runtime_includes_unselected_unconverged_endpoints_and_all_bound_ts() -> None:
-    engine = create_engine(get_settings().database_url)
+    engine = create_engine(get_settings().runtime.database_url)
     samples = []
     cleanup_samples = []
     candidate_frame = candidate_geometry = None

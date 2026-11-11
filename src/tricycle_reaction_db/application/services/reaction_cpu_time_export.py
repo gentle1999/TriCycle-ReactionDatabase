@@ -155,18 +155,22 @@ class ReactionCpuTimeExport:
             )
             for mid, role, artifact_id, revision, seconds in rows:
                 individual[mid].add(role, artifact_id, int(revision), seconds)
-                key = self.group_by_mapping.get(mid)
-                if key in shared:
-                    shared[key].add(role, artifact_id, int(revision), seconds)
+                group_key = self.group_by_mapping.get(mid)
+                if group_key in shared:
+                    shared[group_key].add(role, artifact_id, int(revision), seconds)
         shared_hours = {key: times.hours() for key, times in shared.items()}
         for mid, times in individual.items():
-            key = self.group_by_mapping.get(mid)
+            group_key = self.group_by_mapping.get(mid)
             self.values[mid] = {
                 **times.hours(),
-                "substrate_pair_key": key,
-                "substrate_pair_reaction_count": len(self.members[key]) if key else None,
+                "substrate_pair_key": group_key,
+                "substrate_pair_reaction_count": (
+                    len(self.members[group_key]) if group_key else None
+                ),
                 **{
-                    f"substrate_pair_{column}": shared_hours[key][column] if key else None
+                    f"substrate_pair_{column}": shared_hours[group_key][column]
+                    if group_key
+                    else None
                     for column in CPU_TIME_COLUMNS
                 },
             }

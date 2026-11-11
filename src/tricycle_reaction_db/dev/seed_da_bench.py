@@ -1021,7 +1021,7 @@ def main() -> None:
     fixture_root = args.fixture_root.resolve()
     if not (fixture_root / "manifest.json").is_file():
         parser.error(f"fixture manifest not found under {fixture_root}")
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     try:
         with RustFSObjectStore(RustFSSettings()) as store:
             store.ensure_bucket()

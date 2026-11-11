@@ -705,7 +705,7 @@ async def _run(arguments: argparse.Namespace) -> dict[str, object]:
             candidates,
             fixture_name=str(fixture),
             batch_size=batch_size,
-            n_jobs=settings.molop_batch_n_jobs,
+            n_jobs=settings.ingestion.molop_batch_n_jobs,
             selection_offset=arguments.selection_offset,
             persistence_batch_files=arguments.persistence_batch_files,
         )
@@ -715,8 +715,8 @@ async def _run(arguments: argparse.Namespace) -> dict[str, object]:
     return {
         "schema_version": SCHEMA_VERSION,
         "node": socket.gethostname(),
-        "database_endpoint": settings.database_url.rsplit("@", 1)[-1],
-        "rustfs_endpoint": settings.rustfs_endpoint_url,
+        "database_endpoint": settings.runtime.database_url.rsplit("@", 1)[-1],
+        "rustfs_endpoint": settings.storage.rustfs_endpoint_url,
         "fixture": str(fixture),
         "source_mode": "directory" if fixture.is_dir() else "single_fixture",
         "source_file_count_available": len(candidates),
@@ -725,7 +725,7 @@ async def _run(arguments: argparse.Namespace) -> dict[str, object]:
         "fixture_sha256": (
             hashlib.sha256(fixture.read_bytes()).hexdigest() if fixture.is_file() else None
         ),
-        "n_jobs": settings.molop_batch_n_jobs,
+        "n_jobs": settings.ingestion.molop_batch_n_jobs,
         "batch_sizes": arguments.batch_sizes,
         "persistence_batch_files": arguments.persistence_batch_files,
         "selection_offset": arguments.selection_offset,

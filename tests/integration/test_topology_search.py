@@ -11,6 +11,7 @@ from rdkit import Chem
 from sqlalchemy import create_engine
 from sqlmodel import Session
 
+from tests.config_helpers import copied_application_settings
 from tricycle_reaction_db.api.app import create_app
 from tricycle_reaction_db.api.apps import paginated_graphql_app, use_case_rest_app
 from tricycle_reaction_db.application.dtos import MolecularTopologySearchQuery
@@ -259,7 +260,7 @@ def inserted_topologies(
     development_query_principal: object,
 ) -> Iterator[dict[str, object]]:
     del development_query_principal
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     suffix = uuid4().hex
     ethanol_formula = _formula("C2H6O", {1: 6, 6: 2, 8: 1}, "ethanol")
     benzene_formula = _formula("C6H6", {1: 6, 6: 6}, "benzene")
@@ -550,7 +551,7 @@ def test_candidate_budget_limits_only_the_actual_topology_scan(
     assert isinstance(topologies, dict)
     rare = topologies["rare"]
     assert isinstance(rare, MolecularTopology)
-    settings = get_settings().model_copy(update={"structure_candidate_limit": 1})
+    settings = copied_application_settings(get_settings(), runtime={"structure_candidate_limit": 1})
     monkeypatch.setattr(query_services, "get_settings", lambda: settings)
 
     for unindexed_filter in (
@@ -613,7 +614,7 @@ async def test_topology_candidate_budget_uses_stable_rest_error(
     inserted_topologies: dict[str, object],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = get_settings().model_copy(update={"structure_candidate_limit": 1})
+    settings = copied_application_settings(get_settings(), runtime={"structure_candidate_limit": 1})
     monkeypatch.setattr(query_services, "get_settings", lambda: settings)
     transport = ASGITransport(app=create_app())
     try:

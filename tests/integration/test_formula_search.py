@@ -71,7 +71,7 @@ def inserted_formulas(
     development_query_principal: object,
 ) -> Iterator[list[MolecularFormula]]:
     del development_query_principal
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     formulas: list[MolecularFormula] = []
     for suffix, carbon, hydrogen in (("low", 6, 10), ("high", 8, 14), ("outside", 5, 20)):
         vector = [0] * ELEMENT_COUNT_VECTOR_SIZE
@@ -100,7 +100,7 @@ def test_postgresql_array_subscript_predicates_are_inclusive(
 ) -> None:
     query = _ranges(minimum={6: 6, 1: 10, 118: 2}, maximum={6: 8, 1: 14, 118: 2})
     predicates = molecular_formula_range_predicates(query)
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     try:
         with Session(engine) as session:
             rows = session.exec(

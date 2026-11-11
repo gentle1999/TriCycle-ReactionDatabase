@@ -6,13 +6,13 @@ from pathlib import Path
 from typing import cast
 from uuid import UUID
 
+from tests.config_helpers import application_settings
 from tricycle_reaction_db.application.dtos import UploadBatchItemView, UploadBatchView
 from tricycle_reaction_db.application.services.artifact_upload_types import ArtifactUploadPayload
 from tricycle_reaction_db.application.services.upload_batches import (
     StagedUploadSubmission,
     UploadBatchService,
 )
-from tricycle_reaction_db.core.config import Settings
 from tricycle_reaction_db.dev.import_artifacts import (
     ImportCandidate,
     ImportFingerprint,
@@ -304,7 +304,9 @@ def test_import_files_stages_local_paths_in_the_durable_queue(
     monkeypatch.setattr(UploadBatchService, "create_and_stage", staticmethod(create_and_stage))
     monkeypatch.setattr(
         "tricycle_reaction_db.dev.import_artifacts.get_settings",
-        lambda: Settings.model_validate({"max_batch_files": 10, "max_batch_bytes": 1024}),
+        lambda: application_settings(
+            _env_file=None, ingestion={"max_batch_files": 10, "max_batch_bytes": 1024}
+        ),
     )
     metrics = ImportMetrics()
     summary = asyncio.run(
@@ -345,7 +347,9 @@ def test_import_files_records_worker_filter_results_as_filtered(
     monkeypatch.setattr(UploadBatchService, "create_and_stage", staticmethod(create_and_stage))
     monkeypatch.setattr(
         "tricycle_reaction_db.dev.import_artifacts.get_settings",
-        lambda: Settings.model_validate({"max_batch_files": 10, "max_batch_bytes": 1024}),
+        lambda: application_settings(
+            _env_file=None, ingestion={"max_batch_files": 10, "max_batch_bytes": 1024}
+        ),
     )
 
     summary = asyncio.run(
@@ -385,7 +389,9 @@ def test_import_files_preserves_per_file_queue_failures(monkeypatch, tmp_path: P
     monkeypatch.setattr(UploadBatchService, "create_and_stage", staticmethod(create_and_stage))
     monkeypatch.setattr(
         "tricycle_reaction_db.dev.import_artifacts.get_settings",
-        lambda: Settings(_env_file=None, max_batch_files=10, max_batch_bytes=1024),
+        lambda: application_settings(
+            _env_file=None, ingestion={"max_batch_files": 10, "max_batch_bytes": 1024}
+        ),
     )
     state_path = tmp_path / "state.jsonl"
 
@@ -431,7 +437,9 @@ def test_import_files_uses_queue_windows_and_not_parser_persistence_options(
     monkeypatch.setattr(UploadBatchService, "create_and_stage", staticmethod(create_and_stage))
     monkeypatch.setattr(
         "tricycle_reaction_db.dev.import_artifacts.get_settings",
-        lambda: Settings(_env_file=None, max_batch_files=128, max_batch_bytes=1024),
+        lambda: application_settings(
+            _env_file=None, ingestion={"max_batch_files": 128, "max_batch_bytes": 1024}
+        ),
     )
 
     summary = asyncio.run(
@@ -471,7 +479,9 @@ def test_import_files_honors_queue_batch_byte_budget(
     monkeypatch.setattr(UploadBatchService, "create_and_stage", staticmethod(create_and_stage))
     monkeypatch.setattr(
         "tricycle_reaction_db.dev.import_artifacts.get_settings",
-        lambda: Settings(_env_file=None, max_batch_files=128, max_batch_bytes=1024),
+        lambda: application_settings(
+            _env_file=None, ingestion={"max_batch_files": 128, "max_batch_bytes": 1024}
+        ),
     )
 
     summary = asyncio.run(
@@ -518,7 +528,9 @@ def test_import_files_stages_before_fingerprinting_all_candidates(
     monkeypatch.setattr(UploadBatchService, "create_and_stage", staticmethod(create_and_stage))
     monkeypatch.setattr(
         "tricycle_reaction_db.dev.import_artifacts.get_settings",
-        lambda: Settings(_env_file=None, max_batch_files=128, max_batch_bytes=1024),
+        lambda: application_settings(
+            _env_file=None, ingestion={"max_batch_files": 128, "max_batch_bytes": 1024}
+        ),
     )
 
     summary = asyncio.run(

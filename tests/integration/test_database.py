@@ -30,7 +30,7 @@ class MoleculeProbe(SQLModel, table=True):
 
 
 def test_rdkit_extension_and_molalchemy_round_trip() -> None:
-    database_engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    database_engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     table = MoleculeProbe.__table__
 
     try:

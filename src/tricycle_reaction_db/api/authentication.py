@@ -80,9 +80,9 @@ def _csrf_failure(
     if raw_session_token is None or request.headers.get("authorization") is not None:
         return None
     settings = get_settings()
-    cookie_token = request.cookies.get(settings.csrf_cookie_name)
+    cookie_token = request.cookies.get(settings.identity.csrf_cookie_name)
     header_token = (
-        request.headers.get(settings.csrf_header_name)
+        request.headers.get(settings.identity.csrf_header_name)
         if submitted_token is None
         else submitted_token
     )
@@ -116,10 +116,10 @@ async def _csrf_failure_for_request(
     if (
         request.url.path in _CSRF_FORM_PATHS
         and content_type == "application/x-www-form-urlencoded"
-        and request.headers.get(settings.csrf_header_name) is None
+        and request.headers.get(settings.identity.csrf_header_name) is None
     ):
         form = await request.form()
-        value = form.get(settings.csrf_header_name)
+        value = form.get(settings.identity.csrf_header_name)
         if isinstance(value, str):
             submitted_token = value
     return _csrf_failure(request, raw_session_token, submitted_token=submitted_token)
@@ -134,7 +134,7 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
         if _is_public_request(request):
             return await call_next(request)
         authorization = request.headers.get("authorization")
-        session_token = request.cookies.get(get_settings().session_cookie_name)
+        session_token = request.cookies.get(get_settings().identity.session_cookie_name)
         csrf_error = await _csrf_failure_for_request(request, session_token)
         if csrf_error is not None:
             return JSONResponse(

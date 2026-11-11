@@ -77,7 +77,7 @@ def _wait_until_ready(
 
 
 def main() -> None:
-    host = get_settings().api_host
+    host = get_settings().runtime.api_host
     occupied = [spec.port for spec in SERVICES if _port_is_open(host, spec.port)]
     if occupied:
         raise SystemExit(f"refusing to replace existing listeners on ports: {occupied}")

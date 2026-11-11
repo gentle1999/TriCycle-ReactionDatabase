@@ -350,7 +350,7 @@ async def _create_artifact_batch_download(
         raise HTTPException(status_code=502, detail=str(error)) from error
 
     total_bytes = sum(download.size_bytes for download in downloads)
-    maximum_bytes = get_settings().max_batch_bytes
+    maximum_bytes = get_settings().ingestion.max_batch_bytes
     if total_bytes > maximum_bytes:
         raise HTTPException(
             status_code=413,

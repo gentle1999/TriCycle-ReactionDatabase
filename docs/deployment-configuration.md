@@ -116,12 +116,19 @@ Redis TLS。开发单 worker 可以使用进程内限流；生产环境必须使
 - Linux/amd64 是当前部署基线。
 - 完整容器部署只要求 Docker Engine 及支持 `--wait`、`!reset` 和 `!override` 的 Docker
   Compose（建议 Compose 2.24+）。
-- 宿主机直接开发时要求 Python 3.12、uv 0.9 或更高版本、Node.js 20+ 和 npm。
+- 宿主机直接开发时要求 Python 3.12、uv 0.9 或更高版本、Node.js 22+ 和 npm。
 - 生产 PostgreSQL 必须安装 RDKit extension；开发 Compose 使用明确版本 tag 的
   `antonsiomchen/cheminfo-db` 镜像作为兼容性基线。生产部署可以由镜像仓库或 CI 在发布时
   解析并记录 digest，但不要求把 digest 写进 Compose 文件。
 
 ## 4. 环境文件
+
+完整变量清单、代码默认值和校验边界见 [环境变量参考](environment-variables.md)。
+
+映射反应 TS 几何 MCP 导出的单页字节上限由
+`TRICYCLE_MCP_TS_GEOMETRY_EXPORT_MAX_BYTES` 配置，默认 `524288`（512 KiB），
+允许范围为 1 KiB–64 MiB。调整后重启 API 服务；大 Hessian 会增加单次响应的
+内存和传输开销，仅需坐标时可在工具调用中设置 `include_calculations=false`。
 
 ~~~bash
 cp .env.example .env

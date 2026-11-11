@@ -43,7 +43,7 @@ def test_no_frame_participant_reuses_observed_equivalent_without_mutating_topolo
 
     for method in ("GetSubstructMatch", "GetSubstructMatches", "HasSubstructMatch"):
         monkeypatch.setattr(Chem.Mol, method, forbidden)
-    engine = create_engine(get_settings().database_url)
+    engine = create_engine(get_settings().runtime.database_url)
     with engine.connect() as connection:
         transaction = connection.begin()
         try:
@@ -125,7 +125,7 @@ def test_no_frame_participant_reuses_observed_equivalent_without_mutating_topolo
 
 @pytest.mark.parametrize("missing", ["generation", "policy"])
 def test_audit_recovers_missing_queue_and_does_not_retry_healthy_incomplete_profiles(missing):
-    engine = create_engine(get_settings().database_url)
+    engine = create_engine(get_settings().runtime.database_url)
     with engine.connect() as connection:
         transaction = connection.begin()
         try:

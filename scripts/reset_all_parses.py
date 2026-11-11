@@ -46,7 +46,7 @@ def main() -> None:
         raise ValueError("use a new report path; preserve previous reset evidence")
     _configure_backend_access()
     engine = create_engine(
-        get_settings().database_url,
+        get_settings().runtime.database_url,
         connect_args={
             "connect_timeout": 10,
             "options": "-c lock_timeout=10000 -c statement_timeout=600000",

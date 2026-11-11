@@ -22,12 +22,12 @@ class DatabaseStatus(TypedDict):
 settings = get_settings()
 logger = logging.getLogger(__name__)
 engine = create_async_engine(
-    settings.database_url,
+    settings.runtime.database_url,
     pool_pre_ping=True,
-    pool_size=settings.database_pool_size,
-    max_overflow=settings.database_max_overflow,
-    pool_timeout=settings.database_pool_timeout_seconds,
-    connect_args={"options": f"-c statement_timeout={settings.query_statement_timeout_ms}"},
+    pool_size=settings.runtime.database_pool_size,
+    max_overflow=settings.runtime.database_max_overflow,
+    pool_timeout=settings.runtime.database_pool_timeout_seconds,
+    connect_args={"options": f"-c statement_timeout={settings.runtime.query_statement_timeout_ms}"},
 )
 session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
@@ -57,7 +57,7 @@ def _log_slow_query(
     if started_at is None:
         return
     elapsed_ms = (perf_counter() - float(started_at)) * 1000
-    if elapsed_ms >= settings.slow_query_threshold_ms:
+    if elapsed_ms >= settings.runtime.slow_query_threshold_ms:
         statement_preview = " ".join(statement.split())
         if len(statement_preview) > 1_000:
             statement_preview = f"{statement_preview[:997]}..."

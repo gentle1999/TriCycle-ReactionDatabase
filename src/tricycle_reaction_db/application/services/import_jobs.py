@@ -125,7 +125,7 @@ class ImportJobService:
         artifact_kind: ArtifactKind = ArtifactKind.CALCULATION_OUTPUT,
     ) -> UploadBatchView:
         settings = get_settings()
-        if settings.import_staging_root is None:
+        if settings.ingestion.import_staging_root is None:
             raise ImportJobConflictError(
                 "import_staging_root is not configured; manifest controls are disabled"
             )
@@ -138,7 +138,7 @@ class ImportJobService:
             ProjectPermission.ARTIFACT_UPLOAD,
         )
         try:
-            validate_manifest_staging(manifest, staging_root=settings.import_staging_root)
+            validate_manifest_staging(manifest, staging_root=settings.ingestion.import_staging_root)
         except ManifestError as error:
             raise ImportJobConflictError(str(error)) from error
         manifest_sha256 = manifest.content_sha256()
@@ -258,7 +258,7 @@ class ImportJobService:
     @classmethod
     async def start(cls, job_id: UUID, *, user_id: UUID) -> UploadBatchView:
         settings = get_settings()
-        if settings.import_staging_root is None:
+        if settings.ingestion.import_staging_root is None:
             raise ImportJobConflictError(
                 "import_staging_root is not configured; manifest controls are disabled"
             )
@@ -300,7 +300,7 @@ class ImportJobService:
             try:
                 path, size, digest = fingerprint_staged_file(
                     item.staged_file_path,
-                    staging_root=settings.import_staging_root,
+                    staging_root=settings.ingestion.import_staging_root,
                 )
             except ManifestError as error:
                 failure_code = (
@@ -351,8 +351,8 @@ class ImportJobService:
         # UploadBatchService is deliberately bounded by the HTTP batch budget;
         # a manifest may be much larger, so stage it in bounded chunks while
         # retaining one durable item per manifest entry.
-        max_files = settings.max_batch_files
-        max_bytes = settings.max_batch_bytes
+        max_files = settings.ingestion.max_batch_files
+        max_bytes = settings.ingestion.max_batch_bytes
         offset = 0
         while offset < len(payloads):
             chunk: list[tuple[UUID, ArtifactUploadPayload]] = []

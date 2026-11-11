@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from sqlalchemy.orm import aliased
+from sqlalchemy.sql.selectable import Exists
 from sqlmodel import Session, col, select
 
 from tricycle_reaction_db.application.services._persistence import _require_id
@@ -63,7 +64,7 @@ def observed_participant_topology_replacements(
     source = aliased(MolecularTopology)
     target = aliased(MolecularTopology)
 
-    def has_frames(topology):
+    def has_frames(topology: type[MolecularTopology]) -> Exists:
         return (
             select(Geometry.id)
             .join(CalculationFrame, col(CalculationFrame.geometry_id) == col(Geometry.id))

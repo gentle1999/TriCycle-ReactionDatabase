@@ -10,6 +10,7 @@ from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy import and_, func, select
+from sqlalchemy.orm import Session as SASession
 from sqlmodel import Session, col
 
 from tricycle_reaction_db.application.dtos import (
@@ -41,9 +42,6 @@ from tricycle_reaction_db.db.models import (
     MappedReactionThermodynamicProfile,
 )
 from tricycle_reaction_db.db.session import session_factory
-
-HISTOGRAM_BIN_COUNT = 12
-MAX_SCATTER_POINTS = 1_000
 
 _PROFILE_COLUMNS = (
     "mapped_reaction_id",
@@ -147,8 +145,9 @@ async def _histogram(
             ThermodynamicDistributionBin(lower=float(minimum), upper=float(maximum), count=count)
         ]
 
-    width = (maximum - minimum) / HISTOGRAM_BIN_COUNT
-    bucket = func.width_bucket(column, minimum, maximum, HISTOGRAM_BIN_COUNT)
+    bin_count = get_settings().runtime.analytics_histogram_bin_count
+    width = (maximum - minimum) / bin_count
+    bucket = func.width_bucket(column, minimum, maximum, bin_count)
     rows = (
         await session.execute(
             select(bucket, func.count())
@@ -162,17 +161,15 @@ async def _histogram(
             .group_by(bucket)
         )
     ).all()
-    counts = [0] * HISTOGRAM_BIN_COUNT
+    counts = [0] * bin_count
     for raw_bucket, raw_count in rows:
-        index = min(max(int(raw_bucket) - 1, 0), HISTOGRAM_BIN_COUNT - 1)
+        index = min(max(int(raw_bucket) - 1, 0), bin_count - 1)
         counts[index] += int(raw_count)
     return [
         ThermodynamicDistributionBin(
             lower=round(float(minimum + width * index), 6),
             upper=round(
-                float(
-                    maximum if index == HISTOGRAM_BIN_COUNT - 1 else minimum + width * (index + 1)
-                ),
+                float(maximum if index == bin_count - 1 else minimum + width * (index + 1)),
                 6,
             ),
             count=count,
@@ -300,7 +297,7 @@ class ReactionThermodynamicAnalyticsService:
                         col(profile.reaction_gibbs_free_energy_kcal_mol).is_not(None),
                     )
                     .order_by(col(MappedReaction.id), col(profile.id))
-                    .limit(MAX_SCATTER_POINTS)
+                    .limit(get_settings().runtime.analytics_max_scatter_points)
                 )
             ).all()
 
@@ -369,7 +366,7 @@ class ReactionThermodynamicAnalyticsService:
             predicate,
             visible_mappings=mapped_reaction_id_is_visible(scope, col(MappedReaction.id)),
             project_id=project_id,
-            frontend_base_url=frontend_base_url or get_settings().oidc_frontend_url,
+            frontend_base_url=frontend_base_url or get_settings().identity.oidc_frontend_url,
             limit=limit,
             offset=offset,
         )
@@ -432,11 +429,17 @@ class ReactionThermodynamicAnalyticsService:
                         )
                     )
                 mapped_ids = list(dict.fromkeys(row[0] for row in partition))
-                times = await session.run_sync(
-                    lambda sync_session, cache=costs, ids=mapped_ids: cache.load(
-                        cast(Session, sync_session), ids
-                    )
-                )
+                cost_cache = costs
+                assert cost_cache is not None
+
+                def load_partition_costs(
+                    sync_session: SASession,
+                    cache: ReactionCpuTimeExport = cost_cache,
+                    ids: list[UUID] = mapped_ids,
+                ) -> dict[UUID, dict[str, Any]]:
+                    return cache.load(cast(Session, sync_session), ids)
+
+                times = await session.run_sync(load_partition_costs)
                 for row in partition:
                     (
                         mapped_id,

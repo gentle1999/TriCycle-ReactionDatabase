@@ -1,6 +1,6 @@
 """Code-owned chemistry policies and persisted identity versions.
 
-These values are deliberately separate from :class:`Settings`: they describe
+These values are deliberately separate from :class:`ApplicationSettings`: they describe
 how chemical identities and relations are derived, rather than deployment
 environment.  Changing one changes the meaning of persisted data and therefore
 requires an explicit re-import or migration; they must not be silently

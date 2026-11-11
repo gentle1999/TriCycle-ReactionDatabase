@@ -1049,7 +1049,7 @@ def _check_ts_geometry_mappings(
 
 def run_audit(*, batch_size: int, progress: bool) -> dict[str, Any]:
     audit = Audit(progress=progress)
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     try:
         with engine.connect() as connection:
             transaction = connection.begin()

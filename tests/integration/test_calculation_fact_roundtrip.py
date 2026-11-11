@@ -127,7 +127,7 @@ def test_calculation_facts_round_trip_through_relationships(tmp_path) -> None:
         reconstruction_version="v1",
     )
 
-    database_engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    database_engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = database_engine.connect()
     transaction = connection.begin()
     try:
@@ -563,7 +563,7 @@ def test_postgresql_checks_reject_invalid_calculation_facts(tmp_path) -> None:
         reconstruction_version="v1",
     )
 
-    database_engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    database_engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = database_engine.connect()
     transaction = connection.begin()
     try:
@@ -777,7 +777,7 @@ def test_postgresql_checks_reject_invalid_calculation_facts(tmp_path) -> None:
 
 
 def test_concurrent_parse_revision_persistence_reuses_identity_after_advisory_lock() -> None:
-    database_engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    database_engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     digest = token_hex(32)
     artifact_id: UUID | None = None
     first_session: Session | None = None

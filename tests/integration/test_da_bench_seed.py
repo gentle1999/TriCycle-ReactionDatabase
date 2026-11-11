@@ -91,7 +91,7 @@ def test_da_bench_seed_is_idempotent_across_postgres_and_rustfs(tmp_path: Path) 
 
     bucket = f"tricycle-da-seed-{uuid4().hex}"
     store_settings = RustFSSettings().model_copy(update={"bucket": bucket})
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     written_keys: set[str] = set()
     connection = engine.connect()
     transaction = connection.begin()

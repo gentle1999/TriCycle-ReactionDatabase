@@ -78,12 +78,12 @@ def main() -> None:
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
     settings = get_settings()
-    host = urlsplit(settings.database_url).hostname
+    host = urlsplit(settings.runtime.database_url).hostname
     for key in ("NO_PROXY", "no_proxy"):
         os.environ[key] = ",".join(
             dict.fromkeys(filter(None, [*os.getenv(key, "").split(","), host]))
         )
-    engine = create_engine(settings.database_url)
+    engine = create_engine(settings.runtime.database_url)
     with Session(engine) as session:
         count = session.exec(select(func.count()).select_from(candidates().subquery())).one()
     print(json.dumps({"missing_pairs": count, "apply": args.apply}), flush=True)

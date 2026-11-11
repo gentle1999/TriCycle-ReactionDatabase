@@ -1,6 +1,6 @@
 """Independent NexusX demo-style ASGI applications for each transport."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any, cast
 
@@ -55,7 +55,7 @@ settings = get_settings()
 
 
 @asynccontextmanager
-async def database_lifespan(_: FastAPI) -> AsyncIterator[None]:
+async def database_lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     try:
         yield
     finally:
@@ -70,7 +70,7 @@ def _application(title: str, description: str) -> FastAPI:
         title=title,
         description=description,
         version=__version__,
-        debug=get_settings().debug,
+        debug=get_settings().runtime.debug,
         lifespan=database_lifespan,
     )
     install_query_guards(app)
@@ -78,7 +78,7 @@ def _application(title: str, description: str) -> FastAPI:
     app.add_middleware(AuthenticationMiddleware)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.cors_origins,
+        allow_origins=settings.identity.cors_origins,
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type"],
     )
@@ -87,14 +87,14 @@ def _application(title: str, description: str) -> FastAPI:
 
 
 graphql_playground_app = _application(
-    f"{settings.app_name} Direct-list GraphQL",
+    f"{settings.runtime.app_name} Direct-list GraphQL",
     "Direct-list NexusX UseCase GraphQL browser",
 )
 graphql_playground_app.include_router(
     create_graphql_router(
         playground_config,
         playground_schema,
-        graphiql_title=f"Direct-list GraphQL - {settings.brand_name}",
+        graphiql_title=f"Direct-list GraphQL - {settings.runtime.brand_name}",
         default_query=DIRECT_PLAYGROUND_QUERY,
     )
 )
@@ -110,7 +110,7 @@ async def graphql_playground_info() -> dict[str, str]:
 
 
 core_api_app = _application(
-    f"{settings.app_name} Core API",
+    f"{settings.runtime.app_name} Core API",
     "NexusX DefineSubset, ErManager, Resolver, and explicit REST DTOs",
 )
 core_api_app.include_router(core.router)
@@ -122,14 +122,14 @@ async def core_api_root() -> dict[str, Any]:
 
 
 paginated_graphql_app = _application(
-    f"{settings.app_name} Paginated GraphQL",
+    f"{settings.runtime.app_name} Paginated GraphQL",
     "NexusX UseCase GraphQL with explicit page DTOs",
 )
 paginated_graphql_app.include_router(
     create_graphql_router(
         paginated_config,
         paginated_schema,
-        graphiql_title=f"Paginated GraphQL - {settings.brand_name}",
+        graphiql_title=f"Paginated GraphQL - {settings.runtime.brand_name}",
         default_query=PAGINATED_QUERY,
     )
 )
@@ -146,7 +146,7 @@ async def paginated_graphql_info() -> dict[str, str]:
 
 
 use_case_rest_app = _application(
-    f"{settings.app_name} UseCase REST",
+    f"{settings.runtime.app_name} UseCase REST",
     "NexusX generated FastAPI routes over the canonical UseCase services",
 )
 use_case_rest_app.include_router(use_case_router)
@@ -193,8 +193,8 @@ def database_dtos() -> list[type[BaseModel]]:
 voyager_database_er_manager = ErManager(
     entities=database_entities(voyager_compatible=True),
     session_factory=session_factory,
-    service_name=settings.nexusx_database_cluster_name,
-    color=settings.nexusx_database_cluster_color,
+    service_name=settings.runtime.nexusx_database_cluster_name,
+    color=settings.runtime.nexusx_database_cluster_color,
     dto_classes=database_dtos(),
 )
 voyager_er_manager = ComposedErManager(members=[voyager_database_er_manager])
@@ -203,12 +203,12 @@ voyager_subapp = create_use_case_voyager(
     # Supported NexusX releases expose LoaderRegistry-compatible composed managers at
     # runtime, while this public parameter is still annotated as ErManager.
     er_manager=cast(Any, voyager_er_manager),
-    name=settings.app_name,
+    name=settings.runtime.app_name,
     initial_page_policy="first",
     version=__version__,
 )
 voyager_app = _application(
-    f"{settings.app_name} Voyager",
+    f"{settings.runtime.app_name} Voyager",
     "NexusX UseCase and SQLModel entity visualization",
 )
 voyager_app.mount("/voyager", voyager_subapp, name="voyager")

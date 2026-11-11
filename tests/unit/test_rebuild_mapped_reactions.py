@@ -9,11 +9,18 @@ from uuid import uuid4
 
 import pytest
 
+from tests.config_helpers import application_settings, copied_application_settings
+from tricycle_reaction_db.core.config import ApplicationSettings
+
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/rebuild_mapped_reactions.py"
 spec = importlib.util.spec_from_file_location("reaction_rebuild_script", SCRIPT)
 assert spec and spec.loader
 rebuild = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rebuild)
+
+
+def _settings(**domains: dict[str, object]) -> ApplicationSettings:
+    return copied_application_settings(application_settings(_env_file=None), **domains)
 
 
 def _state():
@@ -239,7 +246,9 @@ def test_backend_bypass_is_scoped_and_preserves_existing_entries(monkeypatch):
     monkeypatch.setattr(
         rebuild,
         "get_settings",
-        lambda: SimpleNamespace(database_url="postgresql://user:password@db.example:5432/test"),
+        lambda: _settings(
+            runtime={"database_url": "postgresql://user:password@db.example:5432/test"}
+        ),
     )
     monkeypatch.setattr(
         rebuild, "RustFSSettings", lambda: SimpleNamespace(endpoint_url="https://objects.example")

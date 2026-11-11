@@ -1,37 +1,39 @@
 import ssl
 
+from tests.config_helpers import application_settings
 from tricycle_reaction_db.application.services.email import smtp_tls_context
-from tricycle_reaction_db.core.config import Settings
+from tricycle_reaction_db.core.config import ApplicationSettings
 from tricycle_reaction_db.dev import deployment_smoke
 from tricycle_reaction_db.storage.rustfs import RustFSSettings
 
 
-def _production_settings() -> Settings:
-    return Settings(
+def _production_settings() -> ApplicationSettings:
+    return application_settings(
         _env_file=None,
-        environment="production",
-        auth_mode="oidc",
-        oidc_issuer="https://identity.example.test",
-        oidc_audience="reaction-database",
-        oidc_jwks_url="https://identity.example.test/jwks.json",
-        oidc_client_id="reaction-client",
-        oidc_client_secret="production-secret",
-        oidc_redirect_uri="https://app.example.test/api/auth/callback",
-        oidc_frontend_url="https://app.example.test",
-        session_secret="production-session-secret-0123456789",
-        session_cookie_secure=True,
-        database_url=(
-            "postgresql+psycopg://tricycle:secret@db.example.test/tricycle?sslmode=verify-full"
-        ),
-        cors_origins=["https://app.example.test"],
-        rustfs_endpoint_url="https://objects.example.test",
-        rustfs_verify_tls=True,
-        email_delivery_mode="smtp",
-        smtp_host="smtp.example.test",
-        smtp_from_email="noreply@example.test",
-        smtp_starttls=True,
-        rate_limit_backend="redis",
-        rate_limit_redis_url="rediss://redis.example.test:6380/0",
+        runtime={
+            "environment": "production",
+            "database_url": "postgresql+psycopg://tricycle:secret@db.example.test/tricycle?sslmode=verify-full",
+            "rate_limit_backend": "redis",
+            "rate_limit_redis_url": "rediss://redis.example.test:6380/0",
+        },
+        identity={
+            "auth_mode": "oidc",
+            "oidc_issuer": "https://identity.example.test",
+            "oidc_audience": "reaction-database",
+            "oidc_jwks_url": "https://identity.example.test/jwks.json",
+            "oidc_client_id": "reaction-client",
+            "oidc_client_secret": "production-secret",
+            "oidc_redirect_uri": "https://app.example.test/api/auth/callback",
+            "oidc_frontend_url": "https://app.example.test",
+            "session_secret": "production-session-secret-0123456789",
+            "session_cookie_secure": True,
+            "cors_origins": ["https://app.example.test"],
+            "email_delivery_mode": "smtp",
+            "smtp_host": "smtp.example.test",
+            "smtp_from_email": "noreply@example.test",
+            "smtp_starttls": True,
+        },
+        storage={"rustfs_endpoint_url": "https://objects.example.test", "rustfs_verify_tls": True},
     )
 
 

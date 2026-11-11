@@ -1,10 +1,10 @@
 import asyncio
-from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from tests.config_helpers import application_settings, copied_application_settings
 from tricycle_reaction_db.api.app import create_app
 from tricycle_reaction_db.api.query_guards import install_query_guards
 from tricycle_reaction_db.api.routes import graphql as graphql_module
@@ -16,6 +16,11 @@ from tricycle_reaction_db.application.query_cost import (
 )
 from tricycle_reaction_db.application.rate_limits import RateLimitBackendUnavailable
 from tricycle_reaction_db.application.services import MappedReactionQueryService
+from tricycle_reaction_db.core.config import ApplicationSettings
+
+
+def _settings(**domains: dict[str, object]) -> ApplicationSettings:
+    return copied_application_settings(application_settings(_env_file=None), **domains)
 
 
 class _UnavailableRateLimiter:
@@ -69,14 +74,15 @@ async def test_http_rate_limit_has_stable_error_and_retry_after(
 ) -> None:
     monkeypatch.setattr(
         "tricycle_reaction_db.api.query_guards.get_settings",
-        lambda: SimpleNamespace(
-            query_rate_limit_requests=1,
-            read_rate_limit_requests=2,
-            upload_rate_limit_requests=3,
-            upload_max_concurrency=2,
-            molecule_query_rate_limit_requests=2,
-            depiction_rate_limit_requests=2,
-            query_rate_limit_window_seconds=30,
+        lambda: _settings(
+            runtime={
+                "query_rate_limit_requests": 1,
+                "read_rate_limit_requests": 2,
+                "molecule_query_rate_limit_requests": 2,
+                "depiction_rate_limit_requests": 2,
+                "query_rate_limit_window_seconds": 30,
+            },
+            ingestion={"upload_rate_limit_requests": 3, "upload_max_concurrency": 2},
         ),
     )
     application = FastAPI()
@@ -109,14 +115,15 @@ async def test_http_rate_limit_backend_failure_returns_503_without_fallback(
 ) -> None:
     monkeypatch.setattr(
         "tricycle_reaction_db.api.query_guards.get_settings",
-        lambda: SimpleNamespace(
-            query_rate_limit_requests=10,
-            read_rate_limit_requests=10,
-            upload_rate_limit_requests=10,
-            upload_max_concurrency=2,
-            molecule_query_rate_limit_requests=10,
-            depiction_rate_limit_requests=10,
-            query_rate_limit_window_seconds=30,
+        lambda: _settings(
+            runtime={
+                "query_rate_limit_requests": 10,
+                "read_rate_limit_requests": 10,
+                "molecule_query_rate_limit_requests": 10,
+                "depiction_rate_limit_requests": 10,
+                "query_rate_limit_window_seconds": 30,
+            },
+            ingestion={"upload_rate_limit_requests": 10, "upload_max_concurrency": 2},
         ),
     )
     monkeypatch.setattr(
@@ -148,14 +155,15 @@ async def test_depiction_rate_limit_is_independent_from_query_limit(
 ) -> None:
     monkeypatch.setattr(
         "tricycle_reaction_db.api.query_guards.get_settings",
-        lambda: SimpleNamespace(
-            query_rate_limit_requests=1,
-            read_rate_limit_requests=1,
-            upload_rate_limit_requests=3,
-            upload_max_concurrency=2,
-            molecule_query_rate_limit_requests=2,
-            depiction_rate_limit_requests=2,
-            query_rate_limit_window_seconds=30,
+        lambda: _settings(
+            runtime={
+                "query_rate_limit_requests": 1,
+                "read_rate_limit_requests": 1,
+                "molecule_query_rate_limit_requests": 2,
+                "depiction_rate_limit_requests": 2,
+                "query_rate_limit_window_seconds": 30,
+            },
+            ingestion={"upload_rate_limit_requests": 3, "upload_max_concurrency": 2},
         ),
     )
     application = FastAPI()
@@ -186,14 +194,15 @@ async def test_molecule_query_rate_limit_is_independent_from_general_queries(
 ) -> None:
     monkeypatch.setattr(
         "tricycle_reaction_db.api.query_guards.get_settings",
-        lambda: SimpleNamespace(
-            query_rate_limit_requests=1,
-            read_rate_limit_requests=1,
-            upload_rate_limit_requests=3,
-            upload_max_concurrency=2,
-            molecule_query_rate_limit_requests=2,
-            depiction_rate_limit_requests=3,
-            query_rate_limit_window_seconds=30,
+        lambda: _settings(
+            runtime={
+                "query_rate_limit_requests": 1,
+                "read_rate_limit_requests": 1,
+                "molecule_query_rate_limit_requests": 2,
+                "depiction_rate_limit_requests": 3,
+                "query_rate_limit_window_seconds": 30,
+            },
+            ingestion={"upload_rate_limit_requests": 3, "upload_max_concurrency": 2},
         ),
     )
     application = FastAPI()
@@ -224,14 +233,15 @@ async def test_read_upload_and_management_requests_use_separate_policies(
 ) -> None:
     monkeypatch.setattr(
         "tricycle_reaction_db.api.query_guards.get_settings",
-        lambda: SimpleNamespace(
-            query_rate_limit_requests=1,
-            read_rate_limit_requests=2,
-            upload_rate_limit_requests=3,
-            upload_max_concurrency=2,
-            molecule_query_rate_limit_requests=4,
-            depiction_rate_limit_requests=5,
-            query_rate_limit_window_seconds=30,
+        lambda: _settings(
+            runtime={
+                "query_rate_limit_requests": 1,
+                "read_rate_limit_requests": 2,
+                "molecule_query_rate_limit_requests": 4,
+                "depiction_rate_limit_requests": 5,
+                "query_rate_limit_window_seconds": 30,
+            },
+            ingestion={"upload_rate_limit_requests": 3, "upload_max_concurrency": 2},
         ),
     )
     application = FastAPI()
@@ -277,14 +287,15 @@ async def test_parallel_uploads_are_bounded_without_becoming_serial(
 ) -> None:
     monkeypatch.setattr(
         "tricycle_reaction_db.api.query_guards.get_settings",
-        lambda: SimpleNamespace(
-            query_rate_limit_requests=10,
-            read_rate_limit_requests=10,
-            upload_rate_limit_requests=10,
-            upload_max_concurrency=2,
-            molecule_query_rate_limit_requests=10,
-            depiction_rate_limit_requests=10,
-            query_rate_limit_window_seconds=30,
+        lambda: _settings(
+            runtime={
+                "query_rate_limit_requests": 10,
+                "read_rate_limit_requests": 10,
+                "molecule_query_rate_limit_requests": 10,
+                "depiction_rate_limit_requests": 10,
+                "query_rate_limit_window_seconds": 30,
+            },
+            ingestion={"upload_rate_limit_requests": 10, "upload_max_concurrency": 2},
         ),
     )
     application = FastAPI()
@@ -328,12 +339,14 @@ async def test_graphql_transport_rejects_over_budget_depth(
     monkeypatch.setattr(
         graphql_module,
         "get_settings",
-        lambda: SimpleNamespace(
-            environment="test",
-            graphql_max_query_characters=20_000,
-            graphql_max_tokens=2_000,
-            graphql_max_depth=2,
-            graphql_max_complexity=250,
+        lambda: _settings(
+            runtime={
+                "environment": "test",
+                "graphql_max_query_characters": 20_000,
+                "graphql_max_tokens": 2_000,
+                "graphql_max_depth": 2,
+                "graphql_max_complexity": 250,
+            }
         ),
     )
     application = FastAPI()

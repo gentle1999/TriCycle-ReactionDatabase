@@ -8,6 +8,7 @@ from uuid import UUID
 
 import pytest
 
+from tests.config_helpers import application_settings
 from tricycle_reaction_db.application.services import artifact_uploads as upload_module
 from tricycle_reaction_db.application.services.artifact_upload_types import ParsedArtifactTask
 from tricycle_reaction_db.application.services.artifact_uploads import ArtifactUploadService
@@ -15,7 +16,6 @@ from tricycle_reaction_db.application.services.upload_batches import (
     UploadBatchService,
     UploadProcessingJob,
 )
-from tricycle_reaction_db.core.config import Settings
 from tricycle_reaction_db.dev import upload_worker as worker_module
 from tricycle_reaction_db.dev.upload_worker import UploadBatchWorker
 from tricycle_reaction_db.domain.enums import ArtifactKind, StorageStatus
@@ -265,11 +265,9 @@ async def test_reparse_batch_uses_fixed_persistence_microbatch_boundary(
     monkeypatch.setattr(
         upload_module,
         "get_settings",
-        lambda: Settings(
+        lambda: application_settings(
             _env_file=None,
-            max_upload_bytes=1024,
-            max_batch_files=64,
-            max_batch_bytes=1024,
+            ingestion={"max_upload_bytes": 1024, "max_batch_files": 64, "max_batch_bytes": 1024},
         ),
     )
     monkeypatch.setattr(upload_module, "session_factory", fake_session_factory)
@@ -299,17 +297,21 @@ async def test_worker_reclaims_interrupted_cycle_after_all_tasks_stop(
     error_type: type[Exception],
 ) -> None:
     """A poll failure must not strand hour-long leases while the worker stays alive."""
-    settings = Settings(
+    settings = application_settings(
         _env_file=None,
-        upload_worker_poll_interval_seconds=0.06,
-        upload_worker_prefetch_files=4,
-        upload_worker_persistence_batch_files=1,
+        ingestion={
+            "upload_worker_poll_interval_seconds": 0.06,
+            "upload_worker_prefetch_files": 4,
+            "upload_worker_persistence_batch_files": 1,
+        },
     )
     jobs = [
         _job(project_id=PROJECT_A, batch_id=30, item_id=30, artifact_id=301),
         _job(project_id=PROJECT_A, batch_id=30, item_id=31, artifact_id=302),
     ]
-    expires_at = datetime.now(UTC) + timedelta(seconds=settings.upload_worker_lease_seconds)
+    expires_at = datetime.now(UTC) + timedelta(
+        seconds=settings.ingestion.upload_worker_lease_seconds
+    )
     jobs = [replace(job, lease_expires_at=expires_at) for job in jobs]
     worker = UploadBatchWorker()
     stop = asyncio.Event()

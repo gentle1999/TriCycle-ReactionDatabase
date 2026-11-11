@@ -28,7 +28,7 @@ target_metadata = metadata
 
 
 def _database_url() -> str:
-    return get_settings().database_url
+    return get_settings().runtime.database_url
 
 
 def _render_item(type_: str, obj: object, autogen_context: object) -> str | Literal[False]:

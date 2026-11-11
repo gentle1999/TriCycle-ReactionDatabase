@@ -75,7 +75,7 @@ class UploadBatchWorker:
         """Return the bounded number of parser tasks admitted ahead of writes."""
 
         settings = get_settings()
-        configured = settings.upload_worker_prefetch_files
+        configured = settings.ingestion.upload_worker_prefetch_files
         if configured > 0:
             return configured
         return max(4, molop_process_worker_count() * 2)
@@ -155,7 +155,7 @@ class UploadBatchWorker:
         """Renew all parser and persistence claims while the stream is active."""
 
         settings = get_settings()
-        interval = max(5.0, min(60.0, settings.upload_worker_lease_seconds / 3))
+        interval = max(5.0, min(60.0, settings.ingestion.upload_worker_lease_seconds / 3))
         while not finished.is_set():
             try:
                 await asyncio.wait_for(finished.wait(), timeout=interval)
@@ -189,8 +189,8 @@ class UploadBatchWorker:
         grouped_frames: dict[tuple[UUID, UUID, bool], int] = {}
         project_write_locks: dict[UUID, asyncio.Lock] = {}
         settings = get_settings()
-        persistence_file_limit = settings.upload_worker_persistence_batch_files
-        persistence_frame_limit = settings.upload_worker_persistence_frame_limit
+        persistence_file_limit = settings.ingestion.upload_worker_persistence_batch_files
+        persistence_frame_limit = settings.ingestion.upload_worker_persistence_frame_limit
         persistence_buffer_limit = max(
             persistence_file_limit,
             min(prefetch_limit, parser_workers * 4),
@@ -496,12 +496,12 @@ class UploadBatchWorker:
                     logger.exception("upload worker poll failed")
 
                 if stop_event is None:
-                    await asyncio.sleep(settings.upload_worker_poll_interval_seconds)
+                    await asyncio.sleep(settings.ingestion.upload_worker_poll_interval_seconds)
                 else:
                     with suppress(TimeoutError):
                         await asyncio.wait_for(
                             stop_event.wait(),
-                            timeout=settings.upload_worker_poll_interval_seconds,
+                            timeout=settings.ingestion.upload_worker_poll_interval_seconds,
                         )
         finally:
             await self._flush_statistics()
@@ -520,7 +520,7 @@ async def _run_worker() -> None:
         logger.info(
             "warmed shared RustFS storage process pool workers=%d configured=%d",
             warmed_storage_workers,
-            get_settings().upload_max_concurrency,
+            get_settings().ingestion.upload_max_concurrency,
         )
         await worker.run()
     finally:
