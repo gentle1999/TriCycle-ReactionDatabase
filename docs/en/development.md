@@ -5,7 +5,7 @@
 ## Prerequisites
 
 - Python 3.12 and `uv 0.9` or later
-- Node.js 20 or later and npm
+- Node.js 22 or later and npm
 - Docker Engine and Docker Compose
 - Linux/amd64 for the supported local baseline
 

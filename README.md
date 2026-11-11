@@ -78,7 +78,7 @@ that observed them.
 ### Prerequisites
 
 - Python 3.12 and [uv](https://docs.astral.sh/uv/)
-- Node.js 20 or later and npm
+- Node.js 22 or later and npm
 - Docker Engine with Docker Compose, for the local PostgreSQL/RDKit, RustFS, and
   development Keycloak services
 

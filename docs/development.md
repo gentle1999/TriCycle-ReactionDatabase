@@ -5,6 +5,7 @@
 ## 前置条件
 
 - `uv 0.9` 或更高版本
+- Node.js 22 或更高版本及 npm
 - Docker 与 Docker Compose
 - Linux/amd64 开发环境
 - 能够访问 PyPI 以安装 MolOP/MolGR 发布包
