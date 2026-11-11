@@ -65,17 +65,18 @@ def normalize_molop_frame(frame: BaseCalcFrame[Any]) -> NormalizedMoleculeRecord
         raise ValueError(
             "reconstructed graph must preserve the complete source atom inventory/order"
         )
-    # MolGR returns the reconstructed graph and its Cartesian conformer, but
-    # RDKit's SMILES writer may still need neighboring BondDir metadata. Keep
-    # this as the single MolGR -> ingestion stereo boundary.
-    mol = normalize_molgr_stereochemistry(rdmol)
-    coordinates = magnitude_in(frame.coords, ANGSTROM)
-    reconstruction_backend = frame.topology_reconstruction_backend or "unknown"
     reconstruction_status = getattr(
         frame.topology_reconstruction_status,
         "value",
         frame.topology_reconstruction_status,
     )
+    # MolGR has already perceived a trusted frame's stereochemistry. Keep its
+    # atom/bond markers authoritative through the ingestion boundary.
+    mol = normalize_molgr_stereochemistry(
+        rdmol, trust_source_stereochemistry=reconstruction_status != "suspicious_fallback"
+    )
+    coordinates = magnitude_in(frame.coords, ANGSTROM)
+    reconstruction_backend = frame.topology_reconstruction_backend or "unknown"
     return normalize_molecule(
         mol,
         coordinates,

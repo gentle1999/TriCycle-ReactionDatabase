@@ -15,6 +15,7 @@ from molgr.utils.converter import (
     METAL_UNPAIRED_ELECTRONS_PROP,
     get_atom_unpaired_electrons,
 )
+from molgr.utils.post_process import make_stereochemistry
 from rdkit import Chem
 from rdkit.Geometry import Point3D
 
@@ -838,15 +839,32 @@ def infer_molgr_stereochemistry_from_3d(mol: Chem.Mol) -> Chem.Mol:
     # Existing BondStereo and BondDir values may have come from MolGR's graph
     # reconstruction or from an earlier SMILES traversal. Neither is evidence
     # for a displaced endpoint, so remove both before the coordinate pass.
+    # Explicit UNKNOWN/crossed annotations are uncertainty evidence, however;
+    # RDKit RemoveStereochemistry also clears them, so restore them before
+    # MolGR's perception pass.
+    unknown_directions = {
+        bond.GetIdx(): bond.GetBondDir()
+        for bond in inferred.GetBonds()  # type: ignore[no-untyped-call]
+        if bond.GetBondDir() in (Chem.BondDir.UNKNOWN, Chem.BondDir.EITHERDOUBLE)
+    }
+    explicit_unknown_double_bonds = {
+        bond.GetIdx()
+        for bond in inferred.GetBonds()  # type: ignore[no-untyped-call]
+        if bond.GetBondType() == Chem.BondType.DOUBLE
+        and bond.GetStereo() == Chem.BondStereo.STEREOANY
+        and not bond.HasProp("_MolGRDerivedUnknownStereo")
+    }
     # Clear computed CIP ranks as well as tags: ranks cached on a graph before
     # coordination was finalized must not select the new stereo control atoms.
     Chem.RemoveStereochemistry(inferred)
+    for bond_index, direction in unknown_directions.items():
+        inferred.GetBondWithIdx(bond_index).SetBondDir(direction)
+    for bond_index in explicit_unknown_double_bonds:
+        inferred.GetBondWithIdx(bond_index).SetStereo(Chem.BondStereo.STEREOANY)
     inferred.UpdatePropertyCache(strict=False)
-    Chem.AssignStereochemistryFrom3D(
-        inferred,
-        confId=-1,
-        replaceExistingTags=True,
-    )
+    # The displaced endpoint has new coordinates, so ask MolGR to perceive
+    # its stereo. A bare RDKit pass would miss MolGR's repaired 3D branches.
+    make_stereochemistry(inferred)
     for bond in inferred.GetBonds():  # type: ignore[no-untyped-call]
         stereo = _LEGACY_DOUBLE_BOND_STEREO_TO_E_Z.get(bond.GetStereo())
         if stereo is not None:
@@ -867,21 +885,28 @@ def infer_molgr_stereochemistry_from_3d(mol: Chem.Mol) -> Chem.Mol:
     return inferred
 
 
-def normalize_molgr_stereochemistry(mol: Chem.Mol) -> Chem.Mol:
+def normalize_molgr_stereochemistry(
+    mol: Chem.Mol, *, trust_source_stereochemistry: bool = False
+) -> Chem.Mol:
     """Normalize a MolGR graph without letting projection become authority.
 
-    A single trusted 3D conformer delegates to
-    :func:`infer_molgr_stereochemistry_from_3d`. Without a conformer, this
-    function only preserves existing MolGR stereo and accepts direction-only
-    graph input for compatibility with non-TS reaction representations. It is
-    never a substitute for endpoint coordinate inference. In either case,
-    configured inversion-labile atom chirality is removed before the graph is
-    handed to topology and geometry identity creation.
+    MolOP frame graphs use ``trust_source_stereochemistry=True`` because MolGR
+    has already assigned their stereo. Other 3D inputs delegate to
+    :func:`infer_molgr_stereochemistry_from_3d`, including displaced endpoints.
+    Without a conformer, this function preserves existing MolGR stereo and
+    accepts direction-only graph input for non-TS representations. Configured
+    inversion-labile atom chirality is removed before identity creation.
     """
 
     mol = Chem.Mol(mol)
     annotate_electronic_state(mol)
     _normalize_aromatic_bond_flags(mol)
+    if trust_source_stereochemistry:
+        # MolOP's frame.rdmol is already perceived by MolGR. Preserve its
+        # source atom and bond stereo rather than running another 3D pass.
+        mol = clear_inversion_labile_atom_chirality(mol)
+        mol.SetBoolProp("_tricycle_molgr_stereo_normalized", True)
+        return mol
     if mol.HasProp("_tricycle_molgr_stereo_normalized"):
         # The marker is set only after the coordinate pass and inversion-labile
         # cleanup have completed. Returning the marked graph avoids repeating

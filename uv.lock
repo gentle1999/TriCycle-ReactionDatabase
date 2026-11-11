@@ -880,7 +880,7 @@ wheels = [
 
 [[package]]
 name = "molgr"
-version = "0.1.9"
+version = "0.1.10"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
@@ -888,13 +888,13 @@ dependencies = [
     { name = "rdkit" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ae/c8/28234a6f0ec93c7312ff2af0eb78ea4b6c9ca010e8df168881cf05c8b9ca/molgr-0.1.9.tar.gz", hash = "sha256:c1e460b716a781dc6706029ca03aa7a7f30be0e16de48b2debdc81c3c5a0b56b", size = 875904, upload-time = "2026-09-05T02:48:29.9Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/50/b7/e2619e48644ad606b0bffa1a5f887e4c1b7e6adf4ebb85920c1961ff2c3e/molgr-0.1.10.tar.gz", hash = "sha256:2ac508a0d20045e480c533a31c0fa65d5907009e4d9dcd179fe93294469f551b", size = 1040929, upload-time = "2026-11-10T08:24:40.51Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/00/99/0667c0a408af7f8dcf91c9963f36c951456d2424a8b2ced155a89bc0a2e0/molgr-0.1.9-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:ff4468cec51c86006667ff0fcb1d8eb543b15d1b18a643f9227e09f13254c63f", size = 765160, upload-time = "2026-09-05T02:48:01.157Z" },
-    { url = "https://files.pythonhosted.org/packages/c7/3d/539aeee0795898290a75477ca827140ccb73a8f67b4da793d1f3e5899615/molgr-0.1.9-cp312-cp312-macosx_14_0_x86_64.whl", hash = "sha256:ef6ea6051e493f7b12e80bf8c462941fbb85920feeae93a8054ca1929d1a2680", size = 790787, upload-time = "2026-09-05T02:48:02.271Z" },
-    { url = "https://files.pythonhosted.org/packages/4f/ce/f9f5db3a8afadbdaf999273ec57061e46299db29c0ec8497e6cbb6668125/molgr-0.1.9-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:c86d30c0e0878f220e4c0bc8cdc7cc0e78b89926690c99f3034825184026ef7e", size = 906445, upload-time = "2026-09-05T02:48:03.381Z" },
-    { url = "https://files.pythonhosted.org/packages/1a/33/461909e6685a5e340ecd70e1e32e53d064f781008fa915e72caeb7051441/molgr-0.1.9-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:3d6c68c2e862ffbc9ede2ab3fd41530e4ae39044da4351bc15af93f2002a5cf8", size = 954969, upload-time = "2026-09-05T02:48:04.79Z" },
-    { url = "https://files.pythonhosted.org/packages/b7/17/5133cde83dca04f6ab79e65c0e6167c6c30d84e774e6a976baf12839d27b/molgr-0.1.9-cp312-cp312-win_amd64.whl", hash = "sha256:8f8f6302d28f1484eadfe6ed376e2f05f69862b94172ffbf9bb136944b18d124", size = 933986, upload-time = "2026-09-05T02:48:05.801Z" },
+    { url = "https://files.pythonhosted.org/packages/6a/5f/8d8c78a12fc101643042bf59d5baf142b0e73fc6e454ac403d213d10e6e5/molgr-0.1.10-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:cfd07eeccb4109ee09ded0ec20003d8cedbea7a86c8fe79899337f81f030c54f", size = 889344, upload-time = "2026-11-10T08:24:11.073Z" },
+    { url = "https://files.pythonhosted.org/packages/b6/44/6bd91b6c2f7511a2cef82e8be416349e6fa44acbe28a5942f31b8c9220ab/molgr-0.1.10-cp312-cp312-macosx_14_0_x86_64.whl", hash = "sha256:08fadf21195f7c174d4a089d6646142d5937b9e7cc75fba511232a314765443b", size = 951336, upload-time = "2026-11-10T08:24:12.105Z" },
+    { url = "https://files.pythonhosted.org/packages/e4/4f/9a4d8eaad95d810b5f225d86e864159cdb45033653af534df694c5e90f80/molgr-0.1.10-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:524776b134cd9473f0262d723550bf6918f891beefdc9f05b794b3c0c924186f", size = 1081626, upload-time = "2026-11-10T08:24:13.545Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/d8/0fc254def6e36ff52392c583b23ec3035dfc60f7e68aad5f33ec6e2acde1/molgr-0.1.10-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:72b8ffd493151ed83b0234a6594a73014adc7c8447c4f93c639055f741828060", size = 1141529, upload-time = "2026-11-10T08:24:14.644Z" },
+    { url = "https://files.pythonhosted.org/packages/c0/97/720acf11a615cefa9a62a13e97b81a687bedded0b53593d95a9432660303/molgr-0.1.10-cp312-cp312-win_amd64.whl", hash = "sha256:fc65f658381fbbfe6fb365ae61090a5cefd9b00bbffb3b176232d002db02a0d3", size = 1078406, upload-time = "2026-11-10T08:24:15.707Z" },
 ]
 
 [[package]]
@@ -1839,7 +1839,7 @@ requires-dist = [
     { name = "fastmcp", extras = ["apps"], specifier = ">=3.4.10,<4" },
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "molalchemy", specifier = "==0.0.7" },
-    { name = "molgr", specifier = ">=0.1.9" },
+    { name = "molgr", specifier = ">=0.1.10" },
     { name = "molop", specifier = ">=0.2.21,<0.3" },
     { name = "nexusx", specifier = ">=6.3" },
     { name = "numpy", specifier = ">=2.2,<3" },

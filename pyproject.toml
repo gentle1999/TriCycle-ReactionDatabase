@@ -14,7 +14,7 @@ dependencies = [
     "fastmcp[apps]>=3.4.10,<4",
     "httpx>=0.28,<1",
     "molalchemy==0.0.7",
-    "molgr>=0.1.9",
+    "molgr>=0.1.10",
     "molop>=0.2.21,<0.3",
     "nexusx>=6.3",
     "numpy>=2.2,<3",

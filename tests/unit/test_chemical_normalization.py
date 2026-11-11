@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from molgr.utils.converter import METAL_UNPAIRED_ELECTRONS_PROP
+from molgr.utils.post_process import make_stereochemistry
 from pydantic import ValidationError
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdDepictor
@@ -292,6 +293,67 @@ def test_molgr_3d_stereo_inference_clears_labile_atom_after_assignment() -> None
     )
     assert sulfur.GetChiralTag() is Chem.ChiralType.CHI_UNSPECIFIED
     assert carbon.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
+
+
+def test_molgr_3d_stereo_inference_keeps_four_ligand_repair() -> None:
+    source = Chem.RWMol()
+    for symbol in ("C", "F", "Cl", "Br", "I"):
+        atom = Chem.Atom(symbol)
+        atom.SetNoImplicit(True)
+        source.AddAtom(atom)
+    for ligand in range(1, 5):
+        source.AddBond(0, ligand, Chem.BondType.SINGLE)
+    molecule = source.GetMol()
+    Chem.SanitizeMol(molecule)
+    conformer = Chem.Conformer(5)
+    conformer.Set3D(True)
+    for index, point in enumerate(
+        ((3, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1), (-1, -1, -1))
+    ):
+        conformer.SetAtomPosition(index, point)
+    molecule.AddConformer(conformer)
+
+    expected = make_stereochemistry(Chem.Mol(molecule))
+    normalized = infer_molgr_stereochemistry_from_3d(molecule)
+
+    assert expected.GetAtomWithIdx(0).GetProp("_CIPCode") == "S"
+    assert normalized.GetAtomWithIdx(0).GetProp("_CIPCode") == "S"
+    assert Chem.MolToSmiles(normalized) == Chem.MolToSmiles(expected)
+
+
+def test_trusted_molgr_frame_keeps_source_stereo_without_reperception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    molecule = Chem.AddHs(Chem.MolFromSmiles("F[C@H](Cl)Br"))
+    assert AllChem.EmbedMolecule(molecule, randomSeed=17) == 0
+    source_tag = molecule.GetAtomWithIdx(1).GetChiralTag()
+
+    def unexpected_reperception(*_: object, **__: object) -> None:
+        raise AssertionError("trusted MolGR frame stereo must not be reperceived")
+
+    monkeypatch.setattr(Chem, "AssignStereochemistryFrom3D", unexpected_reperception)
+    normalized = normalize_molgr_stereochemistry(
+        molecule, trust_source_stereochemistry=True
+    )
+
+    assert normalized.GetAtomWithIdx(1).GetChiralTag() == source_tag
+    assert normalized.HasProp("_tricycle_molgr_stereo_normalized")
+
+
+def test_molgr_endpoint_inference_keeps_explicit_unknown_double_bond() -> None:
+    molecule = Chem.AddHs(Chem.MolFromSmiles("F/C=C/F"))
+    assert AllChem.EmbedMolecule(molecule, randomSeed=17) == 0
+    double_bond = next(
+        bond for bond in molecule.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE
+    )
+    double_bond.SetStereo(Chem.BondStereo.STEREOANY)
+    double_bond.SetBondDir(Chem.BondDir.EITHERDOUBLE)
+
+    inferred = infer_molgr_stereochemistry_from_3d(molecule)
+
+    assert inferred.GetBondWithIdx(double_bond.GetIdx()).GetStereo() == (
+        Chem.BondStereo.STEREOANY
+    )
 
 
 def test_topology_identity_is_independent_of_source_atom_order() -> None:
