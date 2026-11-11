@@ -341,7 +341,7 @@ async def _run(args: argparse.Namespace) -> int:
         return 0
 
     settings = get_settings()
-    user_id = args.user_id or settings.development_user_id
+    user_id = args.user_id or settings.identity.development_user_id
     clear_completed = _load_phase_completed(
         args.state_file,
         phase="clear",

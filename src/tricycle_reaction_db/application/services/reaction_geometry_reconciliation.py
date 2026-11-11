@@ -598,9 +598,12 @@ def _bind_participant_geometry(
             cache=cache,
             thermodynamic_property_verified=thermodynamic_property_verified,
         )
+        node_geometry_id = node_geometry.id
         existing_mapping = (
-            cache.mappings_by_node_geometry_id.get(node_geometry.id)
-            if cache is not None and node_geometry.id in cache.loaded_mappings
+            cache.mappings_by_node_geometry_id.get(node_geometry_id)
+            if cache is not None
+            and node_geometry_id is not None
+            and node_geometry_id in cache.loaded_mappings
             else session.exec(
                 select(MappedReactionNodeGeometryMapping).where(
                     MappedReactionNodeGeometryMapping.mapped_reaction_node_geometry_id

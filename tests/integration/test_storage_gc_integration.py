@@ -105,7 +105,7 @@ def test_incremental_gc_retains_available_and_deletes_orphans_and_stale_pending(
             _listed(orphan_key, base + timedelta(minutes=30)),
         ],
     )
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     settings = StorageGarbageCollectionSettings(
         _env_file=None,
         grace_period_seconds=3600,
@@ -196,7 +196,7 @@ def test_failed_gc_does_not_advance_watermark() -> None:
     partition = base.strftime("%Y/%m/%d/%H")
     key = f"uploads/{partition}/sha256/ff/orphan"
     store = _FailingStore(bucket, [_listed(key, base + timedelta(minutes=10))])
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     settings = StorageGarbageCollectionSettings(
         _env_file=None,
         grace_period_seconds=3600,

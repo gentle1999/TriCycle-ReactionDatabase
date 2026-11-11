@@ -50,12 +50,12 @@ def main() -> None:
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     settings = get_settings()
-    host = urlsplit(settings.database_url).hostname
+    host = urlsplit(settings.runtime.database_url).hostname
     for key in ("NO_PROXY", "no_proxy"):
         os.environ[key] = ",".join(
             dict.fromkeys(filter(None, [*os.getenv(key, "").split(","), host]))
         )
-    engine = create_engine(settings.database_url, pool_pre_ping=True)
+    engine = create_engine(settings.runtime.database_url, pool_pre_ping=True)
     try:
         statement = (
             select(col(LogicalReaction.id), col(LogicalReaction.project_id))

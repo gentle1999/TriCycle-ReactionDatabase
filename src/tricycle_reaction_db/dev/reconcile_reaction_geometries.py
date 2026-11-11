@@ -25,6 +25,7 @@ from tricycle_reaction_db.application.services.reaction_geometry_reconciliation 
     _reaction_geometry_predicate,
     reconcile_mapped_reaction_with_geometries,
 )
+from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
     Geometry,
     LogicalReactionParticipant,
@@ -39,11 +40,13 @@ from tricycle_reaction_db.domain.enums import (
     MappedReactionNodeRole,
 )
 
-DEFAULT_BATCH_SIZE = 100
-DEFAULT_STATEMENT_TIMEOUT_MS = 300_000
-MAX_STATEMENT_TIMEOUT_MS = 3_600_000
-DEFAULT_REACTION_TIMEOUT_SECONDS = 300.0
-MAX_REACTION_TIMEOUT_SECONDS = 86_400.0
+DEFAULT_BATCH_SIZE = get_settings().ingestion.reconcile_default_batch_size
+DEFAULT_STATEMENT_TIMEOUT_MS = get_settings().ingestion.reconcile_default_statement_timeout_ms
+MAX_STATEMENT_TIMEOUT_MS = get_settings().ingestion.reconcile_max_statement_timeout_ms
+DEFAULT_REACTION_TIMEOUT_SECONDS = (
+    get_settings().ingestion.reconcile_default_reaction_timeout_seconds
+)
+MAX_REACTION_TIMEOUT_SECONDS = get_settings().ingestion.reconcile_max_reaction_timeout_seconds
 
 
 @dataclass(slots=True)

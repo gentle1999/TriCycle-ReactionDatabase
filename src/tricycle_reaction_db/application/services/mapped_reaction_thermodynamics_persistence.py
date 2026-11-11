@@ -886,7 +886,7 @@ def enqueue_mapped_reaction_profile_refresh(
     available_at = now
     if not immediate:
         available_at += timedelta(
-            seconds=get_settings().upload_worker_profile_refresh_debounce_seconds
+            seconds=get_settings().ingestion.upload_worker_profile_refresh_debounce_seconds
         )
     session.add_all(tuple(canonical_by_id.values()))
     session.flush()

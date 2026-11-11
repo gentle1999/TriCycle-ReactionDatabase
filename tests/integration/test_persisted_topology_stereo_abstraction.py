@@ -43,7 +43,7 @@ def test_persisted_stereo_abstraction_is_a_dag() -> None:
         reconstruction_method="tests/topology-abstraction",
         reconstruction_version="1",
     )
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
 
     try:
         with Session(engine) as session:

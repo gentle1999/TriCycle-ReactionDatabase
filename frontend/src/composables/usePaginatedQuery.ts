@@ -2,8 +2,9 @@ import { keepPreviousData, useQuery, useQueryClient, type QueryKey } from "@tans
 import { watch, type ComputedRef, type Ref } from "vue";
 
 import type { Page } from "@/types";
+import { configuredInteger } from "@/envNumbers";
 
-const DEFAULT_PAGE_PREFETCH_RADIUS = 3;
+const DEFAULT_PAGE_PREFETCH_RADIUS = configuredInteger(import.meta.env.VITE_PAGE_PREFETCH_RADIUS, 3, 0);
 
 interface PaginatedQueryOptions<TPage extends Page<unknown>> {
   queryKey: ComputedRef<QueryKey>;

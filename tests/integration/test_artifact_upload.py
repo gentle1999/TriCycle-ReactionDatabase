@@ -91,7 +91,7 @@ def test_gzip_upload_tracks_artifact_and_decoded_source_identities_separately() 
     digest = sha256(payload).hexdigest()
     parsed = _parse_calculation_output(payload, FIXTURE.name)
     now = datetime.now(UTC)
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -175,7 +175,7 @@ def test_calculation_upload_persists_every_frame_and_reuses_ts_reaction(
     digest = sha256(payload).hexdigest()
     parsed = _parse_calculation_output(payload, FIXTURE.name.removesuffix(".gz"))
     now = datetime.now(UTC)
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -688,7 +688,7 @@ def test_partial_frame_parse_persists_valid_sibling_frames(
         ),
     )
     now = datetime.now(UTC)
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
 
@@ -783,7 +783,7 @@ def test_nonconverged_ts_binds_geometry_and_converged_reparse_adds_evidence() ->
     )
     nonconverged = replace(parsed, frame_records=nonconverged_records)
     now = datetime.now(UTC)
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -961,7 +961,7 @@ def test_successful_parse_with_failed_ts_inference_is_partial() -> None:
         ),
     )
     now = datetime.now(UTC)
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:

@@ -219,7 +219,7 @@ class CalculationLogWorkspace(FastMCPApp):
                         "one or more files are staged as a single upload batch."
                     ),
                     "multiple": True,
-                    "max_size": get_settings().max_upload_bytes,
+                    "max_size": get_settings().ingestion.max_upload_bytes,
                 }
                 DropZone(**drop_zone_options)
                 Text(f"Selected files: {STATE.pending.length()}")
@@ -274,8 +274,8 @@ class CalculationLogWorkspace(FastMCPApp):
         if not files:
             raise ValueError("select at least one calculation log")
         settings = get_settings()
-        if len(files) > settings.max_batch_files:
-            raise ValueError(f"select at most {settings.max_batch_files} files per batch")
+        if len(files) > settings.ingestion.max_batch_files:
+            raise ValueError(f"select at most {settings.ingestion.max_batch_files} files per batch")
 
         payloads: list[ArtifactUploadPayload] = []
         for index, file in enumerate(files):
@@ -292,7 +292,7 @@ class CalculationLogWorkspace(FastMCPApp):
                 raise ValueError(f"{filename} is missing Base64 content")
             payload = decode_base64_payload(
                 encoded,
-                maximum_bytes=settings.max_upload_bytes,
+                maximum_bytes=settings.ingestion.max_upload_bytes,
                 payload_description=f"calculation log {filename!r}",
             )
             payloads.append(

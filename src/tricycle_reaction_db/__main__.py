@@ -7,9 +7,9 @@ def main() -> None:
     settings = get_settings()
     uvicorn.run(
         "tricycle_reaction_db.api.app:app",
-        host=settings.api_host,
-        port=settings.api_port,
-        reload=settings.debug,
+        host=settings.runtime.api_host,
+        port=settings.runtime.api_port,
+        reload=settings.runtime.debug,
     )
 
 

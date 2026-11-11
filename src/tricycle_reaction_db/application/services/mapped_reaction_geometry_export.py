@@ -22,6 +22,7 @@ from tricycle_reaction_db.application.services.mapped_geometry_atom_order import
     molecule_in_atom_map_order,
     validate_geometry_atom_map_elements,
 )
+from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
     CalculationFrame,
     Geometry,
@@ -38,7 +39,6 @@ from tricycle_reaction_db.db.session import session_factory
 from tricycle_reaction_db.domain.enums import MappedReactionNodeRole
 
 logger = logging.getLogger(__name__)
-PAGE_SIZE = 64
 
 
 def _calculation_record(
@@ -190,6 +190,7 @@ async def iter_mapped_reaction_geometry_export(
     *,
     after_binding_id: UUID | None = None,
     max_records: int | None = None,
+    include_calculations: bool = True,
 ) -> AsyncIterator[bytes]:
     """Yield verified project TS mappings, optionally from a cursor with a record limit."""
 
@@ -225,7 +226,7 @@ async def iter_mapped_reaction_geometry_export(
                 col(MappedReactionNodeGeometryMapping.verified).is_(True),
             )
             .order_by(col(MappedReactionNodeGeometry.id))
-            .limit(PAGE_SIZE)
+            .limit(get_settings().mcp_export.mapped_geometry_export_page_size)
         )
         if last_binding_id is not None:
             statement = statement.where(col(MappedReactionNodeGeometry.id) > last_binding_id)
@@ -235,7 +236,7 @@ async def iter_mapped_reaction_geometry_export(
         async with session_factory() as session:
             rows = (await session.exec(statement)).all()
             geometry_ids = [geometry.id for _, _, geometry, _ in rows]
-            if geometry_ids:
+            if geometry_ids and include_calculations:
                 frames = (
                     await session.exec(
                         select(CalculationFrame)

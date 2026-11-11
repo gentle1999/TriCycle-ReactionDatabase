@@ -236,41 +236,41 @@ class QueryRateLimitMiddleware(BaseHTTPMiddleware):
         settings = get_settings()
         self._query_limiter = create_rate_limiter(
             policy="management",
-            maximum_requests=settings.query_rate_limit_requests,
-            window_seconds=settings.query_rate_limit_window_seconds,
+            maximum_requests=settings.runtime.query_rate_limit_requests,
+            window_seconds=settings.runtime.query_rate_limit_window_seconds,
             backend=getattr(settings, "rate_limit_backend", "memory"),
             redis_url=getattr(settings, "rate_limit_redis_url", None),
             key_prefix=getattr(settings, "rate_limit_key_prefix", "reaction-database"),
         )
         self._read_limiter = create_rate_limiter(
             policy="read",
-            maximum_requests=settings.read_rate_limit_requests,
-            window_seconds=settings.query_rate_limit_window_seconds,
+            maximum_requests=settings.runtime.read_rate_limit_requests,
+            window_seconds=settings.runtime.query_rate_limit_window_seconds,
             backend=getattr(settings, "rate_limit_backend", "memory"),
             redis_url=getattr(settings, "rate_limit_redis_url", None),
             key_prefix=getattr(settings, "rate_limit_key_prefix", "reaction-database"),
         )
         self._upload_limiter = create_rate_limiter(
             policy="upload",
-            maximum_requests=settings.upload_rate_limit_requests,
-            window_seconds=settings.query_rate_limit_window_seconds,
+            maximum_requests=settings.ingestion.upload_rate_limit_requests,
+            window_seconds=settings.runtime.query_rate_limit_window_seconds,
             backend=getattr(settings, "rate_limit_backend", "memory"),
             redis_url=getattr(settings, "rate_limit_redis_url", None),
             key_prefix=getattr(settings, "rate_limit_key_prefix", "reaction-database"),
         )
-        self._upload_slots = asyncio.Semaphore(settings.upload_max_concurrency)
+        self._upload_slots = asyncio.Semaphore(settings.ingestion.upload_max_concurrency)
         self._molecule_query_limiter = create_rate_limiter(
             policy="molecule-query",
-            maximum_requests=settings.molecule_query_rate_limit_requests,
-            window_seconds=settings.query_rate_limit_window_seconds,
+            maximum_requests=settings.runtime.molecule_query_rate_limit_requests,
+            window_seconds=settings.runtime.query_rate_limit_window_seconds,
             backend=getattr(settings, "rate_limit_backend", "memory"),
             redis_url=getattr(settings, "rate_limit_redis_url", None),
             key_prefix=getattr(settings, "rate_limit_key_prefix", "reaction-database"),
         )
         self._depiction_limiter = create_rate_limiter(
             policy="depiction",
-            maximum_requests=settings.depiction_rate_limit_requests,
-            window_seconds=settings.query_rate_limit_window_seconds,
+            maximum_requests=settings.runtime.depiction_rate_limit_requests,
+            window_seconds=settings.runtime.query_rate_limit_window_seconds,
             backend=getattr(settings, "rate_limit_backend", "memory"),
             redis_url=getattr(settings, "rate_limit_redis_url", None),
             key_prefix=getattr(settings, "rate_limit_key_prefix", "reaction-database"),

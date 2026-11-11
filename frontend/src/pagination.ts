@@ -1,8 +1,10 @@
+import { configuredInteger } from "./envNumbers";
+
 export const MIN_PAGE_SIZE = 1;
-export const REACTION_PAGE_SIZE_MAX = 12;
-export const CATALOG_PAGE_SIZE_MAX = 500;
-export const DEFAULT_REACTION_PAGE_SIZE = 12;
-export const DEFAULT_CATALOG_PAGE_SIZE = 50;
+export const REACTION_PAGE_SIZE_MAX = configuredInteger(import.meta.env.VITE_REACTION_PAGE_SIZE_MAX, 12, 1);
+export const CATALOG_PAGE_SIZE_MAX = configuredInteger(import.meta.env.VITE_CATALOG_PAGE_SIZE_MAX, 500, 1);
+export const DEFAULT_REACTION_PAGE_SIZE = configuredInteger(import.meta.env.VITE_DEFAULT_REACTION_PAGE_SIZE, 12, 1);
+export const DEFAULT_CATALOG_PAGE_SIZE = configuredInteger(import.meta.env.VITE_DEFAULT_CATALOG_PAGE_SIZE, 50, 1);
 
 export const REACTION_PAGE_SIZE_STORAGE_KEY = "tricycle.pagination.reactions";
 export const GEOMETRY_PAGE_SIZE_STORAGE_KEY = "tricycle.pagination.geometries";

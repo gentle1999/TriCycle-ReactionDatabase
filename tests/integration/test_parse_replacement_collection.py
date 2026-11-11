@@ -45,7 +45,7 @@ def _ingested_connection():
     )
     payload = gzip.decompress(fixture.read_bytes()) + f"\n{uuid4()}\n".encode()
     parsed = _parse_calculation_output(payload, fixture.name.removesuffix(".gz"))
-    engine = create_engine(get_settings().database_url)
+    engine = create_engine(get_settings().runtime.database_url)
     connection = engine.connect()
     outer = connection.begin()
     try:

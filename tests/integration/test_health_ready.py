@@ -35,7 +35,7 @@ async def test_ready_health_endpoint_reports_database_and_object_storage() -> No
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "ok"
-    assert payload["database"] == make_url(get_settings().database_url).database
+    assert payload["database"] == make_url(get_settings().runtime.database_url).database
     assert payload["postgresql_version"].startswith("18.")
     assert payload["rdkit_extension_version"] == "4.8.0"
     assert payload["object_storage"] == "ok"

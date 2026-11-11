@@ -11,7 +11,7 @@ class SystemService(UseCaseService):  # type: ignore[misc]
         """Return non-sensitive service metadata."""
         settings = get_settings()
         return SystemInfo(
-            name=settings.app_name,
+            name=settings.runtime.app_name,
             version=__version__,
-            environment=settings.environment,
+            environment=settings.runtime.environment,
         )

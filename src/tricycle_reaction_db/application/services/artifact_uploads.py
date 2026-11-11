@@ -18,7 +18,7 @@ import tempfile
 import threading
 import zlib
 from collections import Counter
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, MutableMapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, MutableMapping, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -178,7 +178,6 @@ from tricycle_reaction_db.db.models import (
 )
 from tricycle_reaction_db.db.session import session_factory
 from tricycle_reaction_db.db.transaction_retry import (
-    TRANSACTION_RETRY_LIMIT,
     is_transaction_conflict,
     retry_transaction,
     wait_for_transaction_retry,
@@ -245,21 +244,17 @@ logger = logging.getLogger(__name__)
 # so keep each default write transaction deliberately small. Deployments can
 # raise these limits after measuring their PostgreSQL lock-table capacity.
 # Defaults for callers that do not supply worker settings.  The durable
-# worker resolves the same limits from Settings so deployments can tune the
+# worker resolves the same limits from application settings so deployments can tune the
 # commit boundary without changing parser admission.
-PERSISTENCE_PRELOAD_BATCH_SIZE = 8
-PERSISTENCE_BATCH_FRAME_LIMIT = 256
+PERSISTENCE_PRELOAD_BATCH_SIZE = get_settings().ingestion.upload_worker_persistence_batch_files
+PERSISTENCE_BATCH_FRAME_LIMIT = get_settings().ingestion.upload_worker_persistence_frame_limit
 # MolGR reconstruction is CPU-heavy and each frame crosses a process boundary.
 # Larger chunks amortize pickle/future overhead while retaining enough tasks to
 # keep all configured workers busy across a multi-file batch.
-FRAME_CONVERSION_CHUNK_SIZE = 32
-INFERENCE_PERSIST_BATCH_SIZE = 16
 # The configured timeout covers the first 10 MiB. Above that, each additional
 # 10 MiB gets a configurable allowance. This gives large files headroom without
 # making a small malformed file hold a parser slot for an unbounded period.
-MOLOP_PARSE_TIMEOUT_REFERENCE_BYTES = 10 * 1024 * 1024
 GZIP_MAGIC = b"\x1f\x8b"
-RUSTFS_PARSE_DOWNLOAD_CHUNK_SIZE = 4 * 1024 * 1024
 
 
 def _is_no_calculation_frames_message(message: str | None) -> bool:
@@ -442,11 +437,11 @@ def _resolve_molop_process_workers(n_jobs: int) -> int:
 def molop_process_worker_count() -> int:
     """Return the effective shared MolOP process count for this service."""
 
-    return _resolve_molop_process_workers(get_settings().molop_batch_n_jobs)
+    return _resolve_molop_process_workers(get_settings().ingestion.molop_batch_n_jobs)
 
 
 def _frame_submission_limit() -> int:
-    workers = _resolve_molop_process_workers(get_settings().molop_batch_n_jobs)
+    workers = _resolve_molop_process_workers(get_settings().ingestion.molop_batch_n_jobs)
     return max(1, workers)
 
 
@@ -455,7 +450,7 @@ def _file_worker_submission_slots() -> asyncio.Semaphore:
 
     global _file_worker_slots
     loop = asyncio.get_running_loop()
-    workers = _resolve_molop_process_workers(get_settings().molop_batch_n_jobs)
+    workers = _resolve_molop_process_workers(get_settings().ingestion.molop_batch_n_jobs)
     if (
         _file_worker_slots is None
         or _file_worker_slots[0] is not loop
@@ -485,7 +480,7 @@ def _rustfs_download_submission_slots() -> asyncio.Semaphore:
 
     global _rustfs_download_slots
     loop = asyncio.get_running_loop()
-    workers = max(1, get_settings().upload_max_concurrency)
+    workers = max(1, get_settings().ingestion.upload_max_concurrency)
     if (
         _rustfs_download_slots is None
         or _rustfs_download_slots[0] is not loop
@@ -505,7 +500,7 @@ def _fast_molop_ingestion_enabled() -> bool:
     """
 
     settings = get_settings()
-    return settings.molop_parallel_frame_persistence
+    return settings.ingestion.molop_parallel_frame_persistence
 
 
 def _parsed_artifact_requires_isolated_frame_persistence(
@@ -591,7 +586,7 @@ async def warm_molop_process_pool() -> int:
     """
 
     workers = molop_process_worker_count()
-    pool = _get_molop_process_pool(get_settings().molop_batch_n_jobs)
+    pool = _get_molop_process_pool(get_settings().ingestion.molop_batch_n_jobs)
     loop = asyncio.get_running_loop()
     warmed: set[int] = set()
     for _ in range(3):
@@ -646,7 +641,7 @@ def _warm_storage_process_worker(
 async def warm_storage_process_pool() -> int:
     """Start and initialize every shared RustFS storage child."""
 
-    workers = max(1, get_settings().upload_max_concurrency)
+    workers = max(1, get_settings().ingestion.upload_max_concurrency)
     pool = _get_storage_process_pool(workers)
     settings = RustFSSettings()
     loop = asyncio.get_running_loop()
@@ -720,7 +715,7 @@ async def _run_molop_source_parser(
             input_index=0,
         )
         try:
-            process_pool = _get_molop_process_pool(get_settings().molop_batch_n_jobs)
+            process_pool = _get_molop_process_pool(get_settings().ingestion.molop_batch_n_jobs)
             loop = asyncio.get_running_loop()
             parsed, error_message = await loop.run_in_executor(
                 process_pool,
@@ -814,7 +809,7 @@ def _source_size_bytes(source: bytes | Path) -> int:
     uncompressed_size = int.from_bytes(trailer, byteorder="little", signed=False)
     if uncompressed_size == 0:
         return compressed_size
-    return min(max(compressed_size, uncompressed_size), get_settings().max_upload_bytes)
+    return min(max(compressed_size, uncompressed_size), get_settings().ingestion.max_upload_bytes)
 
 
 def _molop_file_parse_timeout_seconds(source: bytes | Path) -> float:
@@ -826,10 +821,12 @@ def _molop_file_parse_timeout_seconds(source: bytes | Path) -> float:
     """
 
     settings = get_settings()
-    size_scale = _source_size_bytes(source) / MOLOP_PARSE_TIMEOUT_REFERENCE_BYTES
+    size_scale = (
+        _source_size_bytes(source) / get_settings().ingestion.molop_parse_timeout_reference_bytes
+    )
     extra_size_scale = max(0.0, size_scale - 1.0)
-    return settings.molop_file_parse_timeout_seconds * (
-        1.0 + extra_size_scale * settings.molop_file_parse_timeout_size_multiplier
+    return settings.ingestion.molop_file_parse_timeout_seconds * (
+        1.0 + extra_size_scale * settings.ingestion.molop_file_parse_timeout_size_multiplier
     )
 
 
@@ -960,7 +957,7 @@ async def _pipeline_task_lifecycle(
     tasks: list[asyncio.Task[Any]],
     *,
     on_abort: Callable[[BaseException], Awaitable[None]] | None = None,
-) -> AsyncIterator[None]:
+) -> AsyncGenerator[None, None]:
     """Ensure file tasks cannot outlive a failed/cancelled batch request."""
 
     async def cancel_unfinished_tasks() -> None:
@@ -997,7 +994,7 @@ async def _pipeline_task_lifecycle(
 
 
 def _require_upload_size(payload: bytes) -> None:
-    _require_upload_size_impl(payload, maximum_size=get_settings().max_upload_bytes)
+    _require_upload_size_impl(payload, maximum_size=get_settings().ingestion.max_upload_bytes)
 
 
 def _inspect_upload_source(
@@ -1017,9 +1014,9 @@ def _require_batch_upload_budget(
     settings = get_settings()
     return _require_batch_upload_budget_impl(
         files,
-        maximum_upload_size=settings.max_upload_bytes,
-        maximum_batch_files=settings.max_batch_files,
-        maximum_batch_bytes=settings.max_batch_bytes,
+        maximum_upload_size=settings.ingestion.max_upload_bytes,
+        maximum_batch_files=settings.ingestion.max_batch_files,
+        maximum_batch_bytes=settings.ingestion.max_batch_bytes,
         enforce_batch_files=enforce_batch_files,
         enforce_batch_bytes=enforce_batch_bytes,
     )
@@ -1031,7 +1028,7 @@ def _parser_payload(
     *,
     max_decompressed_bytes: int | None = None,
 ) -> tuple[bytes, str | None]:
-    maximum = max_decompressed_bytes or get_settings().max_upload_bytes
+    maximum = max_decompressed_bytes or get_settings().ingestion.max_upload_bytes
     return _parser_payload_impl(payload, filename, max_decompressed_bytes=maximum)
 
 
@@ -1059,7 +1056,7 @@ def _signed_ts_endpoints(
         frame,
         vibration_position,
         infer_endpoint_stereochemistry=_infer_endpoint_stereochemistry_from_3d,
-        allow_openbabel_fallback=get_settings().ts_endpoint_openbabel_fallback,
+        allow_openbabel_fallback=get_settings().ingestion.ts_endpoint_openbabel_fallback,
     )
 
 
@@ -1272,7 +1269,7 @@ def _download_payload_worker(
 ) -> tuple[int, str]:
     """Stream one staged object to the parser spool in a storage child."""
 
-    maximum = get_settings().max_upload_bytes
+    maximum = get_settings().ingestion.max_upload_bytes
     if expected_size > maximum:
         raise ArtifactUploadError(f"uploaded artifact exceeds the {maximum}-byte limit")
     digest = sha256()
@@ -1281,7 +1278,7 @@ def _download_payload_worker(
     with destination.open("wb") as output:
         for chunk in store.iter_bytes(
             object_key,
-            chunk_size=RUSTFS_PARSE_DOWNLOAD_CHUNK_SIZE,
+            chunk_size=get_settings().storage.rustfs_parse_download_chunk_size,
         ):
             size += len(chunk)
             if size > expected_size or size > maximum:
@@ -1348,7 +1345,7 @@ def _materialize_parsed_artifacts(
     """Process deferred frames through the dedicated frame process pool."""
 
     materialized: dict[int, _ParsedArtifact] = {}
-    pool = _get_molop_process_pool(get_settings().molop_batch_n_jobs)
+    pool = _get_molop_process_pool(get_settings().ingestion.molop_batch_n_jobs)
     for parsed in parsed_artifacts:
         if parsed.frame_records:
             materialized[id(parsed)] = parsed
@@ -1438,7 +1435,7 @@ async def _process_parsed_artifact_frames(
     if parsed.frame_records:
         return parsed
     chem_file = parsed.chem_file
-    pool = _get_molop_process_pool(get_settings().molop_batch_n_jobs)
+    pool = _get_molop_process_pool(get_settings().ingestion.molop_batch_n_jobs)
     loop = asyncio.get_running_loop()
 
     frame_inputs = tuple(
@@ -1450,8 +1447,10 @@ async def _process_parsed_artifact_frames(
         if isinstance(frame, BaseCalcFrame)
     )
     frame_chunks = tuple(
-        frame_inputs[start : start + FRAME_CONVERSION_CHUNK_SIZE]
-        for start in range(0, len(frame_inputs), FRAME_CONVERSION_CHUNK_SIZE)
+        frame_inputs[start : start + get_settings().ingestion.frame_conversion_chunk_size]
+        for start in range(
+            0, len(frame_inputs), get_settings().ingestion.frame_conversion_chunk_size
+        )
     )
 
     async def process_frame_chunk(
@@ -1462,7 +1461,9 @@ async def _process_parsed_artifact_frames(
                 (_detach_frame_for_process(frame), fallback_index)
                 for frame, fallback_index in chunk
             )
-            budget = get_settings().molop_file_parse_timeout_seconds * max(1, len(chunk) / 16)
+            budget = get_settings().ingestion.molop_file_parse_timeout_seconds * max(
+                1, len(chunk) / 16
+            )
             async with asyncio.timeout(budget):
                 return await loop.run_in_executor(
                     pool,
@@ -1482,7 +1483,9 @@ async def _process_parsed_artifact_frames(
         ) -> _ProcessedFrame:
             async with submission_slots:
                 try:
-                    async with asyncio.timeout(get_settings().molop_file_parse_timeout_seconds):
+                    async with asyncio.timeout(
+                        get_settings().ingestion.molop_file_parse_timeout_seconds
+                    ):
                         return await loop.run_in_executor(
                             pool,
                             _process_frame_worker,
@@ -1695,7 +1698,7 @@ def _prepare_calculation_parser_path(
         path.write_bytes(decoded_payload)
         return str(path), source_compression
 
-    maximum = get_settings().max_upload_bytes
+    maximum = get_settings().ingestion.max_upload_bytes
     if source.stat().st_size > maximum:
         raise ArtifactUploadError(f"uploaded artifact exceeds the {maximum}-byte limit")
     parser_suffix = _safe_parser_suffix(filename)
@@ -2211,7 +2214,7 @@ def _create_pending_ingestion(
         )
         ingestion.worker_lease_id = uuid4()
         ingestion.worker_lease_expires_at = started_at + timedelta(
-            seconds=get_settings().upload_worker_lease_seconds
+            seconds=get_settings().ingestion.upload_worker_lease_seconds
         )
         if session.info.get("tricycle_fast_insert", False):
             _prepare_new_entity(session, ingestion)
@@ -2232,7 +2235,7 @@ def _create_pending_ingestion(
             ingestion.completed_at = None
             ingestion.worker_lease_id = uuid4()
             ingestion.worker_lease_expires_at = started_at + timedelta(
-                seconds=get_settings().upload_worker_lease_seconds
+                seconds=get_settings().ingestion.upload_worker_lease_seconds
             )
             ingestion.error_code = None
             ingestion.error_message = None
@@ -2285,7 +2288,7 @@ def _create_pending_ingestions(
             )
             ingestion.worker_lease_id = uuid4()
             ingestion.worker_lease_expires_at = started_by_artifact_id[artifact_id] + timedelta(
-                seconds=get_settings().upload_worker_lease_seconds
+                seconds=get_settings().ingestion.upload_worker_lease_seconds
             )
             _prepare_new_entity(session, ingestion)
         elif ingestion.status is ArtifactIngestionStatus.PENDING or (
@@ -2299,7 +2302,7 @@ def _create_pending_ingestions(
             ingestion.completed_at = None
             ingestion.worker_lease_id = uuid4()
             ingestion.worker_lease_expires_at = started_by_artifact_id[artifact_id] + timedelta(
-                seconds=get_settings().upload_worker_lease_seconds
+                seconds=get_settings().ingestion.upload_worker_lease_seconds
             )
             ingestion.error_code = None
             ingestion.error_message = None
@@ -3296,7 +3299,7 @@ def _persist_artifact_inferences_batch(
                     calculation_frame=calculation_frame,
                 )
             )
-            if len(pending_tasks) >= INFERENCE_PERSIST_BATCH_SIZE:
+            if len(pending_tasks) >= get_settings().ingestion.inference_persist_batch_size:
                 flush_pending()
     flush_pending()
 
@@ -4577,7 +4580,7 @@ class ArtifactUploadService:
                     payload=payload if isinstance(payload, bytes) else None,
                     spool_path=payload if isinstance(payload, Path) else None,
                 ),
-                maximum_size=get_settings().max_upload_bytes,
+                maximum_size=get_settings().ingestion.max_upload_bytes,
             )
         source = inspected.source
         digest = inspected.content_sha256
@@ -4651,7 +4654,9 @@ class ArtifactUploadService:
                 # session per HTTP upload makes many small files look serial;
                 # the child-local store keeps the connection warm across all
                 # upload sessions.
-                storage_pool = _get_storage_process_pool(get_settings().upload_max_concurrency)
+                storage_pool = _get_storage_process_pool(
+                    get_settings().ingestion.upload_max_concurrency
+                )
                 loop = asyncio.get_running_loop()
                 stored = await _await_cancellation_safe(
                     loop.run_in_executor(
@@ -4758,7 +4763,7 @@ class ArtifactUploadService:
                 payload=source if isinstance(source, bytes) else None,
                 spool_path=source if isinstance(source, Path) else None,
             ),
-            maximum_size=get_settings().max_upload_bytes,
+            maximum_size=get_settings().ingestion.max_upload_bytes,
         )
         prepared = await cls._prepare_upload(
             payload=source,
@@ -4801,7 +4806,9 @@ class ArtifactUploadService:
             with tempfile.TemporaryDirectory(prefix="tricycle-staged-parse-") as directory:
                 parser_source = Path(directory) / _safe_parser_suffix(artifact.original_filename)
                 async with _rustfs_download_submission_slots():
-                    storage_pool = _get_storage_process_pool(get_settings().upload_max_concurrency)
+                    storage_pool = _get_storage_process_pool(
+                        get_settings().ingestion.upload_max_concurrency
+                    )
                     loop = asyncio.get_running_loop()
                     await _await_cancellation_safe(
                         loop.run_in_executor(
@@ -4967,7 +4974,10 @@ class ArtifactUploadService:
                 remaining = [task for task in tasks if task.artifact_id not in results]
                 if not remaining:
                     return
-                if is_transaction_conflict(error) and conflict_attempt < TRANSACTION_RETRY_LIMIT:
+                if (
+                    is_transaction_conflict(error)
+                    and conflict_attempt < get_settings().ingestion.transaction_retry_limit
+                ):
                     # The failed session has closed. Retry only uncommitted
                     # files using the existing parser results and fresh lease
                     # checks; never replay an earlier committed window.
@@ -5085,7 +5095,8 @@ class ArtifactUploadService:
             )
 
         resolved_batch_files = (
-            persistence_batch_files or get_settings().upload_worker_persistence_batch_files
+            persistence_batch_files
+            or get_settings().ingestion.upload_worker_persistence_batch_files
         )
         batch_result = await cls.upload_batch(
             files=files,
@@ -5094,7 +5105,8 @@ class ArtifactUploadService:
             user_id=user_id,
             persistence_batch_files=min(resolved_batch_files, len(files)),
             persistence_frame_limit=(
-                persistence_frame_limit or get_settings().upload_worker_persistence_frame_limit
+                persistence_frame_limit
+                or get_settings().ingestion.upload_worker_persistence_frame_limit
             ),
             defer_thermodynamic_refresh=defer_thermodynamic_refresh,
             _source_atom_order_authoritative=source_atom_order_authoritative,
@@ -5326,15 +5338,15 @@ class ArtifactUploadService:
         current_chunk: list[ArtifactFile] = []
         current_bytes = 0
         for artifact in valid_artifacts:
-            if artifact.size_bytes > settings.max_batch_bytes:
+            if artifact.size_bytes > settings.ingestion.max_batch_bytes:
                 artifact_id = _require_id(artifact, label="ArtifactFile")
                 results[artifact_id] = ArtifactUploadError(
                     "artifact exceeds the configured reparse batch byte budget"
                 )
                 continue
             if current_chunk and (
-                len(current_chunk) >= settings.max_batch_files
-                or current_bytes + artifact.size_bytes > settings.max_batch_bytes
+                len(current_chunk) >= settings.ingestion.max_batch_files
+                or current_bytes + artifact.size_bytes > settings.ingestion.max_batch_bytes
             ):
                 artifact_chunks.append(current_chunk)
                 current_chunk = []
@@ -5629,7 +5641,7 @@ class ArtifactUploadService:
                     if source_inspections is not None
                     else _inspect_upload_source(
                         file,
-                        maximum_size=get_settings().max_upload_bytes,
+                        maximum_size=get_settings().ingestion.max_upload_bytes,
                     )
                 )
                 if not inspected.size_bytes:
@@ -5839,7 +5851,7 @@ class ArtifactUploadService:
                                 ingestion.error_message = None
                                 ingestion.worker_lease_id = uuid4()
                                 ingestion.worker_lease_expires_at = started_at + timedelta(
-                                    seconds=get_settings().upload_worker_lease_seconds
+                                    seconds=get_settings().ingestion.upload_worker_lease_seconds
                                 )
                                 session.add(ingestion)
                                 ingestion_status = ArtifactIngestionStatus.PENDING
@@ -6045,7 +6057,7 @@ class ArtifactUploadService:
             # A worker microbatch supplies already staged/parser-owned files;
             # it must not start an unused RustFS process pool.
             storage_pool = (
-                _get_storage_process_pool(get_settings().upload_max_concurrency)
+                _get_storage_process_pool(get_settings().ingestion.upload_max_concurrency)
                 if any(reservation.needs_storage for reservation in prepared.values())
                 else None
             )

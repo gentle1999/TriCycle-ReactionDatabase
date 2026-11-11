@@ -16,7 +16,6 @@ from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.session import dispose_engine
 
 logger = logging.getLogger(__name__)
-LEGACY_EXPORT_PURGE_INTERVAL_SECONDS = 300.0
 
 
 class UnitsTsDatasetWorker:
@@ -31,7 +30,8 @@ class UnitsTsDatasetWorker:
                 try:
                     if loop.time() >= next_legacy_export_purge:
                         next_legacy_export_purge = (
-                            loop.time() + LEGACY_EXPORT_PURGE_INTERVAL_SECONDS
+                            loop.time()
+                            + settings.mcp_export.units_ts_legacy_export_purge_interval_seconds
                         )
                         await purge_legacy_units_ts_dataset_exports()
                     await expire_units_ts_dataset_exports()
@@ -42,12 +42,14 @@ class UnitsTsDatasetWorker:
                 except Exception:
                     logger.exception("UniTS dataset worker pass failed")
                 if stop_event is None:
-                    await asyncio.sleep(settings.units_dataset_worker_poll_interval_seconds)
+                    await asyncio.sleep(
+                        settings.mcp_export.units_dataset_worker_poll_interval_seconds
+                    )
                 else:
                     with suppress(TimeoutError):
                         await asyncio.wait_for(
                             stop_event.wait(),
-                            timeout=settings.units_dataset_worker_poll_interval_seconds,
+                            timeout=settings.mcp_export.units_dataset_worker_poll_interval_seconds,
                         )
         finally:
             await dispose_engine()

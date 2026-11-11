@@ -38,9 +38,9 @@ def main() -> None:
     settings = get_settings()
     for key in ("NO_PROXY", "no_proxy"):
         os.environ[key] = ",".join(
-            filter(None, [os.getenv(key, ""), urlsplit(settings.database_url).hostname])
+            filter(None, [os.getenv(key, ""), urlsplit(settings.runtime.database_url).hostname])
         )
-    engine = create_engine(settings.database_url)
+    engine = create_engine(settings.runtime.database_url)
     backup = args.backup.open("x") if args.apply else None
     try:
         with Session(engine) as session:

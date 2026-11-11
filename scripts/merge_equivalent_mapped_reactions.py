@@ -12,24 +12,31 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from audit_mapped_reaction_atom_mappings import (
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from rdkit import Chem
+from sqlalchemy import create_engine, text
+from sqlmodel import Session, col, select
+
+from scripts.audit_mapped_reaction_atom_mappings import (
     _load_geometry_mappings,
     _load_source_frames,
     _mapping_matches_source_frame,
     _source_components_from_frame,
 )
-from rdkit import Chem
-from sqlalchemy import create_engine, text
-from sqlmodel import Session, col, select
-
 from tricycle_reaction_db.application.services.canonical_atom_mapping import (
+    ReactionComponents,
     canonical_atom_index_mapping,
     canonical_reaction_atom_map_translation,
 )
@@ -59,25 +66,45 @@ from tricycle_reaction_db.db.models import (
 from tricycle_reaction_db.domain.enums import LogicalReactionParticipantSide as Side
 
 
-def translate_maps(maps, translation):
+def translate_maps(maps: Sequence[int], translation: Mapping[int, int]) -> list[int]:
     result = [translation[int(number)] for number in maps]
     if not result or len(set(result)) != len(result) or min(result) <= 0:
         raise ValueError("map translation must preserve distinct positive labels")
     return result
 
 
-def participant_components(participants, topologies, translation=None):
-    result = {Side.REACTANT: [], Side.PRODUCT: []}
+def required_uuid(value: UUID | None, label: str) -> UUID:
+    if value is None:
+        raise ValueError(f"{label} is missing")
+    return value
+
+
+def participant_topology(
+    participant: MappedReactionParticipant, topologies: Mapping[UUID, MolecularTopology]
+) -> MolecularTopology:
+    topology_id = required_uuid(participant.concrete_topology_id, "participant topology ID")
+    return topologies[topology_id]
+
+
+def participant_components(
+    participants: Sequence[MappedReactionParticipant],
+    topologies: Mapping[UUID, MolecularTopology],
+    translation: Mapping[int, int] | None = None,
+) -> dict[Side, list[tuple[Chem.Mol, list[int]]]]:
+    result: dict[Side, list[tuple[Chem.Mol, list[int]]]] = {
+        Side.REACTANT: [],
+        Side.PRODUCT: [],
+    }
     for participant in participants:
         maps = list(participant.atom_map_numbers)
         if translation is not None:
             maps = translate_maps(maps, translation)
-        result[participant.side].append((topologies[participant.concrete_topology_id].mol, maps))
+        result[participant.side].append((participant_topology(participant, topologies).mol, maps))
     return result
 
 
-def without_stereo(components):
-    result = {}
+def without_stereo(components: ReactionComponents) -> dict[Side, list[tuple[Chem.Mol, list[int]]]]:
+    result: dict[Side, list[tuple[Chem.Mol, list[int]]]] = {}
     for side, entries in components.items():
         result[side] = []
         for molecule, maps in entries:
@@ -87,7 +114,9 @@ def without_stereo(components):
     return result
 
 
-def equivalent_geometry_labels(first, second, components):
+def equivalent_geometry_labels(
+    first: Sequence[int], second: Sequence[int], components: ReactionComponents
+) -> bool:
     """Accept only a simultaneous automorphism of both labelled stereo graphs.
 
     An independent symmetry match on each endpoint would discard the reaction's
@@ -105,7 +134,7 @@ def equivalent_geometry_labels(first, second, components):
     return serialize_reaction_components(translated) == serialize_reaction_components(components)
 
 
-def archive_group(session, ids):
+def archive_group(session: Session, ids: Sequence[UUID]) -> dict[str, Sequence[Any]]:
     params = {"ids": list(ids)}
     predicate = "mapped_reaction_id=any(cast(:ids as uuid[]))"
     nodes = f"select id from mapped_reaction_node where {predicate}"
@@ -135,7 +164,12 @@ def archive_group(session, ids):
     }
 
 
-def merge_group(session, group, backup_dir, apply):
+def merge_group(
+    session: Session,
+    group: Mapping[str, Any],
+    backup_dir: Path,
+    apply: bool,
+) -> dict[str, Any]:
     logical_id = UUID(group["logical_reaction_id"])
     ids = [UUID(value) for value in group["mapped_reaction_ids"]]
     derived = group.get("mode") == "derived-variant"
@@ -147,7 +181,7 @@ def merge_group(session, group, backup_dir, apply):
     reactions = session.exec(
         select(MappedReaction)
         .where(col(MappedReaction.id).in_(ids))
-        .order_by(MappedReaction.id)
+        .order_by(col(MappedReaction.id))
         .with_for_update()
     ).all()
     if len(reactions) == 1:
@@ -163,30 +197,35 @@ def merge_group(session, group, backup_dir, apply):
         .where(col(MappedReactionParticipant.mapped_reaction_id).in_(ids))
         .with_for_update()
     ).all()
-    by_reaction = defaultdict(list)
-    topologies = {}
+    by_reaction: defaultdict[UUID, list[MappedReactionParticipant]] = defaultdict(list)
+    topologies: dict[UUID, MolecularTopology] = {}
     for p in participants:
-        by_reaction[p.mapped_reaction_id].append(p)
-        if p.concrete_topology_id not in topologies:
-            topologies[p.concrete_topology_id] = session.get(
-                MolecularTopology, p.concrete_topology_id
-            )
+        by_reaction[required_uuid(p.mapped_reaction_id, "participant reaction ID")].append(p)
+        topology_id = required_uuid(p.concrete_topology_id, "participant topology ID")
+        if topology_id not in topologies:
+            topology = session.get(MolecularTopology, topology_id)
+            if topology is None:
+                raise ValueError("participant topology is missing")
+            topologies[topology_id] = topology
     identities = {
-        r.id: canonical_reaction_identity(participant_components(by_reaction[r.id], topologies))
+        required_uuid(r.id, "reaction ID"): canonical_reaction_identity(
+            participant_components(by_reaction[required_uuid(r.id, "reaction ID")], topologies)
+        )
         for r in reactions
     }
     if derived:
         target = next(r for r in reactions if str(r.id) == group["target_id"])
-        if identities[target.id].smiles != group["canonical_smiles"]:
+        target_id = required_uuid(target.id, "target reaction ID")
+        if identities[target_id].smiles != group["canonical_smiles"]:
             raise ValueError("selected observed or retained reaction changed since audit")
         variant_keys = {
             derived_reaction_variant_key(
                 {
                     (p.side, p.template_index): (
-                        topologies[p.concrete_topology_id].mol,
+                        participant_topology(p, topologies).mol,
                         p.atom_map_numbers,
                     )
-                    for p in by_reaction[r.id]
+                    for p in by_reaction[required_uuid(r.id, "reaction ID")]
                 }
             )
             for r in reactions
@@ -195,7 +234,7 @@ def merge_group(session, group, backup_dir, apply):
             raise ValueError(
                 "derived candidates differ in endpoint stereo or connectivity correspondence"
             )
-        retired_ids = [r.id for r in reactions if r.id != target.id]
+        retired_ids = [required_uuid(r.id, "reaction ID") for r in reactions if r.id != target_id]
         # Any independent source, even an unfinished inference, protects its row.
         if (
             session.exec(
@@ -213,23 +252,25 @@ def merge_group(session, group, backup_dir, apply):
             reactions,
             key=lambda r: (r.mapped_reaction_smiles != group["canonical_smiles"], str(r.id)),
         )
+        target_id = required_uuid(target.id, "target reaction ID")
     translations = {rid: identity.source_map_to_canonical for rid, identity in identities.items()}
     target_components = participant_components(
-        by_reaction[target.id], topologies, translations[target.id]
+        by_reaction[target_id], topologies, translations[target_id]
     )
     if derived:
         for reaction in reactions:
-            if reaction.id == target.id:
+            reaction_id = required_uuid(reaction.id, "reaction ID")
+            if reaction_id == target_id:
                 continue
             transfer = canonical_reaction_atom_map_translation(
-                participant_components(by_reaction[reaction.id], topologies),
+                participant_components(by_reaction[reaction_id], topologies),
                 target_components,
                 include_stereochemistry=False,
             )
             if transfer is None:
                 raise ValueError("derived candidate changes full atom correspondence")
-            translations[reaction.id] = transfer.source_to_target
-    target_participants = {p.logical_reaction_participant_id: p for p in by_reaction[target.id]}
+            translations[reaction_id] = transfer.source_to_target
+    target_participants = {p.logical_reaction_participant_id: p for p in by_reaction[target_id]}
     participant_targets = {}
     participant_maps = {}
     participant_smiles = {}
@@ -240,19 +281,22 @@ def merge_group(session, group, backup_dir, apply):
             counterpart.template_index,
         ):
             raise ValueError("participant slot mismatch")
-        maps = translate_maps(p.atom_map_numbers, translations[p.mapped_reaction_id])
-        smiles = mapped_smiles_for_topology(topologies[p.concrete_topology_id], maps)
+        participant_reaction_id = required_uuid(p.mapped_reaction_id, "participant reaction ID")
+        source_topology = participant_topology(p, topologies)
+        counterpart_topology = participant_topology(counterpart, topologies)
+        maps = translate_maps(p.atom_map_numbers, translations[participant_reaction_id])
+        smiles = mapped_smiles_for_topology(source_topology, maps)
         expected = mapped_smiles_for_topology(
-            topologies[counterpart.concrete_topology_id],
-            translate_maps(counterpart.atom_map_numbers, translations[target.id]),
+            counterpart_topology,
+            translate_maps(counterpart.atom_map_numbers, translations[target_id]),
         )
         if smiles != expected:
-            if not derived or p.mapped_reaction_id == target.id:
+            if not derived or participant_reaction_id == target_id:
                 raise ValueError("translated participant graph differs from target slot")
             if (
                 canonical_atom_index_mapping(
-                    topologies[p.concrete_topology_id].mol,
-                    topologies[counterpart.concrete_topology_id].mol,
+                    source_topology.mol,
+                    counterpart_topology.mol,
                 )
                 is None
             ):
@@ -270,13 +314,13 @@ def merge_group(session, group, backup_dir, apply):
         match = target_nodes.get(n.node_key)
         if match is None or (match.role, match.node_index) != (n.role, n.node_index):
             raise ValueError("reaction path node differs")
-        node_targets[n.id] = match.id
+        node_targets[required_uuid(n.id, "node ID")] = required_uuid(match.id, "target node ID")
     edges = session.exec(
         select(MappedReactionEdge).where(col(MappedReactionEdge.mapped_reaction_id).in_(ids))
     ).all()
     edge_shapes = defaultdict(set)
     for edge in edges:
-        edge_shapes[edge.mapped_reaction_id].add(
+        edge_shapes[required_uuid(edge.mapped_reaction_id, "edge reaction ID")].add(
             (
                 edge.edge_key,
                 edge.edge_kind,
@@ -287,7 +331,9 @@ def merge_group(session, group, backup_dir, apply):
                 else None,
             )
         )
-    if any(edge_shapes[r.id] != edge_shapes[target.id] for r in reactions):
+    if any(
+        edge_shapes[required_uuid(r.id, "reaction ID")] != edge_shapes[target_id] for r in reactions
+    ):
         raise ValueError("reaction path edges differ")
     # Protected endpoint records are read only; no endpoint rebuild is called.
     inferences = session.exec(
@@ -302,10 +348,12 @@ def merge_group(session, group, backup_dir, apply):
         raise ValueError("inference without complete succeeded source frame")
     for f in [frame for values in frames.values() for frame in values]:
         for endpoint in f.endpoints:
-            if endpoint.topology_id not in topologies:
-                topologies[endpoint.topology_id] = session.get(
-                    MolecularTopology, endpoint.topology_id
-                )
+            topology_id = required_uuid(endpoint.topology_id, "endpoint topology ID")
+            if topology_id not in topologies:
+                topology = session.get(MolecularTopology, topology_id)
+                if topology is None:
+                    raise ValueError("endpoint topology is missing")
+                topologies[topology_id] = topology
     rows = [row for row in _load_geometry_mappings(session, [logical_id]) if row.reaction_id in ids]
     buckets = defaultdict(list)
     for row in rows:
@@ -423,8 +471,8 @@ def merge_group(session, group, backup_dir, apply):
                 None,
             )
             if selected is None:
-                participant = next(p for p in by_reaction[target.id] if p.id == key[2])
-                topology = topologies[participant.concrete_topology_id]
+                participant = next(p for p in by_reaction[target_id] if p.id == key[2])
+                topology = participant_topology(participant, topologies)
                 witness = canonical_atom_index_mapping(keep.geometry.mol, topology.mol)
                 if witness is not None:
                     candidate = [participant_maps[participant.id][index] for index in witness]
@@ -442,15 +490,15 @@ def merge_group(session, group, backup_dir, apply):
         raise ValueError("a source inference has no preserved TS geometry binding")
     backup = archive_group(session, ids)
     # All validations have completed. Update only labels and reaction ownership.
-    for p in by_reaction[target.id]:
+    for p in by_reaction[target_id]:
         p.atom_map_numbers = participant_maps[p.id]
         p.mapped_smiles = participant_smiles[p.id]
         session.add(p)
     target.mapped_reaction_smiles = group["canonical_smiles"]
     target.mapping_hash = sha256(target.mapped_reaction_smiles.encode()).hexdigest()
-    target.normalization_metadata = identities[target.id].normalization_metadata()
+    target.normalization_metadata = identities[target_id].normalization_metadata()
     session.add(target)
-    used_coordinates = defaultdict(set)
+    used_coordinates: defaultdict[tuple[Any, Any], set[int]] = defaultdict(set)
     primary_components = set()
     # Keep existing target indices first; moved rows get fresh indices.
     plans.sort(
@@ -460,7 +508,7 @@ def merge_group(session, group, backup_dir, apply):
             str(item[1].binding.id),
         )
     )
-    discarded = []
+    discarded: list[UUID | None] = []
     for key, keep, members, maps, smiles in plans:
         binding = keep.binding
         component = (key[0], binding.component_key)
@@ -475,8 +523,11 @@ def merge_group(session, group, backup_dir, apply):
         binding.coordinate_index = coordinate
         binding.is_primary = component not in primary_components
         primary_components.add(component)
-        keep.mapping.geometry_atom_map_numbers = maps
-        keep.mapping.mapped_smiles = smiles
+        mapping = keep.mapping
+        if mapping is None:
+            raise ValueError("missing coordinate mapping")
+        mapping.geometry_atom_map_numbers = maps
+        mapping.mapped_smiles = smiles
         discarded.extend(row.binding.id for row in members if row is not keep)
     # Clear old primary flags first, avoiding immediate unique-index conflicts.
     session.execute(
@@ -507,11 +558,13 @@ def merge_group(session, group, backup_dir, apply):
                 "id": b.id,
             },
         )
+        if keep.mapping is None:
+            raise ValueError("missing coordinate mapping")
         session.add(keep.mapping)
     for item in inferences:
         settings = dict(item.inference_settings or {})
         settings.update(
-            source_atom_map_numbers=frame_maps[item.id],
+            source_atom_map_numbers=frame_maps[required_uuid(item.id, "inference ID")],
             canonical_mapped_reaction_smiles=target.mapped_reaction_smiles,
             reaction_index_policy=REACTION_INDEX_POLICY,
         )
@@ -569,7 +622,7 @@ def merge_group(session, group, backup_dir, apply):
     return report
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--audit", type=Path, required=True)
     parser.add_argument("--backup-dir", type=Path, required=True)
@@ -584,19 +637,21 @@ def main():
                 None,
                 [
                     os.environ.get(key, ""),
-                    urlsplit(settings.database_url).hostname,
-                    urlsplit(settings.rustfs_endpoint_url).hostname,
+                    urlsplit(settings.runtime.database_url).hostname,
+                    urlsplit(settings.storage.rustfs_endpoint_url).hostname,
                 ],
             )
         )
-    engine = create_engine(settings.database_url)
+    engine = create_engine(settings.runtime.database_url)
     groups = json.loads(args.audit.read_text())["duplicate_groups"]
     args.backup_dir.mkdir(parents=True, exist_ok=True)
     with args.report.open("a") as output:
         for i, group in enumerate(groups[: args.limit]):
             with Session(engine, autoflush=False) as session:
                 try:
-                    result = merge_group(session, group, args.backup_dir, args.apply)
+                    result: dict[str, Any] = merge_group(
+                        session, group, args.backup_dir, args.apply
+                    )
                 except Exception as exc:
                     session.rollback()
                     result = {"status": "blocked", "error": str(exc).split("[SQL:")[0][:1000]}

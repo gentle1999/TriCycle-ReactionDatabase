@@ -10,6 +10,7 @@ from uuid import UUID
 import pytest
 from mcp.types import TextContent
 
+from tests.config_helpers import copied_application_settings
 from tricycle_reaction_db.api import mcp as mcp_module
 from tricycle_reaction_db.api import mcp_apps
 from tricycle_reaction_db.api.mcp import QueryGuardMiddleware, _mcp_success, mcp_server
@@ -500,8 +501,10 @@ def test_mcp_artifact_download_still_verifies_integrity(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("include_calculations", [None, True, False])
 async def test_mcp_transition_state_geometry_export_is_project_scoped_and_paginated(
     monkeypatch: pytest.MonkeyPatch,
+    include_calculations: bool | None,
 ) -> None:
     project_id = UUID("00000000-0000-7000-8000-000000000798")
     first_binding_id = "00000000-0000-7000-8000-000000000797"
@@ -520,8 +523,14 @@ async def test_mcp_transition_state_geometry_export_is_project_scoped_and_pagina
         *,
         after_binding_id: UUID | None,
         max_records: int | None,
+        include_calculations: bool,
     ) -> AsyncIterator[bytes]:
-        observed["page"] = (requested_project_id, after_binding_id, max_records)
+        observed["page"] = (
+            requested_project_id,
+            after_binding_id,
+            max_records,
+            include_calculations,
+        )
         for binding_id in (first_binding_id, second_binding_id):
             yield json.dumps(
                 {
@@ -543,7 +552,15 @@ async def test_mcp_transition_state_geometry_export_is_project_scoped_and_pagina
 
     result = await _call_as_development_user(
         "export_mapped_reaction_transition_state_geometries",
-        {"project_id": str(project_id), "limit": 1},
+        {
+            "project_id": str(project_id),
+            "limit": 1,
+            **(
+                {}
+                if include_calculations is None
+                else {"include_calculations": include_calculations}
+            ),
+        },
     )
 
     assert result["success"] is True
@@ -555,7 +572,53 @@ async def test_mcp_transition_state_geometry_export_is_project_scoped_and_pagina
         project_id,
         mcp_module.ProjectPermission.ARTIFACT_DOWNLOAD,
     )
-    assert observed["page"] == (project_id, None, 2)
+    expected = True if include_calculations is None else include_calculations
+    assert observed["page"] == (project_id, None, 2, expected)
+    assert result["data"]["include_calculations"] is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget, fits", [(1024, False), (2048, True)])
+async def test_mcp_transition_state_geometry_export_uses_configured_byte_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    budget: int,
+    fits: bool,
+) -> None:
+    project_id = UUID("00000000-0000-7000-8000-000000000798")
+
+    async def require_permission(*args: Any) -> None:
+        pass
+
+    async def export_records(*args: Any, **kwargs: Any) -> AsyncIterator[bytes]:
+        yield json.dumps(
+            {
+                "value": {
+                    "geometry": {"geometry_binding_id": str(project_id)},
+                    "rdkit_mol": {"value": "x" * 1400},
+                }
+            }
+        ).encode()
+
+    settings = copied_application_settings(
+        mcp_module.get_settings(), mcp_export={"mcp_ts_geometry_export_max_bytes": budget}
+    )
+    monkeypatch.setattr(mcp_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        mcp_module.AuthorizationService,
+        "require_project_permission",
+        staticmethod(require_permission),
+    )
+    monkeypatch.setattr(mcp_module, "iter_mapped_reaction_geometry_export", export_records)
+
+    result = await _call_as_development_user(
+        "export_mapped_reaction_transition_state_geometries",
+        {"project_id": str(project_id)},
+    )
+    assert result["success"] is fits
+    if fits:
+        assert len(result["data"]["records"]) == 1
+    else:
+        assert result["error"]["code"] == "payload_too_large"
 
 
 @pytest.mark.asyncio

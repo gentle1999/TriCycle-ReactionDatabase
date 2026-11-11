@@ -142,7 +142,7 @@ async def _delete_lock_test_graph(
 @pytest.mark.asyncio
 async def test_enqueue_generation_does_not_block_on_source_foreign_key_lock() -> None:
     """Profile/source FK checks must not deadlock a generation lock upgrade."""
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     organization_id, project_id, logical_reaction_id, mapped_reaction_id = _create_lock_test_graph(
         engine
     )
@@ -173,7 +173,7 @@ async def test_profile_calculation_does_not_hold_upload_generation_lock(
 ) -> None:
     """A source write can advance a generation while profile calculation is paused."""
 
-    sync_engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    sync_engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     organization_id, project_id, logical_reaction_id, mapped_reaction_id = _create_lock_test_graph(
         sync_engine
     )
@@ -279,7 +279,7 @@ async def test_profile_calculation_does_not_hold_upload_generation_lock(
 async def test_profile_refresh_replaces_stale_rows_and_coalesces_generations() -> None:
     """Queued refreshes replace stale profiles and materialize the newest generation."""
 
-    sync_engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    sync_engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     sample: tuple[object, ...] | None = None
     mapped_reaction_id: UUID | None = None
     old_profile_id: UUID | None = None

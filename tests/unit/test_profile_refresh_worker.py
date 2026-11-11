@@ -1,14 +1,19 @@
 import asyncio
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
 
+from tests.config_helpers import application_settings, copied_application_settings
 from tricycle_reaction_db.application.services.thermodynamic_profile_recovery import (
     ProfileDependencyAudit,
 )
+from tricycle_reaction_db.core.config import ApplicationSettings
 from tricycle_reaction_db.dev import profile_refresh_worker as worker
+
+
+def _settings(**domains: dict[str, object]) -> ApplicationSettings:
+    return copied_application_settings(application_settings(_env_file=None), **domains)
 
 
 @pytest.mark.asyncio
@@ -53,10 +58,12 @@ async def test_worker_audits_without_queue_and_bounds_draining(monkeypatch, fail
     monkeypatch.setattr(
         worker,
         "get_settings",
-        lambda: SimpleNamespace(
-            profile_refresh_worker_audit_batch_size=256,
-            upload_worker_profile_refresh_batch_size=32,
-            profile_refresh_worker_poll_interval_seconds=0.001,
+        lambda: _settings(
+            ingestion={
+                "profile_refresh_worker_audit_batch_size": 256,
+                "upload_worker_profile_refresh_batch_size": 32,
+                "profile_refresh_worker_poll_interval_seconds": 0.001,
+            }
         ),
     )
     await worker.ThermodynamicProfileRefreshWorker().run(stop)

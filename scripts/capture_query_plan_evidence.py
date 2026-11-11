@@ -189,7 +189,7 @@ def capture_query_plan_evidence(
     max_seq_scan_rows: int,
 ) -> dict[str, object]:
     settings = get_settings()
-    engine = create_engine(settings.database_url, pool_pre_ping=True)
+    engine = create_engine(settings.runtime.database_url, pool_pre_ping=True)
     try:
         with engine.connect() as connection:
             database_info = connection.execute(

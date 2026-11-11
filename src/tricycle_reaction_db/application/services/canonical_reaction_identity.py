@@ -29,7 +29,10 @@ def derived_reaction_variant_key(
     Direct TS ingestion still uses the strict stereo reaction identity below.
     """
     endpoint_keys = []
-    connectivity = {Side.REACTANT: [], Side.PRODUCT: []}
+    connectivity: dict[Side, list[tuple[Chem.Mol, Sequence[int]]]] = {
+        Side.REACTANT: [],
+        Side.PRODUCT: [],
+    }
     for (side, index), (molecule, maps) in components.items():
         projection = _canonical_smiles(
             molecule, include_stereochemistry=True, preserve_assigned_stereo=True
@@ -88,8 +91,8 @@ def _ranking_projection(molecule: Chem.Mol) -> Chem.Mol:
         atom.SetAtomMapNum(atom.GetIdx() + 1)
     smiles = serialize_molecule_smiles(labelled, preserve_atom_maps=True, all_hs_explicit=True)
     parser = Chem.SmilesParserParams()
-    parser.removeHs = False
-    parser.sanitize = False
+    parser.removeHs = False  # type: ignore[assignment]  # RDKit stub mistypes writable flags.
+    parser.sanitize = False  # type: ignore[assignment]
     parsed = Chem.MolFromSmiles(smiles, parser)
     if parsed is None:
         raise ValueError("reaction ranking requires a lossless stereo projection")

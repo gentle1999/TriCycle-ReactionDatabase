@@ -11,6 +11,7 @@ import pytest
 from rdkit import Chem
 from rdkit.Chem import rdChemReactions
 
+from tests.config_helpers import application_settings
 from tricycle_reaction_db.application.services import artifact_uploads, rdkit_graph_matching
 from tricycle_reaction_db.application.services.artifact_upload_types import (
     _FailedInference,
@@ -21,7 +22,6 @@ from tricycle_reaction_db.application.services.rdkit_graph_matching import (
     get_substruct_matches,
 )
 from tricycle_reaction_db.core.chemistry_config import INVERSION_LABILE_RULES
-from tricycle_reaction_db.core.config import Settings
 from tricycle_reaction_db.ingestion.normalization import (
     clear_inversion_labile_atom_chirality,
     serialize_molecule_smiles,
@@ -104,11 +104,13 @@ def close_shared_molop_pool_after_test() -> Iterator[None]:
 async def test_real_segmented_and_large_gaussian_files_run_through_shared_frame_pipeline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = Settings(
+    settings = application_settings(
         _env_file=None,
-        molop_batch_n_jobs=2,
-        molop_file_parse_timeout_seconds=60.0,
-        molop_file_parse_timeout_size_multiplier=1.5,
+        ingestion={
+            "molop_batch_n_jobs": 2,
+            "molop_file_parse_timeout_seconds": 60.0,
+            "molop_file_parse_timeout_size_multiplier": 1.5,
+        },
     )
     monkeypatch.setattr(artifact_uploads, "get_settings", lambda: settings)
 
@@ -179,11 +181,13 @@ async def test_real_segmented_and_large_gaussian_files_run_through_shared_frame_
 async def test_additional_real_world_sources_keep_frames_segments_and_ts_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = Settings(
+    settings = application_settings(
         _env_file=None,
-        molop_batch_n_jobs=2,
-        molop_file_parse_timeout_seconds=60.0,
-        molop_file_parse_timeout_size_multiplier=1.5,
+        ingestion={
+            "molop_batch_n_jobs": 2,
+            "molop_file_parse_timeout_seconds": 60.0,
+            "molop_file_parse_timeout_size_multiplier": 1.5,
+        },
     )
     monkeypatch.setattr(artifact_uploads, "get_settings", lambda: settings)
     manifest = json.loads(FIXTURE_MANIFEST.read_text(encoding="utf-8"))

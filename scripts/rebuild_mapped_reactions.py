@@ -115,7 +115,7 @@ def _save(path: Path, value: dict[str, Any]) -> None:
 
 def _configure_backend_access() -> None:
     hosts = {
-        urlsplit(get_settings().database_url).hostname,
+        urlsplit(get_settings().runtime.database_url).hostname,
         urlsplit(RustFSSettings().endpoint_url).hostname,
     }
     for key in ("NO_PROXY", "no_proxy"):
@@ -995,7 +995,7 @@ def run(args: argparse.Namespace) -> int:
     logical_reaction_ids: tuple[UUID, ...] | None = args.logical_reaction_ids
     retire_scoped_logicals: bool = args.retire_scoped_logicals
     engine = create_engine(
-        get_settings().database_url,
+        get_settings().runtime.database_url,
         connect_args={
             "connect_timeout": 10,
             "options": "-c lock_timeout=5000 -c statement_timeout=300000",

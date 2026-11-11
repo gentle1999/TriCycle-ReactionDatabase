@@ -55,7 +55,7 @@ def test_real_world_large_ts_endpoint_builds_hash_scoped_stereo_dag(
     assert record.topology.atom_count == 78
     assert record.topology.stereo_agnostic_graph_hash is not None
 
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = engine.connect()
     transaction = connection.begin()
     try:

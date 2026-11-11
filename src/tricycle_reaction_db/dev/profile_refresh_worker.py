@@ -8,9 +8,11 @@ from contextlib import suppress
 from typing import cast
 from uuid import UUID
 
+from sqlalchemy.orm import Session as SASession
 from sqlmodel import Session
 
 from tricycle_reaction_db.application.services.thermodynamic_profile_recovery import (
+    ProfileDependencyAudit,
     recover_profile_refresh_dependencies,
 )
 from tricycle_reaction_db.application.services.thermodynamic_profile_refresh import (
@@ -39,15 +41,19 @@ class ThermodynamicProfileRefreshWorker:
             while stop_event is None or not stop_event.is_set():
                 try:
                     async with session_factory() as session:
-                        audit = await session.run_sync(
-                            lambda sync_session, audit_cursor=cursor: (
-                                recover_profile_refresh_dependencies(
-                                    cast(Session, sync_session),
-                                    after_id=audit_cursor,
-                                    batch_size=settings.profile_refresh_worker_audit_batch_size,
-                                )
+                        audit_cursor = cursor
+
+                        def audit_page(
+                            sync_session: SASession,
+                            after_id: UUID | None = audit_cursor,
+                        ) -> ProfileDependencyAudit:
+                            return recover_profile_refresh_dependencies(
+                                cast(Session, sync_session),
+                                after_id=after_id,
+                                batch_size=settings.ingestion.profile_refresh_worker_audit_batch_size,
                             )
-                        )
+
+                        audit = await session.run_sync(audit_page)
                         await session.commit()
                     cursor = audit.next_cursor
                     scanned_in_cycle += audit.scanned
@@ -67,19 +73,21 @@ class ThermodynamicProfileRefreshWorker:
                 refreshed = await refresh_pending_mapped_reaction_profiles(
                     # Bound queue draining so continuous imports cannot starve
                     # the next dependency-audit page or worker shutdown.
-                    limit=settings.upload_worker_profile_refresh_batch_size * 4,
+                    limit=settings.ingestion.upload_worker_profile_refresh_batch_size * 4,
                     allow_while_busy=False,
                     reason="profile-refresh-worker",
                 )
                 if not refreshed:
                     logger.warning("profile refresh pass failed; retrying after poll interval")
                 if stop_event is None:
-                    await asyncio.sleep(settings.profile_refresh_worker_poll_interval_seconds)
+                    await asyncio.sleep(
+                        settings.ingestion.profile_refresh_worker_poll_interval_seconds
+                    )
                 else:
                     with suppress(TimeoutError):
                         await asyncio.wait_for(
                             stop_event.wait(),
-                            timeout=settings.profile_refresh_worker_poll_interval_seconds,
+                            timeout=settings.ingestion.profile_refresh_worker_poll_interval_seconds,
                         )
         finally:
             await dispose_engine()

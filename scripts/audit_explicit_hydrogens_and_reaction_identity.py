@@ -41,7 +41,9 @@ def main() -> None:
     reaction_reindex_candidates: list[dict[str, object]] = []
     reaction_ids_by_canonical_smiles: dict[str, list[str]] = {}
     params = {"project": args.project_id}
-    engine = create_engine(get_settings().database_url, connect_args={"connect_timeout": 10})
+    engine = create_engine(
+        get_settings().runtime.database_url, connect_args={"connect_timeout": 10}
+    )
     with engine.connect() as connection:
         connection.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
         for table, query, ids in (

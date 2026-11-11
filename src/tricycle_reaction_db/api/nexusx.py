@@ -39,7 +39,7 @@ from tricycle_reaction_db.core.config import get_settings
 settings = get_settings()
 
 config = UseCaseAppConfig(
-    name=settings.nexusx_app_name,
+    name=settings.runtime.nexusx_app_name,
     description="Topology-first cycloaddition reaction calculation database",
     services=[
         SystemService,
@@ -69,7 +69,7 @@ config = UseCaseAppConfig(
 )
 
 playground_config = UseCaseAppConfig(
-    name=settings.nexusx_playground_name,
+    name=settings.runtime.nexusx_playground_name,
     description="Small read-only GraphQL browser with direct-list results",
     services=[
         SystemService,

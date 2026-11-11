@@ -23,7 +23,7 @@ from sqlalchemy import and_, delete, or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import col, select
 
-from tricycle_reaction_db.core.config import Settings, get_settings
+from tricycle_reaction_db.core.config import ApplicationSettings, get_settings
 from tricycle_reaction_db.core.tls import verified_tls_context
 from tricycle_reaction_db.db.models import (
     AuthSession,
@@ -83,9 +83,6 @@ _request_context_active: ContextVar[bool] = ContextVar(
 )
 _oidc_metadata_cache: dict[str, tuple[datetime, dict[str, str]]] = {}
 _oidc_metadata_locks: dict[str, asyncio.Lock] = {}
-_OIDC_METADATA_TTL = timedelta(minutes=5)
-_SESSION_LAST_SEEN_INTERVAL = timedelta(minutes=5)
-_MCP_TOKEN_LAST_USED_INTERVAL = timedelta(minutes=5)
 
 
 def current_principal() -> AuthenticatedPrincipal | None:
@@ -130,14 +127,18 @@ def _jwk_client(url: str, ca_bundle: str | None) -> PyJWKClient:
     )
 
 
-def _decode_oidc_token(token: str, settings: Settings) -> dict[str, Any]:
-    if not settings.oidc_jwks_url or not settings.oidc_audience or not settings.oidc_issuer:
+def _decode_oidc_token(token: str, settings: ApplicationSettings) -> dict[str, Any]:
+    if (
+        not settings.identity.oidc_jwks_url
+        or not settings.identity.oidc_audience
+        or not settings.identity.oidc_issuer
+    ):
         raise AuthenticationError("OIDC configuration is incomplete")
     try:
         key = (
             _jwk_client(
-                settings.oidc_jwks_url,
-                settings.oidc_ca_bundle,
+                settings.identity.oidc_jwks_url,
+                settings.identity.oidc_ca_bundle,
             )
             .get_signing_key_from_jwt(token)
             .key
@@ -145,9 +146,9 @@ def _decode_oidc_token(token: str, settings: Settings) -> dict[str, Any]:
         claims = jwt.decode(
             token,
             key=key,
-            algorithms=[settings.oidc_algorithm],
-            audience=settings.oidc_audience,
-            issuer=settings.oidc_issuer,
+            algorithms=[settings.identity.oidc_algorithm],
+            audience=settings.identity.oidc_audience,
+            issuer=settings.identity.oidc_issuer,
             options={"require": ["exp", "iat", "iss", "sub", "aud"]},
         )
     except PyJWTError as error:
@@ -155,17 +156,17 @@ def _decode_oidc_token(token: str, settings: Settings) -> dict[str, Any]:
     return dict(claims)
 
 
-def _validated_oidc_metadata(payload: object, settings: Settings) -> dict[str, str]:
+def _validated_oidc_metadata(payload: object, settings: ApplicationSettings) -> dict[str, str]:
     if not isinstance(payload, dict):
         raise AuthenticationError("OIDC discovery is not an object")
-    issuer = settings.oidc_issuer.rstrip("/") if settings.oidc_issuer else None
+    issuer = settings.identity.oidc_issuer.rstrip("/") if settings.identity.oidc_issuer else None
     if payload.get("issuer") != issuer:
         raise AuthenticationError("OIDC discovery issuer does not match configuration")
     required = ("authorization_endpoint", "token_endpoint")
     if not all(isinstance(payload.get(key), str) for key in required):
         raise AuthenticationError("OIDC discovery is incomplete")
     metadata = {key: str(value) for key, value in payload.items() if isinstance(value, str)}
-    if settings.environment == "production":
+    if settings.runtime.environment == "production":
         methods = payload.get("code_challenge_methods_supported")
         if not isinstance(methods, list) or "S256" not in methods:
             raise AuthenticationError("OIDC provider does not advertise PKCE S256")
@@ -253,19 +254,22 @@ async def _provision_oidc_principal(
             if row is None:
                 settings = get_settings()
                 bootstrap_user = (
-                    await session.get(UserAccount, settings.oidc_bootstrap_user_id)
-                    if settings.oidc_bootstrap_user_id is not None
+                    await session.get(UserAccount, settings.identity.oidc_bootstrap_user_id)
+                    if settings.identity.oidc_bootstrap_user_id is not None
                     else None
                 )
-                bootstrap_subject_matches = settings.oidc_bootstrap_subject == subject
+                bootstrap_subject_matches = settings.identity.oidc_bootstrap_subject == subject
                 bootstrap_email_matches = (
-                    settings.environment != "production"
+                    settings.runtime.environment != "production"
                     and bootstrap_user is not None
                     and email is not None
                     and bootstrap_user.primary_email is not None
                     and bootstrap_user.primary_email.strip().lower() == email.strip().lower()
                 )
-                if bootstrap_subject_matches and settings.oidc_bootstrap_user_id is not None:
+                if (
+                    bootstrap_subject_matches
+                    and settings.identity.oidc_bootstrap_user_id is not None
+                ):
                     if bootstrap_user is None:
                         raise AuthenticationError("configured OIDC bootstrap user does not exist")
                     user = bootstrap_user
@@ -366,9 +370,9 @@ class AuthenticationService:
     @staticmethod
     async def oidc_metadata() -> dict[str, str]:
         settings = get_settings()
-        if not settings.oidc_issuer:
+        if not settings.identity.oidc_issuer:
             raise AuthenticationError("OIDC issuer is not configured")
-        issuer = settings.oidc_issuer.rstrip("/")
+        issuer = settings.identity.oidc_issuer.rstrip("/")
         now = datetime.now(UTC)
         cached = _oidc_metadata_cache.get(issuer)
         if cached is not None and cached[0] > now:
@@ -382,7 +386,7 @@ class AuthenticationService:
             try:
                 async with httpx.AsyncClient(
                     timeout=10,
-                    verify=oidc_tls_context(ca_bundle=settings.oidc_ca_bundle),
+                    verify=oidc_tls_context(ca_bundle=settings.identity.oidc_ca_bundle),
                 ) as client:
                     response = await client.get(f"{issuer}/.well-known/openid-configuration")
                     response.raise_for_status()
@@ -390,7 +394,10 @@ class AuthenticationService:
             except (httpx.HTTPError, ValueError) as error:
                 raise AuthenticationError("OIDC discovery failed") from error
             metadata = _validated_oidc_metadata(payload, settings)
-            _oidc_metadata_cache[issuer] = (now + _OIDC_METADATA_TTL, metadata)
+            _oidc_metadata_cache[issuer] = (
+                now + timedelta(seconds=settings.identity.oidc_metadata_ttl_seconds),
+                metadata,
+            )
             return dict(metadata)
 
     @staticmethod
@@ -403,12 +410,12 @@ class AuthenticationService:
     ) -> str:
         settings = get_settings()
         metadata = await AuthenticationService.oidc_metadata()
-        if not settings.oidc_client_id:
+        if not settings.identity.oidc_client_id:
             raise AuthenticationError("OIDC client ID is not configured")
         return f"{metadata['authorization_endpoint']}?{
             urlencode(
                 {
-                    'client_id': settings.oidc_client_id,
+                    'client_id': settings.identity.oidc_client_id,
                     'response_type': 'code',
                     'scope': 'openid profile email',
                     'redirect_uri': redirect_uri,
@@ -429,14 +436,14 @@ class AuthenticationService:
         """Build the RP-initiated logout URL when the provider supports it."""
 
         settings = get_settings()
-        if settings.auth_mode != "oidc":
+        if settings.identity.auth_mode != "oidc":
             return None
         metadata = await AuthenticationService.oidc_metadata()
         endpoint = metadata.get("end_session_endpoint")
         if endpoint is None:
             return None
         parameters = {
-            "client_id": settings.oidc_client_id,
+            "client_id": settings.identity.oidc_client_id,
             "post_logout_redirect_uri": post_logout_redirect_uri,
         }
         if id_token_hint:
@@ -452,20 +459,20 @@ class AuthenticationService:
     ) -> tuple[dict[str, Any], str | None]:
         settings = get_settings()
         metadata = await AuthenticationService.oidc_metadata()
-        if not settings.oidc_client_id or not settings.oidc_client_secret:
+        if not settings.identity.oidc_client_id or not settings.identity.oidc_client_secret:
             raise AuthenticationError("OIDC client credentials are not configured")
         try:
             async with httpx.AsyncClient(
                 timeout=15,
-                verify=oidc_tls_context(ca_bundle=settings.oidc_ca_bundle),
+                verify=oidc_tls_context(ca_bundle=settings.identity.oidc_ca_bundle),
             ) as client:
                 response = await client.post(
                     metadata["token_endpoint"],
                     data={
                         "grant_type": "authorization_code",
                         "code": code,
-                        "client_id": settings.oidc_client_id,
-                        "client_secret": settings.oidc_client_secret,
+                        "client_id": settings.identity.oidc_client_id,
+                        "client_secret": settings.identity.oidc_client_secret,
                         "redirect_uri": redirect_uri,
                         "code_verifier": code_verifier,
                     },
@@ -502,7 +509,7 @@ class AuthenticationService:
         """Bind a readable double-submit token to the opaque session cookie."""
 
         return hmac.new(
-            get_settings().session_secret.encode("utf-8"),
+            get_settings().identity.session_secret.encode("utf-8"),
             raw_session_token.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
@@ -519,7 +526,7 @@ class AuthenticationService:
         session = AuthSession(
             user_id=principal.user_id,
             token_hash=AuthenticationService._token_hash(raw_token),
-            expires_at=now + timedelta(seconds=get_settings().session_ttl_seconds),
+            expires_at=now + timedelta(seconds=get_settings().identity.session_ttl_seconds),
             last_seen_at=now,
             user_agent=user_agent,
             ip_address=ip_address,
@@ -556,12 +563,15 @@ class AuthenticationService:
             if row is None:
                 raise AuthenticationError("session is invalid or expired")
             auth_session, user, identity = row
-            if auth_session.last_seen_at <= now - _SESSION_LAST_SEEN_INTERVAL:
+            last_seen_interval = timedelta(
+                seconds=get_settings().identity.session_last_seen_interval_seconds
+            )
+            if auth_session.last_seen_at <= now - last_seen_interval:
                 await database.execute(
                     update(AuthSession)
                     .where(
                         col(AuthSession.id) == auth_session.id,
-                        col(AuthSession.last_seen_at) <= now - _SESSION_LAST_SEEN_INTERVAL,
+                        col(AuthSession.last_seen_at) <= now - last_seen_interval,
                         col(AuthSession.revoked_at).is_(None),
                         col(AuthSession.expires_at) > now,
                     )
@@ -660,7 +670,7 @@ class AuthenticationService:
             user_id=principal.user_id,
             name=name.strip(),
             token_hash=AuthenticationService._token_hash(raw_token),
-            expires_at=now + timedelta(seconds=get_settings().mcp_token_ttl_seconds),
+            expires_at=now + timedelta(seconds=get_settings().identity.mcp_token_ttl_seconds),
         )
         async with session_factory() as database:
             database.add(token)
@@ -750,9 +760,8 @@ class AuthenticationService:
             if row is None:
                 raise AuthenticationError("MCP access token is invalid or expired")
             access_token, user, identity = row
-            if (
-                access_token.last_used_at is None
-                or access_token.last_used_at <= now - _MCP_TOKEN_LAST_USED_INTERVAL
+            if access_token.last_used_at is None or access_token.last_used_at <= now - timedelta(
+                seconds=get_settings().identity.mcp_token_last_used_interval_seconds
             ):
                 await database.execute(
                     update(McpAccessToken)
@@ -796,9 +805,13 @@ class AuthenticationService:
         session_token: str | None = None,
     ) -> AuthenticatedPrincipal | None:
         settings = get_settings()
-        if authorization is None and session_token is not None and settings.auth_mode == "oidc":
+        if (
+            authorization is None
+            and session_token is not None
+            and settings.identity.auth_mode == "oidc"
+        ):
             return await AuthenticationService.authenticate_session(session_token)
-        if authorization is None and settings.auth_mode == "oidc":
+        if authorization is None and settings.identity.auth_mode == "oidc":
             return None
         if session_token is None:
             return await AuthenticationService.authenticate(authorization)
@@ -823,9 +836,9 @@ class AuthenticationService:
                 raise AuthenticationError("Bearer access token required")
             if raw_token.startswith("mcp_"):
                 return await AuthenticationService.authenticate_mcp_access_token(raw_token)
-        if settings.auth_mode == "development":
+        if settings.identity.auth_mode == "development":
             return AuthenticatedPrincipal(
-                user_id=settings.development_user_id,
+                user_id=settings.identity.development_user_id,
                 display_name="Development User",
                 primary_email="developer@localhost",
                 is_service_account=False,

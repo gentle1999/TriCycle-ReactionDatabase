@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 from sqlalchemy import create_engine, text
@@ -30,7 +31,7 @@ or exists(select 1 from molecular_topology_derivation d where d.topology_id=t.id
       or d.reconstruction_method ilike '%endpoint%'))"""
 
 
-def run(session: Session, backup: Path, apply: bool) -> dict:
+def run(session: Session, backup: Path, apply: bool) -> dict[str, Any]:
     session.execute(text("SET LOCAL lock_timeout='5s'"))
     session.execute(text("SET LOCAL statement_timeout='180s'"))
     session.execute(text("CREATE TEMP TABLE protected_topology ON COMMIT DROP AS " + PROTECTED))
@@ -232,12 +233,12 @@ def main() -> None:
                 None,
                 [
                     os.environ.get(key, ""),
-                    urlsplit(settings.database_url).hostname,
-                    urlsplit(settings.rustfs_endpoint_url).hostname,
+                    urlsplit(settings.runtime.database_url).hostname,
+                    urlsplit(settings.storage.rustfs_endpoint_url).hostname,
                 ],
             )
         )
-    with Session(create_engine(settings.database_url)) as session:
+    with Session(create_engine(settings.runtime.database_url)) as session:
         print(json.dumps(run(session, args.backup, args.apply)), flush=True)
 
 

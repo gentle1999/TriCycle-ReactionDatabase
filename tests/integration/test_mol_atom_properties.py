@@ -61,7 +61,7 @@ def test_metal_spin_survives_cartridge_storage_and_aliased_scalar_reads() -> Non
     # Production bulk ingestion must retain mol_from_pkl(), not COPY raw
     # pickle bytes into the cartridge's text SMILES input function.
     assert not _copy_compatible(tuple(table.columns))
-    engine = create_engine(get_settings().database_url)
+    engine = create_engine(get_settings().runtime.database_url)
     try:
         with engine.connect() as connection:
             transaction = connection.begin()
@@ -97,7 +97,7 @@ def test_fast_ingestion_retains_metal_spin() -> None:
     ) as pool:
         record = pool.submit(_normalize_in_child, molecule).result(timeout=30)
     assert any(not k.startswith("radical:") for k in record.topology.mol_atom_properties)
-    engine = create_engine(get_settings().database_url)
+    engine = create_engine(get_settings().runtime.database_url)
     try:
         with engine.connect() as connection:
             transaction = connection.begin()
@@ -152,7 +152,7 @@ def test_coordination_arrangement_survives_normalization_and_cartridge(smiles) -
         prefixes=["TEMPORARY"],
     )
     expected = serialize_molecule_smiles(source)
-    engine = create_engine(get_settings().database_url)
+    engine = create_engine(get_settings().runtime.database_url)
     try:
         with engine.connect() as connection:
             transaction = connection.begin()

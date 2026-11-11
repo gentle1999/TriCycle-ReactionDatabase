@@ -473,7 +473,7 @@ def _reaction_geometry_counts(session: Session, mapped_reaction_id: UUID) -> tup
 def test_frame_detail_links_only_reactions_with_a_bound_transition_state(
     development_query_principal: object,
 ) -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     sample: tuple[Any, ...] | None = None
     try:
         with Session(engine, expire_on_commit=False) as session:
@@ -546,7 +546,7 @@ def test_frame_detail_links_only_reactions_with_a_bound_transition_state(
 def test_domain_filters_compose_and_preserve_pagination_totals(
     development_query_principal: object,
 ) -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     sample: tuple[Any, ...] | None = None
     try:
         with Session(engine, expire_on_commit=False) as session:
@@ -1074,7 +1074,7 @@ def test_endpoint_topology_resolves_logical_reactions(
 ) -> None:
     """A TS endpoint topology must be searchable as a reaction topology."""
 
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     sample: tuple[Any, ...] | None = None
     endpoint_topology: MolecularTopology | None = None
     endpoint_topology_id: UUID | None = None
@@ -1168,7 +1168,7 @@ def test_transition_state_node_topology_resolves_reactions(
 ) -> None:
     """A topology used only by a TS node must resolve both reaction views."""
 
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     sample: tuple[Any, ...] | None = None
     transition_state_topology: MolecularTopology | None = None
     transition_state_derivation: MolecularTopologyDerivation | None = None
@@ -1385,7 +1385,7 @@ def test_transition_state_node_topology_resolves_reactions(
 def test_logical_reactions_are_grouped_by_reactant_set_across_pages(
     development_query_principal: object,
 ) -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     grouped_reaction_ids: set[UUID] = set()
     grouped_topology_id: UUID | None = None
     grouped_formula_id: UUID | None = None
@@ -1556,7 +1556,7 @@ def test_logical_reactions_are_grouped_by_reactant_set_across_pages(
 def test_protocol_version_family_and_solvation_filters_compose(
     development_query_principal: object,
 ) -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     sample: tuple[Any, ...] | None = None
     protocol_id: UUID | None = None
     segment_id: UUID | None = None
@@ -1652,7 +1652,7 @@ def _sequential_scan_relations(plan: dict[str, Any]) -> set[str]:
 
 
 def test_low_selectivity_metadata_scans_have_bounded_cost() -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     scan_row_limits = {
         "calculation_frame": 10_000,
         "scientific_array": 25_000,
@@ -1815,7 +1815,7 @@ def test_domain_filter_bounds_are_validated(
 async def test_logical_reaction_totals_include_all_child_paths_before_pagination(
     development_query_principal: object,
 ) -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     samples: list[tuple[Any, ...]] = []
     try:
         with Session(engine, expire_on_commit=False) as session:

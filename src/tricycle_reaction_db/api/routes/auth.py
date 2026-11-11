@@ -61,13 +61,13 @@ def _safe_return_to(value: str | None) -> str:
 
 def _frontend_url(path: str, request: Request | None = None) -> str:
     settings = get_settings()
-    frontend_origin = settings.oidc_frontend_url.rstrip("/")
+    frontend_origin = settings.identity.oidc_frontend_url.rstrip("/")
     configured_host = urlsplit(frontend_origin).hostname
     if (
         request is not None
-        and settings.environment != "production"
+        and settings.runtime.environment != "production"
         and (
-            settings.auth_mode == "development"
+            settings.identity.auth_mode == "development"
             or configured_host in {"localhost", "127.0.0.1", "::1"}
         )
     ):
@@ -98,7 +98,7 @@ def _callback_error_response(message: str, request: Request | None = None) -> Re
 @router.get("/config", response_model=AuthConfigView)
 async def auth_config() -> AuthConfigView:
     return AuthConfigView(
-        oidc_enabled=get_settings().auth_mode == "oidc",
+        oidc_enabled=get_settings().identity.auth_mode == "oidc",
         login_path="/api/auth/login",
     )
 
@@ -107,7 +107,7 @@ async def auth_config() -> AuthConfigView:
 async def login(request: Request, return_to: str = "/reactions") -> RedirectResponse:
     settings = get_settings()
     destination = _safe_return_to(return_to)
-    if settings.auth_mode == "development":
+    if settings.identity.auth_mode == "development":
         return RedirectResponse(destination, status_code=status.HTTP_303_SEE_OTHER)
     state = secrets.token_urlsafe(32)
     nonce = secrets.token_urlsafe(32)
@@ -120,7 +120,7 @@ async def login(request: Request, return_to: str = "/reactions") -> RedirectResp
             "return_to": destination,
             "exp": datetime.now(UTC) + timedelta(minutes=10),
         },
-        settings.session_secret,
+        settings.identity.session_secret,
         algorithm="HS256",
     )
     try:
@@ -128,7 +128,7 @@ async def login(request: Request, return_to: str = "/reactions") -> RedirectResp
             state=state,
             nonce=nonce,
             code_challenge=_pkce_challenge(code_verifier),
-            redirect_uri=settings.oidc_redirect_uri or "",
+            redirect_uri=settings.identity.oidc_redirect_uri or "",
         )
     except AuthenticationError as error:
         raise HTTPException(
@@ -140,7 +140,7 @@ async def login(request: Request, return_to: str = "/reactions") -> RedirectResp
         "tricycle_oidc_state",
         state_cookie,
         httponly=True,
-        secure=settings.session_cookie_secure,
+        secure=settings.identity.session_cookie_secure,
         samesite="lax",
         max_age=600,
         path="/api/auth",
@@ -162,7 +162,9 @@ async def callback(
     try:
         if not code or not state or not state_cookie:
             raise AuthenticationError("OIDC callback is missing code or state")
-        state_payload = jwt.decode(state_cookie, settings.session_secret, algorithms=["HS256"])
+        state_payload = jwt.decode(
+            state_cookie, settings.identity.session_secret, algorithms=["HS256"]
+        )
         if state_payload.get("state") != state:
             raise AuthenticationError("OIDC callback state mismatch")
         code_verifier = state_payload.get("code_verifier")
@@ -171,7 +173,7 @@ async def callback(
         claims, id_token = await AuthenticationService.exchange_oidc_code(
             code=code,
             code_verifier=code_verifier,
-            redirect_uri=settings.oidc_redirect_uri or "",
+            redirect_uri=settings.identity.oidc_redirect_uri or "",
         )
         if claims.get("nonce") != state_payload.get("nonce"):
             raise AuthenticationError("OIDC callback nonce mismatch")
@@ -196,32 +198,32 @@ async def callback(
         status_code=status.HTTP_303_SEE_OTHER,
     )
     response.set_cookie(
-        key=settings.session_cookie_name,
+        key=settings.identity.session_cookie_name,
         value=raw_token,
         httponly=True,
-        secure=settings.session_cookie_secure,
+        secure=settings.identity.session_cookie_secure,
         samesite="lax",
         path="/",
-        max_age=settings.session_ttl_seconds,
+        max_age=settings.identity.session_ttl_seconds,
     )
     response.set_cookie(
-        key=settings.csrf_cookie_name,
+        key=settings.identity.csrf_cookie_name,
         value=AuthenticationService.csrf_token(raw_token),
         httponly=False,
-        secure=settings.session_cookie_secure,
+        secure=settings.identity.session_cookie_secure,
         samesite="strict",
         path="/",
-        max_age=settings.session_ttl_seconds,
+        max_age=settings.identity.session_ttl_seconds,
     )
     if id_token is not None:
         response.set_cookie(
             key="tricycle_oidc_id_token",
             value=id_token,
             httponly=True,
-            secure=settings.session_cookie_secure,
+            secure=settings.identity.session_cookie_secure,
             samesite="lax",
             path="/api/auth/logout",
-            max_age=settings.session_ttl_seconds,
+            max_age=settings.identity.session_ttl_seconds,
         )
     response.delete_cookie("tricycle_oidc_state", path="/api/auth")
     return response
@@ -313,7 +315,7 @@ async def update_current_user(payload: UserProfileUpdate, principal: Principal) 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(request: Request, response: Response) -> None:
-    raw_token = request.cookies.get(get_settings().session_cookie_name)
+    raw_token = request.cookies.get(get_settings().identity.session_cookie_name)
     principal = None
     if raw_token:
         with suppress(AuthenticationError):
@@ -325,8 +327,8 @@ async def logout(request: Request, response: Response) -> None:
             entity_type="auth_session",
             actor_user_id=principal.user_id,
         )
-    response.delete_cookie(get_settings().session_cookie_name, path="/")
-    response.delete_cookie(get_settings().csrf_cookie_name, path="/")
+    response.delete_cookie(get_settings().identity.session_cookie_name, path="/")
+    response.delete_cookie(get_settings().identity.csrf_cookie_name, path="/")
     response.delete_cookie("tricycle_oidc_id_token", path="/api/auth/logout")
 
 
@@ -337,9 +339,9 @@ async def logout_redirect(
     csrf_token: str | None = None,
 ) -> RedirectResponse:
     settings = get_settings()
-    raw_session_token = request.cookies.get(settings.session_cookie_name)
+    raw_session_token = request.cookies.get(settings.identity.session_cookie_name)
     if raw_session_token is not None:
-        cookie_token = request.cookies.get(settings.csrf_cookie_name)
+        cookie_token = request.cookies.get(settings.identity.csrf_cookie_name)
         expected_token = AuthenticationService.csrf_token(raw_session_token)
         if (
             csrf_token is None
@@ -354,7 +356,7 @@ async def logout_redirect(
     await AuthenticationService.revoke_session(raw_session_token)
     frontend_target = _frontend_url(_safe_return_to(return_to), request)
     provider_target: str | None = None
-    if settings.auth_mode == "oidc":
+    if settings.identity.auth_mode == "oidc":
         with suppress(AuthenticationError):
             provider_target = await AuthenticationService.oidc_logout_url(
                 post_logout_redirect_uri=frontend_target,
@@ -364,8 +366,8 @@ async def logout_redirect(
         provider_target or frontend_target,
         status_code=status.HTTP_303_SEE_OTHER,
     )
-    response.delete_cookie(settings.session_cookie_name, path="/")
-    response.delete_cookie(settings.csrf_cookie_name, path="/")
+    response.delete_cookie(settings.identity.session_cookie_name, path="/")
+    response.delete_cookie(settings.identity.csrf_cookie_name, path="/")
     response.delete_cookie("tricycle_oidc_id_token", path="/api/auth/logout")
     return response
 
@@ -379,7 +381,7 @@ async def list_sessions(
 ) -> list[SessionViewDTO]:
     sessions = await AuthenticationService.list_sessions(
         principal.user_id,
-        current_token=request.cookies.get(get_settings().session_cookie_name),
+        current_token=request.cookies.get(get_settings().identity.session_cookie_name),
         limit=limit,
         offset=offset,
     )
@@ -390,7 +392,7 @@ async def list_sessions(
 async def revoke_all_sessions(request: Request, principal: Principal) -> None:
     await AuthenticationService.revoke_all_sessions(
         principal.user_id,
-        except_token=request.cookies.get(get_settings().session_cookie_name),
+        except_token=request.cookies.get(get_settings().identity.session_cookie_name),
     )
     await AuditService.record(
         action="auth.sessions.revoked_all",

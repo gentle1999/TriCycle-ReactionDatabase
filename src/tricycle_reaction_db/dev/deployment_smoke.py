@@ -20,7 +20,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 
 from tricycle_reaction_db.application.services.email import smtp_tls_context
-from tricycle_reaction_db.core.config import Settings
+from tricycle_reaction_db.core.config import ApplicationSettings, load_application_settings
 from tricycle_reaction_db.core.tls import verified_tls_context
 from tricycle_reaction_db.storage.rustfs import RustFSObjectStore, RustFSSettings
 
@@ -57,8 +57,8 @@ def _run_check(name: str, operation: Callable[[], dict[str, object]]) -> Deploym
         )
 
 
-def _check_public_health(settings: Settings) -> dict[str, object]:
-    base_url = f"{settings.oidc_frontend_url.rstrip('/')}/"
+def _check_public_health(settings: ApplicationSettings) -> dict[str, object]:
+    base_url = f"{settings.identity.oidc_frontend_url.rstrip('/')}/"
     statuses: dict[str, int] = {}
     # The public edge certificate has a different trust boundary from the
     # private CA that may secure the OIDC issuer.
@@ -72,16 +72,16 @@ def _check_public_health(settings: Settings) -> dict[str, object]:
     return {"origin": base_url.rstrip("/"), "statuses": statuses}
 
 
-def _check_oidc(settings: Settings) -> dict[str, object]:
-    issuer = settings.oidc_issuer
-    jwks_url = settings.oidc_jwks_url
+def _check_oidc(settings: ApplicationSettings) -> dict[str, object]:
+    issuer = settings.identity.oidc_issuer
+    jwks_url = settings.identity.oidc_jwks_url
     if issuer is None or jwks_url is None:
         raise RuntimeError("OIDC issuer and JWKS URL are required")
     discovery_url = f"{issuer.rstrip('/')}/.well-known/openid-configuration"
     with httpx.Client(
         timeout=10,
         follow_redirects=False,
-        verify=verified_tls_context(ca_bundle=settings.oidc_ca_bundle),
+        verify=verified_tls_context(ca_bundle=settings.identity.oidc_ca_bundle),
     ) as client:
         discovery_response = client.get(discovery_url)
         discovery_response.raise_for_status()
@@ -114,8 +114,8 @@ def _check_oidc(settings: Settings) -> dict[str, object]:
     }
 
 
-def _check_database(settings: Settings) -> dict[str, object]:
-    engine = create_engine(settings.database_url, pool_pre_ping=True)
+def _check_database(settings: ApplicationSettings) -> dict[str, object]:
+    engine = create_engine(settings.runtime.database_url, pool_pre_ping=True)
     try:
         with engine.connect() as connection:
             row = (
@@ -150,7 +150,7 @@ def _check_database(settings: Settings) -> dict[str, object]:
         raise RuntimeError("PostgreSQL endpoint resolved to a read-only standby")
     if not row["rdkit_extension_version"]:
         raise RuntimeError("PostgreSQL RDKit extension is unavailable")
-    database_url = make_url(settings.database_url)
+    database_url = make_url(settings.runtime.database_url)
     return {
         "host": database_url.host or "",
         "database": str(row["database"]),
@@ -179,8 +179,8 @@ return {created, ttl}
 """
 
 
-def _check_redis(settings: Settings) -> dict[str, object]:
-    redis_url = settings.rate_limit_redis_url
+def _check_redis(settings: ApplicationSettings) -> dict[str, object]:
+    redis_url = settings.runtime.rate_limit_redis_url
     if redis_url is None:
         raise RuntimeError("Redis URL is required")
     client: Redis = Redis.from_url(
@@ -189,7 +189,7 @@ def _check_redis(settings: Settings) -> dict[str, object]:
         socket_connect_timeout=2,
         socket_timeout=2,
     )
-    key = f"{settings.rate_limit_key_prefix}:deployment-smoke:{uuid4()}"
+    key = f"{settings.runtime.rate_limit_key_prefix}:deployment-smoke:{uuid4()}"
     try:
         response: Any = client.eval(_REDIS_WRITE_PROBE, 1, key, "1", "60")
         if not isinstance(response, list) or response[0] != "OK" or int(response[1]) <= 0:
@@ -205,40 +205,42 @@ def _check_redis(settings: Settings) -> dict[str, object]:
     }
 
 
-def _check_smtp(settings: Settings) -> dict[str, object]:
-    host = settings.smtp_host
-    sender = settings.smtp_from_email
+def _check_smtp(settings: ApplicationSettings) -> dict[str, object]:
+    host = settings.identity.smtp_host
+    sender = settings.identity.smtp_from_email
     if host is None or sender is None:
         raise RuntimeError("SMTP host and sender are required")
-    context = smtp_tls_context(ca_bundle=settings.smtp_ca_bundle)
-    with smtplib.SMTP(host, settings.smtp_port, timeout=settings.smtp_timeout_seconds) as client:
+    context = smtp_tls_context(ca_bundle=settings.identity.smtp_ca_bundle)
+    with smtplib.SMTP(
+        host, settings.identity.smtp_port, timeout=settings.identity.smtp_timeout_seconds
+    ) as client:
         client.ehlo_or_helo_if_needed()
         if not client.has_extn("starttls"):
             raise RuntimeError("SMTP relay does not advertise STARTTLS")
         client.starttls(context=context)
         client.ehlo()
-        if settings.smtp_username:
-            client.login(settings.smtp_username, settings.smtp_password or "")
+        if settings.identity.smtp_username:
+            client.login(settings.identity.smtp_username, settings.identity.smtp_password or "")
         tls_socket = client.sock
         cipher_info = tls_socket.cipher() if isinstance(tls_socket, ssl.SSLSocket) else None
         cipher = cipher_info[0] if cipher_info is not None else "unknown"
     return {
         "host": host,
-        "port": settings.smtp_port,
+        "port": settings.identity.smtp_port,
         "starttls": True,
-        "authenticated": bool(settings.smtp_username),
+        "authenticated": bool(settings.identity.smtp_username),
         "sender_domain": sender.rsplit("@", 1)[1],
         "cipher": cipher,
     }
 
 
 def run_deployment_smoke(
-    settings: Settings | None = None,
+    settings: ApplicationSettings | None = None,
     storage: RustFSSettings | None = None,
 ) -> DeploymentSmokeResult:
-    resolved_settings = settings or Settings()
+    resolved_settings = settings or load_application_settings()
     resolved_storage = storage or RustFSSettings()
-    if resolved_settings.environment != "production":
+    if resolved_settings.runtime.environment != "production":
         raise RuntimeError("deployment smoke requires TRICYCLE_ENVIRONMENT=production")
     checks = (
         _run_check("public_health", lambda: _check_public_health(resolved_settings)),
@@ -252,7 +254,7 @@ def run_deployment_smoke(
         schema_version=DEPLOYMENT_SMOKE_SCHEMA_VERSION,
         checked_at=datetime.now(UTC).isoformat(),
         node=socket.gethostname(),
-        app_name=resolved_settings.app_name,
+        app_name=resolved_settings.runtime.app_name,
         checks=checks,
         succeeded=all(check.succeeded for check in checks),
     )

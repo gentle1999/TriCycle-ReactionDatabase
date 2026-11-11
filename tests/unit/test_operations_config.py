@@ -4,8 +4,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
-from tricycle_reaction_db.core.config import Settings
-from tricycle_reaction_db.storage.rustfs import RustFSSettings
+from tricycle_reaction_db.core.config import load_configuration
 
 REPOSITORY_ROOT = Path(__file__).parents[2]
 
@@ -55,15 +54,18 @@ def test_multi_host_api_environment_is_a_valid_production_configuration(
             monkeypatch.delenv(name)
     environment_file = REPOSITORY_ROOT / "infra/deployment/multi-host-api.env.example"
 
-    settings = Settings(_env_file=environment_file)
-    storage = RustFSSettings(_env_file=environment_file)
+    configuration = load_configuration(_env_file=environment_file)
+    settings = configuration.application
+    storage = configuration.rustfs
 
-    assert settings.environment == "production"
-    assert settings.app_name == "Example Chemistry Database"
-    assert settings.nexusx_database_cluster_name == "example-chemistry-postgresql"
-    assert settings.nexusx_database_cluster_color == "#E3F2FD"
-    assert urlsplit(settings.database_url).hostname == "db-rw.internal.example"
-    assert urlsplit(settings.rate_limit_redis_url or "").hostname == ("redis-rw.internal.example")
+    assert settings.runtime.environment == "production"
+    assert settings.runtime.app_name == "Example Chemistry Database"
+    assert settings.runtime.nexusx_database_cluster_name == "example-chemistry-postgresql"
+    assert settings.runtime.nexusx_database_cluster_color == "#E3F2FD"
+    assert urlsplit(settings.runtime.database_url).hostname == "db-rw.internal.example"
+    assert urlsplit(settings.runtime.rate_limit_redis_url or "").hostname == (
+        "redis-rw.internal.example"
+    )
     assert urlsplit(storage.endpoint_url).hostname == "s3.internal.example"
     assert storage.bucket == "example-chemistry-raw-files"
 

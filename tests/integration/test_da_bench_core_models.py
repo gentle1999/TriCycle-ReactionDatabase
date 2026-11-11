@@ -96,7 +96,7 @@ def test_real_da_fixture_round_trips_through_core_business_models(
     parsed_da_bench_records: dict[str, NormalizedMoleculeRecord],
     da_bench_log_paths: dict[str, Path],
 ) -> None:
-    database_engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    database_engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     connection = database_engine.connect()
     transaction = connection.begin()
     try:

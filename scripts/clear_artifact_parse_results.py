@@ -99,7 +99,7 @@ async def _run(arguments: argparse.Namespace) -> int:
 
     cleanup = await ArtifactUploadService.clear_previous_parse_results(
         artifact_ids=artifact_ids,
-        user_id=arguments.user_id or get_settings().development_user_id,
+        user_id=arguments.user_id or get_settings().identity.development_user_id,
     )
     print(
         json.dumps(

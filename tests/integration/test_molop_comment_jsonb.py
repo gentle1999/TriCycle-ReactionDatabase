@@ -35,7 +35,7 @@ def test_wrapped_utf8_comment_survives_postgresql_copy():
     comments.append(parsed.chem_file.comments.model_dump(mode="json"))
     assert "TS6a-2" in json.dumps(comments)
     assert parsed.chem_file.artifact_sha256 == sha256(payload).hexdigest()
-    url = get_settings().database_url.replace("postgresql+psycopg://", "postgresql://", 1)
+    url = get_settings().runtime.database_url.replace("postgresql+psycopg://", "postgresql://", 1)
     with psycopg.connect(url) as connection:
         connection.execute(
             "CREATE TEMP TABLE comment_jsonb_regression (payload jsonb) ON COMMIT DROP"

@@ -41,22 +41,22 @@ def _send_smtp(
     text: str,
 ) -> None:
     settings = get_settings()
-    if not settings.smtp_host or not settings.smtp_from_email:
+    if not settings.identity.smtp_host or not settings.identity.smtp_from_email:
         raise RuntimeError("SMTP configuration is incomplete")
     message = EmailMessage()
-    message["From"] = settings.smtp_from_email
+    message["From"] = settings.identity.smtp_from_email
     message["To"] = recipient
     message["Subject"] = subject
     message.set_content(text)
     with smtplib.SMTP(
-        settings.smtp_host,
-        settings.smtp_port,
-        timeout=settings.smtp_timeout_seconds,
+        settings.identity.smtp_host,
+        settings.identity.smtp_port,
+        timeout=settings.identity.smtp_timeout_seconds,
     ) as client:
-        if settings.smtp_starttls:
-            client.starttls(context=smtp_tls_context(ca_bundle=settings.smtp_ca_bundle))
-        if settings.smtp_username:
-            client.login(settings.smtp_username, settings.smtp_password or "")
+        if settings.identity.smtp_starttls:
+            client.starttls(context=smtp_tls_context(ca_bundle=settings.identity.smtp_ca_bundle))
+        if settings.identity.smtp_username:
+            client.login(settings.identity.smtp_username, settings.identity.smtp_password or "")
         client.send_message(message)
 
 
@@ -71,7 +71,7 @@ class EmailDeliveryService:
         expires_at: datetime,
     ) -> EmailDeliveryResult:
         settings = get_settings()
-        if settings.email_delivery_mode == "link":
+        if settings.identity.email_delivery_mode == "link":
             return EmailDeliveryResult(EmailDeliveryStatus.LINK_ONLY)
         body = (
             f"你已被邀请加入项目“{project_name}”。\n\n"
@@ -84,7 +84,7 @@ class EmailDeliveryService:
             await asyncio.to_thread(
                 _send_smtp,
                 recipient=recipient,
-                subject=f"{settings.brand_name} 项目邀请：{project_name}",
+                subject=f"{settings.runtime.brand_name} 项目邀请：{project_name}",
                 text=body,
             )
         except Exception as error:  # SMTP libraries expose many provider-specific errors.

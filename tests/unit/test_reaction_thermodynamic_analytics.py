@@ -1,18 +1,23 @@
 import csv
 import io
 from collections.abc import AsyncIterator
-from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
 import pytest
 
+from tests.config_helpers import application_settings, copied_application_settings
 from tricycle_reaction_db.application.services import reaction_thermodynamic_analytics as analytics
 from tricycle_reaction_db.application.services.reaction_thermodynamic_analytics import (
     ReactionThermodynamicAnalyticsService,
     _level_label,
 )
+from tricycle_reaction_db.core.config import ApplicationSettings
 from tricycle_reaction_db.domain.enums import MappedReactionKind
+
+
+def _settings(**domains: dict[str, object]) -> ApplicationSettings:
+    return copied_application_settings(application_settings(_env_file=None), **domains)
 
 
 class _Stream:
@@ -208,7 +213,7 @@ async def test_export_csv_uses_the_same_visible_profile_predicate(
     monkeypatch.setattr(
         analytics,
         "get_settings",
-        lambda: SimpleNamespace(oidc_frontend_url="https://reactions.example"),
+        lambda: _settings(identity={"oidc_frontend_url": "https://reactions.example"}),
     )
     monkeypatch.setattr(
         ReactionThermodynamicAnalyticsService,
@@ -264,10 +269,9 @@ async def test_csv_routes_use_the_frontend_origin_behind_the_proxy(
     monkeypatch.setattr(
         auth,
         "get_settings",
-        lambda: SimpleNamespace(
-            environment="development",
-            auth_mode="development",
-            oidc_frontend_url="http://127.0.0.1:5173",
+        lambda: _settings(
+            runtime={"environment": "development"},
+            identity={"auth_mode": "development", "oidc_frontend_url": "http://127.0.0.1:5173"},
         ),
     )
     request = Request(

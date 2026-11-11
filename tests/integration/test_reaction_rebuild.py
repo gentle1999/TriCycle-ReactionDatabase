@@ -50,11 +50,11 @@ def isolated_project(monkeypatch):
     # The maintenance command commits and disposes its engine. Give it a
     # schema owned by this fixture, including every engine it creates.
     schema = "tricycle_test_" + uuid4().hex
-    admin = create_engine(get_settings().database_url)
+    admin = create_engine(get_settings().runtime.database_url)
     with admin.begin() as connection:
         connection.execute(text(f'CREATE SCHEMA "{schema}"'))
     engine = create_engine(
-        get_settings().database_url,
+        get_settings().runtime.database_url,
         connect_args={"options": f"-csearch_path={schema},public"},
     ).execution_options(schema_translate_map={None: schema})
     monkeypatch.setattr(rebuild, "create_engine", lambda *args, **kwargs: engine)

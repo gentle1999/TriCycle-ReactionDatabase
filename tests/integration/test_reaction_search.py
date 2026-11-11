@@ -9,6 +9,7 @@ from rdkit import Chem
 from sqlalchemy import create_engine, text
 from sqlmodel import Session
 
+from tests.config_helpers import copied_application_settings
 from tricycle_reaction_db.application.query_cost import QueryBudgetExceeded
 from tricycle_reaction_db.application.services import (
     LogicalReactionQueryService,
@@ -37,7 +38,7 @@ def test_reaction_smarts_and_similarity_use_indexed_rdkit_projections(
     monkeypatch: pytest.MonkeyPatch,
     development_query_principal: object,
 ) -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     logical_ids = []
     logical_hashes = []
     mapped_hashes = []
@@ -234,7 +235,9 @@ def test_reaction_smarts_and_similarity_use_indexed_rdkit_projections(
         assert exact.similarity_score == pytest.approx(1.0)
         assert exact.reaction_structural_bfp_schema_version == "reaction-structural-bfp-r5-v1"
 
-        settings = get_settings().model_copy(update={"structure_candidate_limit": 1})
+        settings = copied_application_settings(
+            get_settings(), runtime={"structure_candidate_limit": 1}
+        )
         monkeypatch.setattr(query_services, "get_settings", lambda: settings)
         with pytest.raises(QueryBudgetExceeded, match="candidate set exceeds the 1-row limit"):
             asyncio.run(

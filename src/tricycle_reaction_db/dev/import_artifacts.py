@@ -35,16 +35,20 @@ from tricycle_reaction_db.ingestion.manifest import (
     validate_manifest_staging,
 )
 
-HASH_CHUNK_BYTES = 1024 * 1024
-MAX_FINGERPRINT_WORKERS = 32
+HASH_CHUNK_BYTES = get_settings().ingestion.import_hash_chunk_bytes
+MAX_FINGERPRINT_WORKERS = get_settings().ingestion.import_max_fingerprint_workers
 # The local importer only controls discovery/fingerprinting and RustFS staging
 # windows. MolOP concurrency and database commit microbatches are owned by the
 # durable upload worker, not this process.
-IMPORT_COMMIT_BATCH_FILES = 16  # retained as a deprecated CLI compatibility option
-IMPORT_PIPELINE_WINDOW_FILES = 64
-IMPORT_STREAM_QUEUE_SIZE = 64
-IMPORT_MAX_TRANSIENT_RETRIES = 3
-IMPORT_TRANSIENT_RETRY_BACKOFF_SECONDS = 0.25
+IMPORT_COMMIT_BATCH_FILES = (
+    get_settings().ingestion.import_commit_batch_files
+)  # deprecated CLI compatibility
+IMPORT_PIPELINE_WINDOW_FILES = get_settings().ingestion.import_pipeline_window_files
+IMPORT_STREAM_QUEUE_SIZE = get_settings().ingestion.import_stream_queue_size
+IMPORT_MAX_TRANSIENT_RETRIES = get_settings().ingestion.import_max_transient_retries
+IMPORT_TRANSIENT_RETRY_BACKOFF_SECONDS = (
+    get_settings().ingestion.import_transient_retry_backoff_seconds
+)
 
 # A calculation-output root often contains manifests, CSV indexes, and other
 # sidecars next to the actual Gaussian/ORCA output.  Unknown extensions remain
@@ -736,7 +740,7 @@ async def import_files(
     if transient_retry_backoff_seconds < 0:
         raise ValueError("transient_retry_backoff_seconds must be non-negative")
     settings = get_settings()
-    stage_window_files = min(pipeline_window_files, settings.max_batch_files)
+    stage_window_files = min(pipeline_window_files, settings.ingestion.max_batch_files)
     summary = ImportSummary(scanned=len(candidates))
     workers = fingerprint_workers or min(MAX_FINGERPRINT_WORKERS, max(4, os.cpu_count() or 4))
     if workers < 1:
@@ -1002,7 +1006,7 @@ async def import_files(
                     break
                 if (
                     batch_with_fingerprints
-                    and batch_bytes + next_item[0].size_bytes > settings.max_batch_bytes
+                    and batch_bytes + next_item[0].size_bytes > settings.ingestion.max_batch_bytes
                 ):
                     pending_candidate = next_item
                     break
@@ -1142,7 +1146,7 @@ async def _run(args: argparse.Namespace) -> int:
     metrics = ImportMetrics()
 
     if args.manifest is not None:
-        if settings.import_staging_root is None:
+        if settings.ingestion.import_staging_root is None:
             raise ValueError("TRICYCLE_IMPORT_STAGING_ROOT is required for --manifest")
         if any(
             (
@@ -1160,7 +1164,7 @@ async def _run(args: argparse.Namespace) -> int:
         if args.dry_run:
             candidates = candidates_from_manifest(
                 manifest,
-                staging_root=settings.import_staging_root,
+                staging_root=settings.ingestion.import_staging_root,
             )
             summary = await import_files(
                 candidates,

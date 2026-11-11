@@ -73,7 +73,7 @@ async def upload_artifact(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="uploaded artifact requires a filename",
         )
-    maximum = get_settings().max_upload_bytes
+    maximum = get_settings().ingestion.max_upload_bytes
     payload = await file.read(maximum + 1)
     await file.close()
     if len(payload) > maximum:
@@ -134,11 +134,11 @@ async def upload_artifact_batch(
     """Stage raw files independently; a durable worker performs parsing later."""
 
     settings = get_settings()
-    maximum = settings.max_upload_bytes
-    if len(files) > settings.max_batch_files:
+    maximum = settings.ingestion.max_upload_bytes
+    if len(files) > settings.ingestion.max_batch_files:
         raise HTTPException(
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-            detail=f"upload batch exceeds the {settings.max_batch_files}-file limit",
+            detail=f"upload batch exceeds the {settings.ingestion.max_batch_files}-file limit",
             headers=UPLOAD_PREFLIGHT_HEADERS,
         )
     with tempfile.TemporaryDirectory(prefix="tricycle-upload-batch-") as spool_directory:
@@ -178,10 +178,12 @@ async def upload_artifact_batch(
                 )
                 continue
             total_bytes += size
-            if total_bytes > settings.max_batch_bytes:
+            if total_bytes > settings.ingestion.max_batch_bytes:
                 raise HTTPException(
                     status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-                    detail=f"upload batch exceeds the {settings.max_batch_bytes}-byte limit",
+                    detail=(
+                        f"upload batch exceeds the {settings.ingestion.max_batch_bytes}-byte limit"
+                    ),
                     headers=UPLOAD_PREFLIGHT_HEADERS,
                 )
             payloads.append(
@@ -252,7 +254,7 @@ async def validate_artifact(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="uploaded artifact requires a filename",
         )
-    maximum = get_settings().max_upload_bytes
+    maximum = get_settings().ingestion.max_upload_bytes
     payload = await file.read(maximum + 1)
     await file.close()
     if len(payload) > maximum:

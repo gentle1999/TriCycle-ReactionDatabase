@@ -23,6 +23,7 @@ from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.util import await_only
 from sqlmodel import Session
 
+from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import LogicalReaction
 
 LEGACY_BULK_IMPORT_SESSION_INFO_KEY = "tricycle_legacy_bulk_import"
@@ -98,7 +99,6 @@ _FAST_PRIMARY_KEY_KEYS: dict[type[Any], tuple[str, ...]] = {}
 _FAST_PENDING_ENTITIES_KEY = "_fast_pending_entities"
 _FAST_PENDING_ENTITY_INDEX_KEY = "_fast_pending_entity_index"
 _FAST_PENDING_LOGICAL_REACTION_INDEX_KEY = "_fast_pending_logical_reaction_index"
-_FAST_COPY_MIN_ROWS = 32
 
 
 def _identity_lock_id(*parts: object) -> int:
@@ -762,7 +762,8 @@ def _bulk_insert_pending_entities(session: Session) -> None:
             # driver/cartridge environments that need the Core executemany
             # fallback while avoiding a deployment-specific performance switch.
             use_copy = (
-                os.getenv("TRICYCLE_FAST_COPY", "1") != "0" and len(rows) >= _FAST_COPY_MIN_ROWS
+                os.getenv("TRICYCLE_FAST_COPY", "1") != "0"
+                and len(rows) >= get_settings().ingestion.fast_copy_min_rows
             )
             if use_copy and _copy_compatible(columns):
                 dialect = session.get_bind().dialect

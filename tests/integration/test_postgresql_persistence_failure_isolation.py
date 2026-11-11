@@ -50,7 +50,7 @@ def test_deferred_flush_deduplicates_and_preserves_file_rollback(bulk_disabled):
         pass
 
     mapper_registry.map_imperatively(Row, table)
-    engine = create_engine(get_settings().database_url)
+    engine = create_engine(get_settings().runtime.database_url)
     try:
         with engine.connect() as connection, connection.begin():
             table.create(connection)
@@ -140,7 +140,7 @@ async def test_invalid_json_isolated_without_replaying_committed_prefix(monkeypa
     ]
     bad_id = entries[4].artifact_id
     calls = []
-    url = get_settings().database_url.replace("postgresql+psycopg://", "postgresql://", 1)
+    url = get_settings().runtime.database_url.replace("postgresql+psycopg://", "postgresql://", 1)
     async with await psycopg.AsyncConnection.connect(url, autocommit=True) as connection:
         await connection.execute(
             "CREATE TEMP TABLE isolation_rows (id uuid PRIMARY KEY, comments jsonb) "

@@ -101,7 +101,7 @@ def test_manifest_revision_and_binding_queries(
     second_path.write_text('{"revision":2}\n', encoding="utf-8")
     calculation_path.write_text("calculation\n", encoding="utf-8")
     manifest_key = f"read-query:{uuid4().hex}"
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     manifest_ids: list[UUID] = []
     artifact_ids: list[UUID] = []
     try:
@@ -251,7 +251,7 @@ def test_manifest_revision_and_binding_queries(
 def test_storage_gc_state_and_run_queries() -> None:
     now = datetime.now(UTC)
     bucket = f"read-query-gc-{uuid4().hex}"
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     state_id: UUID | None = None
     run_ids: list[UUID] = []
     try:
@@ -350,7 +350,7 @@ def test_storage_gc_state_and_run_queries() -> None:
 def test_advanced_results_and_derivation_queries_use_explicit_fixture(
     development_query_principal: object,
 ) -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     sample: tuple[Any, ...] | None = None
     try:
         with Session(engine, expire_on_commit=False) as session:

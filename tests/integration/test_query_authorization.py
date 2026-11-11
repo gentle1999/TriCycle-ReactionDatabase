@@ -1,6 +1,6 @@
 import json
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -368,7 +368,7 @@ async def _create_calculation_source(
 
 
 @asynccontextmanager
-async def _request_as(principal: AuthenticatedPrincipal) -> AsyncIterator[None]:
+async def _request_as(principal: AuthenticatedPrincipal) -> AsyncGenerator[None, None]:
     request_token = set_request_context_active()
     principal_token = set_current_principal(principal)
     try:
@@ -826,7 +826,7 @@ async def _participant_topology_source(
     logical_reaction_id: UUID,
     mapped_reaction_id: UUID,
     project_id: UUID,
-) -> AsyncIterator[UUID]:
+) -> AsyncGenerator[UUID, None]:
     participant_id = uuid4()
     mapped_participant_id = uuid4()
     formula_id: UUID | None = None

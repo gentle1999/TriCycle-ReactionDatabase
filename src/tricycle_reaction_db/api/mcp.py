@@ -148,13 +148,6 @@ from tricycle_reaction_db.ingestion.manifest import ArtifactManifest
 
 ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 logger = logging.getLogger(__name__)
-MCP_TS_GEOMETRY_EXPORT_MAX_RECORDS = 100
-MCP_TS_GEOMETRY_EXPORT_MAX_BYTES = 512 * 1024
-MCP_EXPORT_MAX_RECORDS = 100
-MCP_EXPORT_MAX_BYTES = 512 * 1024
-MCP_ARTIFACT_PREVIEW_MAX_BYTES = 256 * 1024
-MCP_BATCH_MAX_FILES = 100
-MCP_ARRAY_PREVIEW_MAX_ELEMENTS = 4096
 
 
 class MCPContentTooLargeError(RuntimeError):
@@ -183,14 +176,15 @@ async def _collect_jsonl_page(
     records: list[dict[str, Any]] = []
     response_bytes = 0
     has_more = False
+    max_bytes = get_settings().mcp_export.mcp_export_max_bytes
     async for line in records_iterator:
         if len(records) >= limit:
             has_more = True
             break
-        if response_bytes + len(line) > MCP_EXPORT_MAX_BYTES:
+        if response_bytes + len(line) > max_bytes:
             if not records:
                 raise MCPContentTooLargeError(
-                    f"a single JSONL record exceeds the {MCP_EXPORT_MAX_BYTES}-byte MCP limit"
+                    f"a single JSONL record exceeds the {max_bytes}-byte MCP limit"
                 )
             has_more = True
             break
@@ -317,11 +311,11 @@ class QueryGuardMiddleware(FastMCPMiddleware):
         self._scoped_methods = project_scoped_use_case_methods(config)
         self._limiter = create_rate_limiter(
             policy="mcp-read",
-            maximum_requests=settings.read_rate_limit_requests,
-            window_seconds=settings.query_rate_limit_window_seconds,
-            backend=settings.rate_limit_backend,
-            redis_url=settings.rate_limit_redis_url,
-            key_prefix=settings.rate_limit_key_prefix,
+            maximum_requests=settings.runtime.read_rate_limit_requests,
+            window_seconds=settings.runtime.query_rate_limit_window_seconds,
+            backend=settings.runtime.rate_limit_backend,
+            redis_url=settings.runtime.rate_limit_redis_url,
+            key_prefix=settings.runtime.rate_limit_key_prefix,
         )
 
     @staticmethod
@@ -377,10 +371,10 @@ class QueryGuardMiddleware(FastMCPMiddleware):
                 try:
                     validate_graphql_query_budget(
                         query,
-                        maximum_characters=self._settings.graphql_max_query_characters,
-                        maximum_tokens=self._settings.graphql_max_tokens,
-                        maximum_depth=self._settings.graphql_max_depth,
-                        maximum_complexity=self._settings.graphql_max_complexity,
+                        maximum_characters=self._settings.runtime.graphql_max_query_characters,
+                        maximum_tokens=self._settings.runtime.graphql_max_tokens,
+                        maximum_depth=self._settings.runtime.graphql_max_depth,
+                        maximum_complexity=self._settings.runtime.graphql_max_complexity,
                     )
                 except QueryBudgetExceeded as error:
                     return self._result(graphql_error_result(error))
@@ -402,7 +396,7 @@ class QueryGuardMiddleware(FastMCPMiddleware):
 
 mcp_server = create_use_case_graphql_mcp_server(
     apps=[config],
-    name=get_settings().mcp_server_name,
+    name=get_settings().runtime.mcp_server_name,
 )
 
 
@@ -508,7 +502,7 @@ def _decode_mcp_payload(content_base64: str) -> bytes:
     """Decode one MCP file payload while enforcing the configured byte budget."""
     return decode_base64_payload(
         content_base64,
-        maximum_bytes=get_settings().max_upload_bytes,
+        maximum_bytes=get_settings().ingestion.max_upload_bytes,
         payload_description="calculation log",
     )
 
@@ -822,7 +816,7 @@ async def create_project_invitation(
                 UUID(project_id),
                 payload,
                 principal,
-                frontend_url=get_settings().oidc_frontend_url,
+                frontend_url=get_settings().identity.oidc_frontend_url,
             )
         )
     except Exception as error:
@@ -852,7 +846,7 @@ async def resend_project_invitation(project_id: str, invitation_id: str) -> dict
                 UUID(project_id),
                 UUID(invitation_id),
                 principal,
-                frontend_url=get_settings().oidc_frontend_url,
+                frontend_url=get_settings().identity.oidc_frontend_url,
             )
         )
     except Exception as error:
@@ -1089,7 +1083,7 @@ async def get_units_ts_dataset_status(job_id: str) -> dict[str, Any]:
 async def export_units_ts_dataset_jsonl(
     project_id: str,
     after_binding_id: str | None = None,
-    limit: int = 20,
+    limit: int | None = None,
 ) -> dict[str, Any]:
     """Read a bounded page of UniTS TS feature records as JSONL-decoded objects."""
 
@@ -1097,8 +1091,11 @@ async def export_units_ts_dataset_jsonl(
         principal = _require_mcp_principal()
         requested_project_id = UUID(project_id)
         cursor = UUID(after_binding_id) if after_binding_id is not None else None
-        if not 1 <= limit <= MCP_EXPORT_MAX_RECORDS:
-            raise ValueError(f"limit must be between 1 and {MCP_EXPORT_MAX_RECORDS}")
+        max_records = get_settings().mcp_export.mcp_export_max_records
+        if limit is None:
+            limit = min(20, max_records)
+        if not 1 <= limit <= max_records:
+            raise ValueError(f"limit must be between 1 and {max_records}")
         await AuthorizationService.require_project_permission(
             principal.user_id,
             requested_project_id,
@@ -1124,21 +1121,32 @@ async def export_mapped_reaction_thermodynamics_csv(
     filter_expression: str | None = None,
     has_activation_gibbs_free_energy: bool | None = None,
     has_reaction_gibbs_free_energy: bool | None = None,
-    limit: int = 20,
+    limit: int | None = None,
     offset: int = 0,
-    max_bytes: int = MCP_EXPORT_MAX_BYTES,
+    max_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Return one bounded page of the cleaned mapped-reaction thermodynamics CSV."""
 
     try:
         principal = _require_mcp_principal()
         requested_project_id = UUID(project_id)
-        if not 1 <= limit <= MCP_EXPORT_MAX_RECORDS:
-            raise ValueError(f"limit must be between 1 and {MCP_EXPORT_MAX_RECORDS}")
-        if not 0 <= offset <= 1_000_000:
-            raise ValueError("offset must be between 0 and 1000000")
-        if not 1024 <= max_bytes <= MCP_EXPORT_MAX_BYTES:
-            raise ValueError(f"max_bytes must be between 1024 and {MCP_EXPORT_MAX_BYTES}")
+        settings = get_settings()
+        if limit is None:
+            limit = min(20, settings.mcp_export.mcp_export_max_records)
+        if not 1 <= limit <= settings.mcp_export.mcp_export_max_records:
+            raise ValueError(
+                f"limit must be between 1 and {settings.mcp_export.mcp_export_max_records}"
+            )
+        if not 0 <= offset <= settings.mcp_export.mcp_csv_max_offset:
+            raise ValueError(
+                f"offset must be between 0 and {settings.mcp_export.mcp_csv_max_offset}"
+            )
+        if max_bytes is None:
+            max_bytes = settings.mcp_export.mcp_export_max_bytes
+        if not 1024 <= max_bytes <= settings.mcp_export.mcp_export_max_bytes:
+            raise ValueError(
+                f"max_bytes must be between 1024 and {settings.mcp_export.mcp_export_max_bytes}"
+            )
         await AuthorizationService.require_project_permission(
             principal.user_id,
             requested_project_id,
@@ -1197,14 +1205,17 @@ async def export_mapped_reaction_thermodynamics_csv(
 async def preview_artifact_content(
     artifact_id: str,
     project_id: str,
-    max_bytes: int = 64 * 1024,
+    max_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Return a bounded text preview for an authorized project artifact."""
 
     try:
         principal = _require_mcp_principal()
-        if not 1024 <= max_bytes <= MCP_ARTIFACT_PREVIEW_MAX_BYTES:
-            raise ValueError(f"max_bytes must be between 1024 and {MCP_ARTIFACT_PREVIEW_MAX_BYTES}")
+        maximum = get_settings().mcp_export.mcp_artifact_preview_max_bytes
+        if max_bytes is None:
+            max_bytes = min(64 * 1024, maximum)
+        if not 1024 <= max_bytes <= maximum:
+            raise ValueError(f"max_bytes must be between 1024 and {maximum}")
         preview = await ArtifactContentService.preview(
             UUID(artifact_id),
             max_bytes=max_bytes,
@@ -1254,13 +1265,16 @@ async def download_artifacts_batch(
 
     try:
         principal = _require_mcp_principal()
-        if not 1 <= len(artifact_ids) <= MCP_BATCH_MAX_FILES:
-            raise ValueError(f"artifact_ids must contain 1 to {MCP_BATCH_MAX_FILES} items")
+        settings = get_settings()
+        if not 1 <= len(artifact_ids) <= settings.mcp_export.mcp_batch_max_files:
+            raise ValueError(
+                f"artifact_ids must contain 1 to {settings.mcp_export.mcp_batch_max_files} items"
+            )
         requested_ids = [UUID(artifact_id) for artifact_id in artifact_ids]
         if len(set(requested_ids)) != len(requested_ids):
             raise ValueError("artifact_ids must be unique")
         requested_project_id = UUID(project_id)
-        slots = asyncio.Semaphore(16)
+        slots = asyncio.Semaphore(settings.mcp_export.mcp_batch_download_concurrency)
 
         async def resolve(artifact_id: UUID) -> ArtifactDownload:
             async with slots:
@@ -1303,15 +1317,18 @@ async def download_artifacts_batch(
 async def preview_scientific_array(
     array_id: str,
     project_id: str,
-    max_elements: int = 512,
+    max_elements: int | None = None,
 ) -> dict[str, Any]:
     """Return a bounded preview of a project-scoped scientific array."""
 
     try:
         principal = _require_mcp_principal()
         requested_project_id = UUID(project_id)
-        if not 1 <= max_elements <= MCP_ARRAY_PREVIEW_MAX_ELEMENTS:
-            raise ValueError(f"max_elements must be between 1 and {MCP_ARRAY_PREVIEW_MAX_ELEMENTS}")
+        maximum = get_settings().mcp_export.mcp_array_preview_max_elements
+        if max_elements is None:
+            max_elements = min(512, maximum)
+        if not 1 <= max_elements <= maximum:
+            raise ValueError(f"max_elements must be between 1 and {maximum}")
         await AuthorizationService.require_project_permission(
             principal.user_id,
             requested_project_id,
@@ -1379,16 +1396,21 @@ async def download_scientific_array_npy(
 async def export_mapped_reaction_transition_state_geometries(
     project_id: str,
     after_binding_id: str | None = None,
-    limit: int = 20,
+    limit: int | None = None,
+    include_calculations: bool = True,
 ) -> dict[str, Any]:
-    """Read a bounded page of mapped-reaction TS geometry and RDKit Mol records."""
+    """Read mapped TS geometries; omit calculations for coordinate-only consumers."""
 
     try:
         principal = _require_mcp_principal()
         requested_project_id = UUID(project_id)
         cursor = UUID(after_binding_id) if after_binding_id is not None else None
-        if not 1 <= limit <= MCP_TS_GEOMETRY_EXPORT_MAX_RECORDS:
-            raise ValueError(f"limit must be between 1 and {MCP_TS_GEOMETRY_EXPORT_MAX_RECORDS}")
+        settings = get_settings()
+        max_records = settings.mcp_export.mcp_ts_geometry_export_max_records
+        if limit is None:
+            limit = min(20, max_records)
+        if not 1 <= limit <= max_records:
+            raise ValueError(f"limit must be between 1 and {max_records}")
         await AuthorizationService.require_project_permission(
             principal.user_id,
             requested_project_id,
@@ -1398,15 +1420,17 @@ async def export_mapped_reaction_transition_state_geometries(
         records: list[dict[str, Any]] = []
         response_bytes = 0
         has_more = False
+        max_bytes = settings.mcp_export.mcp_ts_geometry_export_max_bytes
         async for line in iter_mapped_reaction_geometry_export(
             requested_project_id,
             after_binding_id=cursor,
             max_records=limit + 1,
+            include_calculations=include_calculations,
         ):
             if len(records) >= limit:
                 has_more = True
                 break
-            if response_bytes + len(line) > MCP_TS_GEOMETRY_EXPORT_MAX_BYTES:
+            if response_bytes + len(line) > max_bytes:
                 if not records:
                     return _mcp_error(
                         "payload_too_large",
@@ -1424,6 +1448,7 @@ async def export_mapped_reaction_transition_state_geometries(
         return _mcp_success(
             {
                 "project_id": requested_project_id,
+                "include_calculations": include_calculations,
                 "records": records,
                 "next_after_binding_id": next_cursor,
                 "has_more": has_more,

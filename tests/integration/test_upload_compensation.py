@@ -84,7 +84,7 @@ def test_upload_compensation_only_deletes_unavailable_reserved_objects(
         payload,
         uploaded_at=datetime.now(UTC),
     )
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     artifact_id = None
     try:
         with RustFSObjectStore(settings) as store:
@@ -154,7 +154,7 @@ def test_upload_compensation_restores_retired_tombstone() -> None:
         uploaded_at=datetime.now(UTC),
     )
     retired_key = f"retired/sha256/{digest[:2]}/{digest}"
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     artifact_id = None
     try:
         with RustFSObjectStore(settings) as store:

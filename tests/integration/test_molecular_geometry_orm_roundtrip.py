@@ -40,7 +40,7 @@ class MolecularGeometryProbe(SQLModel, table=True):
 
 @pytest.fixture
 def database_engine() -> Iterator[Engine]:
-    database_engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    database_engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     table = MolecularGeometryProbe.__table__
 
     try:

@@ -56,6 +56,9 @@ Caddy proxies API, health, OpenAPI, GraphQL, MCP, and NexusX routes.
 
 ## Required Configuration
 
+The complete variable list, code defaults, and validation bounds are in the
+[environment variable reference](environment-variables.md).
+
 Prepare stable endpoints and credentials for public DNS/TLS, PostgreSQL with
 RDKit and `sslmode=verify-full`, private HTTPS RustFS/S3, writable TLS Redis,
 OIDC issuer/audience/JWKS/client, SMTP STARTTLS, bootstrap administrator, and

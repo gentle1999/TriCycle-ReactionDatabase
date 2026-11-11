@@ -63,7 +63,7 @@ async def test_statistics_and_export_share_logical_reaction_filters(
     suffix = uuid4().hex
     logical_reaction_ids: list[UUID] = []
     source_sample: tuple[object, ...] | None = None
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     try:
         # A profile is only visible when its state points at project-visible
         # source evidence. Reuse the canonical domain fixture so this test
@@ -199,7 +199,7 @@ async def test_export_filters_each_mapping_and_profile_within_one_logical_reacti
 ) -> None:
     del development_query_principal
     suffix = uuid4().hex
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     logical_id = uuid4()
     mapped_ids = [uuid4() for _ in range(3)]
     source_sample = None

@@ -34,6 +34,7 @@ from tricycle_reaction_db.application.services.mapped_geometry_atom_order import
     parse_mapped_reaction_smiles,
     validate_geometry_atom_map_elements,
 )
+from tricycle_reaction_db.core.config import get_settings
 from tricycle_reaction_db.db.models import (
     Geometry,
     MappedReaction,
@@ -51,12 +52,6 @@ from tricycle_reaction_db.storage.rustfs import RustFSObjectStore, RustFSSetting
 
 logger = logging.getLogger(__name__)
 
-DOWNLOAD_TTL = timedelta(days=7)
-JOB_LEASE = timedelta(minutes=30)
-PAGE_SIZE = 128
-MAX_REACTIVE_ATOMS = 20
-MAX_RC_BONDS = 25
-MAX_RC_ANGLES = 25
 DATASET_FORMAT = "units-multidatasetv2-adapter-npy-v2"
 LEGACY_DATASET_EXPORT_PREFIX = "dataset-exports/units-ts/"
 
@@ -376,15 +371,16 @@ def _reaction_center_indices(
     indices = sorted(map_to_index[map_number] for map_number in center_maps)
     if not indices:
         raise ValueError("mapped reaction has no inferable bond or atom changes")
-    if len(indices) > MAX_REACTIVE_ATOMS:
-        raise ValueError(f"reaction center exceeds UniTS limit of {MAX_REACTIVE_ATOMS} atoms")
+    maximum = get_settings().mcp_export.units_ts_max_reactive_atoms
+    if len(indices) > maximum:
+        raise ValueError(f"reaction center exceeds UniTS limit of {maximum} atoms")
     return indices
 
 
 def _empty_rc_indices() -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
     return (
-        np.full((MAX_RC_BONDS, 2), -1, dtype=np.int64),
-        np.full((MAX_RC_ANGLES, 3), -1, dtype=np.int64),
+        np.full((get_settings().mcp_export.units_ts_max_rc_bonds, 2), -1, dtype=np.int64),
+        np.full((get_settings().mcp_export.units_ts_max_rc_angles, 3), -1, dtype=np.int64),
     )
 
 
@@ -393,11 +389,11 @@ def _make_reactive_geometry_indices(
 ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
     rc_bonds, rc_angles = _empty_rc_indices()
     for row, combination in enumerate(itertools.combinations(reactive_atoms, 2)):
-        if row >= MAX_RC_BONDS:
+        if row >= get_settings().mcp_export.units_ts_max_rc_bonds:
             break
         rc_bonds[row] = combination
     for row, angle_combination in enumerate(itertools.combinations(reactive_atoms, 3)):
-        if row >= MAX_RC_ANGLES:
+        if row >= get_settings().mcp_export.units_ts_max_rc_angles:
             break
         rc_angles[row, 0] = angle_combination[0]
         rc_angles[row, 1] = angle_combination[1]
@@ -499,7 +495,9 @@ def make_units_ts_sample(
     coordinates = np.asarray(molecule.GetConformer().GetPositions(), dtype=np.float32)
     if coordinates.shape != (molecule.GetNumAtoms(), 3) or not np.isfinite(coordinates).all():
         raise ValueError("TS geometry coordinates are invalid")
-    padded_reactive_atoms = np.full(MAX_REACTIVE_ATOMS, -1, dtype=np.int64)
+    padded_reactive_atoms = np.full(
+        get_settings().mcp_export.units_ts_max_reactive_atoms, -1, dtype=np.int64
+    )
     padded_reactive_atoms[: len(reactive_atoms)] = reactive_atoms
     rc_bond_indices, rc_angle_indices = _make_reactive_geometry_indices(reactive_atoms)
     rc_bond_indices_batch = rc_bond_indices[np.newaxis, ...]
@@ -608,7 +606,8 @@ class UnitsTsDatasetExportService:
             project_id=project_id,
             requested_by_user_id=user_id,
             download_token_hash=hashlib.sha256(token.encode("ascii")).hexdigest(),
-            expires_at=datetime.now(UTC) + DOWNLOAD_TTL,
+            expires_at=datetime.now(UTC)
+            + timedelta(seconds=get_settings().mcp_export.units_ts_download_ttl_seconds),
         )
         async with session_factory() as session:
             session.add(job)
@@ -749,7 +748,9 @@ async def claim_units_ts_dataset_export_job() -> ClaimedUnitsDatasetExportJob | 
             return None
         job.status = UnitsDatasetExportJobStatus.PROCESSING
         job.lease_id = lease_id
-        job.lease_expires_at = now + JOB_LEASE
+        job.lease_expires_at = now + timedelta(
+            seconds=get_settings().mcp_export.units_ts_job_lease_seconds
+        )
         job.attempt_count += 1
         job.updated_at = now
         session.add(job)
@@ -776,7 +777,8 @@ async def _save_job_progress(
                 sample_count=sample_count,
                 skipped_count=skipped_count,
                 skip_reasons=skip_reasons,
-                lease_expires_at=now + JOB_LEASE,
+                lease_expires_at=now
+                + timedelta(seconds=get_settings().mcp_export.units_ts_job_lease_seconds),
                 updated_at=now,
             )
         )
@@ -891,7 +893,7 @@ async def build_units_ts_dataset_file(
                 col(Geometry.project_id) == claimed.project_id,
             )
             .order_by(col(MappedReactionNodeGeometry.id))
-            .limit(PAGE_SIZE)
+            .limit(get_settings().mcp_export.units_ts_export_page_size)
         )
         if last_binding_id is not None:
             statement = statement.where(col(MappedReactionNodeGeometry.id) > last_binding_id)
@@ -1007,7 +1009,7 @@ async def iter_units_ts_dataset_jsonl(
                 col(MappedReactionNodeGeometryMapping.verified).is_(True),
             )
             .order_by(col(MappedReactionNodeGeometry.id))
-            .limit(PAGE_SIZE)
+            .limit(get_settings().mcp_export.units_ts_export_page_size)
         )
         if last_binding_id is not None:
             statement = statement.where(col(MappedReactionNodeGeometry.id) > last_binding_id)

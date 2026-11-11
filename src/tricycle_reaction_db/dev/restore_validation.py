@@ -224,7 +224,7 @@ def validate_restore(
         raise ValueError("expected_manifest cannot be combined with max_artifacts")
     expected = _load_expected_manifest(expected_manifest) if expected_manifest else None
     settings = get_settings()
-    database_engine = create_engine(settings.database_url, pool_pre_ping=True)
+    database_engine = create_engine(settings.runtime.database_url, pool_pre_ping=True)
     stores: dict[str, RustFSObjectStore] = {}
     try:
         with Session(database_engine) as session:

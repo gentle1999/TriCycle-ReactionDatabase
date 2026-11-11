@@ -5,9 +5,9 @@ import pytest
 from molop.unit import atom_ureg
 from rdkit import Chem
 
+from tests.config_helpers import application_settings
 from tricycle_reaction_db.application.services import artifact_molop_inference as inference
 from tricycle_reaction_db.application.services.ts_endpoint_fallback import endpoint_provenance
-from tricycle_reaction_db.core.config import Settings
 
 
 def frame():
@@ -38,7 +38,7 @@ def endpoint(source, direction):
 
 
 def test_compatibility_is_disabled_by_default():
-    assert Settings(_env_file=None).ts_endpoint_openbabel_fallback is False
+    assert application_settings(_env_file=None).ingestion.ts_endpoint_openbabel_fallback is False
 
 
 def test_unverified_charge_exception_does_not_relax_strict_reactions(monkeypatch):

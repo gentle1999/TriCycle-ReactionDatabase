@@ -123,6 +123,13 @@ Redis TLS。开发单 worker 可以使用进程内限流；生产环境必须使
 
 ## 4. 环境文件
 
+完整变量清单、代码默认值和校验边界见 [环境变量参考](environment-variables.md)。
+
+映射反应 TS 几何 MCP 导出的单页字节上限由
+`TRICYCLE_MCP_TS_GEOMETRY_EXPORT_MAX_BYTES` 配置，默认 `524288`（512 KiB），
+允许范围为 1 KiB–64 MiB。调整后重启 API 服务；大 Hessian 会增加单次响应的
+内存和传输开销，仅需坐标时可在工具调用中设置 `include_calculations=false`。
+
 ~~~bash
 cp .env.example .env
 chmod 600 .env

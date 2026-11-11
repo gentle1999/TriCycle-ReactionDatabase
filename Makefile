@@ -6,7 +6,7 @@
 	reinfer-transition-state-endpoints \
 	benchmark-upload-resources benchmark-remote-upload-resources capture-query-plan-evidence probe-shared-rate-limit probe-upload-limit \
 	validate-da-bench-fixture validate-restore deployment-smoke validate-deployment-acceptance \
-	stack-build stack-up stack-down stack-logs
+	stack-build stack-up stack-down stack-logs env-docs validate-config validate-frontend-config
 
 DEV_DATABASE_URL := postgresql+psycopg://example_user:example-local-password@127.0.0.1:5432/example_reaction_db
 DEV_RUSTFS_ENDPOINT := http://127.0.0.1:19000
@@ -51,10 +51,10 @@ init:
 frontend-install:
 	npm --prefix frontend ci
 
-frontend-build:
+frontend-build: validate-frontend-config
 	npm --prefix frontend run build
 
-frontend-check:
+frontend-check: validate-frontend-config
 	npm --prefix frontend run check
 
 frontend-test-e2e:
@@ -192,10 +192,10 @@ infra-up:
 infra-down:
 	docker compose down
 
-stack-build:
+stack-build: validate-config
 	docker compose build api frontend caddy
 
-stack-up:
+stack-up: validate-config
 	docker compose up -d --build --wait
 
 stack-down:
@@ -203,6 +203,12 @@ stack-down:
 
 stack-logs:
 	docker compose logs --follow api upload-worker frontend caddy
+
+validate-config:
+	uv run --frozen python -m scripts.validate_environment --target all
+
+validate-frontend-config:
+	uv run --frozen python -m scripts.validate_environment --target frontend --env-file frontend/.env
 
 migrate:
 	uv run alembic upgrade head
@@ -323,3 +329,6 @@ serve:
 
 serve-nexusx:
 	uv run tricycle-nexusx-services
+
+env-docs:
+	uv run --frozen python -m scripts.generate_environment_reference

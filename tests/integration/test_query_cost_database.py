@@ -68,7 +68,7 @@ def _plan_nodes(plan: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def test_representative_query_plans_execute_with_buffers_and_expected_indexes() -> None:
-    engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+    engine = create_engine(get_settings().runtime.database_url, pool_pre_ping=True)
     statements = {
         "formula exact counts": (
             "SELECT id FROM molecular_formula "

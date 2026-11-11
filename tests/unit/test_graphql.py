@@ -1,10 +1,14 @@
-from types import SimpleNamespace
-
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from tests.config_helpers import application_settings, copied_application_settings
 from tricycle_reaction_db.api.app import create_app
 from tricycle_reaction_db.api.routes import graphql as graphql_module
+from tricycle_reaction_db.core.config import ApplicationSettings
+
+
+def _settings(**domains: dict[str, object]) -> ApplicationSettings:
+    return copied_application_settings(application_settings(_env_file=None), **domains)
 
 
 @pytest.mark.asyncio
@@ -106,7 +110,7 @@ async def test_graphiql_is_development_only(monkeypatch: pytest.MonkeyPatch) -> 
         monkeypatch.setattr(
             graphql_module,
             "get_settings",
-            lambda: SimpleNamespace(environment="production"),
+            lambda: _settings(runtime={"environment": "production"}),
         )
         production = await client.get("/graphql")
 

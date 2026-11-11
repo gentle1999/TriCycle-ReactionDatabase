@@ -389,7 +389,7 @@ def _reaction_structure_predicate(
         raise ValueError(f"{field} must be a non-empty string")
     enforce_structure_input_budget(
         {field: value},
-        maximum_characters=get_settings().structure_query_max_characters,
+        maximum_characters=get_settings().runtime.structure_query_max_characters,
     )
     if field in {"smarts", "reactant_smarts", "product_smarts"}:
         if Chem.MolFromSmarts(value) is None:
@@ -919,7 +919,7 @@ def logical_reaction_filter_expression_predicate(
 ) -> Any:
     """Parse one public filter expression with the logical-reaction query rules."""
 
-    if len(filter_expression) > get_settings().structure_query_max_characters:
+    if len(filter_expression) > get_settings().runtime.structure_query_max_characters:
         raise ValueError("filter_expression exceeds the configured character budget")
     try:
         expression = json.loads(filter_expression)
@@ -939,7 +939,7 @@ async def _enforce_candidate_limit(
     label: str,
     session: Any,
 ) -> None:
-    maximum = get_settings().structure_candidate_limit
+    maximum = get_settings().runtime.structure_candidate_limit
     candidate_ids = (await session.exec(statement.limit(maximum + 1))).all()
     if len(candidate_ids) > maximum:
         raise QueryBudgetExceeded(
@@ -1783,7 +1783,7 @@ class MolecularTopologyQueryService(UseCaseService):  # type: ignore[misc]
                 "smarts": smarts,
                 "scaffold_smiles": scaffold_smiles,
             },
-            maximum_characters=settings.structure_query_max_characters,
+            maximum_characters=settings.runtime.structure_query_max_characters,
         )
 
         scope = await query_visibility_scope(project_id=project_id)
@@ -2227,7 +2227,7 @@ class LogicalReactionQueryService(UseCaseService):  # type: ignore[misc]
         }
         enforce_structure_input_budget(
             structure_inputs,
-            maximum_characters=settings.structure_query_max_characters,
+            maximum_characters=settings.runtime.structure_query_max_characters,
         )
         if reaction_smarts is not None and (
             reactant_mol_block is not None or product_mol_block is not None
@@ -2952,7 +2952,7 @@ class MappedReactionQueryService(UseCaseService):  # type: ignore[misc]
                 "reaction_smarts": reaction_smarts,
                 "similarity_reaction_smiles": similarity_reaction_smiles,
             },
-            maximum_characters=settings.structure_query_max_characters,
+            maximum_characters=settings.runtime.structure_query_max_characters,
         )
         scope = await query_visibility_scope(project_id=project_id)
         predicates: list[Any] = [mapped_reaction_id_is_visible(scope, col(MappedReaction.id))]
